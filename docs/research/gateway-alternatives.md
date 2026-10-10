@@ -220,7 +220,17 @@
 - Ollama Cloud：官方用量頁 `https://ollama.com/settings/usage`（截至 2026-10-10 **沒有公開 API**，要自動化只能像 sub2api 一樣爬設定頁）。出處：https://docs.ollama.com/cloud
 - Claude 訂閱：Claude Code OTel（上節）；另外 Anthropic Console 的 Admin API 有組織層 usage/cost report（本文件未展開）。
 
-### 5.5 綜合評語
+### 5.5 OpenRouter Management API key
+
+- **性質與範圍**：Management API key 是**帳號層級**（組織內只有 Organization Admins 能建立），而且是**不分範圍（unscoped）**的——一把涵蓋該帳號所有 workspace 的管理操作，不綁單一 workspace。個人帳號亦可建立。出處：https://openrouter.ai/docs/features/provisioning-api-keys
+- **不能用來呼叫模型**：官方明文「Management keys cannot be used to make API calls to OpenRouter's completion endpoints - they are exclusively for administrative operations.」——只能打管理路由（`/api/v1/keys`、analytics、credits、BYOK、guardrails、workspaces／budgets 等）。出處：同上
+- **能建立／停用／刪除帳號內的 key**：`/api/v1/keys` 提供列出（GET，`offset` 分頁）、建立（POST，回應含 key 字串本體、只顯示一次）、查單把（GET `{hash}`）、更新（PATCH：`name`、`disabled`、`include_byok_in_limit`、`limit_reset`）、刪除（DELETE `{hash}`）。注意：洩漏警告段落明講管理 key 可改動帳號內 API keys，**但不能動由 Connect client 簽發的 key**。出處：同上
+- **對簽發出去的 key 設上限／到期**：
+  - 上限：建立時可帶 `limit`（credit limit）；更新時可設 `limit_reset`（daily／weekly／monthly 自動重置），並可選擇 BYOK 用量是否計入上限（`include_byok_in_limit`）；key 查詢回應含 `limit_remaining` 與每日／週／月 usage 欄位。出處：同上
+  - 到期：文件中「expiration」講的是 **management key 自己**——建立時可選到期，之後不可修改，要延長得建新刪舊，過期後所有請求回 `401`（`API key expired`）。**截至 2026-10-10，官方文件中為簽發出去的 API key 未見「到期日」參數**（能設的是額度上限與重置週期）；key 的生命週期管理要靠管理端自行停用（`disabled`）或刪除。出處：同上
+- 對 LLMGateway 的意涵：這是在「無閘道」路線下，中央自動化「發 OpenRouter key／停用／查用量」的官方途徑；但它是帳號層級、沒有 metadata／標籤概念——worker／角色／agent 歸因仍要靠 key 的 `name` 與我們自己的帳本。
+
+### 5.6 綜合評語
 
 - 優點：沒有新的憑證集中點（每台 worker 自己持有）、條款最乾淨、零閘道維運；Claude Code 與 Zen 的官方紀錄已足以做帳。
 - 缺點：沒有「發 key—配額—停用」的中央政策點；opencode 紀錄在本機（要自己想辦法拉）、Ollama Cloud 無公開 API（截至 2026-10-10）；跨供應商彙總要自建（OTel collector＋一份儲存＋報表）。

@@ -29,4 +29,4 @@
 ## 5. 第 3 階段：照租約發放（只對 OpenRouter）
 
 - [ ] 5.1 本人裁定 OpenRouter Management API key 的保管者
-- [ ] 5.2 租約核准時發一把有上限、短效的 OpenRouter key，release 時撤銷
+- [ ] 5.2 租約核准時發一把有額度上限的 OpenRouter key，租約結束（含逾期、撤銷、切換）時刪除

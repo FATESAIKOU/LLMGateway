@@ -83,11 +83,11 @@ LLMGateway 只做三件事：依政策發租約、記錄租約事件、彙整用
 | 0（現在） | 能力全掛、agent 自己讀 | 無 | — |
 | 1 只記錄 | 同上 | launcher 申請租約並回報事件；申請失敗也照樣啟動，只發警告 | 0 |
 | 2 照租約注入 | 能力全掛，但 launcher 只注入租約指定的那一把 | 沒有租約就不啟動；切換照決定 4 | 1 |
-| 3 照租約發放 | 能發短效、可撤銷 key 的供應商（OpenRouter）改由租約當下發一把有上限的 key；Claude 訂閱 token 仍走掛載 | 發 key、在 release 時撤銷 | 2 |
+| 3 照租約發放 | 能用 API 發放與刪除 key 的供應商（OpenRouter）改由租約當下發一把有額度上限的 key；Claude 訂閱 token 仍走掛載 | 發 key；在 released、expired、revoked、superseded 時刪除（OpenRouter 發出的 key 沒有到期參數，截至 2026-10-10，所以「短效」靠租約結束時刪除） | 2 |
 
 - 每個階段都用 launcher 的一個設定切換，不改 agent。
 - 第 2 階段完成後，MyLinuxPool 的能力可以從「全給」縮成「照政策給」（期 2，依部門）。
-- **第 3 階段是「憑證值不經過 LLMGateway」的唯一例外**：發出的短效 key 必然經過發放者。發放與撤銷要用 OpenRouter 的 Management API key，這把 key 是帳號層級、不分範圍的，外洩後可以建立或刪除帳號內所有 key。因此第 3 階段另開工單，開工前要本人裁定這把 key 由誰保管：放在控制面，或放在 launcher、由 LLMGateway 只下指令。
+- **第 3 階段是「憑證值不經過 LLMGateway」的唯一例外**：發出的短效 key 必然經過發放者。發放與刪除要用 OpenRouter 的 Management API key，這把 key 是帳號層級、不分範圍的，外洩後可以建立、停用或刪除帳號內所有 key（`gateway-alternatives.md` §5.5）。因此第 3 階段另開工單，開工前要本人裁定這把 key 由誰保管：放在控制面，或放在 launcher、由 LLMGateway 只下指令。
 
 ### 決定 6：什麼時候才上資料面閘道
 
@@ -115,6 +115,7 @@ LLMGateway 只做三件事：依政策發租約、記錄租約事件、彙整用
 - [同時用個人和公司兩把 Claude 訂閱給自己的 agent，可能有條款與公司政策問題] → 要本人確認（公司訂閱的合約與內部政策）；確認前，政策檔可以先把 `claude-company` 設為只在切換時使用。
 - [v0 後端是 GitHub repo，有寫入次數上限] → 事件只在狀態變化與每小時續期時寫入；即使有十個 agent，每小時也遠低於上限。
 - [sidecar 的 headless 啟動還沒定] → 本設計只要求 sidecar 能在啟動前與結束後各呼叫一次 CLI，不依賴 headless 的細節。
+- [v0 用 Prometheus 匯出時，Claude Code 的本機指標端點固定在 9464 埠，同一台機器同時有兩個 Claude Code session 會互撞] → v0 假設每台機器同時只有一個 Claude Code session 匯出指標，其餘 session 的 Claude 用量列為未歸因；sidecar 開多個 Claude session 成為常態時，改用 OTLP 送到 collector。
 - [切換要先安全結束 agent，依賴 sidecar 的終止語意] → 列為和 MyAiStorage#31 對齊的項目（tasks 1.1）。
 - [角色的格式依賴 Angareion 的身分表示（MyAiStorage#30 待設計）] → 規格先把角色當不透明字串，定案後再對齊。
 

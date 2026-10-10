@@ -31,7 +31,7 @@ LLMGateway SHALL 依政策檔（角色 × coding agent × 訂閱 × 模型 的�
 - **THEN** 該租約在下一次與 LLMGateway 往來時記為 revoked（觸發者：政策），launcher 終止該 agent
 
 ### Requirement: 租約狀態與事件
-租約 SHALL 依序經過 requested → granted 或 denied → active → released、expired、revoked 或 superseded 其中之一。每次狀態變化與每次續期 MUST 以只追加的事件記錄，事件帶單調遞增的序號、時刻與觸發者；事件的先後以序號為準，時刻只作註記。launcher 的動作與事件的對應 SHALL 為：start → active、stop → released、switch → 原租約 superseded 並申請新租約、renew → 有效期限延長（狀態不變）、revoke → revoked。
+租約 SHALL 依序經過 requested → granted 或 denied → active → released、expired、revoked 或 superseded 其中之一；唯一的例外是 granted 之後沒有啟動 agent 就結束，此時直接由 granted 記為 released（理由：未啟動）。沒有租約就啟動的 agent 另以「未租約啟動」事件記錄，不進入租約的狀態機。每次狀態變化與每次續期 MUST 以只追加的事件記錄，事件帶單調遞增的序號、時刻與觸發者；事件的先後以序號為準，時刻只作註記。launcher 的動作與事件的對應 SHALL 為：start → active、stop → released、switch → 原租約 superseded 並申請新租約、renew → 有效期限延長（狀態不變）、revoke → revoked。
 
 #### Scenario: 正常一輪
 - **WHEN** launcher 取得 granted 租約、以 start 回報 agent 已啟動，之後以 stop 回報 agent 結束
@@ -58,11 +58,15 @@ LLMGateway SHALL 依政策檔（角色 × coding agent × 訂閱 × 模型 的�
 - **THEN** 紀錄只有一筆對應事件
 
 ### Requirement: 回報暫時失敗時保存後補送
-launcher 回報 start、stop、switch 或用量時若 LLMGateway 暫時無法連線，SHALL 將回報保存在本機、恢復後依原順序補送；補送不得造成事件重複。
+launcher 回報 start、stop、switch、renew 或用量時若 LLMGateway 暫時無法連線，SHALL 將回報保存在本機、恢復後依原順序補送；補送不得造成事件重複。續期在有效期限前一直無法送達時，已啟用強制的 launcher MUST 在有效期限到達時終止 agent；尚未啟用強制的 launcher 讓 agent 繼續，並在恢復後補送。
 
 #### Scenario: 結束時連不上
 - **WHEN** agent 結束時 launcher 的 stop 回報失敗，之後 LLMGateway 恢復
 - **THEN** launcher 補送 stop，紀錄最終恰有一筆 released 事件，用量不漏
+
+#### Scenario: 強制階段續期一直失敗
+- **WHEN** 已啟用強制，launcher 在有效期限到達前都無法送出續期
+- **THEN** launcher 在有效期限到達時終止 agent，恢復後補送的續期被拒絕，租約記為 expired
 
 ### Requirement: 憑證由 launcher 注入
 既有的上游訂閱與供應商憑證的值 MUST NOT 經過、存放於 LLMGateway。launcher SHALL 在取得 granted 租約後，只從本機憑證來源取出租約指定的那一個訂閱的憑證，以該 coding agent 實際讀取的變數名注入 agent 的環境；其他訂閱的憑證 MUST NOT 出現在該 agent 的環境裡。
@@ -73,15 +77,15 @@ launcher 回報 start、stop、switch 或用量時若 LLMGateway 暫時無法連
 
 #### Scenario: 憑證來源缺失
 - **WHEN** 租約 granted，但本機憑證來源找不到該訂閱的憑證
-- **THEN** launcher 不啟動 agent、不做部分注入，並以 stop 回報失敗理由
+- **THEN** launcher 不啟動 agent、不做部分注入，租約由 granted 直接記為 released（理由：未啟動，說明為憑證來源缺失）
 
 #### Scenario: 強制階段沒有租約
 - **WHEN** 已啟用強制，而申請被拒或 LLMGateway 無法連線
 - **THEN** launcher 不啟動 agent，並回報失敗原因
 
 #### Scenario: 只記錄階段沒有租約
-- **WHEN** 尚未啟用強制，而 LLMGateway 無法連線
-- **THEN** launcher 照樣啟動 agent，並在本機留下警告，待恢復後補送一筆未經核准的啟動紀錄
+- **WHEN** 尚未啟用強制，而 LLMGateway 無法連線或拒絕申請
+- **THEN** launcher 照樣啟動 agent，在本機留下警告，並記錄（連不上時於恢復後補送）一筆「未租約啟動」事件，事件帶 worker、角色、訂閱、coding agent、模型與未取得租約的理由
 
 ### Requirement: 訂閱切換不得安靜發生
 當 agent 因額度或限流必須改用另一個訂閱時，launcher SHALL 先安全結束原 agent，將原租約記為 superseded（帶理由與恢復時刻），申請政策中下一個訂閱的新租約，再以新憑證接續原 session；每次切換 MUST 對 PMO 發出通知，通知帶新舊租約 id。通知失敗 MUST NOT 讓切換回滾，通知 SHALL 留在本機重試直到送出。新開的 session SHALL 從政策的第一優先訂閱開始。

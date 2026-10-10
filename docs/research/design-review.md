@@ -113,3 +113,67 @@
 
 - MyLinuxPool#46／#50、MyPMO#4 是 private repo，本次**未讀**；相關陳述（能力全給現況、裁定的原文）只能照 proposal／design 的轉述，無法獨立查證。
 - `docs/research/` 的五份調查已經二輪查證（`review-notes.md` 六～八節）；本審查引用的是查證後的版本。
+
+## 複查（PR #5）
+
+> 複查者：LLMGateway 團隊 reviewer。日期：2026-10-10。
+> 對象：PR #5 `design/agent-lease-and-usage`，commit `95c9748`（2026-10-10 17:56:52 +0900）；工作樹乾淨、與 origin 同步。
+> 方法：對照原審查 M1、M2、D1–D12 逐條核對修法；檢查是否引入新矛盾；對照 test 的 `spec-testability.md`（MS-1–MS-12）確認哪些進 spec、哪些留在實作；`openspec validate agent-lease-and-usage-record --strict` 實測通過。
+> 結論：**M2、D1–D12 全部處理**；M1 主體已處理，僅剩「Management API key 出處補進 `docs/research/`」未做。修法引入 **1 條狀態機矛盾（N1）** 與 5 條小殘留（N2–N6，皆建議）。
+
+### 一、原審查項目的處理狀態
+
+| 項目 | 狀態 | 說明 |
+|---|---|---|
+| M1 憑證例外＋Management key | ✅ 主體處理 | Goals 改成「既有的…（第 3 階段的例外見決定 5）」；決定 5 新增例外段落並把「誰保管 Management API key」交給本人裁定（tasks 5.1）；proposal 同步改「不持有、不轉送**既有的**上游憑證值」。**殘留**：Management API key 的關鍵事實（帳號層級、unscoped、可建刪所有 key）仍沒有 `docs/research/` 出處（見 N5）。 |
+| M2 逾期／續期機制 | ✅ 處理 | 決定 3 新增「延後結算」（任何 CLI 往來先補記 expired）；spec 改寫「launcher 沒回報結束」為下次往來時結算、新增「續期」情境、CLI 加 `revoke` 並補「撤銷」「對已結束的租約續期→拒絕」「重複回報→恰一筆」情境、新增「回報暫時失敗時保存後補送」Requirement；去重鍵（租約 id＋動作＋請求 id）與單調序號寫進決定 3。 |
+| D1 來源名稱≠變數名 | ✅ 處理 | 決定 2 改成「來源識別鍵」並明說 launcher 要換成 agent 實際讀的變數名（Claude Code 一律是 `CLAUDE_CODE_OAUTH_TOKEN`）；spec「只注入一把」情境同步。 |
+| D2 閘道否決理由 | ✅ 處理 | 決定 4 放棄的選項改寫：「閘道端也能留紀錄，『不安靜』做得到；不採用是因為要把兩把訂閱 token 集中在閘道，而且要多維運一個服務」；#50 的要求改為轉述（留紀錄＋通知）。 |
+| D3 終止依賴 | ✅ 處理 | 決定 4 流程第 2 步加入「先送 SIGINT、等 agora 寫回；依賴 sidecar 的終止語意」；Risks 增列同項並指向 tasks 1.1。 |
+| D4 opencode 用量來源 | ✅ 處理 | 決定 7 改「`stats` 是彙總，不能指定單一 session；啟動時記 session id，release 時 `opencode export <sessionID>`」；spec 同步；tasks 3.3 同步。 |
+| D5 OTel 在 v0 的落地 | ✅ 處理（引入 N3） | 決定 7 改「v0 不架 collector：launcher 讓 Claude Code 用 `OTEL_METRICS_EXPORTER=prometheus`，結束前抓一次」；並註明 OTel 設定不能放專案 `.claude/settings.json`。見 N3 的併發限制。 |
+| D6 lgw 後端 token | ✅ 處理 | Open Questions 增列「寫入它的 token 的範圍與發放方式（比照 Angareion 的 token 設計）」。 |
+| D7 與 Angareion 互指 | ✅ 處理 | 決定 4 流程第 5 步：通知帶新舊租約 id、lgw 事件記 Angareion 訊息 id、通知失敗不回滾並留本機重試；spec 新增「通知管道失效」情境。也一併回應了 test 的 MS-9。 |
+| D8 角色格式依賴 #30 | ✅ 處理 | spec 欄位改「角色（不透明字串；格式待 Angareion 的身分表示定案後對齊）」；Risks 增列同項。 |
+| D9 動詞／狀態／事件對映 | ✅ 處理 | spec 明列 start→active、stop→released、switch→superseded＋新租約、renew→續期事件（狀態不變）、revoke→revoked；revoke 進入 CLI 與 tasks 2.1／2.3。 |
+| D10 拒絕通知不一致 | ✅ 處理 | proposal Impact 改成「切換與額度用完的通知走 Angareion」，與 spec 的通知範圍一致。 |
+| D11 政策預設可驗證性 | ✅ 處理 | spec 改「政策檔的內容就是允許集合的權威；期 1 的初始政策檔 SHALL 列入當時能力已提供的全部組合」。 |
+| D12 私有工單引句 | ✅ 處理 | 決定 1 的 MyPMO#4 引句已移除（只留連號）；決定 4 對 #50 改為轉述。proposal Why 仍用「不能安靜地切換」一詞，但其行為已在 spec 定義，可接受。 |
+
+### 二、修法引入／殘留的新問題
+
+| # | 嚴重度 | 位置 | 問題與建議 |
+|---|---|---|---|
+| N1 | **必修**（低成本） | specs/agent-lease/spec.md「租約狀態與事件」＋「憑證來源缺失」＋「只記錄階段沒有租約」 | 規格說「SHALL **依序** 經過 requested → granted／denied → active → released…」，但新情境出現兩條不合法路徑：(a)「憑證來源缺失」是 granted 後直接以 stop 回報（released），沒有 active；(b)「只記錄階段」要補送「未經核准的啟動紀錄」（start→active 卻沒有 granted）。建議補一張允許的轉移表（例如 granted→released 允許、理由＝未啟動；未核准啟動另立事件類型 `unleased-start` 不進狀態機），或改寫這兩個情境。 |
+| N2 | 建議 | specs/agent-lease/spec.md「只記錄階段沒有租約」 | 只涵蓋「LLMGateway 無法連線」；design 階段 1 說「申請**失敗**也照樣啟動」，但「政策拒絕（denied）」在階段 1 的行為沒有情境。建議補一個 denied 的階段 1 情境，或把情境文字擴成「無法連線或被拒」。 |
+| N3 | 建議 | design.md 決定 7（prometheus 方案） | Prometheus exporter 固定在本機 `http://localhost:9464/metrics`，官方文件未載可改埠；同一台 worker／Mac 同時兩個 Claude Code session（sidecar 的 team 常態）會撞同一個埠。建議在 Risks 或 Open Questions 註明「v0 假設同時只有一個 Claude session 導出」，或改用 OTLP／確認埠可設定。出處：<https://code.claude.com/docs/en/monitoring-usage>（“For Prometheus, scraped from http://localhost:9464/metrics”；self-hosted 段落也以 capacity one 描述）。 |
+| N4 | 建議 | specs/agent-lease/spec.md「回報暫時失敗時保存後補送」 | 列舉了 start／stop／switch／用量，**漏了 renew**；test 的 MS-3（a–c：暫時失敗、重試耗盡、過期後才續期）也因此仍沒有語意。建議把 renew 納入補送範圍，或明說失敗語意留給實作（fail closed 或撐到有效期限）。 |
+| N5 | 建議 | design.md 決定 5 第 3 段的敘述（「出處都在 docs/research/」） | M1 要求的出處未補：`docs/research/gateway-alternatives.md` 沒有 OpenRouter Management API Keys 一節（現有 `management key` 字樣只出現在 agent-endpoints 的 `/credits` 說明）。建議在 gateway-alternatives.md §5.4 或新小節補：Management API key 帳號層級、unscoped、可建立／停用／刪除帳號內 key、不能發 completion 呼叫（<https://openrouter.ai/docs/features/provisioning-api-keys>）。 |
+| N6 | 建議（小） | proposal.md「What Changes」第 2 點 | 仍寫「opencode **stats**」帶租約 id 回報；design／spec 已改成 `opencode export <sessionID>`（stats 為彙總）。建議同步 proposal 措辭。 |
+
+### 三、test 的 MS-1～MS-12 對照（哪些進 spec、哪些刻意留實作）
+
+| MS | 去處 | 說明 |
+|---|---|---|
+| MS-1 申請時連不上 | **部分進 spec** | 進：「強制階段沒有租約」「只記錄階段沒有租約」兩情境的結果（不啟動／照樣啟動＋警告＋補送）。留實作：逾時上界、重試次數、不得留半張租約的具體判定；階段 1 的 denied 未涵蓋（N2）。 |
+| MS-2 結束回報時連不上 | **進 spec** | 新 Requirement「回報暫時失敗時保存後補送」＋情境「結束時連不上」（最終恰一筆 released、用量不漏）。 |
+| MS-3 續期失敗 | **部分進 spec** | 進：正常續期情境；「對已結束的租約續期→拒絕＋launcher 終止」（＝子情境 d）。留實作：a（暫時失敗重試）、b（耗盡）、c（過期後續期）、e（併發）的語意；renew 未納入補送（N4）。 |
+| MS-4 同一 session 連續切換 | **部分進 spec** | 進：d（切換後新開 session 回第一優先）、e 的通知部分（備援用完→停止＋通知）、「通知管道失效→補送恰一則」。留實作：a（連續撞限上限）、b（三把以上的鏈）、c（切換中併發訊號）。 |
+| MS-5 時鐘誤差 | **進 spec（要點）** | 序號為準、時刻只作註記；查詢期間「含起點、不含終點」。留實作：亂序時鐘注入的測試方法；恢復時刻的權威來源在 design（上游 reset）。 |
+| MS-6 憑證來源缺失 | **進 spec** | 新情境「憑證來源缺失」（不啟動、不部分注入、回報失敗理由）。⚠ 與狀態機的矛盾見 N1。 |
+| MS-7 重複與亂序回報冪等 | **進 spec（部分）** | 進：「重複回報」情境（恰一筆）；去重鍵寫在 design 決定 3。留實作：亂序重排（spec 已說以序號為準，具體機制留實作）。 |
+| MS-8 同 worker×角色兩張 active | **留實作／政策** | spec 未定允許或拒絕；測試大綱本身也說「依先定的政策」——刻意留給政策檔與實作。 |
+| MS-9 通知管道失效 | **進 spec** | 新情境「通知管道失效」＋ Requirement「通知失敗 MUST NOT 讓切換回滾、留本機重試直到送出」。 |
+| MS-10 內容外洩掃描 | **進 spec（要點）** | 理由欄位改為固定代碼＋≤200 字、說明不得直接貼 agent 錯誤輸出；掃描情境加入「內容標記」。留實作：具體的截斷／過濾實作。 |
+| MS-11 政策變更撤銷 | **進 spec** | 新情境「政策收緊」（下次往來 revoked、觸發者：政策、launcher 終止 agent）。 |
+| MS-12 用量遲到與改歸屬 | **進 spec** | 新情境「用量晚到」（併入原租約、彙總更新）＋「未歸因只有在之後出現相同租約 id 時才能改歸屬」。 |
+
+**刻意留在實作**（test `spec-testability.md` §5 的其餘項目）：政策檔 schema（tasks 1.3）、worker 名稱來源與測試覆寫、錯誤碼／逾時詞彙表、通知 sink 的介面細節（依 MyAiStorage#30）、`lgw` 的退出碼。
+
+### 四、複查驗證
+
+- `openspec validate agent-lease-and-usage-record --strict`：**通過**（2026-10-10 實測）。
+- 憑證／PII 掃描（沿用前次 regex 集）：`openspec/` 全部檔案 **0 命中**。
+- 無新增私有資料引用（MyPMO#4 引句已移除；僅存工單號）。
+- 原審查的 M1 殘留（N5）與新問題（N1）之外，未發現其他新矛盾。
+
