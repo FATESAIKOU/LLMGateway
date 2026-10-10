@@ -2,7 +2,7 @@
 
 動機見 proposal.md。這裡只列影響做法的現況與限制（出處都在 `docs/research/`）：
 
-- **憑證現況**：期 1 用 MyLinuxPool 的能力把 LLM 憑證唯讀掛進 worker（MyLinuxPool#46／#50），預設 profile 全給。Claude 用訂閱的長效 token（`CLAUDE_CODE_OAUTH_TOKEN`，個人為主、公司備援），同一台機器不放 API key。
+- **憑證現況**：期 1 用 MyLinuxPool 的能力把 LLM 憑證唯讀掛進 worker（MyLinuxPool#46／#50），預設 profile 全給。Claude 用訂閱的長效 token（`CLAUDE_CODE_OAUTH_TOKEN`），個人與公司兩把都給，同一台機器不放 API key。本人裁定（2026-10-10）：兩把**地位相同**，哪個 agent 用哪一把、額度用完怎麼切換，由 LLMGateway 的設計決定。
 - **sidecar 現況**：MyAiStorage#31 還在設計；已定的是「啟動用 `agora continue`、匯出用 `agora import`、AI team 的啟動經過 sidecar」。登錄方式、暫停語意、headless 啟動都還沒定（`sidecar-angareion.md` §1、§4）。
 - **Angareion**：角色信箱，收件人是 repo × 職務；叫醒與投遞由 sidecar 負責（MyAiStorage#30）。
 - **Claude 條款**：Claude Code 法務頁不允許第三方以 Free／Pro／Max 憑證代使用者路由請求，也不允許代為收集、儲存、中介這類憑證（`claude-failover.md` §4.2）。「本人自己的兩把、自己的機器」是否落在這條之外，官方沒有正面說法。
@@ -59,19 +59,32 @@ LLMGateway 只做三件事：依政策發租約、記錄租約事件、彙整用
   - 現在就做 HTTP 服務：要先決定主機與可用性。
   - 直接把租約當 Angareion 訊息：Angareion 是對話管道，要查「現在有哪些 active 租約」得重播整個話題；而且叫醒邏輯綁在 sidecar 上，LLMGateway 不該依賴它。
 
-### 決定 4：Claude 個人／公司的切換由 launcher 做，並且留下紀錄、發出通知
+### 決定 4：訂閱由租約政策選定，同等地位的訂閱以平均分攤選定；切換由 launcher 做，並且留下紀錄、發出通知
 
-流程：
+**選定**：申請可以不指定訂閱，由 LLMGateway 依政策選定。同一組角色 × coding agent 可用的訂閱地位相同。政策對每組角色 × coding agent 指定一種選定規則：
+
+- **平均分攤**（Claude 兩把的預設）：先排除冷卻中的訂閱，再選出目前額度窗口內已用量最少的；用量相同時，選最久沒被選到的。
+- **固定順序**：給偏好明確的組合用，例如某個角色只想用免費模型，付費模型只當最後手段。
+
+冷卻的依據是租約紀錄本身：某個訂閱最近一張因額度結束的租約，帶有上游給的恢復時刻，時刻到之前不再選它。已用量取 usage-record 的彙總。v0 拿不到即時用量時，退而比「這個窗口內開過的租約數」。
+
+**切換**流程：
 
 1. 偵測額度訊號：Claude Code 的 `StopFailure`（rate_limit）hook，或 `-p` 模式非零結束且輸出帶額度錯誤。
 2. 安全結束原 agent：先送 SIGINT 讓這一輪收尾，再等 agora 寫回 session。這一步依賴 sidecar 的終止語意（MyAiStorage#31）。
-3. `lgw lease switch`：原租約記為 superseded（理由代碼、恢復時刻），同時申請政策裡的下一個訂閱。
+3. `lgw lease switch`：原租約記為 superseded（理由代碼、恢復時刻），原訂閱因此進入冷卻；同時以不指定訂閱的方式申請新租約，由政策選出另一個。
 4. 只換注入的那一把，以 `agora continue`（Mac 上用 `claude --resume`）接續原 session。
 5. 透過 Angareion 通知 PMO。通知帶新舊租約 id；送出後，lgw 的事件記下 Angareion 的訊息 id，兩邊可以互查。通知送不出去時不回滾切換，留在本機佇列重試。
 
-下一次新開的租約仍然從個人開始，不會因為上次切到公司就一直用公司。
+切換不改變任何訂閱的地位。之後新開的租約照選定規則挑選：冷卻中的不選，恢復後就重新加入平均分攤。
 
-- **為什麼**：MyLinuxPool#50 要求切換時要留下紀錄並發出通知。在 launcher 切換時，每次換帳號都留得下事件，也發得出通知；官方的接續機制也完整。
+- **為什麼**：
+  - 兩把地位相同（本人裁定），所以不寫死主從。平均分攤可以讓兩把的額度窗口都用得到，比「一把用完才換另一把」少碰到額度上限。
+  - 冷卻直接從租約紀錄推出來，不需要另外查上游。
+  - MyLinuxPool#50 要求切換時要留下紀錄並發出通知。在 launcher 切換，每次換帳號都留得下事件，也發得出通知；官方的接續機制也完整。
+- **放棄的選擇方式**：
+  - 固定「個人為主、公司備援」：和本人的裁定不符。
+  - 由 launcher 自己挑訂閱：各台機器看不到彼此的用量，無法分攤。
 - **放棄的選項**：
   - 閘道在中間換帳號：閘道端也能留紀錄，「不安靜」做得到；不採用是因為要把兩把訂閱 token 集中在閘道（條款風險最大），而且要多維運一個服務（決定 1）。
   - `apiKeyHelper` 動態回傳：官方的定位是產生 API 憑證，拿來回傳訂閱 token 沒有文件支持；而且它的優先順序會蓋過訂閱 token。
@@ -112,7 +125,7 @@ LLMGateway 只做三件事：依政策發租約、記錄租約事件、彙整用
 
 - [agent 端回報可以被關掉或漏掉] → 租約事件仍記下「誰在何時用了什麼」；對不上的用量列為未歸因，長期對不上就觸發決定 6。
 - [launcher 自己沒申請就直接開 agent] → 第 2 階段起能力不再讓 agent 自己讀，只有 launcher 讀得到；Mac 上靠本人的使用習慣（啟動包裝），不能強制。
-- [同時用個人和公司兩把 Claude 訂閱給自己的 agent，可能有條款與公司政策問題] → 要本人確認（公司訂閱的合約與內部政策）；確認前，政策檔可以先把 `claude-company` 設為只在切換時使用。
+- [平均分攤依賴用量彙總，v0 的用量回報可能不完整或晚到] → 拿不到用量時退而比租約數；選錯的代價只是兩把的消耗不夠平均，不影響正確性。
 - [v0 後端是 GitHub repo，有寫入次數上限] → 事件只在狀態變化與每小時續期時寫入；即使有十個 agent，每小時也遠低於上限。
 - [sidecar 的 headless 啟動還沒定] → 本設計只要求 sidecar 能在啟動前與結束後各呼叫一次 CLI，不依賴 headless 的細節。
 - [v0 用 Prometheus 匯出時，Claude Code 的本機指標端點固定在 9464 埠，同一台機器同時有兩個 Claude Code session 會互撞] → v0 假設每台機器同時只有一個 Claude Code session 匯出指標，其餘 session 的 Claude 用量列為未歸因；sidecar 開多個 Claude session 成為常態時，改用 OTLP 送到 collector。
