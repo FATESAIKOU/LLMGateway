@@ -100,7 +100,7 @@ LLMGateway 只做三件事：依政策發租約、記錄租約事件、彙整用
 
 - 每個階段都用 launcher 的一個設定切換，不改 agent。
 - 第 2 階段完成後，MyLinuxPool 的能力可以從「全給」縮成「照政策給」（期 2，依部門）。
-- **第 3 階段是「憑證值不經過 LLMGateway」的唯一例外**：發出的短效 key 必然經過發放者。發放與刪除要用 OpenRouter 的 Management API key，這把 key 是帳號層級、不分範圍的，外洩後可以建立、停用或刪除帳號內所有 key（`gateway-alternatives.md` §5.5）。因此第 3 階段另開工單，開工前要本人裁定這把 key 由誰保管：放在控制面，或放在 launcher、由 LLMGateway 只下指令。
+- **第 3 階段是「憑證值不經過 LLMGateway」的唯一例外**：發出的短效 key 必然經過發放者。發放與刪除要用 OpenRouter 的 Management API key，這把 key 是帳號層級、不分範圍的，外洩後可以建立、停用或刪除帳號內所有 key（`gateway-alternatives.md` §5.5）。因此第 3 階段另開工單。本人裁定（2026-10-10）：LLM 系列的 key 先放在 MyLinuxPool（worker 用的 secret），LLMGateway 開始實作時再交給它；第 3 階段之前不建立 Management API key。
 
 ### 決定 6：什麼時候才上資料面閘道
 

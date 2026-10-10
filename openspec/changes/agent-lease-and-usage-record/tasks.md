@@ -29,5 +29,5 @@
 
 ## 5. 第 3 階段：照租約發放（只對 OpenRouter）
 
-- [ ] 5.1 本人裁定 OpenRouter Management API key 的保管者
+- [x] 5.1 本人裁定 OpenRouter Management API key 的保管者：LLM 系列的 key 先放 MyLinuxPool（worker 用的 secret），LLMGateway 實作時再交給它；第 3 階段之前不建立 Management API key（2026-10-10）
 - [ ] 5.2 租約核准時發一把有額度上限的 OpenRouter key，租約結束（含逾期、撤銷、切換）時刪除
