@@ -33,7 +33,7 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 
 | 動作 | 輸入 | 回傳 |
 |---|---|---|
-| `request_lease` | worker、角色、coding agent、模型（可空）、訂閱（可空，空的就照順序選）、來由 | 租約 id、選到的訂閱、**要設給 agent 的環境變數**、效期；或拒絕（理由；全部冷卻時附最早的重置時間） |
+| `request_lease` | worker、角色、coding agent、模型（可空）、訂閱（可空，空的就照順序選）、來由 | `{lease_id, subscription, env, unset, expires_at}`；或拒絕 `{reason: all_cooling\|cap_reached\|not_allowed, earliest_reset}` |
 | `report_exhausted` | 租約 id、偵測到的訊號、重置時間（有就給） | 那一把進冷卻，原租約結束；**順便回傳下一張租約**（或拒絕） |
 | `renew` | 租約 id | 新效期 |
 | `report_usage` | 租約 id、用量快照（例如 Claude status line 的 `rate_limits`） | — |
@@ -48,7 +48,17 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 | `openrouter`、`ollama-cloud` | `ANTHROPIC_BASE_URL`＋`ANTHROPIC_AUTH_TOKEN`（`ANTHROPIC_API_KEY` 設成空字串）。兩家都有官方的 Claude Code 接法 | 各自的連線位址與 key |
 | `opencode-zen` | 不提供：官方沒有 Claude Code 接法，只有社群做法 | 連線位址與 key（opencode 官方支援） |
 
-- sidecar 和包裝指令只把環境變數交給 agent，**不寫進檔案、不保存**；租約結束或換把時就丟掉。同時確保 agent 環境裡沒有其他把的值，例如 `ANTHROPIC_API_KEY` 會蓋過訂閱 token，一律清掉。
+- sidecar 和包裝指令只把環境變數交給 agent，**不保存**，租約結束或換把時就丟掉。
+  - 回傳裡有一份 `unset` 清單，啟動前從 agent 的環境裡明確去掉。例如 `ANTHROPIC_API_KEY` 會蓋過訂閱 token，一律去掉；herdr server 繼承來的環境裡也可能有。
+  - **值不能出現在命令列上**，否則會出現在 `ps` 和 herdr 的 pane 資訊裡。sidecar 的做法：寫一個 0600 的暫存 env 檔，pane 的命令讀進環境後立刻刪掉。Mac 的包裝指令直接 exec，不經 shell 命令字串。
+- 和 sidecar 已對齊的部分（aistorage-pm，2026-10-11）：
+  - 用上表的命名；
+  - renew 由 sidecar 的常駐迴圈每小時做；
+  - report_usage 之後再接；
+  - 拒絕時把 `earliest_reset` 記進 sidecar 的 registry，到時間再申請；
+  - 客戶端憑證放 `/run/mlp-secrets/llmgateway-client-token`（0400），比照 A2A token；
+  - 服務的 base URL 可以設定，連不上時 sidecar 回報「無法確認」，不會掛掉；
+  - agent 種類對應 sidecar 內部的 claude／opencode。
 
 ### 3. 選把與切換（判斷在 LLMGateway，執行在 sidecar）
 
