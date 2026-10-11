@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,13 @@ class ConnectCase(unittest.TestCase):
     def _argv_of(self, script):
         return json.loads(Path(str(script) + ".argv").read_text(encoding="utf-8"))
 
+    def _config_path(self, argv):
+        self.assertEqual(argv.count("-F"), 1)
+        return Path(argv[argv.index("-F") + 1])
+
+    def _config_text(self, argv):
+        return self._config_path(argv).read_text(encoding="utf-8")
+
     def _assert_dead(self, script):
         """斷言假 ssh 的子行程已經結束（讀它開頭寫的 pid 檔）。"""
         pid_path = Path(str(script) + ".pid")
@@ -153,6 +161,21 @@ class ConnectCase(unittest.TestCase):
         self.fail("fake ssh pid {0} still alive".format(pid))
 
 
+def _ssh_config(identity, known_hosts_path):
+    return (
+        "Host *\n"
+        "    IdentityFile \"{0}\"\n"
+        "    IdentitiesOnly yes\n"
+        "    UserKnownHostsFile \"{1}\"\n"
+        "    GlobalKnownHostsFile /dev/null\n"
+        "    StrictHostKeyChecking yes\n"
+        "    BatchMode yes\n"
+        "    ExitOnForwardFailure yes\n"
+        "    ServerAliveInterval 30\n"
+        "    ServerAliveCountMax 3\n"
+    ).format(identity, known_hosts_path)
+
+
 class ConnectTest(ConnectCase):
     def test_argv_and_base_url(self):
         with connect(self.cfg) as base_url:
@@ -164,28 +187,60 @@ class ConnectTest(ConnectCase):
                 self.assertEqual(resp.status, 200)
                 self.assertEqual(json.loads(resp.read())["schema"], 1)
             argv = self._argv_of(self.ssh_ok)
-        # argv：ssh -N -L 127.0.0.1:<臨時埠>:127.0.0.1:4710 [-J …] -i … -o … -p … user@host
-        self.assertEqual(argv[0], str(self.ssh_ok))
-        self.assertIn("-N", argv)
-        self.assertEqual(
-            argv[argv.index("-L") + 1],
-            "127.0.0.1:{0}:127.0.0.1:4710".format(port),
-        )
-        self.assertEqual(
-            argv[argv.index("-J") + 1], "jump1@hop1:2200,jump2@hop2:2200"
-        )
-        self.assertEqual(argv[argv.index("-i") + 1], str(self.root / "id_fake"))
-        self.assertIn(
-            "UserKnownHostsFile={0}".format(self.root / "known_hosts_fake"), argv
-        )
-        self.assertIn("StrictHostKeyChecking=yes", argv)
-        self.assertIn("BatchMode=yes", argv)
-        self.assertIn("ExitOnForwardFailure=yes", argv)
-        self.assertIn("ServerAliveInterval=30", argv)
-        self.assertEqual(argv[argv.index("-p") + 1], "2222")
-        self.assertEqual(argv[-1], "tester@fake-rendezvous")
-        self.assertNotIn("accept-new", " ".join(argv))
+            config_path = self._config_path(argv)
+            temp_dir = config_path.parent
+            # ssh -F <ssh_config> -N -L … [-J …] -p … user@host；不再有 -i／-o
+            self.assertEqual(argv[0], str(self.ssh_ok))
+            self.assertEqual(argv[1], "-F")
+            self.assertIn("-N", argv)
+            self.assertEqual(
+                argv[argv.index("-L") + 1],
+                "127.0.0.1:{0}:127.0.0.1:4710".format(port),
+            )
+            self.assertEqual(
+                argv[argv.index("-J") + 1], "jump1@hop1:2200,jump2@hop2:2200"
+            )
+            self.assertEqual(argv[argv.index("-p") + 1], "2222")
+            self.assertEqual(argv[-1], "tester@fake-rendezvous")
+            self.assertNotIn("-i", argv)
+            self.assertFalse([a for a in argv if "=" in a and "UserKnownHosts" in a])
+            self.assertNotIn("StrictHostKeyChecking=yes", argv)
+            self.assertNotIn("accept-new", " ".join(argv))
+            # ssh_config：內容、0700 目錄、0600 檔
+            self.assertEqual(
+                self._config_text(argv),
+                _ssh_config(self.cfg.identity, self.cfg.known_hosts),
+            )
+            self.assertTrue(temp_dir.name.startswith("lgw-connect-"))
+            self.assertEqual(stat.S_IMODE(temp_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+        self.assertFalse(temp_dir.exists())  # 結束後整個暫存目錄刪掉
         self._assert_dead(self.ssh_ok)  # 離開後 ssh 子行程已結束
+
+    def test_ssh_config_quotes_paths_with_spaces(self):
+        spaced = self.root / "dir with space"
+        spaced.mkdir()
+        identity = spaced / "id fake"
+        identity.write_text("fake", encoding="utf-8")
+        known_hosts = spaced / "known_hosts fake"
+        known_hosts.write_text("[fake-rendezvous]:2222 ssh-ed25519 A\n",
+                               encoding="utf-8")
+        cfg = ConnectConfig(
+            rendezvous=self.cfg.rendezvous,
+            identity=str(identity),
+            known_hosts=str(known_hosts),
+            ssh_path=str(self.ssh_ok),
+        )
+        with connect(cfg) as base_url:
+            argv = self._argv_of(self.ssh_ok)
+            text = self._config_text(argv)
+            self.assertIn('IdentityFile "{0}"'.format(identity), text)
+            self.assertIn('UserKnownHostsFile "{0}"'.format(known_hosts), text)
+            with urllib.request.urlopen(
+                base_url + "/v1/subscriptions", timeout=5
+            ) as resp:
+                self.assertEqual(resp.status, 200)
+        self._assert_dead(self.ssh_ok)
 
     def test_without_jumps_omits_J(self):
         cfg = ConnectConfig(
@@ -202,6 +257,43 @@ class ConnectTest(ConnectCase):
                 base_url + "/v1/subscriptions", timeout=5
             ) as resp:
                 self.assertEqual(resp.status, 200)
+        self._assert_dead(self.ssh_ok)
+
+    def test_host_keys_temp_file_0600_and_cleanup(self):
+        host_keys = [
+            "[fake-rendezvous]:2222 ssh-ed25519 AAAAFAKEKEY0001",
+            "[fake-rendezvous]:2222 ssh-ed25519 AAAAFAKEKEY0002",
+        ]
+        cfg = ConnectConfig(
+            rendezvous=self.cfg.rendezvous,
+            identity=self.cfg.identity,
+            host_keys=host_keys,
+            ssh_path=str(self.ssh_ok),
+        )
+        with connect(cfg) as base_url:
+            argv = self._argv_of(self.ssh_ok)
+            config_path = self._config_path(argv)
+            temp_dir = config_path.parent
+            known_hosts = None
+            for line in self._config_text(argv).splitlines():
+                if line.strip().startswith("UserKnownHostsFile"):
+                    known_hosts = Path(line.split('"')[1])
+            self.assertIsNotNone(known_hosts)
+            self.assertEqual(known_hosts.parent, temp_dir)  # 同一個暫存目錄
+            self.assertTrue(known_hosts.exists())
+            self.assertEqual(
+                known_hosts.read_text(encoding="utf-8"),
+                "\n".join(host_keys) + "\n",
+            )
+            self.assertEqual(stat.S_IMODE(known_hosts.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(temp_dir.stat().st_mode), 0o700)
+            with urllib.request.urlopen(
+                base_url + "/v1/subscriptions", timeout=5
+            ) as resp:
+                self.assertEqual(resp.status, 200)
+        # 結束後檔案與整個目錄都刪掉
+        self.assertFalse(known_hosts.exists())
+        self.assertFalse(temp_dir.exists())
         self._assert_dead(self.ssh_ok)
 
     def test_client_through_tunnel(self):
@@ -269,6 +361,16 @@ class ConnectTest(ConnectCase):
             with connect(ConnectConfig(ssh_path=str(self.ssh_ok)), timeout=1):
                 self.fail("connect 不該成功")
         self.assertEqual(ctx.exception.kind, "bad_config")
+        bad = ConnectConfig(
+            rendezvous="tester@fake-rendezvous:2222",
+            identity='x"y',
+            known_hosts=str(self.root / "known_hosts_fake"),
+            ssh_path=str(self.ssh_ok),
+        )
+        with self.assertRaises(Unavailable) as ctx:
+            with connect(bad, timeout=1):
+                self.fail("connect 不該成功")
+        self.assertEqual(ctx.exception.kind, "bad_config")  # 引號進不了 ssh_config
 
     def test_port_freed_after_exit(self):
         with connect(self.cfg) as base_url:
@@ -282,121 +384,172 @@ class ConnectTest(ConnectCase):
             sock.close()
 
 
+def _base(**overrides):
+    config = {
+        "schema": 1,
+        "rendezvous": "sshproxy@fake-rendezvous:2222",
+        "identity": "/tmp/fake-id",
+        "known_hosts": "/tmp/fake-known-hosts",
+    }
+    config.update(overrides)
+    return config
+
+
 class LoadConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self.tmp.name) / "connect.env"
+        self.path = Path(self.tmp.name) / "connect.json"
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _write(self, text):
+    def _write(self, payload):
+        text = payload if isinstance(payload, str) else json.dumps(payload)
         self.path.write_text(text, encoding="utf-8")
         return self.path
 
-    def test_full(self):
-        self._write(
-            "# 註解\n"
-            "\n"
-            "JUMPS=jump1@hop1:2200, jump2@hop2:2200\n"
-            "RENDEZVOUS=sshproxy@fake-rendezvous:2222\n"
-            "IDENTITY=/tmp/fake-id\n"
-            "KNOWN_HOSTS=/tmp/fake-known-hosts\n"
-            "REMOTE_API=5000\n"
-        )
-        cfg = load_config(self.path)
+    def _error(self, payload):
+        self._write(payload)
+        with self.assertRaises(ConfigError) as ctx:
+            load_config(self.path)
+        return str(ctx.exception)
+
+    def test_full_known_hosts(self):
+        cfg = load_config(self._write(_base(
+            jumps=["jump1@hop1:2200", "jump2@hop2:2200"],
+            remote_api=5000,
+        )))
         self.assertEqual(cfg.jumps, ["jump1@hop1:2200", "jump2@hop2:2200"])
         self.assertEqual(cfg.rendezvous, "sshproxy@fake-rendezvous:2222")
         self.assertEqual(cfg.identity, "/tmp/fake-id")
         self.assertEqual(cfg.known_hosts, "/tmp/fake-known-hosts")
+        self.assertIsNone(cfg.host_keys)
         self.assertEqual(cfg.remote_api, 5000)
         self.assertEqual(cfg.ssh_path, "ssh")
 
-    def test_defaults(self):
-        self._write(
-            "JUMPS=\n"
-            "RENDEZVOUS=sshproxy@fake-rendezvous:2222\n"
-            "IDENTITY=/tmp/fake-id\n"
-            "KNOWN_HOSTS=/tmp/fake-known-hosts\n"
-        )
-        cfg = load_config(self.path)
+    def test_minimal_host_keys_defaults(self):
+        cfg = load_config(self._write({
+            "schema": 1,
+            "rendezvous": "sshproxy@fake-rendezvous:2222",
+            "identity": "/tmp/fake-id",
+            "host_keys": ["[fake-rendezvous]:2222 ssh-ed25519 AAAAFAKEKEY0001"],
+        }))
         self.assertEqual(cfg.jumps, [])
+        self.assertIsNone(cfg.known_hosts)
+        self.assertEqual(
+            cfg.host_keys,
+            ["[fake-rendezvous]:2222 ssh-ed25519 AAAAFAKEKEY0001"],
+        )
         self.assertEqual(cfg.remote_api, 4710)
 
-    def test_unknown_key_no_value(self):
-        self._write(
-            "RENDEZVOUS=sshproxy@fake-rendezvous:2222\n"
-            "IDENTITY=/tmp/fake-id\n"
-            "KNOWN_HOSTS=/tmp/fake-known-hosts\n"
-            "SECRET_THING=canary-value-zz9\n"
-        )
-        with self.assertRaises(ConfigError) as ctx:
-            load_config(self.path)
-        text = str(ctx.exception)
-        self.assertIn("line 4", text)
-        self.assertIn("SECRET_THING", text)  # 只寫行號與鍵名
+    def test_from_dict_direct(self):
+        cfg = ConnectConfig.from_dict(_base())
+        self.assertEqual(cfg.rendezvous, "sshproxy@fake-rendezvous:2222")
+        with self.assertRaises(ConfigError):
+            ConnectConfig.from_dict(_base(remote_api="4710"))
+
+    def test_rereads_file_every_call(self):
+        path = self._write(_base(remote_api=5000))
+        self.assertEqual(load_config(path).remote_api, 5000)
+        self._write(_base(remote_api=5001))
+        self.assertEqual(load_config(path).remote_api, 5001)
+
+    def test_unknown_field_no_value(self):
+        text = self._error(_base(frobnicate="canary-value-zz9"))
+        self.assertIn("unknown field", text)
+        self.assertIn("frobnicate", text)  # 欄位名可以寫
         self.assertNotIn("canary-value-zz9", text)  # 不印值
 
-    def test_bad_rendezvous_no_value(self):
-        self._write(
-            "RENDEZVOUS=no-port-here\n"
-            "IDENTITY=/tmp/fake-id\n"
-            "KNOWN_HOSTS=/tmp/fake-known-hosts\n"
-        )
-        with self.assertRaises(ConfigError) as ctx:
-            load_config(self.path)
-        self.assertIn("RENDEZVOUS", str(ctx.exception))
-        self.assertNotIn("no-port-here", str(ctx.exception))
+    def test_known_hosts_and_host_keys_conflict(self):
+        text = self._error(_base(host_keys=["[fake-rendezvous]:2222 ssh-ed25519 A"]))
+        self.assertIn("mutually exclusive", text)
+        text = self._error({"schema": 1, "rendezvous": "sshproxy@fake-rendezvous:2222",
+                            "identity": "/tmp/fake-id"})  # 都沒給
+        self.assertIn("known_hosts", text)
 
-    def test_bad_jumps_no_value(self):
-        self._write(
-            "JUMPS=jump1@hop1:2200,no-port-here\n"
-            "RENDEZVOUS=sshproxy@fake-rendezvous:2222\n"
-            "IDENTITY=/tmp/fake-id\n"
-            "KNOWN_HOSTS=/tmp/fake-known-hosts\n"
-        )
-        with self.assertRaises(ConfigError) as ctx:
-            load_config(self.path)
-        self.assertIn("JUMPS", str(ctx.exception))
-        self.assertNotIn("no-port-here", str(ctx.exception))
+    def test_schema_errors(self):
+        text = self._error({k: v for k, v in _base().items() if k != "schema"})
+        self.assertIn("schema", text)
+        for bad in (2, "1", True, 1.0, None):
+            with self.assertRaises(ConfigError) as ctx:
+                ConnectConfig.from_dict(_base(schema=bad))
+            self.assertIn("schema", str(ctx.exception))
 
-    def test_bad_remote_api_no_value(self):
-        self._write(
-            "RENDEZVOUS=sshproxy@fake-rendezvous:2222\n"
-            "IDENTITY=/tmp/fake-id\n"
-            "KNOWN_HOSTS=/tmp/fake-known-hosts\n"
-            "REMOTE_API=not-a-number\n"
-        )
-        with self.assertRaises(ConfigError) as ctx:
-            load_config(self.path)
-        self.assertIn("REMOTE_API", str(ctx.exception))
-        self.assertNotIn("not-a-number", str(ctx.exception))
+    def test_missing_fields(self):
+        for field in ("rendezvous", "identity"):
+            payload = {k: v for k, v in _base().items() if k != field}
+            with self.assertRaises(ConfigError) as ctx:
+                ConnectConfig.from_dict(payload)
+            self.assertIn("missing field", str(ctx.exception))
+            self.assertIn(field, str(ctx.exception))
 
-    def test_missing_and_not_keyvalue(self):
-        self._write("RENDEZVOUS=sshproxy@fake-rendezvous:2222\nIDENTITY=/tmp/fake-id\n")
+    def test_bad_types_no_values(self):
+        cases = [
+            (_base(rendezvous=42), "rendezvous", "42"),
+            (_base(rendezvous="no-port-here"), "rendezvous", "no-port-here"),
+            (_base(identity=17), "identity", "17"),
+            (_base(identity='has"quote'), "identity", 'has"quote'),
+            (_base(identity="line\nbreak"), "identity", "line\nbreak"),
+            (_base(jumps="jump1@hop1:2200"), "jumps", "jump1@hop1:2200"),
+            (_base(jumps=["jump1@hop1:2200", "no-port-here"]), "jumps[1]",
+             "no-port-here"),
+            (_base(known_hosts=""), "known_hosts", None),
+            (_base(known_hosts=5), "known_hosts", "5"),
+            (_base(known_hosts='kh"quote'), "known_hosts", 'kh"quote'),
+            (_base(remote_api="4710"), "remote_api", "4710"),
+            (_base(remote_api=0), "remote_api", "0"),
+            (_base(remote_api=65536), "remote_api", "65536"),
+            (_base(remote_api=True), "remote_api", "True"),
+        ]
+        for payload, field, value in cases:
+            with self.assertRaises(ConfigError) as ctx:
+                ConnectConfig.from_dict(payload)
+            text = str(ctx.exception)
+            self.assertIn(field, text)
+            if value is not None:
+                self.assertNotIn(value, text)
+
+    def test_host_keys_errors(self):
+        def host_only(host_keys):
+            payload = _base()
+            del payload["known_hosts"]
+            payload["host_keys"] = host_keys
+            return payload
+
+        cases = [
+            (host_only("[fake-rendezvous]:2222 ssh-ed25519 A"), "host_keys"),
+            (host_only([]), "host_keys"),
+            (host_only([5]), "host_keys[0]"),
+            (host_only(["[fake-rendezvous]:2222 ssh-ed25519 A", ""]),
+             "host_keys[1]"),
+        ]
+        for payload, field in cases:
+            with self.assertRaises(ConfigError) as ctx:
+                ConnectConfig.from_dict(payload)
+            self.assertIn(field, str(ctx.exception))
+
+    def test_not_json_or_not_object_no_content(self):
+        text = self._error('{"rendezvous": "canary-value-zz9"')
+        self.assertIn("JSON", text)
+        self.assertNotIn("canary-value-zz9", text)
         with self.assertRaises(ConfigError) as ctx:
-            load_config(self.path)
-        self.assertIn("KNOWN_HOSTS", str(ctx.exception))
-        self._write("JUSTAKEY\nRENDEZVOUS=x\nIDENTITY=x\nKNOWN_HOSTS=x\n")
-        with self.assertRaises(ConfigError) as ctx:
-            load_config(self.path)
-        self.assertIn("line 1", str(ctx.exception))
+            load_config(self._write("[1, 2]"))
+        self.assertIn("object", str(ctx.exception))
 
 
 class CliTest(ConnectCase):
     def _config_env(self, rendezvous):
-        return self._write_config(
-            "JUMPS=\n"
-            "RENDEZVOUS={0}\n"
-            "IDENTITY={1}\n"
-            "KNOWN_HOSTS={2}\n"
-            "REMOTE_API=4710\n".format(
-                rendezvous, self.root / "id_fake", self.root / "known_hosts_fake"
-            )
-        )
+        return self._write_config(json.dumps({
+            "schema": 1,
+            "rendezvous": rendezvous,
+            "jumps": [],
+            "identity": str(self.root / "id_fake"),
+            "known_hosts": str(self.root / "known_hosts_fake"),
+            "remote_api": 4710,
+        }))
 
     def _write_config(self, text):
-        path = self.root / "connect.env"
+        path = self.root / "connect.json"
         path.write_text(text, encoding="utf-8")
         return path
 
@@ -456,6 +609,16 @@ class CliTest(ConnectCase):
         proc.stderr.close()
         self.assertIn("unavailable: ssh_exited", err)
         self.assertNotIn("fake-secret-host", err)  # 錯誤不印位址
+
+    def test_cli_bad_config(self):
+        config_path = self._write_config('{"schema": 1, "rendezvous": "canary-value-zz9"}')
+        proc = self._run_cli(config_path, self.ssh_ok)
+        rc = proc.wait(timeout=10)
+        err = proc.stderr.read()
+        proc.stdout.close()
+        proc.stderr.close()
+        self.assertEqual(rc, 2)
+        self.assertNotIn("canary-value-zz9", err)  # 錯誤不印值
 
 
 if __name__ == "__main__":
