@@ -79,9 +79,9 @@ rm -rf ~/lgw-bootstrap
 1. 建 `~/.local/state/llmgateway/`（0700）、空的 `keys.env`（0600）；
 2. 沒有設定檔時建範本：`llmgateway.env`、`tunnel.env`（值留空，不含任何位址）；
 3. 原子切換 `current`、裝 `llmgateway-run`、`llmgateway-tunnel` 與兩個 unit；
-4. `daemon-reload`；啟用並重啟 `llmgateway.service`；啟用 `llmgateway-tunnel.service`。
+4. `daemon-reload`；`llmgateway.service` 在跑就重啟、沒跑就啟用並啟動；`llmgateway-tunnel.service` 只 `enable`，沒在跑才 `start`，**不會當場重啟它**（部署連線本身走這條隧道，見 4.2 第 4 點）。
 
-這時 key 還沒部署，list 裡每一把的 `available` 都是 false；隧道設定也還是空的，隧道守護起不來，這是預期的，1.8 填好就好。
+這時 key 還沒部署，list 裡每一把的 `available` 都是 false；`tunnel.env` 的必填三項（`RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS`）還是空的，隧道守護起來後在 log 寫一行 `config_missing` 就以結束碼 78 結束。unit 有 `RestartPreventExitStatus=78`，78 不會觸發自動重開，所以不會在設定填好前反覆重啟，`systemctl --user status llmgateway-tunnel` 會看到它停在 failed。這是預期的，1.8 填好設定後手動重啟即可。（bootstrap 腳本帶 `--rendezvous` 時會代做 1.8 的填設定與重啟。）
 
 ### 1.6 產生隧道金鑰（私鑰不離開那台）
 
@@ -122,11 +122,15 @@ PROBE_INTERVAL=60
 PROBE_FAILS=3
 ```
 
+- 必填只有 `RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS` 三項；其餘留空（`install.sh` 的範本就是空值）就用預設值（4710、4711、8480、60、3）。
+- 任何一項缺、`RENDEZVOUS` 不是 `user@host:port`、埠不在 1–65535、`PROBE_*` 不是正數，都算設定不能用，一樣是 `config_missing`、結束碼 78。
 - `LOCAL_API` 要和 `llmgateway.env` 的 `LGW_API_PORT` 一樣。
 - 4710、4711 是 MyLinuxPool 在會合點上替 LLMGateway 保留的埠（`NODE_GATEWAY.ports.llmgateway`），避開 2220–2499 與 3000–3999。
 
+填好後重啟（78 不會自動重開，一定要手動做這一步；沒有 `config_missing` 的情況下也可以用同一個指令）：
+
 ```bash
-systemctl --user enable --now llmgateway-tunnel.service
+systemctl --user restart llmgateway-tunnel.service
 journalctl --user -u llmgateway-tunnel -n 20
 ```
 
@@ -256,7 +260,7 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`（`id
 1. 打 tag `lgw-vX.Y.Z` 並 push。
 2. Actions → **deploy-service** → Run workflow，輸入 tag，本人核准。
 3. 那台跑 `install.sh --tag <tag>`：已有完整的就重用、沒有就抓到暫存再搬；原子切換 `current`；重裝兩個 unit 與執行檔；重啟 `lgwd`。只留用中與前一個版本。
-4. 隧道守護有變更時，`install.sh` 不當場重啟它（部署連線本身就走這條隧道，當場重啟會切斷部署），而是排一個約 60 秒後的重啟；這段時間 list／get 會斷一下，客戶端重連即可。
+4. 隧道守護有變更時，`install.sh` 不當場重啟它（部署連線本身就走這條隧道，當場重啟會切斷部署），而是用 `systemd-run --user --on-active=60` 排一個約 60 秒後的重啟（只有隧道執行檔或 unit 與已裝的不同時才排；隧道沒在跑就直接 start）。所以 workflow 結束後約一分鐘隧道會重連，這段時間 list／get 會斷一下，客戶端重連即可，也不要在這一分鐘內接著再部署（排程用固定的 unit 名 `llmgateway-tunnel-restart`，還沒觸發時第二次排程會失敗，已知問題，見 docs/research/v0-impl-review.md M4）。
 
 ### 4.3 看狀態
 
@@ -324,6 +328,7 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`（`id
 
 `journalctl --user -u llmgateway-tunnel` 看事件：
 
+- `config_missing`（結束碼 78）：`tunnel.env` 的必填三項沒填，或值不能用（1.8）。這種情況**不會**自動重開，unit 停在 failed；改好 `~/.config/llmgateway/tunnel.env` 後執行 `systemctl --user restart llmgateway-tunnel.service`。（log 只寫事件種類，不會說是哪一項。）
 - 一起來就結束、反覆重開：多半是遠端埠被佔住（會合點上還留著舊的隧道連線），`ExitOnForwardFailure` 讓 ssh 直接結束。舊連線在 ServerAlive 逾時（約 90 秒）後會被會合點清掉，之後自動恢復；一直不恢復就請 mylinuxpool-pm 看會合點上 4710／4711 是誰在聽。
 - `probe_fail` 連續出現後重開：隧道在，但端對端打不通 `lgwd`。先看 `systemctl --user status llmgateway`，以及 `tunnel.env` 的 `LOCAL_API` 是否等於 `LGW_API_PORT`。
 - 認證或 host key 失敗：隧道公鑰還沒登記（1.6），或 `KNOWN_HOSTS` 不對（1.7）。
