@@ -361,5 +361,166 @@ class ClaudeRateLimitEventTest(unittest.TestCase):
         self.assertIsNone(sig.window)
 
 
+class StructuralSignalEdgeCasesTest(unittest.TestCase):
+    def test_epoch_units_conversion(self):
+        # opencode: milliseconds
+        opencode_raw = {
+            "type": "retry",
+            "action": {"reason": "free_tier_limit"},
+            "next": 1791763200000,
+        }
+        sig_op = from_opencode_status(opencode_raw)
+        self.assertIsNotNone(sig_op)
+        self.assertEqual(sig_op.resets_at, at_utc(2026, 10, 12, 0, 0))
+
+        # claude: seconds
+        claude_raw = {
+            "status": "rejected",
+            "resetsAt": 1791763200,
+            "rateLimitType": "five_hour",
+        }
+        sig_cl = from_claude_rate_limit_event(claude_raw)
+        self.assertIsNotNone(sig_cl)
+        self.assertEqual(sig_cl.resets_at, at_utc(2026, 10, 12, 0, 0))
+
+    def test_missing_fields_returns_none(self):
+        # opencode missing fields
+        for bad in (
+            {},
+            {"type": "session.status"},
+            {"type": "session.status", "properties": {}},
+            {"type": "session.status", "properties": {"status": {}}},
+            {"type": "retry"},
+            {"type": "retry", "action": {}},
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(from_opencode_status(bad))
+
+        # claude missing fields
+        for bad in (
+            {},
+            {"type": "rate_limit_event"},
+            {"type": "rate_limit_event", "rate_limit_info": {}},
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(from_claude_rate_limit_event(bad))
+
+    def test_missing_next_or_resets_at(self):
+        # opencode with no next field still returns Signal with resets_at=None
+        op_no_next = {
+            "type": "retry",
+            "action": {"reason": "free_tier_limit"},
+        }
+        sig_op = from_opencode_status(op_no_next)
+        self.assertIsNotNone(sig_op)
+        self.assertTrue(sig_op.exhausted)
+        self.assertIsNone(sig_op.resets_at)
+
+        # claude with no resetsAt field still returns Signal with resets_at=None
+        cl_no_resets = {
+            "status": "rejected",
+            "rateLimitType": "five_hour",
+        }
+        sig_cl = from_claude_rate_limit_event(cl_no_resets)
+        self.assertIsNotNone(sig_cl)
+        self.assertTrue(sig_cl.exhausted)
+        self.assertIsNone(sig_cl.resets_at)
+
+    def test_non_dict_inputs_returns_none(self):
+        for bad in (None, "string", 12345, [1, 2, 3], True, False):
+            with self.subTest(bad=bad):
+                self.assertIsNone(from_opencode_status(bad))
+                self.assertIsNone(from_claude_rate_limit_event(bad))
+
+    def test_nested_non_dict_returns_none(self):
+        # opencode nested non-dict
+        self.assertIsNone(from_opencode_status({
+            "type": "session.status",
+            "properties": "not_a_dict",
+        }))
+        self.assertIsNone(from_opencode_status({
+            "type": "session.status",
+            "properties": {"status": "not_a_dict"},
+        }))
+        self.assertIsNone(from_opencode_status({
+            "type": "retry",
+            "action": "not_a_dict",
+        }))
+
+        # claude nested non-dict
+        self.assertIsNone(from_claude_rate_limit_event({
+            "type": "rate_limit_event",
+            "rate_limit_info": "not_a_dict",
+        }))
+
+    def test_wrong_types_returns_none(self):
+        # opencode next wrong type
+        self.assertIsNone(from_opencode_status({
+            "type": "retry",
+            "action": {"reason": "free_tier_limit"},
+            "next": "1791763200000",  # string instead of number
+        }))
+        self.assertIsNone(from_opencode_status({
+            "type": "retry",
+            "action": {"reason": "free_tier_limit"},
+            "next": True,  # boolean
+        }))
+
+        # claude resetsAt wrong type or status wrong type
+        self.assertIsNone(from_claude_rate_limit_event({
+            "status": "rejected",
+            "resetsAt": "1791748200",  # string instead of number
+        }))
+        self.assertIsNone(from_claude_rate_limit_event({
+            "status": "rejected",
+            "resetsAt": True,  # boolean
+        }))
+        self.assertIsNone(from_claude_rate_limit_event({
+            "status": 12345,  # int instead of str
+        }))
+
+    def test_unknown_reason_returns_none(self):
+        for reason in ("unknown_reason", "billing_issue", "auth_failed", "", 123):
+            with self.subTest(reason=reason):
+                self.assertIsNone(from_opencode_status({
+                    "type": "retry",
+                    "action": {"reason": reason},
+                    "next": 1791763200000,
+                }))
+
+    def test_signal_dataclass_features(self):
+        sig = Signal(
+            exhausted=True,
+            window="5h",
+            resets_at=at_utc(2026, 10, 11, 19, 50),
+            source="claude-code",
+        )
+        self.assertTrue(sig.exhausted)
+        self.assertEqual(sig.window, "5h")
+        self.assertEqual(sig.source, "claude-code")
+        self.assertEqual(
+            sig.to_cooldown_body(),
+            {"window": "5h", "resets_at": "2026-10-11T19:50:00Z"},
+        )
+
+        # with window=None and fallback_window provided
+        sig_no_win = Signal(
+            exhausted=True,
+            window=None,
+            resets_at=at_utc(2026, 10, 12, 0, 0),
+            source="opencode",
+        )
+        self.assertEqual(
+            sig_no_win.to_cooldown_body(fallback_window="5h"),
+            {"window": "5h", "resets_at": "2026-10-12T00:00:00Z"},
+        )
+        with self.assertRaises(ValueError):
+            sig_no_win.to_cooldown_body()
+
+        # frozen check
+        with self.assertRaises(Exception):
+            sig.exhausted = False  # type: ignore
+
+
 if __name__ == "__main__":
     unittest.main()
