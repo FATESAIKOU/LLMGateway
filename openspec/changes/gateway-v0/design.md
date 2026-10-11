@@ -38,7 +38,10 @@
 - **部署**：
   - 手動觸發的 workflow `deploy-keys`：經池的 SSH 跳板登入那台 provider，把五把寫進 `~/.local/state/llmgateway/keys.env`（0600，擁有者是服務帳號）；寫完送 SIGHUP 讓服務重讀。
   - 輪替 key 的流程：改 secret → 跑 workflow。
-- **workflow 的登入身分**：MyLinuxPool 為本 repo 的 Actions 加一個 client 身分（公鑰登記在 MyLinuxPool，私鑰放本 repo 的 secret）。這要 MyLinuxPool 開單。
+- **workflow 的登入身分**（MyLinuxPool#68）：一把**部署專用**的金鑰，不沿用 MyLinuxPool 的管理身分（管理身分在跳板機上權限太大）。
+  - 在跳板機上只允許轉發到那台 provider 的隧道埠（`restrict,port-forwarding,permitopen=…`），不能開 shell。
+  - 在 provider 上用 `command="<部署腳本>",restrict` 限定只能跑部署腳本。腳本只做：從 stdin 讀 → 寫暫存檔 → chmod 0600 → rename 成 keys.env → 送 SIGHUP。
+  - 私鑰放本 repo 的 secret，由本人設。
 - workflow 的 log 只出現 secret 名稱；寫檔用 stdin 傳值，不上命令列。
 - **為什麼**：本人已同意把來源放在這裡；GitHub secret 加上 Actions 是本人既有的做法（MyPMO、MyLinuxPool 都這樣）。
 - **放棄的選項**：
@@ -48,7 +51,9 @@
 ### 決定 3：服務的形狀
 
 - **程式**：Python 標準函式庫，HTTP 用 `http.server.ThreadingHTTPServer`、資料用 `sqlite3`，沒有第三方套件。
-- **位置**：池內常駐的 provider，做成 MyLinuxPool 的一個 shared-config 單元（systemd user unit），只綁 loopback 與 worker 容器看得到的那個介面。
+- **位置**：池內常駐的 provider，做成 MyLinuxPool 的一個 shared-config 單元（systemd user unit，MyLinuxPool#67）。只綁 loopback，以及同一台 provider 上容器看得到的 docker bridge 位址。
+  - 平常關機的 provider 不適合放常駐服務。常駐的候選有兩台，**由本人選一台**（機器名稱不寫在 public repo，見 MyLinuxPool#67）。
+  - 單元裡只在一處寫版本 tag；`--check` 檢查三件事：服務在跑、版本對、`GET /v1/board` 不帶憑證時回 401。
 - **資料**：同一個 SQLite 檔，表有 `events`（只追加，單調序號）、`leases`（由 events 推出的現況）、`cooldowns`、`clients`（客戶端憑證的雜湊）。
 - **重啟**：從 `events` 重建現況。
 - **為什麼**：
@@ -63,17 +68,24 @@
 ### 決定 4：客戶端身分
 
 - 每個客戶端一把隨機的客戶端憑證，服務只存雜湊，可以單獨撤銷。客戶端是：每台 worker 的 sidecar、Mac、之後的手機。
-- 由 PM 在 provider 上用 `lgw admin client add <名稱>` 發，值只印一次。
+- 由 PM 在 provider 上用 `lgw admin client add <名稱>` 發，值只印一次。用 `lgw admin client rm <名稱>` 撤銷（等同 revoke，紀錄保留）。
+- worker 的客戶端憑證由 MyLinuxPool 的 create-worker 自動發，delete-worker 自動撤銷（MyLinuxPool#70）：
+  - create-worker 經 SSH 到服務那台跑 `lgw admin client add <worker 名>`，輸出經唯讀掛載通道寫進 worker；
+  - 值只經過 runner 的記憶體，先 add-mask，不進 log 與 output。
 - 客戶端憑證放的地方：
   - worker：`/run/mlp-secrets/llmgateway-client-token`（0400），由 MyLinuxPool 的能力放進去，和 A2A token 同一種做法；
   - Mac：`~/.config/lgw/client-token`（0600）。
 - 租約的 `worker` 欄位必須和客戶端憑證登記的名稱一致，服務端檢查，所以一個客戶端不能冒用別台機器的名字。
+- `GET /v1/whoami`：回 `200 {client}`，不花任何額度，給 MyLinuxPool 的驗證程式核對憑證用。
 - **為什麼**：池內只能經 SSH 進來，SSH 已經擋掉外人；客戶端憑證是為了區分身分、撤銷、記錄，不靠它擋外人。
 
 ### 決定 5：怎麼連到服務
 
 - **Mac**：沿用 `mlp` 的 SSH 跳板做本機埠轉送（`ssh -L`）。`lgw` 的 base URL 指向本機那個埠。
-- **worker**：容器要連得到 provider 上的服務。做法由 MyLinuxPool 決定，例如 provider 上的容器經 docker 的 host gateway 連，其他 provider 上的容器經隧道連。這要開 MyLinuxPool 的單。
+- **worker**（MyLinuxPool#69）：sidecar 一律連 `http://127.0.0.1:<固定埠>`，不必管服務在哪一台。
+  - 同一台 provider 上的容器：經 docker bridge 的位址連。
+  - 其他 provider 上的容器：放服務的那台在既有隧道上多掛一條 `-R`，把服務放到跳板機本機的固定埠；worker 在既有隧道上多掛一條 `-L`，接到自己本機的固定埠。
+  - 全程只綁 loopback，不改 sshd；埠宣告在 MyLinuxPool 的設定裡。
 - **手機**：之後由 MyAiEntry 的 App 經同一條 SSH 跳板做埠轉送（本人選 (2)）。
 - 服務本身從不對外。
 
@@ -84,17 +96,18 @@
 - 每個會改變狀態的請求都帶客戶端產生的 `request_id`（去重見決定 12）。
 - 每個回覆都帶 `api_version`（v0 是 `1`）。
 
-**租約物件**（`lease`）：`{lease_id, subscription, agent, model, env, unset, expires_at, confirm_by}`。`env` 與 `unset` 只出現在核准的那一次回覆，之後查詢都不帶。
+**租約物件**（`lease`）：`{lease_id, subscription, agent, model, env, unset, expires_at, confirm_by}`。`env` 與 `unset` 只出現在核准的那一次回覆，之後查詢都不帶。回覆一律把租約物件包在鍵裡：申請回 `{"lease": …}`，`exhausted` 回 `{"next": …}`。
 
 | 方法 | 路徑 | 請求 | 成功回傳 |
 |---|---|---|---|
-| POST | `/v1/leases` | `worker, role, agent, instance, model?, subscription?, purpose?, preferences?, request_id` | `201 {lease}` |
+| POST | `/v1/leases` | `worker, role, agent, instance, model?, subscription?, purpose?, preferences?, request_id` | `201 {"lease": <租約物件>}` |
 | POST | `/v1/leases/{id}/start` | `request_id` | `200 {expires_at}`：確認 agent 已經開起來，granted → active；對已 active 的租約重送也回 200 |
 | POST | `/v1/leases/{id}/exhausted` | `signal, resets_at?, request_id` | `200 {next: lease}`，或 `200 {next: null, refusal}` |
 | POST | `/v1/leases/{id}/renew` | `request_id` | `200 {expires_at}` |
 | POST | `/v1/leases/{id}/usage` | `snapshot` | `204` |
 | POST | `/v1/leases/{id}/release` | `reason?, request_id` | `204`（重複 release 也回 204） |
 | GET | `/v1/board` | — | `200 {subscriptions: [...]}` |
+| GET | `/v1/whoami` | — | `200 {client}`（核對憑證用，不花額度） |
 
 **欄位說明**
 - `agent`：`claude-code` 或 `opencode`。sidecar 內部的 `claude`、`opencode` 由它自己對應。
@@ -105,6 +118,7 @@
 **錯誤**
 - `400 bad_request`：欄位缺漏或格式不合，附缺的欄位。
 - `401`：沒有或錯誤的客戶端憑證。
+- `413 body_too_large`：請求 body 超過 1 MB，不讀內容。
 - `403 client_mismatch`：worker 與客戶端憑證登記的名稱不符。
 - `403 not_owner`：動到別的客戶端的租約。
 - `404 not_found`：租約不存在。
@@ -176,7 +190,7 @@
   - 判讀：用 `herdr agent read` 讀畫面，交給 `lgw` 的規則判讀。
   - 安全結束：`herdr agent send-keys <name> ctrl+c` 讓 agent 收尾，由 agora continue 做最後寫回；5 秒後還在就對 process group 送 SIGTERM，再 5 秒送 SIGKILL，最後才 `pane close`。
   - 打斷一輪而不結束 agent 時用 Esc（Claude Code 1 次、opencode 2 次）。
-  - 開起來之後呼叫 `start` 確認租約。
+  - 開起來之後呼叫 `start` 確認租約：時機在 agent 的 prompt 出現之後、送 harness 之前；agent 開不起來就不呼叫 `start`，直接 `release`。
   - 接回：`agora continue session <Session> --agent <agent> --sync-period <分鐘>`，不用 `--fork`；session id 的寫法照 sidecar 既有的慣例。
   - 這些都是 sidecar 已有、已審過的生命週期程式（MyAiStorage#31 的 D4 與 10-11 的 spike）。
 - **誰呼叫**：
@@ -217,7 +231,12 @@
 ### 決定 12：一致性、邊界與錯誤處理
 
 - **交易**：每個會改變狀態的 API 動作是一筆 SQLite 交易（`BEGIN IMMEDIATE`）。例如 `exhausted` 的「設冷卻＋原租約 superseded＋發下一張」要嘛全成、要嘛全不成，服務中途當掉也不會留下一半。搶最後一個上限名額也在同一筆交易裡判定。
-- **去重**：以（客戶端，`request_id`）為鍵，把第一次的回覆存進資料庫保留 7 天；重送時回同一份回覆，跨重啟也有效。同一張租約用不同的 `request_id` 再回報 `exhausted`，回 `409 lease_not_active`，不會發出第二張。
+- **去重**：以（客戶端，`request_id`）為鍵，把第一次的回覆存進資料庫保留 7 天；重送時回同一份回覆，跨重啟也有效。
+  - **存進去的回覆不含 `env` 的值**，只留變數名。重送時若回覆含租約，依那張租約的訂閱與目前的 key 檔重新組出 `env`；那張租約已結束就回 `409 lease_not_active`。
+  - 這樣資料庫的任何一張表都沒有 key 的值，key 只存在 key 檔（2026-10-11 實作冒煙測試時發現：原本的寫法會把值存進去重表）。
+  - 重送不保證位元組一致：重組的 `env` 依當下的 key 檔（輪替後拿到新值）；租約已結束 → `409 lease_not_active`，客戶端要重新申請；key 已撤下 → `409 not_allowed`；原本是拒絕的就照原樣回。重送不是新申請，不記 `denied` 事件。
+  - **順序**：認證 → 延後結算 → 去重 → 業務邏輯。撤銷後拿舊 `request_id` 重送一律回 401。
+  - 請求 body 超過 1 MB 回 413，不讀內容。同一張租約用不同的 `request_id` 再回報 `exhausted`，回 `409 lease_not_active`，不會發出第二張。
 - **時鐘**：服務的「現在」經可替換的 clock 介面取得（測試用假時鐘）。冷卻在 `now < 結束時刻` 時算冷卻中，等於就算結束。
 - **逾期結算**：任何一次經過認證的請求（包含讀狀態板）都先補記已過期的租約，再處理該請求。
 - **key 檔重讀**：`deploy-keys` 以「寫暫存檔再 rename」原子替換。SIGHUP 重讀失敗時（檔案損壞、格式錯）沿用舊的 key，並在狀態板與 log 標示重讀失敗。值是空字串視同沒部署。已經發出的租約不受重讀影響。
