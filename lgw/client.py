@@ -13,7 +13,10 @@
   body {"window": "5h"|"1w", "resets_at": RFC 3339 UTC?}；成功 204。
 - 沒有應用層認證（design 決定 5a），所以不帶任何認證標頭。
 - 回 Result：ok、status、data、error、unreachable。連不上或逾時回 unreachable=True、
-  不丟例外；403／404／409／400 照實回狀態碼與 error。
+  不丟例外；403／404／409／400 照實回狀態碼與 error。error 可能是：
+  - 服務回的碼：bad_request｜invalid_window｜invalid_resets_at｜resets_at_out_of_range｜
+    agent_not_allowed｜not_found｜not_deployed｜body_too_large；
+  - 客戶端判讀的：unreachable（連不上或逾時）｜bad_response（回覆不是 JSON 物件）。
 - Result 的 repr 不印 data（get 的 data 裡有 key）；不要 log／print 整個 Result。
 - 只用標準函式庫（urllib）；不引用 subprocess、herdr、agora。
 """
@@ -84,9 +87,9 @@ class Client:
             text = payload.decode("utf-8") if payload.strip() else ""
             body = json.loads(text) if text else {}
         except (UnicodeDecodeError, ValueError):
-            return Result(ok=False, status=status, error="bad response")
+            return Result(ok=False, status=status, error="bad_response")
         if not isinstance(body, dict):
-            return Result(ok=False, status=status, error="bad response")
+            return Result(ok=False, status=status, error="bad_response")
         if 200 <= status < 300 and "error" not in body:
             return Result(ok=True, status=status, data=body)
         # 400／403／404／409：狀態碼與錯誤碼照實回（不重寫成拒絕理由）

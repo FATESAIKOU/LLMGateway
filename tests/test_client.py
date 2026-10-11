@@ -49,6 +49,10 @@ class FakeService:
                 return 404, {"error": "not_found"}
             if sub_id == "idle":
                 return 409, {"error": "not_deployed"}
+            if sub_id == "garbage":
+                return 200, b"<html>not json</html>"
+            if sub_id == "notobject":
+                return 200, b"[1, 2]"
             agent = query.get("agent", [None])[0]
             if sub_id == "claude-personal" and agent != "claude-code":
                 return 403, {"error": "agent_not_allowed"}
@@ -87,7 +91,10 @@ def make_server(fake):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            data = json.dumps(payload).encode("utf-8")
+            if isinstance(payload, bytes):
+                data = payload
+            else:
+                data = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -167,6 +174,19 @@ class GetTest(ClientCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 409)
         self.assertEqual(res.error, "not_deployed")
+
+    def test_bad_response_not_json(self):
+        res = self.client.get("garbage", "claude-code")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.error, "bad_response")  # 碼不含空白
+        self.assertFalse(res.unreachable)
+
+    def test_bad_response_not_object(self):
+        res = self.client.get("notobject", "claude-code")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.error, "bad_response")
 
     def test_get_encodes_id_and_agent(self):
         self.client.get("a/b c", "agent x")

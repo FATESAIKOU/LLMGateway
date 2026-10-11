@@ -311,6 +311,23 @@ class ConnectTest(ConnectCase):
             self.assertEqual(res.status, 204)
         self._assert_dead(self.ssh_ok)
 
+    def test_ssh_dies_after_connect_is_unreachable(self):
+        """進入 with 之後 ssh 斷掉：client 回 unreachable，不丟例外。"""
+        with connect(self.cfg) as base_url:
+            client = Client(base_url, timeout=2)
+            self.assertTrue(client.list().ok)
+            pid = int(Path(str(self.ssh_ok) + ".pid").read_text(encoding="utf-8"))
+            os.kill(pid, signal.SIGTERM)  # 模擬隧道斷掉
+            deadline = time.monotonic() + 5
+            res = client.list()
+            while res.ok and time.monotonic() < deadline:
+                time.sleep(0.05)
+                res = client.list()
+            self.assertFalse(res.ok)
+            self.assertTrue(res.unreachable)
+            self.assertIsNone(res.status)
+        self._assert_dead(self.ssh_ok)
+
     def test_ssh_exits_immediately(self):
         cfg = ConnectConfig(
             rendezvous="tester@fake-secret-host:2222",
@@ -535,6 +552,17 @@ class LoadConfigTest(unittest.TestCase):
         with self.assertRaises(ConfigError) as ctx:
             load_config(self._write("[1, 2]"))
         self.assertIn("object", str(ctx.exception))
+
+    def test_invalid_utf8_is_config_error(self):
+        self.path.write_bytes(b'{"schema": 1, "rendezvous": "\xff\xfe"}')
+        with self.assertRaises(ConfigError) as ctx:
+            load_config(self.path)
+        self.assertIn("UTF-8", str(ctx.exception))
+
+    def test_missing_file_is_oserror(self):
+        missing = Path(self.tmp.name) / "nope.json"
+        with self.assertRaises(OSError):
+            load_config(missing)
 
 
 class CliTest(ConnectCase):

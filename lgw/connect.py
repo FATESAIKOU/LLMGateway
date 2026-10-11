@@ -35,7 +35,9 @@ v0 沒有應用層認證，開著不放只增加暴露面。
     暫存目錄寫一個 0600 的 known_hosts 給這次的 ssh 用。
 - host key 一律照 known_hosts 檢查（`StrictHostKeyChecking yes`），不用 accept-new。
 - 未知欄位、缺必填、型別錯、`schema` 不是 1、`known_hosts`／`host_keys` 兩個都給或
-  都沒給 → `ConfigError`；訊息只寫欄位名與原因，不印值。
+  都沒給 → `ConfigError`；訊息只寫欄位名與原因，不印值。檔案不存在或沒權限丟
+  `OSError`（路徑／權限問題，不是格式問題）；內容不是 UTF-8 或不是 JSON →
+  `ConfigError`。
 
 範例（位址、金鑰一律用假的佔位）：
 
@@ -90,9 +92,10 @@ base URL，Ctrl-C 結束。
 - 等本機埠真的能連上才 yield `http://127.0.0.1:<臨時埠>`；臨時埠用
   bind 127.0.0.1:0 取得再釋放。
 - 離開（正常或例外）時一定關掉 ssh 子行程，並刪掉整個暫存目錄。
-- 連不上、ssh 先結束、逾時：丟 `Unavailable`，只帶錯誤種類（kind），不帶 ssh 的
-  stderr（裡面可能有位址）。kind ∈ ssh_missing｜bad_config｜temp_failed｜
-  ssh_exited｜timeout。
+- `Unavailable` 只在進入 `with` 時（建立隧道期間）丟，kind ∈ ssh_missing｜bad_config｜
+  temp_failed｜ssh_exited｜timeout，只帶錯誤種類、不帶 ssh 的 stderr（裡面可能有
+  位址）。進入之後 ssh 若斷掉不會丟例外：`lgw.client` 的後續呼叫回 unreachable，
+  呼叫方重新 connect 即可。
 
 只用標準函式庫。
 """
@@ -268,8 +271,14 @@ def _split_target(value: str) -> tuple[str, str, int]:
 
 
 def load_config(path: str | Path) -> ConnectConfig:
-    """讀 JSON 設定檔（schema 1，格式見模組 docstring）；每次呼叫都重讀、不快取。"""
-    text = Path(path).read_text(encoding="utf-8")
+    """讀 JSON 設定檔（schema 1，格式見模組 docstring）；每次呼叫都重讀、不快取。
+
+    檔案不存在或沒權限丟 OSError；內容不是 UTF-8 或不是 JSON → ConfigError。
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise ConfigError("config is not valid UTF-8") from None
     try:
         data = json.loads(text)
     except ValueError:
@@ -450,7 +459,10 @@ def connect(cfg: ConnectConfig, timeout: float = DEFAULT_TIMEOUT):
     """在本機開一個到會合點的轉發，yield base URL；離開時關掉 ssh。
 
     每次操作才 connect、用完就關，不長期持有、不自動重連（見模組 docstring）。
-    ssh 先結束、逾時或起不來丟 Unavailable（只帶錯誤種類）。
+
+    `Unavailable` 只在**進入 with 時**（建立隧道期間）丟，kind 是 ssh_missing｜
+    bad_config｜temp_failed｜ssh_exited｜timeout。進入之後 ssh 若斷掉不會丟例外：
+    `lgw.client` 的後續呼叫回 unreachable（「無法確認」），呼叫方重新 connect 即可。
     """
     with _connected(cfg, timeout=timeout) as (_proc, base_url):
         yield base_url
