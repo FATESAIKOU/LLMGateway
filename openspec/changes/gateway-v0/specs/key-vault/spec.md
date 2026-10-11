@@ -41,6 +41,25 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫（包含事件紀錄與�
 - **WHEN** 請求沒有帶客戶端憑證或帶錯
 - **THEN** 服務回 401，不留下租約事件
 
+### Requirement: 發證用的管理憑證
+服務 SHALL 支援 issuer 角色的客戶端憑證，只能用管理 API 發撤客戶端，不能租用；一般客戶端 MUST NOT 能用管理 API。管理 API MUST 只接受從 loopback 來的請求，issuer 只能發撤名字符合 `worker-*` 的客戶端。同名重複發證時，服務 MUST 先撤掉舊的憑證（連同它未結束的租約）再回新的。
+
+#### Scenario: 發證
+- **WHEN** issuer 從 loopback 以名字 `worker-a1` 發證
+- **THEN** 服務回新的憑證，`worker-a1` 之後可以租用
+
+#### Scenario: 同名重發
+- **WHEN** `worker-a1` 已有憑證與一張 active 租約，issuer 再以同名發證
+- **THEN** 舊憑證失效、舊租約記為 revoked，只有新憑證有效
+
+#### Scenario: 角色與來源
+- **WHEN** 一般客戶端呼叫管理 API，或 issuer 呼叫租用 API，或管理請求不是從 loopback 來的
+- **THEN** 服務回 403
+
+#### Scenario: 名字不在範圍
+- **WHEN** issuer 發撤名字為 `mac-x` 的客戶端
+- **THEN** 服務回 403，不發也不撤
+
 ### Requirement: 服務不對外
 租用服務 SHALL 只綁在 provider 的 loopback，以及池內客戶端連得到的內部介面；MUST NOT 對網際網路開放。Mac 與手機 SHALL 經池的 SSH 跳板以埠轉送連入。
 

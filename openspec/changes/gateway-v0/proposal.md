@@ -177,11 +177,8 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 ## 銜接
 
 - **MyLinuxPool#50**：先照原樣做，當過渡（本人裁定）。租用做好後另開單，把 worker 的 key 來源換成租用，並收掉 MyLinuxPool 裡的 key；屆時 #50 大概縮成「確認 worker 連得到 LLMGateway」。
-- **MyLinuxPool**：
-  - 部署 workflow 要一把能經跳板登入 provider 的 Actions 身分；
-  - 服務要做成 provider 上的一個單元；
-  - worker 容器要連得到服務。
-  - 這三件另開 MyLinuxPool 的工單。
+- **服務的歸屬**（本人裁定，2026-10-11 晚）：LLMGateway 是獨立的服務，只是和池的服務跑在同一台；在那台用自己的帳號 `llmgw` 跑，安裝與部署都在本 repo（design 決定 2、3）。
+- **MyLinuxPool** 只留池的部分：#68 跳板機上的轉發專用條目、#69 worker 連到服務的路、#70 透過管理 API 發撤 worker 的客戶端憑證。
 - **MyAiStorage#31**：照上面的租用介面和 aistorage-pm 對齊 `ModelBroker` 的形狀（`request_lease` 回傳環境變數、`report_exhausted`、`release`）。
 - **MyAiEntry#147**：手機用的轉送（照 (2)），接 MyAiEntry#31、#33；租約欄位定案與 agent 種類要加給 App 的值時，通知 MyAiEntry PM。
 - **MyAiStorage#32（Atelier）**：harness 的能力需求要能寫「優先模型」與「底線模型」（PMO 會轉告 aistorage-pm）；LLMGateway 這邊見「之後」。
