@@ -229,7 +229,14 @@ curl -s http://127.0.0.1:<臨時埠>/v1/subscriptions
 
 ### 3.2 worker
 
-worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`，連線資訊從 `/run/mlp-gateway/gateway.json`（位址、帳號、埠、host key）填進 `ConnectConfig`，並固定 host key。這部分在 sidecar 那一側（MyAiStorage），LLMGateway 不需要知道有新 worker。
+worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`（`identity`）。sidecar **不讀 MyLinuxPool 的任何檔**，只讀同一種 JSON 連線設定（3.1）：
+
+- 這份 JSON 由 MyLinuxPool 的一個 unit 依 `/run/mlp-gateway/gateway.json`（位址、帳號、埠、host key）產生；rotate 後重新發布時整檔原子改寫，所以用 `host_keys`（自成一體）而不是 `known_hosts` 檔。
+- `rendezvous` 要寫成完整的 `user@host:port`，帳號用 gateway.json 給的（不固定是 `sshproxy`）；非 22 埠的 host key 主機寫 `[host]:port`。
+- `load_config` 每次操作都重讀，所以改寫後不用重啟 sidecar。
+- host key 固定在這份設定裡，不用 accept-new。
+
+這部分在 MyLinuxPool 與 sidecar（MyAiStorage）那一側，LLMGateway 不需要知道有新 worker。
 
 ## 4. 日常維運
 

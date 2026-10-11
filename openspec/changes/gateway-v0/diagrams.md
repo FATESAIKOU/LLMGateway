@@ -100,7 +100,7 @@
 - 客戶端：`lgw connect`。
   - 函式庫：`with lgw.connect(cfg) as base_url`；
   - 指令：`lgw connect`。
-  - 設定檔 `connect.env` 有 `jumps`、`rendezvous`、`identity`、`known_hosts`、`remote_api`。
+  - 設定檔是 JSON（`connect.json`，schema 1）：`rendezvous`、`jumps`、`identity`、`known_hosts` 或 `host_keys`、`remote_api`；每次連線重讀。worker 的由 MyLinuxPool 的 unit 依 gateway.json 產生，Mac 手寫。
 - 會合點（sshproxy）上登記的 LLMGateway 公鑰：隧道金鑰（服務那台產生）、部署金鑰（secret）。能帶選項就收窄；本人已接受不收窄。
 
 **共通 JSON schema（LLMGateway 與 sidecar 一致）**

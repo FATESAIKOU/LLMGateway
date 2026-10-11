@@ -67,18 +67,22 @@
 - `lgw` 提供連線程式，函式庫與指令兩種用法。sidecar 的 SubscriptionSource 用函式庫。
   - 函式庫：`with lgw.connect(cfg) as base_url:`，在本機開一個轉發，回 `http://127.0.0.1:<臨時埠>`；離開時關掉。
   - 指令：`lgw connect`，前景維持轉發並印出 base URL。
-- 做法：`ssh -N -L 127.0.0.1:<臨時埠>:127.0.0.1:4710 [-J <跳板…>] sshproxy@<跳板機>`，帶 `ExitOnForwardFailure=yes`、`BatchMode=yes`、`StrictHostKeyChecking=yes`。連不上或中途斷掉就回「無法確認」，由呼叫方等一下再試。
-- 設定（`~/.config/lgw/connect.env`，或 sidecar 設定裡的同名欄位）：
-  - `jumps`：零到多個 `user@host:port`；
-  - `rendezvous`：`sshproxy@host:port`；
-  - `identity`：金鑰路徑；
-  - `known_hosts`；
-  - `remote_api`：預設 4710。
+- 做法：`ssh -F <自己產生的設定> -N -L 127.0.0.1:<臨時埠>:127.0.0.1:4710 [-J <跳板…>] <帳號>@<會合點> -p <埠>`，設定裡有 `StrictHostKeyChecking yes`、`BatchMode yes`、`ExitOnForwardFailure yes`。連不上或中途斷掉就回「無法確認」，由呼叫方等一下再試。
+  - 用 `-F` 而不是命令列的 `-i`／`-o`：OpenSSH 用 `-J` 時，命令列上的 `-i`／`-o` 不會套到跳板那一段。所以所有跳板與會合點共用同一把 identity 與同一份 known_hosts。
+  - 自己的設定檔意味著**不讀 `~/.ssh/config`**：別名、`Host` 區塊裡的帳號與埠都沒用，`rendezvous` 與 `jumps` 必須寫成明確的 `user@host:port`。帳號由設定指定，不固定是 `sshproxy`。
+- **設定檔是 JSON**（慣例叫 `connect.json`，格式的唯一定義在 `lgw/connect.py` 的模組說明）。`lgw.connect.load_config(path)` 每次呼叫都重讀檔案、不快取；sidecar 每次操作才 connect，所以設定檔被改寫後，下一次操作自然用新的。欄位就是這些，多一個都不行：
+  - `schema`：必填，只能是 `1`；
+  - `rendezvous`：必填，`user@host:port`；
+  - `jumps`：選填，字串陣列，每個 `user@host:port`，照順序，預設空；
+  - `identity`：必填，私鑰路徑；
+  - `known_hosts`（檔案路徑）與 `host_keys`（known_hosts 格式的一行一字串，陣列）：**恰給一個**；`host_keys` 讓設定檔自成一體，連線時寫進私有暫存目錄的 0600 檔；
+  - `remote_api`：選填，預設 4710。
+  - host key 的主機寫法照 known_hosts：埠不是 22 時是 `[host]:port`，是 22 時只寫 `host`。
+- **設定檔從哪來**：sidecar 不讀 MyLinuxPool 的任何檔，只讀這份 JSON，`lgw` 也一樣，所以兩者都不依賴 MyLinuxPool。
+  - worker：由 MyLinuxPool 的一個 unit 依 `/run/mlp-gateway/gateway.json`（`ip`、`tunnel_user`、`ssh_port`、`host_key` 等）產生這份 JSON，rotate 後重新發布時整檔原子改寫（所以用 `host_keys` 自成一體），sidecar 下次操作就讀到新的。host key 釘在這份設定裡，不和 pool-tunnel 共用，也不用 accept-new。
+  - Mac：手寫。
 - 用哪把金鑰：
-  - worker 用 **pool-tunnel 既有的 sshproxy 金鑰** `/home/worker/.ssh/id_tunnel`。擁有者 worker、權限 0600；sidecar 也以 worker 身分跑，讀得到（mylinuxpool-pm 確認）。
-  - worker 上的 connect 設定由 sidecar 從 MyLinuxPool 提供的 `/run/mlp-gateway/gateway.json` 填入：`ip`、`tunnel_user`、`ssh_port`、`host_key`。rotate 後會重新發布，不用會過期的環境變數。
-    - host key 釘在 LLMGateway 自己的 known_hosts，不和 pool-tunnel 共用，也不用 accept-new。
-    - `lgw` 本身只吃 connect 設定，不讀 MyLinuxPool 的檔，維持不依賴 MyLinuxPool。
+  - worker 用 **pool-tunnel 既有的 sshproxy 金鑰** `/home/worker/.ssh/id_tunnel`（設定的 `identity`）。擁有者 worker、權限 0600；sidecar 也以 worker 身分跑，讀得到（mylinuxpool-pm 確認）。
   - Mac 用它自己能登入 sshproxy 的金鑰。
   - LLMGateway 不另外發金鑰給客戶端。
 
