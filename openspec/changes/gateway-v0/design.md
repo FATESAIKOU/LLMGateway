@@ -94,6 +94,8 @@
   - worker：`/run/mlp-secrets/llmgateway-client-token`（0400），由 MyLinuxPool 放進去；
   - Mac：`~/.config/lgw/client-token`（0600）。
 - 租約的 `worker` 欄位必須和客戶端憑證登記的名稱一致，服務端檢查，所以一個客戶端不能冒用別台機器的名字。
+  - 池的 worker 名是 `<provider>-<image>-<run_id>` 這種形式；MyLinuxPool 發證時用 `worker-<池的 worker 名>` 當客戶端名（上限 57 字元，超過的 worker 在建容器前就被拒絕）。
+  - sidecar 啟動時先呼叫 `GET /v1/whoami`，用回來的 `client` 當租約的 `worker` 欄位，不自己拼名字。
 - `GET /v1/whoami`：回 `200 {client, role}`，不花任何額度，給 MyLinuxPool 的驗證程式核對憑證用。
 - **為什麼**：池內只能經 SSH 進來，SSH 已經擋掉外人；客戶端憑證是為了區分身分、撤銷、記錄，不靠它擋外人。MyLinuxPool 透過 API 發證，就不用碰 LLMGateway 的資料庫。
 
