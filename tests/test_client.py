@@ -237,6 +237,22 @@ class LocalFileTest(unittest.TestCase):
             self.assertNotIn("s3cr3t-token-value", text)
             self.assertIn("http://127.0.0.1:1", text)
 
+    def test_result_repr_no_data(self):
+        """repr(Result) 不含 data 內容（S6：canary 不得出現在 log）。"""
+        from lgw.client import Refusal, Result
+
+        canary = "s3cr3t-env-value-zz9"
+        res = Result(ok=True, status=201,
+                     data={"lease_id": "L1",
+                           "env": {"CLAUDE_CODE_OAUTH_TOKEN": canary}},
+                     refusal=Refusal(reason="all_cooling",
+                                     earliest_reset="2026-10-11T01:02:00Z"))
+        text = repr(res)
+        self.assertNotIn(canary, text)
+        self.assertNotIn("lease_id", text)
+        self.assertIn("ok=True", text)
+        self.assertIn("all_cooling", text)  # refusal 理由保留可讀性
+
     def test_no_agent_tool_imports(self):
         """lgw 不引用 subprocess、herdr、agora（AST 檢查，docstring 文字不算）。"""
         tree = ast.parse(Path(client_mod.__file__).read_text(encoding="utf-8"))
