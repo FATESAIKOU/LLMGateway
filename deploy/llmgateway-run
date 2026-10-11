@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# llmgateway-run：讀 env 檔，組出 python3 -m lgwd 的 argv 並 exec。
+# 工作目錄是 current（python 從 CWD 找到 lgwd 套件）。
+set -uo pipefail
+
+HOME_DIR="${HOME:?HOME 未設定}"
+CURRENT="${HOME_DIR}/.local/share/llmgateway/current"
+STATE="${HOME_DIR}/.local/state/llmgateway"
+CONF="${HOME_DIR}/.config/llmgateway/llmgateway.env"
+
+[[ -f "$CONF" ]] && . "$CONF"
+HOSTS="${LGW_API_HOSTS:-127.0.0.1}"
+API_PORT="${LGW_API_PORT:-8480}"
+BOARD_PORT="${LGW_BOARD_PORT:-8481}"
+USAGE="${LGW_USAGE:-1}"
+
+cd "$CURRENT" || exit 1
+args=(--db "${STATE}/llm.db"
+      --policy "${CURRENT}/policy/default.json"
+      --keys "${STATE}/keys.env")
+# 空白分隔的多個位址，各一個 --api-host。
+for h in $HOSTS; do
+    args+=(--api-host "$h")
+done
+args+=(--api-port "$API_PORT" --board-port "$BOARD_PORT")
+if [[ "$USAGE" == "1" ]]; then
+    args+=(--usage)
+else
+    args+=(--no-usage)
+fi
+exec python3 -m lgwd "${args[@]}"

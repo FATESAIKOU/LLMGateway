@@ -1,0 +1,12 @@
+[Unit]
+Description=LLMGateway lease service (lgwd)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/llmgateway-run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
