@@ -1,6 +1,6 @@
 ## Purpose
 
-把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；只有持有讀取 token 的客戶端能經 get 拿到，其他地方不再放 key。
+把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；客戶端經會合點的 SSH 轉發用 get 拿到，其他地方不再放 key。
 
 ## ADDED Requirements
 
@@ -22,16 +22,16 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 - **WHEN** 以憑證樣式掃描 repo、服務資料庫、服務 log 與 list 的回覆
 - **THEN** 沒有任何命中
 
-### Requirement: 一把共用的讀取 token
-服務 SHALL 以一把共用的讀取 token 認證所有客戶端（本人在 design 決定 5a 選 (b) 的前提；選 (a) 時本條改為「不做應用層認證」）。token 由本人產生，和 key 一起由部署流程放到服務那台，服務只保存雜湊。換掉 token（改 secret、重新部署）SHALL 讓舊的立即失效。沒有發證或撤證的 API。
+### Requirement: 不做應用層認證
+服務 SHALL NOT 要求應用層的憑證；能連到服務的就能 list、get、登錄冷卻。存取控制只靠 SSH：服務只綁 127.0.0.1，只能經會合點的 SSH 轉發連入（本人選定，design 決定 5a）。發現外洩時，以換掉五把 key 並重新部署因應；客戶端不持有 key，不用改。
 
-#### Scenario: 沒有 token
-- **WHEN** 請求沒有帶 token 或帶錯
-- **THEN** 服務回 401，不回任何 subscription 資料
+#### Scenario: 經會合點連入
+- **WHEN** 持有會合點 SSH 金鑰的客戶端經轉發呼叫 list
+- **THEN** 服務回 200，不要求任何 token
 
-#### Scenario: 換掉 token
-- **WHEN** 本人換掉 token 並重新部署
-- **THEN** 舊 token 之後一律 401，新 token 可以用
+#### Scenario: 換 key
+- **WHEN** 本人換掉某把 key 的 secret 並重新部署
+- **THEN** 之後的 get 回新值，客戶端的設定不用改
 
 ### Requirement: 服務不對外
 服務 SHALL 只綁在服務那台的 127.0.0.1；MUST NOT 綁任何對外或容器網路的介面。客戶端只能經會合機（spec `connectivity`）連入。
