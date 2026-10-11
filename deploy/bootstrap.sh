@@ -609,8 +609,35 @@ step_check() {
 
     if [[ $rc -eq 0 ]]; then
         log_step check ok "install.sh --check 通過 (rc=0)"
+    elif [[ $rc -eq 1 ]]; then
+        # 新三態 rc=1：確定不成立。
+        # 檢查是否為「隧道設定未填 (結束碼 78) / 尚未提供會合點」所致：
+        # 若主要服務 llmgateway.service 是 active，且 tunnel.env 尚未填妥 RENDEZVOUS，
+        # 則此狀態為等待會合點設定的預期 todo，而非腳本安裝失敗。
+        local conf_dir="${BOOT_HOME}/.config/llmgateway"
+        local tunnel_env="${conf_dir}/tunnel.env"
+        local tunnel_configured=0
+        if [[ -f "$tunnel_env" ]] && grep -Eq '^RENDEZVOUS=[^[:space:]]+' "$tunnel_env" 2>/dev/null; then
+            tunnel_configured=1
+        fi
+
+        local gw_active=0
+        if run_as_llmgw systemctl --user is-active --quiet llmgateway.service 2>/dev/null; then
+            gw_active=1
+        fi
+
+        if [[ $tunnel_configured -eq 0 && $gw_active -eq 1 ]]; then
+            log_step check todo "install.sh --check 未通過 (rc=1，llmgateway 正常但隧道設定未填/結束碼 78)"
+            record_todo "待完成會合點設定後使 install.sh --check 通過"
+        else
+            log_step check fail "install.sh --check 未通過 (rc=1)"
+            step_failed=1
+        fi
+    elif [[ $rc -eq 2 ]]; then
+        log_step check fail "install.sh --check 無法確認 (rc=2)"
+        step_failed=1
     else
-        log_step check fail "install.sh --check 未通過 (rc=${rc})"
+        log_step check fail "install.sh --check 異常退出 (rc=${rc})"
         step_failed=1
     fi
 }
