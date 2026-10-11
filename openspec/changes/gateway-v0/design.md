@@ -3,7 +3,7 @@
 動機與範圍見 proposal.md（v4 定案）。影響做法的現況與限制：
 
 - **Claude 條款**：訂閱的 OAuth 是給原版 Claude Code 這類 Anthropic 原生 app 的一般使用；第三方不得代為路由、收集、存放、中轉 Claude.ai 的 token（`docs/research/claude-failover.md` §7）。LLMGateway 不代轉請求，Claude 訂閱的 key 只給 `agent=claude-code` 的 get。
-- **sidecar v3**（MyAiStorage，aistorage-pm）：一台機器一個 daemon（Mac 也能跑），對外五個操作加 HTTP 控制，不基於 herdr。它用 LLMGateway 的 list／get／登錄冷卻；挑把與換把在它內部；key 變成哪些環境變數由它的 AgentDriver 決定。
+- **sidecar v4**（MyAiStorage，aistorage-pm）：一台機器一個 daemon（Mac 也能跑），對外四個動作（open／close／status／poke）加 HTTP 控制，不基於 herdr。它用 LLMGateway 的 list／get／登錄冷卻；挑把與換把在它內部；key 變成哪些環境變數由它的 AgentDriver 決定。
 - **服務的位置**（本人裁定）：本人選定的常駐 provider，LLMGateway 跟 MyLinuxPool 無關，用自己的帳號 `llmgw` 跑。
 - **v4（本人定案）**（本人對 v3 的第 5～7 點與後續的裁定）：
   - 部署與啟動不依賴 MyLinuxPool，只依賴「一台連得到的 Linux 機器＋SSH」；
@@ -159,7 +159,7 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 - 有 `resets_at` 時冷卻到它加 2 分鐘；沒有時用窗口的預設長度（5 小時、7 天）。過去或 8 天以後的時刻拒收。同一窗口取較晚的結束時刻；到時自動解除。
 - `available` = key 已部署，而且兩個窗口都沒在冷卻。
 
-### 決定 9：換把由 sidecar 做（MyAiStorage v3）
+### 決定 9：換把由 sidecar 做（MyAiStorage v4）
 
 - sidecar 的 AgentDriver 偵測到額度用完 → sidecar 登錄冷卻 → 從 list 挑 `available` 而且 `agents` 含自己種類、`priority` 最前的 → get → 停掉 agent（寫回 agora）→ 用新 key 重開並 continue 同一個 Session。
 - 之後依 harness 的優先模型與底線挑，也在 sidecar 這一層。
@@ -169,7 +169,7 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 ### 決定 10：稽核紀錄
 
 - 每次 get 與登錄冷卻記一筆，內容是時刻、subscription id、agent（get）、窗口與結束時刻（冷卻）。不記 key。
-- 這是「紀錄全留」在 v3 能做到的部分：看得到誰在何時拿過哪一把、誰登錄過冷卻；看不到現在還在用（沒有租約）。
+- 這是「紀錄全留」在 v4 能做到的部分：看得到誰在何時拿過哪一把、誰登錄過冷卻；看不到現在還在用（沒有租約）。
 
 ### 決定 11：拿掉的與理由
 
@@ -202,7 +202,7 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
    - `lgw` 提供 list／get／登錄冷卻的客戶端。
 3. 本人做一次性的開機設定（決定 5），設 environment 與 secret（tasks 3.4）。
 4. MyLinuxPool：`TUNNEL_EXTRA_PUBKEYS` 與 `NODE_GATEWAY.ports.llmgateway`（mylinuxpool-pm 開 d 單；var 的值由本人或 PMO 設）。#67～#70 已作廢。
-5. sidecar v3 接上 list／get／登錄冷卻，在 Mac 與一台 worker 驗收換把。
+5. sidecar v4 接上 list／get／登錄冷卻，在 Mac 與一台 worker 驗收換把。
 6. 另開單把 MyLinuxPool#50 的 key 來源換成 LLMGateway，收掉 MyLinuxPool 裡的 key。
 
 - **退回**：停服務；worker 在第 6 步之前仍有 MyLinuxPool#50 的 key。

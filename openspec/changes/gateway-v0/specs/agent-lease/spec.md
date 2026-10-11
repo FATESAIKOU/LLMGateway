@@ -10,7 +10,7 @@
 
 ### Requirement: 依政策選定訂閱
 **Reason**: 本人 2026-10-11 夜的裁定：LLMGateway 對外只有 list、get、登錄冷卻三個介面，不再有租約。
-**Migration**: 挑選邏輯移到 sidecar 內部（MyAiStorage v3）；LLMGateway 只提供 `priority` 與 `available`。
+**Migration**: 挑選邏輯移到 sidecar 內部（MyAiStorage v4）；LLMGateway 只提供 `priority` 與 `available`。
 
 ### Requirement: 租約狀態與事件
 **Reason**: 本人 2026-10-11 夜的裁定：LLMGateway 對外只有 list、get、登錄冷卻三個介面，不再有租約。
@@ -22,7 +22,7 @@
 
 ### Requirement: 憑證由 launcher 注入
 **Reason**: 本人 2026-10-11 夜的裁定：LLMGateway 對外只有 list、get、登錄冷卻三個介面，不再有租約。
-**Migration**: sidecar 用 get 拿到 key，由它的 AgentDriver 推出環境變數並交給子行程（MyAiStorage v3）。
+**Migration**: sidecar 用 get 拿到 key，由它的 AgentDriver 推出環境變數並交給子行程（MyAiStorage v4）。
 
 ### Requirement: 訂閱切換不得安靜發生
 **Reason**: 本人 2026-10-11 夜的裁定：LLMGateway 對外只有 list、get、登錄冷卻三個介面，不再有租約。

@@ -115,7 +115,7 @@
 - 政策檔：priority、models、agents。是資料，不是介面。
 - 冷卻表、稽核紀錄：SQLite。
 
-**sidecar 那一側用到 LLMGateway 的地方（MyAiStorage v3）**
+**sidecar 那一側用到 LLMGateway 的地方（MyAiStorage v4）**
 - sidecar 內部有一層包住 list／get／登錄冷卻（aistorage-pm 稱 `SubscriptionSource`）。挑把邏輯在這一層。
 - AgentDriver：把共通 JSON 變成 agent 的環境變數；判讀額度用完。可以用 `lgw.signals` 的規則表。
 
