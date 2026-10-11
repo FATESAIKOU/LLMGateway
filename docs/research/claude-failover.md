@@ -287,3 +287,55 @@
 - Legal and compliance（OAuth 用途、託管條件）：<https://code.claude.com/docs/en/legal-and-compliance>
 - Consumer Terms：<https://www.anthropic.com/legal/consumer-terms>
 - Commercial Terms：<https://www.anthropic.com/legal/commercial-terms>
+
+---
+
+## 7. 追加（2026-10-11）：v0 改方向所依據的條款整理
+
+> 來源：PMO 轉達本人的查證（2026-10-11）。PM 於同日逐條對照原文；原文與轉述有差異的地方，下面都已標出。
+
+### 7.1 Claude Code 法務頁（原文）
+
+出處：<https://code.claude.com/docs/en/legal-and-compliance>（Authentication and credential use、Usage policy 兩節）
+
+- OAuth 的用途：
+  > "OAuth authentication is intended exclusively for purchasers of Claude Free, Pro, Max, Team, and Enterprise subscription plans and is designed to support ordinary use of Claude Code and other native Anthropic applications."
+- 第三方開發者的禁制：
+  > "Anthropic does not permit third-party developers to offer Claude.ai login into their own applications, or to route requests through Free, Pro, or Max plan credentials on behalf of their users. Moreover, developers may not collect, store, or intermediate Claude.ai credentials or session tokens — sign-in to a Claude account must complete through Anthropic's own flow."
+- 不受限的情形：
+  > "Nor does it prevent an end user from signing in to the unmodified Claude Code binary with their own Claude subscription, including where a platform hosts Claude Code …"
+- 執行：
+  > "Anthropic reserves the right to take measures to enforce these restrictions and may do so without prior notice."
+- 用量假設：
+  > "Advertised usage limits for Pro and Max plans assume ordinary, individual usage of Claude Code and the Agent SDK."
+- 註：原文是「OAuth 是設計給 Claude Code 與 Anthropic 原生 app 的一般使用」，加上「第三方不得代為路由、收集、存放、中轉」；沒有逐字寫成「只能用在 Claude Code」。
+
+### 7.2 官方明寫可以的做法
+
+- `claude setup-token` 產生一年期的 OAuth token，設成 `CLAUDE_CODE_OAUTH_TOKEN`，給 CI 或腳本裡的原版 Claude Code 使用（§1.3；<https://code.claude.com/docs/en/authentication>）。
+- Claude Code 自己帶著登入，經 `ANTHROPIC_BASE_URL` 指向只做轉送的 gateway（<https://code.claude.com/docs/en/llm-gateway>）。
+
+### 7.3 社群案例
+
+出處：<https://github.com/anomalyco/opencode/issues/6930>「Using opencode with Anthropic OAuth violates ToS & Results in Ban」
+
+- 2026-01-05 開單：使用者用 opencode 接 Max 訂閱（OAuth）後帳號被停。之後陸續有人回報；其中不少人是在用 OAuth 期間變更了方案，也有人表示根本沒用過 opencode 也被停。
+- 2026-02-19：opencode 維護者表示 Anthropic 法務要求回覆並關閉此 issue，並說明條款禁止在 Claude Code 以外使用 Max 訂閱、官方文件最近改得更嚴格。issue 當天關閉。
+- PMO 轉述「04-04 起訂閱不再涵蓋第三方工具」：此頁沒有這個日期與說法，出處待補。
+
+### 7.4 對 v0 的結論（本人已裁定）
+
+- 不採用：
+  - Gateway 持有 Claude 訂閱 token、替客戶端帶上去代轉；
+  - opencode 經 Gateway 使用 Claude 訂閱；
+  - sub2api 式的訂閱帳號池。
+- 採用：LLMGateway 只保管 token。租用時把 `CLAUDE_CODE_OAUTH_TOKEN` 交給 worker 上**本人自己的原版 Claude Code**，由它直接連 Anthropic。
+- 用完換另一個帳號（個人↔公司）屬灰色地帶，本人知悉並接受。設計上要求冷卻中不硬撞、每把有同時租用上限、紀錄全留。
+
+### 7.5 用量 % 的來源
+
+- Claude Code 的 status line JSON 有 `rate_limits.five_hour.used_percentage`、`rate_limits.five_hour.resets_at`，`seven_day` 也一樣（重置時間是 Unix epoch 秒）。
+- 原文：
+  > "`rate_limits`: appears only for claude.ai Pro and Max subscribers, or behind a Claude apps gateway that sets a spend limit for you, and only after the first API response in the session."
+- 公司方案若是 Team／Enterprise，這個欄位可能沒有。setup-token 下有沒有，要試做確認（v0 試做項目 a）。
+- 出處：<https://code.claude.com/docs/en/statusline>
