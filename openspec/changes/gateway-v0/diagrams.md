@@ -187,12 +187,25 @@ classDiagram
   }
   class CredentialSource {
     <<sidecar internal interface>>
-    acquire(agent, preferences) env
-    started()
-    renew()
-    exhausted(signal, resets_at) env
-    release()
+    acquire(agent, instance, preferences) LeaseOrRefusal
+    started(lease)
+    renew(lease) Lease
+    exhausted(lease, signal, resets_at) LeaseOrRefusal
+    release(lease)
   }
+  class Lease {
+    lease_id
+    subscription
+    env
+    unset
+    expires_at
+  }
+  class Refusal {
+    reason
+    earliest_reset
+  }
+  CredentialSource ..> Lease
+  CredentialSource ..> Refusal
   class LgwCredentialSource {
     <<implementation in lgw>>
   }
@@ -210,6 +223,14 @@ classDiagram
 | 上游的種類 | `CredentialProvider` | Claude 訂閱、OpenRouter、Ollama Cloud、OpenCode Zen | 租用 API、選把規則、sidecar |
 | 選把規則 | `SelectionPolicy` | 固定順序＋冷卻＋上限（之後：優先模型＋底線） | 租用 API、上游實作 |
 | 拿 key 的方式（sidecar 側） | `CredentialSource` | `LgwCredentialSource`（本機開發可換成讀環境變數） | sidecar 本體、agent driver |
+
+`CredentialSource` 的暫定形狀（aistorage-pm 提，**還沒定案**，等本人整理好 v2 的疑問再確認）：
+
+- 同步呼叫。一台 sidecar 同時開好幾個 agent，所以 `acquire` 回一個租約 handle（`Lease`），之後的 `started`、`renew`、`exhausted`、`release` 都帶它。
+- `acquire` 與 `exhausted` 回 `Lease` 或 `Refusal{reason, earliest_reset}`。拒絕是正常回傳，不是例外。
+- 只有「無法確認」（連不上、5xx）才拋 `CredentialUnavailable`，sidecar 照「等一下再試」處理。
+- `Preferences{models（有順序）, floor}`。
+- 角色、base URL、token 路徑在建構 `LgwCredentialSource` 時由設定給；worker 名由它自己呼叫 `whoami` 取得。
 | 額度用完的判讀 | sidecar 的 `AgentDriver` 回報正規化狀態 | Claude Code、opencode 的 driver | sidecar 本體、LLMGateway |
 
 **和前一版相比拿掉的**：
