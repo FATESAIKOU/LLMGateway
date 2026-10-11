@@ -96,11 +96,11 @@
 - 每個會改變狀態的請求都帶客戶端產生的 `request_id`（去重見決定 12）。
 - 每個回覆都帶 `api_version`（v0 是 `1`）。
 
-**租約物件**（`lease`）：`{lease_id, subscription, agent, model, env, unset, expires_at, confirm_by}`。`env` 與 `unset` 只出現在核准的那一次回覆，之後查詢都不帶。
+**租約物件**（`lease`）：`{lease_id, subscription, agent, model, env, unset, expires_at, confirm_by}`。`env` 與 `unset` 只出現在核准的那一次回覆，之後查詢都不帶。回覆一律把租約物件包在鍵裡：申請回 `{"lease": …}`，`exhausted` 回 `{"next": …}`。
 
 | 方法 | 路徑 | 請求 | 成功回傳 |
 |---|---|---|---|
-| POST | `/v1/leases` | `worker, role, agent, instance, model?, subscription?, purpose?, preferences?, request_id` | `201 {lease}` |
+| POST | `/v1/leases` | `worker, role, agent, instance, model?, subscription?, purpose?, preferences?, request_id` | `201 {"lease": <租約物件>}` |
 | POST | `/v1/leases/{id}/start` | `request_id` | `200 {expires_at}`：確認 agent 已經開起來，granted → active；對已 active 的租約重送也回 200 |
 | POST | `/v1/leases/{id}/exhausted` | `signal, resets_at?, request_id` | `200 {next: lease}`，或 `200 {next: null, refusal}` |
 | POST | `/v1/leases/{id}/renew` | `request_id` | `200 {expires_at}` |
