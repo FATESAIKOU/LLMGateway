@@ -94,7 +94,9 @@ base URL，Ctrl-C 結束。
   同一把 identity 與同一份 known_hosts**；用跳板時 `host_keys` 也要包含每個跳板的
   host key。
 - 等本機埠真的能連上才 yield `http://127.0.0.1:<臨時埠>`；臨時埠用
-  bind 127.0.0.1:0 取得再釋放。
+  bind 127.0.0.1:0 取得再釋放。取臨時埠有極短的競爭窗口；被搶時
+  ssh 因 ExitOnForwardFailure 結束，connect 丟 Unavailable('ssh_exited')，
+  呼叫方重試即可。
 - 離開（正常或例外）時一定關掉 ssh 子行程，並刪掉整個暫存目錄。
 - `Unavailable` 只在進入 `with` 時（建立隧道期間）丟，kind ∈ ssh_missing｜bad_config｜
   temp_failed｜ssh_exited｜timeout，只帶錯誤種類、不帶 ssh 的 stderr（裡面可能有
@@ -291,7 +293,11 @@ def load_config(path: str | Path) -> ConnectConfig:
 
 
 def _free_port() -> int:
-    """在 127.0.0.1 上取一個沒人用的埠，立刻釋放（給 -L 用）。"""
+    """在 127.0.0.1 上取一個沒人用的埠，立刻釋放（給 -L 用）。
+
+    取臨時埠有極短的競爭窗口；被搶時 ssh 因 ExitOnForwardFailure 結束，
+    connect 丟 Unavailable('ssh_exited')，呼叫方重試即可。
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
@@ -463,6 +469,9 @@ def connect(cfg: ConnectConfig, timeout: float = DEFAULT_TIMEOUT):
     """在本機開一個到會合點的轉發，yield base URL；離開時關掉 ssh。
 
     每次操作才 connect、用完就關，不長期持有、不自動重連（見模組 docstring）。
+
+    取臨時埠有極短的競爭窗口；被搶時 ssh 因 ExitOnForwardFailure 結束，
+    connect 丟 Unavailable('ssh_exited')，呼叫方重試即可。
 
     `Unavailable` 只在**進入 with 時**（建立隧道期間）丟，kind 是 ssh_missing｜
     bad_config｜temp_failed｜ssh_exited｜timeout。進入之後 ssh 若斷掉不會丟例外：
