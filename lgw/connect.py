@@ -50,13 +50,17 @@ v0 沒有應用層認證，開著不放只增加暴露面。
       "remote_api": 4710
     }
 
-自成一體的版本（`host_keys` 取代 `known_hosts`）：
+自成一體的版本（`host_keys` 取代 `known_hosts`；22 埠寫裸主機名，非 22 埠寫 `[host]:port`）：
 
     {
       "schema": 1,
       "rendezvous": "sshproxy@rendezvous.example:22",
+      "jumps": ["jump1@jump.example:2222"],
       "identity": "/home/sidecar/.ssh/id_tunnel",
-      "host_keys": ["[rendezvous.example]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAFAKEfakeFAKEfakeFAKEfakeFAKEfake"]
+      "host_keys": [
+        "rendezvous.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAFAKEfakeFAKEfakeFAKEfakeFAKEfake",
+        "[jump.example]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAFAKEfakeFAKEfakeFAKEfakeFAKEfake"
+      ]
     }
 
 指令：`python3 -m lgw.connect --config <connect.json>`，前景維持轉發、印出一行
@@ -90,7 +94,9 @@ base URL，Ctrl-C 結束。
   同一把 identity 與同一份 known_hosts**；用跳板時 `host_keys` 也要包含每個跳板的
   host key。
 - 等本機埠真的能連上才 yield `http://127.0.0.1:<臨時埠>`；臨時埠用
-  bind 127.0.0.1:0 取得再釋放。
+  bind 127.0.0.1:0 取得再釋放。取臨時埠有極短的競爭窗口；被搶時
+  ssh 因 ExitOnForwardFailure 結束，connect 丟 Unavailable('ssh_exited')，
+  呼叫方重試即可。
 - 離開（正常或例外）時一定關掉 ssh 子行程，並刪掉整個暫存目錄。
 - `Unavailable` 只在進入 `with` 時（建立隧道期間）丟，kind ∈ ssh_missing｜bad_config｜
   temp_failed｜ssh_exited｜timeout，只帶錯誤種類、不帶 ssh 的 stderr（裡面可能有
@@ -106,6 +112,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -287,7 +294,11 @@ def load_config(path: str | Path) -> ConnectConfig:
 
 
 def _free_port() -> int:
-    """在 127.0.0.1 上取一個沒人用的埠，立刻釋放（給 -L 用）。"""
+    """在 127.0.0.1 上取一個沒人用的埠，立刻釋放（給 -L 用）。
+
+    取臨時埠有極短的競爭窗口；被搶時 ssh 因 ExitOnForwardFailure 結束，
+    connect 丟 Unavailable('ssh_exited')，呼叫方重試即可。
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
@@ -460,9 +471,17 @@ def connect(cfg: ConnectConfig, timeout: float = DEFAULT_TIMEOUT):
 
     每次操作才 connect、用完就關，不長期持有、不自動重連（見模組 docstring）。
 
+    取臨時埠有極短的競爭窗口；被搶時 ssh 因 ExitOnForwardFailure 結束，
+    connect 丟 Unavailable('ssh_exited')，呼叫方重試即可。
+
     `Unavailable` 只在**進入 with 時**（建立隧道期間）丟，kind 是 ssh_missing｜
     bad_config｜temp_failed｜ssh_exited｜timeout。進入之後 ssh 若斷掉不會丟例外：
     `lgw.client` 的後續呼叫回 unreachable（「無法確認」），呼叫方重新 connect 即可。
+
+    呼叫方注意事項：函式庫本身不裝全域 signal handler（避免覆蓋呼叫方的
+    signal 處理）；若行程可能收到 SIGTERM，呼叫方要把 SIGTERM 轉成例外
+    （例如 signal handler 丟 SystemExit），with 的清理（關閉 ssh 子行程、
+    刪除暫存目錄）才會跑。
     """
     with _connected(cfg, timeout=timeout) as (_proc, base_url):
         yield base_url
@@ -485,19 +504,35 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ConfigError) as exc:
         print("lgw.connect: {0}".format(exc), file=sys.stderr)
         return 2
+
+    def _sig_handler(signum, frame):
+        raise SystemExit(0)
+
     try:
-        with _connected(cfg, timeout=args.timeout) as (proc, base_url):
-            print(base_url, flush=True)
-            returncode = proc.wait()
-    except Unavailable as exc:
-        print("lgw.connect: unavailable: {0}".format(exc.kind), file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:  # Ctrl-C：__exit__ 已關掉 ssh
+        prev_term = signal.signal(signal.SIGTERM, _sig_handler)
+        prev_hup = signal.signal(signal.SIGHUP, _sig_handler)
+        signals_installed = True
+    except (ValueError, AttributeError):
+        signals_installed = False
+
+    try:
+        try:
+            with _connected(cfg, timeout=args.timeout) as (proc, base_url):
+                print(base_url, flush=True)
+                returncode = proc.wait()
+        except Unavailable as exc:
+            print("lgw.connect: unavailable: {0}".format(exc.kind), file=sys.stderr)
+            return 1
+        except (KeyboardInterrupt, SystemExit):  # Ctrl-C 或 SIGTERM/SIGHUP：__exit__ 已關掉 ssh
+            return 0
+        if returncode != 0:
+            print("lgw.connect: unavailable: ssh_exited", file=sys.stderr)
+            return 1
         return 0
-    if returncode != 0:
-        print("lgw.connect: unavailable: ssh_exited", file=sys.stderr)
-        return 1
-    return 0
+    finally:
+        if signals_installed:
+            signal.signal(signal.SIGTERM, prev_term)
+            signal.signal(signal.SIGHUP, prev_hup)
 
 
 if __name__ == "__main__":
