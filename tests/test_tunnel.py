@@ -193,6 +193,8 @@ while :; do sleep 0.05; done
         self.assertIn("-o ExitOnForwardFailure=yes", ssh_log)
         self.assertIn("-o StrictHostKeyChecking=yes", ssh_log)
         self.assertIn("-o BatchMode=yes", ssh_log)
+        self.assertIn("-o GlobalKnownHostsFile=/dev/null", ssh_log)
+        self.assertIn("-o IdentitiesOnly=yes", ssh_log)
         self.assertIn("-o ServerAliveInterval=30", ssh_log)
         self.assertIn("-o ServerAliveCountMax=3", ssh_log)
         self.assertIn("UserKnownHostsFile=" + FAKE_KNOWN_HOSTS, ssh_log)
