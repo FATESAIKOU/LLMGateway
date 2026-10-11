@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "subscriptions": {
+    "claude-personal": {
+      "agents": ["claude-code"],
+      "models": {"allow": ["*"], "default": null},
+      "cap": 2,
+      "default_cooldown_seconds": 18000
+    },
+    "claude-company": {
+      "agents": ["claude-code"],
+      "models": {"allow": ["*"], "default": null},
+      "cap": 2,
+      "default_cooldown_seconds": 18000
+    },
+    "openrouter": {
+      "agents": ["opencode"],
+      "models": {"allow": ["*:free"], "default": null},
+      "cap": null,
+      "default_cooldown_seconds": 3600
+    },
+    "opencode-zen": {
+      "agents": ["opencode"],
+      "models": {"allow": ["*"], "default": null},
+      "cap": null,
+      "default_cooldown_seconds": 3600,
+      "max_cooldown_seconds": 86400
+    },
+    "ollama-cloud": {
+      "agents": ["opencode"],
+      "models": {"allow": ["*"], "default": null},
+      "cap": null,
+      "default_cooldown_seconds": 18000
+    }
+  },
+  "order": {
+    "claude-code": ["claude-personal", "claude-company"],
+    "opencode": ["opencode-zen", "openrouter", "ollama-cloud"]
+  },
+  "cooldown_buffer_seconds": 120,
+  "lease_ttl_seconds": 43200,
+  "confirm_within_seconds": 600,
+  "resets_at_max_ahead_seconds": 691200
+}
