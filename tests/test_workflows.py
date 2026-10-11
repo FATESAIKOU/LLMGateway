@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import unittest
 
 WORKFLOWS = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows")
@@ -114,6 +115,41 @@ class WorkflowChecks:
             line.strip().startswith("#") and "-F" in line and "跳板" in line
             for line in self.text.splitlines()
         ))
+
+    def test_address_masking_uses_bash_literal_replacement(self):
+        m = re.search(r"2>\s*>\((while\s+IFS=\s*read\s+-r\s+line;.*?done)\s*>&2\)", self.text)
+        self.assertIsNotNone(m, f"mask loop not found in {self.name}")
+        loop = m.group(1)
+        self.assertIn('${line//"$jump_host"/[jump]}', loop)
+        self.assertIn('${line//"$target_host"/[target]}', loop)
+        self.assertNotIn("sed", loop)
+
+        # 抽出這段 bash 實際跑一次，餵 jump[1].example 與 2001:db8::7 這類位址，確認整段都被換掉
+        script = f"""
+set -euo pipefail
+jump_host='jump[1].example'
+target_host='2001:db8::7'
+{loop}
+"""
+        sample_input = (
+            "ssh: connect to jump[1].example: Connection refused\n"
+            "debug1: Next authentication to 2001:db8::7\n"
+            "error: jump[1].example and 2001:db8::7 failed\n"
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            input=sample_input,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        output = proc.stdout
+        self.assertNotIn("jump[1].example", output)
+        self.assertNotIn("2001:db8::7", output)
+        self.assertIn("ssh: connect to [jump]: Connection refused\n", output)
+        self.assertIn("debug1: Next authentication to [target]\n", output)
+        self.assertIn("error: [jump] and [target] failed\n", output)
+
 
 
 class DeployKeysWorkflowTests(WorkflowChecks, unittest.TestCase):
