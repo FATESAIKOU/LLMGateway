@@ -76,6 +76,7 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
   4. sidecar 安全結束 agent，以新環境變數重開。
   5. `agora continue` 接回同一個 session。
   - 正在跑的那一輪會中斷（本人已知）。
+- **和 Claude Code 自己的等待重疊**：互動模式的 Claude Code 碰到額度上限時，可以自己等到重置再繼續（`autoContinueAtUsageLimit`）。sidecar 換把時要以自己的判斷為準：由 sidecar 開的 agent 關掉這個設定，免得兩邊都在等。這一點進 design 時再確認設定方式。
 - **換回**：冷卻結束後，**下一次新開或重開** agent 時照順序選，所以會回到優先度高的那一把。正在順利跑的 agent 不會為了換回而被打斷。
 - **降低風險的做法**（本人要求寫進設計）：
   - 冷卻中不硬撞：在重置時間（再加一點緩衝）之前，那一把一律不出租，也不重試。拿不到重置時間的，用保守的預設冷卻時間。
@@ -90,7 +91,7 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 - 用量 %，有更好、沒有也行：
   - Claude：sidecar 掛 status line 腳本，回報 `rate_limits.five_hour`、`rate_limits.seven_day` 的已用 % 與重置時間。官方文件寫只有 claude.ai Pro／Max 才有，公司方案與 setup-token 下有沒有，要試做 a。
   - OpenRouter：服務定期查 `GET /api/v1/key`。
-  - Ollama Cloud：文件上有 `GET /api/balance`（有剩餘 % 與重置時間），試做 b 用 key 確認。
+  - Ollama Cloud：官方文件有 `GET /api/balance`，每分鐘最多 10 次。剩餘 % 與重置時間只出現在 legacy 方案的欄位，現行方案回的是美元額度。試做 b 用 key 確認我們的方案回哪一種（reviewer 已查證，見 `review-notes-v0.md`）。
   - OpenCode Zen：截至 2026-10-11 查無公開的用量 API，顯示「未知」。
 
 ### 5. Mac 走同一套
