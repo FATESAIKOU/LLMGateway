@@ -321,7 +321,10 @@
 
 - 2026-01-05 開單：使用者用 opencode 接 Max 訂閱（OAuth）後帳號被停。之後陸續有人回報；其中不少人是在用 OAuth 期間變更了方案，也有人表示根本沒用過 opencode 也被停。
 - 2026-02-19：opencode 維護者表示 Anthropic 法務要求回覆並關閉此 issue，並說明條款禁止在 Claude Code 以外使用 Max 訂閱、官方文件最近改得更嚴格。issue 當天關閉。
-- PMO 轉述「04-04 起訂閱不再涵蓋第三方工具」：此頁沒有這個日期與說法，出處待補。
+- 「04-04 起訂閱不再涵蓋第三方工具」：此頁沒有這個日期與說法。出處是下面三篇，**都是二手資料**（不是 Anthropic 官方），只能當背景參考：
+  - <https://rogs.me/2026/02/use-your-claude-max-subscription-as-an-api-with-cliproxyapi/>（CLIProxyAPI 的文章，文中已標 deprecated）
+  - <https://help.apiyi.com/en/anthropic-claude-subscription-third-party-tools-openclaw-policy-en.html>
+  - <https://kersai.com/anthropic-killed-third-party-claude-access-heres-every-workaround-that-still-works/>
 
 ### 7.4 對 v0 的結論（本人已裁定）
 
