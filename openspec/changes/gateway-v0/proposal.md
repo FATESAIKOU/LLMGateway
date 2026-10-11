@@ -68,7 +68,7 @@
 
 ## 銜接
 
-- **MyAiStorage（sidecar v3）**：用 list、get、登錄冷卻；挑選與換把在 sidecar 內部；env 對應在 AgentDriver。
+- **MyAiStorage（sidecar v4）**：用 list、get、登錄冷卻；挑選與換把在 sidecar 內部；env 對應在 AgentDriver。
 - **MyLinuxPool**（mylinuxpool-pm 提最小的做法，PMO 協調）：
   - 在 sshproxy 登記 LLMGateway 的兩把公鑰（隧道、部署）；
   - 確認 worker 的 sidecar 讀得到 id_tunnel；

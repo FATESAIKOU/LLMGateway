@@ -3,7 +3,7 @@
 動機與範圍見 proposal.md（v4 定案）。影響做法的現況與限制：
 
 - **Claude 條款**：訂閱的 OAuth 是給原版 Claude Code 這類 Anthropic 原生 app 的一般使用；第三方不得代為路由、收集、存放、中轉 Claude.ai 的 token（`docs/research/claude-failover.md` §7）。LLMGateway 不代轉請求，Claude 訂閱的 key 只給 `agent=claude-code` 的 get。
-- **sidecar v3**（MyAiStorage，aistorage-pm）：一台機器一個 daemon（Mac 也能跑），對外五個操作加 HTTP 控制，不基於 herdr。它用 LLMGateway 的 list／get／登錄冷卻；挑把與換把在它內部；key 變成哪些環境變數由它的 AgentDriver 決定。
+- **sidecar v4**（MyAiStorage，aistorage-pm）：一台機器一個 daemon（Mac 也能跑），對外四個動作（open／close／status／poke）加 HTTP 控制，不基於 herdr。它用 LLMGateway 的 list／get／登錄冷卻；挑把與換把在它內部；key 變成哪些環境變數由它的 AgentDriver 決定。
 - **服務的位置**（本人裁定）：本人選定的常駐 provider，LLMGateway 跟 MyLinuxPool 無關，用自己的帳號 `llmgw` 跑。
 - **v4（本人定案）**（本人對 v3 的第 5～7 點與後續的裁定）：
   - 部署與啟動不依賴 MyLinuxPool，只依賴「一台連得到的 Linux 機器＋SSH」；
@@ -67,18 +67,22 @@
 - `lgw` 提供連線程式，函式庫與指令兩種用法。sidecar 的 SubscriptionSource 用函式庫。
   - 函式庫：`with lgw.connect(cfg) as base_url:`，在本機開一個轉發，回 `http://127.0.0.1:<臨時埠>`；離開時關掉。
   - 指令：`lgw connect`，前景維持轉發並印出 base URL。
-- 做法：`ssh -N -L 127.0.0.1:<臨時埠>:127.0.0.1:4710 [-J <跳板…>] sshproxy@<跳板機>`，帶 `ExitOnForwardFailure=yes`、`BatchMode=yes`、`StrictHostKeyChecking=yes`。連不上或中途斷掉就回「無法確認」，由呼叫方等一下再試。
-- 設定（`~/.config/lgw/connect.env`，或 sidecar 設定裡的同名欄位）：
-  - `jumps`：零到多個 `user@host:port`；
-  - `rendezvous`：`sshproxy@host:port`；
-  - `identity`：金鑰路徑；
-  - `known_hosts`；
-  - `remote_api`：預設 4710。
+- 做法：`ssh -F <自己產生的設定> -N -L 127.0.0.1:<臨時埠>:127.0.0.1:4710 [-J <跳板…>] <帳號>@<會合點> -p <埠>`，設定裡有 `StrictHostKeyChecking yes`、`BatchMode yes`、`ExitOnForwardFailure yes`。連不上或中途斷掉就回「無法確認」，由呼叫方等一下再試。
+  - 用 `-F` 而不是命令列的 `-i`／`-o`：OpenSSH 用 `-J` 時，命令列上的 `-i`／`-o` 不會套到跳板那一段。所以所有跳板與會合點共用同一把 identity 與同一份 known_hosts。
+  - 自己的設定檔意味著**不讀 `~/.ssh/config`**：別名、`Host` 區塊裡的帳號與埠都沒用，`rendezvous` 與 `jumps` 必須寫成明確的 `user@host:port`。帳號由設定指定，不固定是 `sshproxy`。
+- **設定檔是 JSON**（慣例叫 `connect.json`，格式的唯一定義在 `lgw/connect.py` 的模組說明）。`lgw.connect.load_config(path)` 每次呼叫都重讀檔案、不快取；sidecar 每次操作才 connect，所以設定檔被改寫後，下一次操作自然用新的。欄位就是這些，多一個都不行：
+  - `schema`：必填，只能是 `1`；
+  - `rendezvous`：必填，`user@host:port`；
+  - `jumps`：選填，字串陣列，每個 `user@host:port`，照順序，預設空；
+  - `identity`：必填，私鑰路徑；
+  - `known_hosts`（檔案路徑）與 `host_keys`（known_hosts 格式的一行一字串，陣列）：**恰給一個**；`host_keys` 讓設定檔自成一體，連線時寫進私有暫存目錄的 0600 檔；
+  - `remote_api`：選填，預設 4710。
+  - host key 的主機寫法照 known_hosts：埠不是 22 時是 `[host]:port`，是 22 時只寫 `host`。
+- **設定檔從哪來**：sidecar 不讀 MyLinuxPool 的任何檔，只讀這份 JSON，`lgw` 也一樣，所以兩者都不依賴 MyLinuxPool。
+  - worker：由 MyLinuxPool 的一個 unit 依 `/run/mlp-gateway/gateway.json`（`ip`、`tunnel_user`、`ssh_port`、`host_key` 等）產生這份 JSON，rotate 後重新發布時整檔原子改寫（所以用 `host_keys` 自成一體），sidecar 下次操作就讀到新的。host key 釘在這份設定裡，不和 pool-tunnel 共用，也不用 accept-new。
+  - Mac：手寫。
 - 用哪把金鑰：
-  - worker 用 **pool-tunnel 既有的 sshproxy 金鑰** `/home/worker/.ssh/id_tunnel`。擁有者 worker、權限 0600；sidecar 也以 worker 身分跑，讀得到（mylinuxpool-pm 確認）。
-  - worker 上的 connect 設定由 sidecar 從 MyLinuxPool 提供的 `/run/mlp-gateway/gateway.json` 填入：`ip`、`tunnel_user`、`ssh_port`、`host_key`。rotate 後會重新發布，不用會過期的環境變數。
-    - host key 釘在 LLMGateway 自己的 known_hosts，不和 pool-tunnel 共用，也不用 accept-new。
-    - `lgw` 本身只吃 connect 設定，不讀 MyLinuxPool 的檔，維持不依賴 MyLinuxPool。
+  - worker 用 **pool-tunnel 既有的 sshproxy 金鑰** `/home/worker/.ssh/id_tunnel`（設定的 `identity`）。擁有者 worker、權限 0600；sidecar 也以 worker 身分跑，讀得到（mylinuxpool-pm 確認）。
   - Mac 用它自己能登入 sshproxy 的金鑰。
   - LLMGateway 不另外發金鑰給客戶端。
 
@@ -96,6 +100,7 @@
 - 本人：「沒事，我選 a，反正洩漏我換 key 很簡單」。
 - **本人已接受的風險**：sshproxy 上的所有金鑰都連得到 API 埠，也就讀得到全部五把 key。這包括所有 provider、worker 的隧道金鑰，以及家人維修機共用的那把。
 - **發現外洩時**：在 LLMGateway 的 secret 換掉五把 key，重新部署。換 key 不需要動任何客戶端，因為客戶端不持有 key。
+- **客戶端裝置遺失時**（例如手機）：裝置上有 sshproxy 的金鑰就等於 key 已外洩。先請 MyLinuxPool 把那把金鑰從 sshproxy 撤掉，再換掉五把 key 並重新部署；撤銷之前那把金鑰仍然讀得到。
 - 稽核紀錄只看得到「從會合點來的連線」，分不出是哪一把 SSH 金鑰（本人接受，v0 不分辨是哪台 worker）。
 
 ### 決定 5b：key 的保管與服務的形狀
@@ -119,12 +124,28 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 | 方法 | 路徑 | 成功 | 錯誤 |
 |---|---|---|---|
 | GET | `/v1/subscriptions` | `200 {schema, subscriptions: [ … ]}`，依 `priority` 排序，不含 `key` | — |
-| GET | `/v1/subscriptions/{id}?agent=claude-code\|opencode` | `200 { … , key}` | 400（缺 `agent`）、403 `agent_not_allowed`、404、409 `not_deployed` |
-| POST | `/v1/subscriptions/{id}/cooldown` | `204`；body `{window: "5h"\|"1w", resets_at?}` | 400（窗口不對、時刻不合理）、404 |
+| GET | `/v1/subscriptions/{id}?agent=claude-code\|opencode` | `200 { … , key}` | 400 `bad_request`（缺 `agent`，帶 `missing`）、403 `agent_not_allowed`、404 `not_found`、409 `not_deployed` |
+| POST | `/v1/subscriptions/{id}/cooldown` | `204`；body `{window: "5h"\|"1w", resets_at?}` | 400（`bad_request`、`invalid_window`、`invalid_resets_at`、`resets_at_out_of_range`）、404 `not_found`、413 `body_too_large` |
 
 - 時刻一律是 RFC 3339 UTC。
 - 請求 body 上限 1 MB。
 - 冷卻中的 subscription 仍可 get，`available` 為 false，由呼叫方決定。
+
+**錯誤碼表**（實作在 `lgwd/errors.py`）：回覆一律是 `{"error": "<碼>", …}`，訊息是固定字串，不回顯請求裡的值。
+
+| 狀態 | 碼 | 什麼時候 |
+|---|---|---|
+| 400 | `bad_request` | JSON 解析失敗、body 不是物件、缺必填（缺的欄位名放在 `"missing": [...]`，get 缺 `agent` 也是這個） |
+| 400 | `invalid_window` | `window` 不是 `"5h"` 或 `"1w"` |
+| 400 | `invalid_resets_at` | `resets_at` 不是 RFC 3339 字串（或型別不對） |
+| 400 | `resets_at_out_of_range` | `resets_at` 在過去，或超過 8 天以後 |
+| 403 | `agent_not_allowed` | `agent` 不在該筆的 `agents` 裡 |
+| 404 | `not_found` | 不存在的 id 或未知路徑（路徑對、方法不對也是 404） |
+| 409 | `not_deployed` | 該筆的 key 尚未部署 |
+| 413 | `body_too_large` | body 超過 1 MB |
+| 500 | `internal` | 伺服器內部非預期錯誤（只記例外種類到 log） |
+
+客戶端（`lgw.client` 的 `Result.error`）照實回上面的碼，另外有兩個**客戶端自己判讀**的值：`unreachable`（連不上或逾時，`Result.unreachable` 為 true，不丟例外）與 `bad_response`（回覆不是 JSON 物件）。呼叫方遇到 `unreachable` 要當成「無法確認」。
 
 ### 決定 7：共通 JSON schema（和 aistorage-pm 一致）
 
@@ -158,7 +179,7 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 - 有 `resets_at` 時冷卻到它加 2 分鐘；沒有時用窗口的預設長度（5 小時、7 天）。過去或 8 天以後的時刻拒收。同一窗口取較晚的結束時刻；到時自動解除。
 - `available` = key 已部署，而且兩個窗口都沒在冷卻。
 
-### 決定 9：換把由 sidecar 做（MyAiStorage v3）
+### 決定 9：換把由 sidecar 做（MyAiStorage v4）
 
 - sidecar 的 AgentDriver 偵測到額度用完 → sidecar 登錄冷卻 → 從 list 挑 `available` 而且 `agents` 含自己種類、`priority` 最前的 → get → 停掉 agent（寫回 agora）→ 用新 key 重開並 continue 同一個 Session。
 - 之後依 harness 的優先模型與底線挑，也在 sidecar 這一層。
@@ -168,7 +189,7 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 ### 決定 10：稽核紀錄
 
 - 每次 get 與登錄冷卻記一筆，內容是時刻、subscription id、agent（get）、窗口與結束時刻（冷卻）。不記 key。
-- 這是「紀錄全留」在 v3 能做到的部分：看得到誰在何時拿過哪一把、誰登錄過冷卻；看不到現在還在用（沒有租約）。
+- 這是「紀錄全留」在 v4 能做到的部分：看得到誰在何時拿過哪一把、誰登錄過冷卻；看不到現在還在用（沒有租約）。
 
 ### 決定 11：拿掉的與理由
 
@@ -201,7 +222,7 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
    - `lgw` 提供 list／get／登錄冷卻的客戶端。
 3. 本人做一次性的開機設定（決定 5），設 environment 與 secret（tasks 3.4）。
 4. MyLinuxPool：`TUNNEL_EXTRA_PUBKEYS` 與 `NODE_GATEWAY.ports.llmgateway`（mylinuxpool-pm 開 d 單；var 的值由本人或 PMO 設）。#67～#70 已作廢。
-5. sidecar v3 接上 list／get／登錄冷卻，在 Mac 與一台 worker 驗收換把。
+5. sidecar v4 接上 list／get／登錄冷卻，在 Mac 與一台 worker 驗收換把。
 6. 另開單把 MyLinuxPool#50 的 key 來源換成 LLMGateway，收掉 MyLinuxPool 裡的 key。
 
 - **退回**：停服務；worker 在第 6 步之前仍有 MyLinuxPool#50 的 key。
