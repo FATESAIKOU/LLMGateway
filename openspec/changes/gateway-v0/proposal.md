@@ -50,7 +50,11 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 
 - sidecar 和包裝指令只把環境變數交給 agent，**不保存**，租約結束或換把時就丟掉。
   - 回傳裡有一份 `unset` 清單，啟動前從 agent 的環境裡明確去掉。例如 `ANTHROPIC_API_KEY` 會蓋過訂閱 token，一律去掉；herdr server 繼承來的環境裡也可能有。
-  - **值不能出現在命令列上**，否則會出現在 `ps` 和 herdr 的 pane 資訊裡。sidecar 的做法：寫一個 0600 的暫存 env 檔，pane 的命令讀進環境後立刻刪掉。Mac 的包裝指令直接 exec，不經 shell 命令字串。
+  - **值不能出現在命令列上**，否則會出現在 `ps` 和 herdr 的 pane 資訊裡。
+    - sidecar 的做法：用 `herdr tab create --env` 交值；unset 在啟動命令裡用 `env -u NAME`，命令列上只有變數名。
+    - aistorage-pm 在 Mac 的 herdr 0.8.0 上用假值實測：值不出現在 herdr 的輸出、pane／tab 資訊、狀態目錄與任何命令列，關掉 tab 就沒了。
+    - worker 上是 herdr 0.9.3，要在 worker 上再驗一次；驗不過就退回「0600 暫存 env 檔，讀完即刪」。
+    - Mac 的包裝指令直接 exec，不經 shell 命令字串。
 - 和 sidecar 已對齊的部分（aistorage-pm，2026-10-11）：
   - 用上表的命名；
   - renew 由 sidecar 的常駐迴圈每小時做；
