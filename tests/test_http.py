@@ -1,4 +1,8 @@
-"""lgwd/http.py 的測試：全用假 service（固定值或丟 ApiError），不用真 key。"""
+"""lgwd/http.py 的測試：全用假 service（固定值或丟 ApiError），不用真 key。
+
+涵蓋 spec subscription-registry 的路由、spec key-vault 的「不做應用層認證」與
+共通錯誤行為（404、413、500、log 不含值）。
+"""
 
 import http.client
 import json
@@ -8,42 +12,26 @@ import urllib.error
 import urllib.request
 
 from lgwd import errors
-from lgwd.http import make_api_server, make_board_server
+from lgwd.http import make_api_server
 
 HOST = "127.0.0.1"
-GOOD_TOKEN = "good-token"
-LEASE = {
-    "lease_id": "L1",
-    "subscription": "claude-personal",
-    "agent": "claude-code",
-    "model": "default",
-    "env": {"CLAUDE_CODE_OAUTH_TOKEN": "x"},
-    "unset": ["ANTHROPIC_API_KEY"],
-    "expires_at": "2026-10-11T12:00:00Z",
-    "confirm_by": "2026-10-11T00:10:00Z",
+
+ITEM = {
+    "schema": 1,
+    "id": "claude-personal",
+    "provider": "anthropic",
+    "kind": "claude-subscription",
+    "agents": ["claude-code"],
+    "priority": 10,
+    "models": {"allow": ["*"], "default": None},
+    "endpoint": None,
+    "key": "fake-key-in-get-reply",
+    "cooldown": {"5h": None, "1w": None},
+    "available": True,
 }
-BOARD = {
-    "api_version": 1,
-    "generated_at": "2026-10-11T00:00:00Z",
-    "subscriptions": [
-        {
-            "name": "claude-personal",
-            "deployed": True,
-            "active": [
-                {
-                    "worker": "worker-a",
-                    "role": "coder",
-                    "agent": "claude-code",
-                    "since": "2026-10-10T20:00:00Z",
-                }
-            ],
-            "count": 1,
-            "cap": 2,
-            "cooling": False,
-            "cooling_until": None,
-            "usage": None,
-        }
-    ],
+LIST = {
+    "schema": 1,
+    "subscriptions": [{k: v for k, v in ITEM.items() if k != "key"}],
 }
 
 
@@ -54,57 +42,30 @@ class FakeService:
         self.calls = []
         self.raise_for = {}
 
-    def authenticate(self, token):
-        return "worker-a" if token == GOOD_TOKEN else None
-
-    def request_lease(self, client, body):
-        self.calls.append(("request_lease", client, body))
-        if "request_lease" in self.raise_for:
-            raise self.raise_for["request_lease"]
-        return 201, dict(LEASE)
-
-    def _lease_op(self, name, client, lease_id, body, code, payload):
-        self.calls.append((name, client, lease_id, body))
+    def _finish(self, name, payload, *args):
+        self.calls.append((name, *args))
         if name in self.raise_for:
             raise self.raise_for[name]
-        return code, payload
+        return payload
 
-    def start(self, client, lease_id, body):
-        return self._lease_op(
-            "start", client, lease_id, body, 200, {"expires_at": LEASE["expires_at"]}
-        )
+    def list_subscriptions(self):
+        return self._finish("list_subscriptions", json.loads(json.dumps(LIST)))
 
-    def exhausted(self, client, lease_id, body):
-        return self._lease_op(
-            "exhausted", client, lease_id, body, 200, {"next": dict(LEASE)}
-        )
+    def get_subscription(self, sub_id, agent):
+        return self._finish("get_subscription", dict(ITEM), sub_id, agent)
 
-    def renew(self, client, lease_id, body):
-        return self._lease_op(
-            "renew", client, lease_id, body, 200, {"expires_at": LEASE["expires_at"]}
-        )
-
-    def release(self, client, lease_id, body):
-        return self._lease_op("release", client, lease_id, body, 204, {})
-
-    def report_usage(self, client, lease_id, body):
-        return self._lease_op("report_usage", client, lease_id, body, 204, {})
-
-    def board(self):
-        self.calls.append(("board",))
-        if "board" in self.raise_for:
-            raise self.raise_for["board"]
-        return json.loads(json.dumps(BOARD))
+    def register_cooldown(self, sub_id, body):
+        return self._finish("register_cooldown", None, sub_id, body)
 
 
 class ServerCase(unittest.TestCase):
-    def serve(self, server):
-        self._server = server
+    def serve(self, service):
+        self._server = make_api_server(service, HOST, 0)
         self._thread = threading.Thread(
-            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
         )
         self._thread.start()
-        host, port = server.server_address[:2]
+        host, port = self._server.server_address[:2]
         return "http://{0}:{1}".format(host, port)
 
     def tearDown(self):
@@ -112,18 +73,16 @@ class ServerCase(unittest.TestCase):
         self._server.server_close()
         self._thread.join(timeout=5)
 
-    def call(self, base, method, path, body=None, raw=None, token=GOOD_TOKEN):
-        """打 API；HTTPError 也解析成 (狀態碼, body)。"""
+    def call(self, method, path, body=None, raw=None, headers=None):
+        """打 API；HTTPError 也解析成 (狀態碼, body)。預設不帶任何憑證。"""
         data = raw if raw is not None else (
             json.dumps(body).encode() if body is not None else None
         )
-        headers = {}
-        if token is not None:
-            headers["Authorization"] = "Bearer " + token
+        all_headers = dict(headers or {})
         if data is not None:
-            headers["Content-Type"] = "application/json"
+            all_headers.setdefault("Content-Type", "application/json")
         req = urllib.request.Request(
-            base + path, data=data, headers=headers, method=method
+            self.base + path, data=data, headers=all_headers, method=method
         )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -135,269 +94,180 @@ class ServerCase(unittest.TestCase):
 class ApiTest(ServerCase):
     def setUp(self):
         self.fake = FakeService()
-        self.base = self.serve(make_api_server(self.fake, HOST, 0))
+        self.base = self.serve(self.fake)
 
-    def body_of(self, payload):
-        data = json.loads(payload.decode())
-        self.assertEqual(data.pop("api_version"), 1)  # 每個回覆都帶
-        return data
+    def json_of(self, payload):
+        return json.loads(payload.decode())
 
-    def test_leases_ok(self):
-        status, payload = self.call(
-            self.base,
-            "POST",
-            "/v1/leases",
-            {"worker": "worker-a", "role": "r", "agent": "claude-code",
-             "instance": "i1", "request_id": "q1"},
-        )
-        self.assertEqual(status, 201)
-        self.assertEqual(self.body_of(payload)["lease_id"], "L1")
-        name, client, body = self.fake.calls[-1]
-        self.assertEqual((name, client), ("request_lease", "worker-a"))
-        self.assertEqual(body["request_id"], "q1")
+    # --- list ---
+    def test_list_ok不帶憑證(self):
+        status, payload = self.call("GET", "/v1/subscriptions")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload), LIST)  # 不要求任何 token
+        self.assertEqual(self.fake.calls, [("list_subscriptions",)])
 
-    def test_bad_json(self):
-        status, payload = self.call(self.base, "POST", "/v1/leases", raw=b"{nope")
+    def test_list_query被忽略(self):
+        status, _ = self.call("GET", "/v1/subscriptions?x=1&agent=opencode")
+        self.assertEqual(status, 200)
+
+    # --- get ---
+    def test_get_ok(self):
+        status, payload = self.call("GET", "/v1/subscriptions/claude-personal?agent=claude-code")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload), ITEM)
+        self.assertEqual(self.fake.calls[-1],
+                         ("get_subscription", "claude-personal", "claude-code"))
+
+    def test_get_沒帶agent回400(self):
+        self.fake.raise_for["get_subscription"] = errors.bad_request(missing=["agent"])
+        status, payload = self.call("GET", "/v1/subscriptions/claude-personal")
         self.assertEqual(status, 400)
-        self.assertEqual(self.body_of(payload)["error"], "bad_request")
+        data = self.json_of(payload)
+        self.assertEqual(data["error"], "bad_request")
+        self.assertEqual(data["missing"], ["agent"])
+        self.assertIsNone(self.fake.calls[-1][2])
 
-    def test_json_list_body(self):
-        status, payload = self.call(self.base, "POST", "/v1/leases", raw=b"[1]")
+    def test_get_空agent回400(self):
+        self.fake.raise_for["get_subscription"] = errors.bad_request(missing=["agent"])
+        status, _ = self.call("GET", "/v1/subscriptions/claude-personal?agent=")
         self.assertEqual(status, 400)
 
-    def test_missing_bearer(self):
-        status, payload = self.call(
-            self.base, "POST", "/v1/leases", {"request_id": "q"}, token=None
-        )
-        self.assertEqual(status, 401)
-        self.assertEqual(self.body_of(payload)["error"], "unauthorized")
+    def test_get_id解碼(self):
+        status, _ = self.call("GET", "/v1/subscriptions/ghost%2Did?agent=opencode")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1][1], "ghost-id")
 
-    def test_wrong_bearer(self):
-        for header_value in ("Bearer bad-token", "Token abc", "Bearer ", "Bearer"):
-            with self.subTest(header_value=header_value):
-                status, _ = self._raw_auth(header_value)
-                self.assertEqual(status, 401)
-
-    def _raw_auth(self, header_value):
-        req = urllib.request.Request(
-            self.base + "/v1/leases",
-            data=json.dumps({"request_id": "q"}).encode(),
-            headers={"Authorization": header_value, "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-
-    def test_unknown_route(self):
-        for method, path in (("GET", "/nope"), ("POST", "/v1/nope"),
-                             ("GET", "/v1/leases"), ("POST", "/v1/board")):
-            with self.subTest(method=method, path=path):
-                status, payload = self.call(self.base, method, path, {"request_id": "q"})
-                self.assertEqual(status, 404)
-                self.assertEqual(self.body_of(payload)["error"], "not_found")
-
-    def test_query_ignored(self):
-        status, _ = self.call(
-            self.base, "POST", "/v1/leases?x=1",
-            {"worker": "w", "role": "r", "agent": "a", "instance": "i", "request_id": "q"},
-        )
-        self.assertEqual(status, 201)
-
-    def test_lease_routes_reach_service(self):
-        for action, code in (("start", 200), ("exhausted", 200), ("renew", 200),
-                             ("release", 204), ("usage", 204)):
-            with self.subTest(action=action):
-                status, _ = self.call(
-                    self.base, "POST", "/v1/leases/L9/" + action, {"request_id": "q"}
-                )
-                self.assertEqual(status, code)
-                self.assertEqual(self.fake.calls[-1][1:3], ("worker-a", "L9"))
-
-    def test_204_empty(self):
-        status, payload = self.call(
-            self.base, "POST", "/v1/leases/L1/release", {"request_id": "q"}
-        )
-        self.assertEqual(status, 204)
-        self.assertEqual(payload, b"")
-
-    def test_api_error_mapping(self):
+    def test_get錯誤對應(self):
         cases = [
-            (errors.client_mismatch(), 403, "client_mismatch"),
-            (errors.not_owner(), 403, "not_owner"),
+            (errors.agent_not_allowed(), 403, "agent_not_allowed"),
             (errors.not_found(), 404, "not_found"),
-            (errors.lease_not_active(), 409, "lease_not_active"),
-            (errors.lease_not_confirmed(), 409, "lease_not_confirmed"),
-            (errors.bad_request(missing=["worker"]), 400, "bad_request"),
+            (errors.not_deployed(), 409, "not_deployed"),
         ]
         for exc, code, err in cases:
             with self.subTest(code=err):
-                self.fake.raise_for["renew"] = exc
+                self.fake.raise_for["get_subscription"] = exc
                 status, payload = self.call(
-                    self.base, "POST", "/v1/leases/L1/renew", {"request_id": "q"}
-                )
+                    "GET", "/v1/subscriptions/claude-personal?agent=opencode")
                 self.assertEqual(status, code)
-                data = self.body_of(payload)
-                self.assertEqual(data["error"], err)
-                if err == "bad_request":
-                    self.assertEqual(data["missing"], ["worker"])
-        del self.fake.raise_for["renew"]
+                self.assertEqual(self.json_of(payload)["error"], err)
+                self.assertNotIn("key", self.json_of(payload))
 
-    def test_refused(self):
-        self.fake.raise_for["request_lease"] = errors.refusal(
-            "all_cooling", "2026-10-11T03:47:00Z"
-        )
-        status, payload = self.call(self.base, "POST", "/v1/leases", {"request_id": "q"})
-        self.assertEqual(status, 409)
-        data = self.body_of(payload)
-        self.assertEqual(data["error"], "refused")
-        self.assertEqual(data["reason"], "all_cooling")
-        self.assertEqual(data["earliest_reset"], "2026-10-11T03:47:00Z")
+    # --- cooldown ---
+    def test_cooldown_204(self):
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/claude-personal/cooldown",
+            {"window": "5h", "resets_at": "2026-10-11T15:00:00Z"})
+        self.assertEqual(status, 204)
+        self.assertEqual(payload, b"")  # 204 不帶 body
+        self.assertEqual(self.fake.calls[-1],
+                         ("register_cooldown", "claude-personal",
+                          {"window": "5h", "resets_at": "2026-10-11T15:00:00Z"}))
 
-    def test_refused_unknown_reason_passthrough(self):
-        self.fake.raise_for["request_lease"] = errors.ApiError(
-            409, "refused", reason="future_reason"
-        )
-        status, payload = self.call(self.base, "POST", "/v1/leases", {"request_id": "q"})
-        self.assertEqual(status, 409)
-        self.assertEqual(self.body_of(payload)["reason"], "future_reason")
+    def test_cooldown_空body到service(self):
+        status, _ = self.call("POST", "/v1/subscriptions/claude-personal/cooldown")
+        self.assertEqual(status, 204)
+        self.assertEqual(self.fake.calls[-1][2], {})
 
-    def test_board_ok(self):
-        status, payload = self.call(self.base, "GET", "/v1/board")
-        self.assertEqual(status, 200)
-        data = self.body_of(payload)
-        self.assertEqual(data["subscriptions"][0]["name"], "claude-personal")
+    def test_cooldown錯誤對應(self):
+        for exc, code, err in (
+            (errors.bad_request(detail="window must be 5h or 1w"), 400, "bad_request"),
+            (errors.not_found(), 404, "not_found"),
+        ):
+            with self.subTest(code=err):
+                self.fake.raise_for["register_cooldown"] = exc
+                status, payload = self.call(
+                    "POST", "/v1/subscriptions/ghost/cooldown", {"window": "24h"})
+                self.assertEqual(status, code)
+                self.assertEqual(self.json_of(payload)["error"], err)
 
-    def test_board_needs_auth(self):
-        status, _ = self.call(self.base, "GET", "/v1/board", token=None)
-        self.assertEqual(status, 401)
+    def test_cooldown_bad_json回400(self):
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/claude-personal/cooldown", raw=b"{nope")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(payload)["error"], "bad_request")
 
-    def test_whoami_ok(self):
-        status, payload = self.call(self.base, "GET", "/v1/whoami")
-        self.assertEqual(status, 200)
-        self.assertEqual(self.body_of(payload), {"client": "worker-a", "role": "client"})
-        self.assertFalse(self.fake.calls)  # 不碰 service、不碰租約
+    def test_json_list_body回400(self):
+        status, _ = self.call(
+            "POST", "/v1/subscriptions/claude-personal/cooldown", raw=b"[1]")
+        self.assertEqual(status, 400)
 
-    def test_whoami_401(self):
-        status, _ = self.call(self.base, "GET", "/v1/whoami", token=None)
-        self.assertEqual(status, 401)
-        status, _ = self._raw_auth("Bearer nope")
-        self.assertEqual(status, 401)
+    # --- 其他路徑一律 404 ---
+    def test_其他路徑404(self):
+        cases = [
+            ("GET", "/nope"), ("GET", "/v1/leases"), ("POST", "/v1/leases"),
+            ("GET", "/v1/whoami"), ("GET", "/v1/board"), ("POST", "/v1/board"),
+            ("GET", "/v1/admin/clients"), ("POST", "/v1/admin/clients"),
+            ("DELETE", "/v1/admin/clients/w1"), ("POST", "/v1/leases/L1/start"),
+            ("GET", "/v1/subscriptions/"), ("POST", "/v1/subscriptions"),
+            ("POST", "/v1/subscriptions/claude-personal"),
+            ("GET", "/v1/subscriptions/claude-personal/cooldown"),
+            ("PUT", "/v1/subscriptions/claude-personal/cooldown"),
+        ]
+        for method, path in cases:
+            with self.subTest(method=method, path=path):
+                status, payload = self.call(method, path, {"x": 1})
+                self.assertEqual(status, 404)
+                self.assertEqual(self.json_of(payload)["error"], "not_found")
+        self.assertFalse(self.fake.calls)  # 完全沒進 service
 
+    # --- 錯誤處理 ---
     def test_unexpected_500(self):
-        self.fake.raise_for["board"] = RuntimeError("boom")
-        status, payload = self.call(self.base, "GET", "/v1/board")
+        self.fake.raise_for["list_subscriptions"] = RuntimeError("boom")
+        status, payload = self.call("GET", "/v1/subscriptions")
         self.assertEqual(status, 500)
-        self.assertEqual(self.body_of(payload), {"error": "internal"})
+        self.assertEqual(self.json_of(payload), {"error": "internal"})
+
+    def test_500_logs_kind_not_value(self):
+        secret = "CANARY-500-zz9"
+        self.fake.raise_for["list_subscriptions"] = ValueError(secret)
+        try:
+            with self.assertLogs("lgwd.http", level="INFO") as logs:
+                status, _ = self.call("GET", "/v1/subscriptions")
+        finally:
+            del self.fake.raise_for["list_subscriptions"]
+        self.assertEqual(status, 500)
+        text = "\n".join(logs.output)
+        self.assertIn("ValueError", text)  # 只記種類
+        self.assertNotIn(secret, text)
 
     def test_log_clean(self):
         secret = "s3cr3t-value-zz9"
         with self.assertLogs("lgwd.http", level="INFO") as logs:
             self.call(
-                self.base, "POST", "/v1/leases",
-                {"purpose": secret, "request_id": "q"},
-                token="Bearer-" + secret,
+                "POST", "/v1/subscriptions/claude-personal/cooldown",
+                {"window": "5h", "resets_at": secret},
+                headers={"Authorization": "Bearer " + secret, "X-Canary": secret},
             )
         text = "\n".join(logs.output)
         self.assertNotIn(secret, text)  # 標頭與 body 都不進 log
-        self.assertIn("POST /v1/leases", text)  # 方法、路徑、狀態碼有記
-        self.assertIn("401", text)
+        self.assertIn("POST /v1/subscriptions/claude-personal/cooldown", text)
+        self.assertIn("204", text)
 
     def test_body_too_large(self):
         # 宣告 2 MB，只送 2 bytes：服務不讀 body，直接 413。
         host, port = self.base.rsplit(":", 1)
         conn = http.client.HTTPConnection(host.rsplit("/", 1)[-1], int(port), timeout=5)
         try:
-            conn.putrequest("POST", "/v1/leases")
-            conn.putheader("Authorization", "Bearer " + GOOD_TOKEN)
+            conn.putrequest("POST", "/v1/subscriptions/claude-personal/cooldown")
             conn.putheader("Content-Type", "application/json")
             conn.putheader("Content-Length", str(2 * 1024 * 1024))
             conn.endheaders()
             conn.send(b"{}")
             resp = conn.getresponse()
             self.assertEqual(resp.status, 413)
-            data = json.loads(resp.read().decode())
-            self.assertEqual(data["error"], "body_too_large")
-            self.assertEqual(data["api_version"], 1)
+            self.assertEqual(json.loads(resp.read().decode())["error"], "body_too_large")
         finally:
             conn.close()
         self.assertFalse(self.fake.calls)  # 沒進 service
 
     def test_body_exactly_1mb_ok(self):
-        status, _ = self.call(self.base, "POST", "/v1/leases", raw=b" " * (1024 * 1024))
-        self.assertEqual(status, 201)  # 邊界：超過才擋，假 service 照常回
-
-    def test_500_logs_kind_not_value(self):
-        secret = "CANARY-500-zz9"
-        self.fake.raise_for["board"] = ValueError(secret)
-        try:
-            with self.assertLogs("lgwd.http", level="INFO") as logs:
-                status, payload = self.call(self.base, "GET", "/v1/board")
-        finally:
-            del self.fake.raise_for["board"]
-        self.assertEqual(status, 500)
-        self.assertEqual(json.loads(payload.decode())["error"], "internal")
-        text = "\n".join(logs.output)
-        self.assertIn("ValueError", text)  # 只記種類
-        self.assertNotIn(secret, text)
-
-
-class BoardServerTest(ServerCase):
-    def setUp(self):
-        self.fake = FakeService()
-        self.base = self.serve(make_board_server(self.fake, HOST, 0))
-
-    def get(self, path, method="GET"):
-        req = urllib.request.Request(self.base + path, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status, resp.read(), resp.headers.get("Content-Type")
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read(), ""
-
-    def test_host_rejected(self):
-        for host in ("0.0.0.0", "", "192.168.1.5", "::1", "localhost"):
-            with self.subTest(host=host):
-                with self.assertRaises(ValueError):
-                    make_board_server(self.fake, host, 0)
-
-    def test_board_ok_no_auth(self):
-        status, payload, ctype = self.get("/board")  # 不帶憑證也看得到
-        self.assertEqual(status, 200)
-        self.assertIn("text/html", ctype)
-        text = payload.decode()
-        self.assertIn("claude-personal", text)
-        self.assertIn("worker-a", text)
-
-    def test_board_escapes(self):
-        evil = '<script>alert("x")</script>'
-        sub = dict(
-            BOARD["subscriptions"][0],
-            active=[{"worker": evil, "role": evil, "agent": evil, "since": evil}],
-        )
-        self.fake.board = lambda: dict(BOARD, subscriptions=[sub])  # 只換這台假資料
-        status, payload, _ = self.get("/board")
-        self.assertEqual(status, 200)
-        text = payload.decode()
-        self.assertNotIn(evil, text)
-        self.assertIn("&lt;script&gt;", text)
-
-    def test_board_404(self):
-        for method, path in (("GET", "/nope"), ("POST", "/board"), ("GET", "/v1/board")):
-            with self.subTest(method=method, path=path):
-                status, _, _ = self.get(path, method)
-                self.assertEqual(status, 404)
-
-    def test_board_pending(self):
-        sub = dict(BOARD["subscriptions"][0], pending=2)
-        self.fake.board = lambda: dict(BOARD, subscriptions=[sub])
-        status, payload, _ = self.get("/board")
-        self.assertEqual(status, 200)
-        text = payload.decode()
-        self.assertIn("未確認", text)
-        self.assertIn("2", text)
+        pad = 1024 * 1024 - len('{"window":"5h","pad":""}'.encode())
+        raw = b'{"window":"5h","pad":"' + b"a" * pad + b'"}'
+        self.assertEqual(len(raw), 1024 * 1024)
+        status, _ = self.call(
+            "POST", "/v1/subscriptions/claude-personal/cooldown", raw=raw)
+        self.assertEqual(status, 204)  # 邊界：超過才擋
+        self.assertEqual(self.fake.calls[-1][2]["window"], "5h")
 
 
 if __name__ == "__main__":
