@@ -23,7 +23,7 @@ v4 定案（2026-10-11 深夜）。
 - [ ] 3.1c `lgw connect`（函式庫＋指令）：`ssh -N -L … [-J …] sshproxy@<跳板機>`，回 base URL；連不上回「無法確認」；設定檔 `connect.env`
 - [ ] 3.1d workflow 改走會合點（`ssh -J sshproxy@<跳板機> -p 4711 llmgw@127.0.0.1`）
 - [ ] 3.1e lgwd 只綁 127.0.0.1（拿掉 docker bridge 綁定）
-- [ ] 3.2 MyLinuxPool（mylinuxpool-pm 的 d 單）：`TUNNEL_EXTRA_PUBKEYS`（裸公鑰，refresh／rotate 都會收）與 `NODE_GATEWAY.ports.llmgateway: [4710, 4711]`；本人或 PMO 設 var 並 dispatch refresh-authorized-keys。worker 的 id_tunnel 已確認讀得到（#67～#70 已作廢）
+- [ ] 3.2 MyLinuxPool#77（mylinuxpool-pm，進行中）：`TUNNEL_EXTRA_PUBKEYS`（裸公鑰，refresh／rotate 都會收）與 `NODE_GATEWAY.ports.llmgateway: [4710, 4711]`；本人或 PMO 設 var 並 dispatch refresh-authorized-keys。worker 的 id_tunnel 已確認讀得到（#67～#70 已作廢）
 - [ ] 3.3 一次性開機設定（root，本人做或本人授權）：服務那台建 `llmgw`（不加 docker 群組）、linger、產生隧道金鑰（公鑰交給 MyLinuxPool 登記）、放部署公鑰、第一次安裝
 - [ ] 3.4 本人設定（AI 不經手值）：
   - environment「llmgateway-deploy」（required reviewer＝本人）；
