@@ -4,8 +4,11 @@ LeaseService 的每個公開方法：
 - 參數 client 是已認證的客戶端名稱（HTTP 層用 Bearer 查出來；查不到 HTTP 層自己回 401）。
 - 參數 body 是已解析的 JSON dict。
 - 成功回傳 (http_status, response_dict)；失敗丟 lgwd.errors.ApiError。
-- 會改變狀態的動作：一筆 SQLite `BEGIN IMMEDIATE` 交易；開頭先做延後結算（過期與未確認的租約補記 expired）；
-  以（client, request_id）去重，重送回第一次的回覆（保留 7 天，跨重啟）。
+- 會改變狀態的動作：一筆 SQLite `BEGIN IMMEDIATE` 交易；先驗客戶端（未知或已撤銷就 401），
+  再做延後結算（過期與未確認的租約補記 expired），再以（client, request_id）去重。
+- 去重表只存拿掉 env 值的回覆（保留 7 天，跨重啟）；重送時若回覆含租約，
+  用該租約的 subscription／agent／model 加上目前的 KeyStore 重組 env 再回，
+  租約已結束就回 409 lease_not_active。
 - 所有時刻經 self.clock；對外是 RFC 3339 UTC 字串（lgwd.clock.to_rfc3339）。
 - 事件只追加、單調序號；事件、log、例外訊息 MUST NOT 含 key 的值。env 只出現在核准的那一次回覆裡。
 
@@ -14,6 +17,7 @@ LeaseService 的每個公開方法：
 
 from __future__ import annotations
 
+import copy
 import datetime as _dt
 import hashlib
 import hmac
@@ -58,13 +62,25 @@ _DEDUP_KEEP = _dt.timedelta(days=7)
 # - granted 回覆的 expires_at 為 None（效期從 start 起算，之前沒有效期）。
 # - usage 不限租約狀態（docstring 只要求 snapshot 是 dict）；404／403 照查。
 # - renew 從現在起算 lease_ttl_seconds（sliding）。
-# - 檢查順序：400 →（401：未知或已撤銷客戶端）→ 403 → 404 → 409；
+# - 檢查順序：400 → 401（未知或已撤銷客戶端）→ 結算 → 去重 → 403 → 404 → 409；
 #   租約 id 不存在時先 404（沒有對象可談 owner）。
 # - 401 不進 dedup（客戶端集合可能變化，重送應重判）。
 # - 403 client_mismatch 與 409 拒絕記 denied 事件；404／409 生命週期錯誤不記。
 # - exhausted 的下一個申請不帶 preferences（docstring 只列六個欄位）。
 # - resets_at 缺失、非字串、無法解析、在過去、超過上限，一律改用預設冷卻。
 # - 冷卻取 max（已有的、新的），寧可等久一點。
+# - dedup 只存去 env 值的回覆；重送含租約的回覆時用現行 KeyStore 重組 env；
+#   key 已撤下就回 not_allowed（不記新事件，只是重送）。
+
+
+def _redact(body: dict) -> dict:
+    """去重存檔用：lease／next 裡 env 的值換成空字串，只留變數名與 unset。"""
+    red = copy.deepcopy(body)
+    for slot in ("lease", "next"):
+        lease = red.get(slot)
+        if isinstance(lease, dict) and isinstance(lease.get("env"), dict):
+            lease["env"] = {k: "" for k in lease["env"]}
+    return red
 
 
 class LeaseService:
@@ -179,7 +195,31 @@ class LeaseService:
         self, cur: sqlite3.Cursor, client: str, request_id: str,
         status: int, body: dict, now: _dt.datetime,
     ) -> None:
-        self._store.dedup_put(cur, client, request_id, status, body, to_rfc3339(now))
+        # 存檔前先拿掉 env 的值；key 的值只活在當次回覆裡。
+        self._store.dedup_put(cur, client, request_id, status, _redact(body), to_rfc3339(now))
+
+    def _replay(self, cur: sqlite3.Cursor, stored: dict, slot: str) -> dict:
+        """重送含租約的回覆：租約還在就用現行 KeyStore 重組 env；已結束就丟 lease_not_active。
+        key 已撤下時重組不出 env，回 not_allowed。都不記新事件。"""
+        lease = stored.get(slot)
+        if not isinstance(lease, dict):
+            return stored  # next: null 的拒絕，原樣回
+        row = self._store.lease_get(cur, lease.get("lease_id", ""))
+        if row is None or row["status"] not in ("granted", "active"):
+            raise lease_not_active()
+        key = self._keys.get(row["subscription"])
+        if key is None:
+            raise refusal("not_allowed")
+        try:
+            env, unset = build_env(row["subscription"], row["agent"], key, row["model"])
+        except ValueError:
+            raise refusal("not_allowed")
+        fresh = dict(lease)
+        fresh["env"] = env
+        fresh["unset"] = unset
+        out = dict(stored)
+        out[slot] = fresh
+        return out
 
     def _need_str(
         self, missing: list[str], name: str, value, *, required: bool, max_len: int | None = None,
@@ -218,6 +258,8 @@ class LeaseService:
         self._store.log(cur, "denied", to_rfc3339(now), client=client,
                         subscription=ctx.get("subscription"),
                         payload={**ctx, "reason": reason, "earliest_reset": earliest_reset})
+        # 去重存檔和 denied 事件走同一個 ctx：request_id 有值才存
+        #（內層申請如 exhausted 的下一張不帶 request_id，由外層存外層的回覆）。
         if ctx.get("request_id"):
             self._dedup_put(cur, client, ctx["request_id"], err.status, err.body(), now)
         return err
@@ -235,14 +277,16 @@ class LeaseService:
         self, cur: sqlite3.Cursor, client: str, worker: str, role: str, agent: str,
         instance: str, model: str | None, specified: str | None,
         purpose: str | None, preferences: dict | None, now: _dt.datetime,
+        request_id: str | None = None,
     ) -> tuple[str, str]:
         """選定並核發；回 (subscription, lease_id)。選不上丟拒絕的 ApiError。"""
+        def ctx(sub):
+            return self._req_ctx(client, worker, role, agent, instance, sub, request_id)
         if specified is not None:
             if specified not in self._policy.subscriptions or not self._policy.allows(
                 specified, agent, model
             ):
-                ctx = self._req_ctx(client, worker, role, agent, instance, specified)
-                raise self._deny(cur, client, ctx, "not_allowed", None, now)
+                raise self._deny(cur, client, ctx(specified), "not_allowed", None, now)
             considered = [specified]
         else:
             considered = [
@@ -250,15 +294,12 @@ class LeaseService:
                 if self._policy.allows(s, agent, model)
             ]
             if not considered:
-                ctx = self._req_ctx(client, worker, role, agent, instance, None)
-                raise self._deny(cur, client, ctx, "not_allowed", None, now)
+                raise self._deny(cur, client, ctx(None), "not_allowed", None, now)
         if self._store.has_unfinished_instance(cur, client, instance):
-            ctx = self._req_ctx(client, worker, role, agent, instance, specified)
-            raise self._deny(cur, client, ctx, "instance_busy", None, now)
+            raise self._deny(cur, client, ctx(specified), "instance_busy", None, now)
         deployed = [s for s in considered if self._keys.deployed(s)]
         if not deployed:
-            ctx = self._req_ctx(client, worker, role, agent, instance, specified)
-            raise self._deny(cur, client, ctx, "not_allowed", None, now)
+            raise self._deny(cur, client, ctx(specified), "not_allowed", None, now)
         cooling_until = {s: self._is_cooling(cur, s, now) for s in deployed}
         for sub in deployed:
             if cooling_until[sub] is not None:
@@ -270,38 +311,37 @@ class LeaseService:
                 cur, client, worker, role, agent, instance, model, specified,
                 purpose, preferences, sub, now,
                 reason="specified" if specified is not None else f"order:{sub}",
+                request_id=request_id,
             )
         still = [s for s in deployed if cooling_until[s] is None]
         if still:
-            ctx = self._req_ctx(client, worker, role, agent, instance, specified)
-            raise self._deny(cur, client, ctx, "cap_reached", None, now)
+            raise self._deny(cur, client, ctx(specified), "cap_reached", None, now)
         earliest = min(cooling_until[s] for s in deployed if cooling_until[s] is not None)
-        ctx = self._req_ctx(client, worker, role, agent, instance, specified)
-        raise self._deny(cur, client, ctx, "all_cooling", earliest, now)
+        raise self._deny(cur, client, ctx(specified), "all_cooling", earliest, now)
 
     @staticmethod
-    def _req_ctx(client, worker, role, agent, instance, subscription):
+    def _req_ctx(client, worker, role, agent, instance, subscription, request_id=None):
         return {
             "client": client, "worker": worker, "role": role, "agent": agent,
-            "instance": instance, "subscription": subscription,
+            "instance": instance, "subscription": subscription, "request_id": request_id,
         }
 
     def _grant(
         self, cur: sqlite3.Cursor, client: str, worker: str, role: str, agent: str,
         instance: str, model: str | None, specified: str | None,
         purpose: str | None, preferences: dict | None, sub: str, now: _dt.datetime,
-        reason: str,
+        reason: str, request_id: str | None = None,
     ) -> str:
         sub_policy = self._policy.subscriptions[sub]
         resolved = model or sub_policy.default_model
         key = self._keys.get(sub)
         if key is None:  # 部署在選定後被抽掉；視同不可用。
-            ctx = self._req_ctx(client, worker, role, agent, instance, specified)
+            ctx = self._req_ctx(client, worker, role, agent, instance, specified, request_id)
             raise self._deny(cur, client, ctx, "not_allowed", None, now)
         try:
             env, unset = build_env(sub, agent, key, resolved)
         except ValueError:
-            ctx = self._req_ctx(client, worker, role, agent, instance, specified)
+            ctx = self._req_ctx(client, worker, role, agent, instance, specified, request_id)
             raise self._deny(cur, client, ctx, "not_allowed", None, now)
         lease_id = uuid.uuid4().hex
         stamp = to_rfc3339(now)
@@ -375,14 +415,15 @@ class LeaseService:
         preferences = self._check_preferences(body.get("preferences"))
         with self._store.txn() as cur:
             now = self._clock.now()
+            self._require_live_client(cur, client)
             self._settle(cur, now)
             hit = self._dedup_hit(cur, client, request_id)
             if hit is not None:
-                return hit
-            self._require_live_client(cur, client)
+                status, stored = hit
+                return status, self._replay(cur, stored, "lease")
             if worker != client:
-                ctx = {**self._req_ctx(client, worker, role, agent, instance, specified),
-                       "request_id": request_id}
+                ctx = self._req_ctx(client, worker, role, agent, instance,
+                                    specified, request_id)
                 self._store.log(cur, "denied", to_rfc3339(now), client=client,
                                 subscription=specified,
                                 payload={**ctx, "reason": "client_mismatch",
@@ -390,17 +431,10 @@ class LeaseService:
                 err = client_mismatch()
                 self._dedup_put(cur, client, request_id, err.status, err.body(), now)
                 raise err
-            try:
-                sub, lease_id = self._select_and_grant(
-                    cur, client, worker, role, agent, instance, model, specified,
-                    purpose, preferences, now,
-                )
-            except ApiError as err:
-                if err.code == "refused" and request_id:
-                    row = self._store.dedup_get(cur, client, request_id)
-                    if row is None:
-                        self._dedup_put(cur, client, request_id, err.status, err.body(), now)
-                raise
+            sub, lease_id = self._select_and_grant(
+                cur, client, worker, role, agent, instance, model, specified,
+                purpose, preferences, now, request_id=request_id,
+            )
             row = self._store.lease_get(cur, lease_id)
             lease = self._lease_obj(cur, lease_id, sub, agent, row["model"], row["confirm_by"])
             resp = {"lease": lease}
@@ -416,11 +450,11 @@ class LeaseService:
             raise bad_request(missing=missing)
         with self._store.txn() as cur:
             now = self._clock.now()
+            self._require_live_client(cur, client)
             self._settle(cur, now)
             hit = self._dedup_hit(cur, client, request_id)
             if hit is not None:
                 return hit
-            self._require_live_client(cur, client)
             row = self._get_owned_lease(cur, client, lease_id)
             if row["status"] == "active":
                 resp = {"expires_at": row["expires_at"]}
@@ -459,11 +493,12 @@ class LeaseService:
         resets = self._parse_resets_at(resets_at)
         with self._store.txn() as cur:
             now = self._clock.now()
+            self._require_live_client(cur, client)
             self._settle(cur, now)
             hit = self._dedup_hit(cur, client, request_id)
             if hit is not None:
-                return hit
-            self._require_live_client(cur, client)
+                status, stored = hit
+                return status, self._replay(cur, stored, "next")
             row = self._get_owned_lease(cur, client, lease_id)
             if row["status"] == "granted":
                 raise lease_not_confirmed()
@@ -488,7 +523,9 @@ class LeaseService:
             try:
                 _, next_id = self._select_and_grant(
                     cur, client, row["worker"], row["role"], row["agent"], row["instance"],
-                    row["model"], None, None, None, now,
+                    row["model"], None, None,
+                    json.loads(row["preferences"]) if row["preferences"] else None,
+                    now,
                 )
             except ApiError as err:
                 if err.code != "refused":
@@ -541,11 +578,11 @@ class LeaseService:
             raise bad_request(missing=missing)
         with self._store.txn() as cur:
             now = self._clock.now()
+            self._require_live_client(cur, client)
             self._settle(cur, now)
             hit = self._dedup_hit(cur, client, request_id)
             if hit is not None:
                 return hit
-            self._require_live_client(cur, client)
             row = self._get_owned_lease(cur, client, lease_id)
             if row["status"] == "granted":
                 raise lease_not_confirmed()
@@ -573,11 +610,11 @@ class LeaseService:
             raise bad_request(detail="reason 須為可列印字串")
         with self._store.txn() as cur:
             now = self._clock.now()
+            self._require_live_client(cur, client)
             self._settle(cur, now)
             hit = self._dedup_hit(cur, client, request_id)
             if hit is not None:
                 return hit
-            self._require_live_client(cur, client)
             row = self._get_owned_lease(cur, client, lease_id)
             if row["status"] in ("granted", "active"):
                 self._store.lease_update(cur, lease_id, status="released")
@@ -600,12 +637,12 @@ class LeaseService:
                 raise bad_request(detail="request_id 須為可列印字串")
         with self._store.txn() as cur:
             now = self._clock.now()
+            self._require_live_client(cur, client)
             self._settle(cur, now)
             if request_id is not None:
                 hit = self._dedup_hit(cur, client, request_id)
                 if hit is not None:
                     return hit
-            self._require_live_client(cur, client)
             row = self._get_owned_lease(cur, client, lease_id)
             self._store.log(cur, "usage", to_rfc3339(now), client=client, lease_id=lease_id,
                             subscription=row["subscription"],
@@ -617,8 +654,8 @@ class LeaseService:
     # --- 狀態板（spec status-board） ---
     def board(self) -> dict:
         """{api_version, generated_at, subscriptions: [{name, deployed, active: [{worker, role, agent, since}],
-        count, cap, cooling, cooling_until, usage}]}。先做延後結算。usage 由 lgwd.board 的查詢器填（這裡留 None）。
-        絕不含 key 的值。"""
+        count, pending, cap, cooling, cooling_until, usage}]}。先做延後結算。usage 由 lgwd.board 的查詢器填（這裡留 None）。
+        pending 是未確認（granted）的數量。絕不含 key 的值。"""
         with self._store.txn() as cur:
             now = self._clock.now()
             self._settle(cur, now)
@@ -635,6 +672,7 @@ class LeaseService:
                     "deployed": self._keys.deployed(name),
                     "active": active,
                     "count": len(active),
+                    "pending": self._store.count_granted_for_sub(cur, name),
                     "cap": sub_policy.cap,
                     "cooling": cooling_until is not None,
                     "cooling_until": cooling_until,

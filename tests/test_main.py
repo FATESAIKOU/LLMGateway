@@ -6,10 +6,12 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -247,6 +249,52 @@ class MainCase(unittest.TestCase):
                               capture_output=True, timeout=30, cwd=str(REPO))
         self.assertEqual(proc.returncode, 0)
         self.assertIn(b"usage: lgwd", proc.stdout)
+
+    @staticmethod
+    def _free_port():
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return port
+
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "no SIGHUP")
+    def test_子程序_SIGHUP與SIGTERM_log(self):
+        api_port, board_port = self._free_port(), self._free_port()
+        env = dict(os.environ,
+                   LGWD_DB=str(self.root / "child.db"),
+                   LGWD_POLICY=str(self.root / "policy.json"),
+                   LGWD_KEYS=str(self.root / "keys.env"),
+                   LGWD_API_HOSTS="127.0.0.1",
+                   LGWD_API_PORT=str(api_port),
+                   LGWD_BOARD_PORT=str(board_port),
+                   LGWD_USAGE="0")
+        proc = subprocess.Popen([sys.executable, "-m", "lgwd"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                cwd=str(REPO), env=env)
+        try:
+            up = False  # whoami 有回應（含 401）即代表已綁定；handler 裝在綁定之前
+            for _ in range(100):
+                try:
+                    http_get(f"http://127.0.0.1:{api_port}/v1/whoami")
+                    up = True
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            self.assertTrue(up)
+            proc.send_signal(signal.SIGHUP)
+            time.sleep(1.0)
+            proc.terminate()  # SIGTERM
+            _, stderr = proc.communicate(timeout=15)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn(b"reload ok", stderr)
+            self.assertIn(b"SIGTERM", stderr)
+            for v in FAKE_KEYS.values():
+                self.assertNotIn(v.encode(), stderr)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
 
 if __name__ == "__main__":

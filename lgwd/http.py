@@ -6,7 +6,8 @@
   GET /v1/whoami（只驗 Bearer，回 {"client": 名稱}，不碰 service）。
 - make_board_server(service, host="127.0.0.1", port) → 只服務 GET /board 的唯讀 HTML（不要憑證、全部輸出跳脫）。
   host 不是 loopback 時丟 ValueError（HTML 只綁 loopback）。
-- log 只記方法、路徑（租約 id 可）、狀態碼；不記標頭與 body。
+- body 超過 1 MB 直接回 413，不讀 body。
+- log 只記方法、路徑（租約 id 可）、狀態碼；500 另記一行例外種類；不記標頭、body 與值。
 """
 
 from __future__ import annotations
@@ -28,6 +29,9 @@ _BOARD_HOST = "127.0.0.1"
 
 _LEASE_ACTIONS = ("start", "exhausted", "renew", "release", "usage")
 
+# body 上限：超過直接 413，不讀 body。
+_MAX_BODY_BYTES = 1024 * 1024
+
 
 def _bearer(handler: BaseHTTPRequestHandler) -> str | None:
     """取 Authorization: Bearer 的值；格式不對回 None。"""
@@ -41,11 +45,14 @@ def _bearer(handler: BaseHTTPRequestHandler) -> str | None:
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> dict:
-    """讀 body 並解析 JSON；空 body 視為 {}；失敗丟 bad_request（不回傳內容）。"""
+    """讀 body 並解析 JSON；空 body 視為 {}；失敗丟 bad_request（不回傳內容）。
+    Content-Length 超過上限直接丟 413，不讀 body。"""
     try:
         size = int(handler.headers.get("Content-Length") or 0)
     except ValueError:
         size = 0
+    if size > _MAX_BODY_BYTES:
+        raise ApiError(413, "body_too_large")
     raw = handler.rfile.read(size) if size > 0 else b""
     if not raw.strip():
         return {}
@@ -152,8 +159,9 @@ def _api_handler(service):
                 _LOG.info("%s %s -> %s", method, path, exc.status)
                 _send_json(self, exc.status, exc.body())
                 return
-            except Exception:  # 未預期錯誤：一律泛化 500，不洩漏內容
+            except Exception as exc:  # 未預期錯誤：一律泛化 500，只記例外種類
                 _LOG.info("%s %s -> %s", method, path, 500)
+                _LOG.error("internal error kind=%s", type(exc).__name__)
                 _send_json(self, 500, {"error": "internal"})
                 return
             _LOG.info("%s %s -> %s", method, path, status)
@@ -203,6 +211,7 @@ def _render_board(data: dict) -> str:
             "<section><h2>{name}</h2><ul>"
             "<li>部署：{deployed}</li>"
             "<li>使用中：{count}／{cap}</li>"
+            "<li>未確認：{pending}</li>"
             "<li>冷卻：{cooling}{until}</li>"
             "<li>用量：{usage}</li>"
             "<li>租約：<ul>{leases}</ul></li>"
@@ -211,6 +220,7 @@ def _render_board(data: dict) -> str:
                 deployed="已部署" if sub.get("deployed") else "未部署",
                 count=_esc(sub.get("count")),
                 cap=_esc(cap) if cap is not None else "無上限",
+                pending=_esc(sub.get("pending")),
                 cooling=_esc(sub.get("cooling")),
                 until="（到 {t}）".format(t=_esc(sub.get("cooling_until")))
                 if sub.get("cooling_until")

@@ -181,6 +181,14 @@ class Store:
             (subscription,),
         ).fetchall()
 
+    def count_granted_for_sub(self, cur: sqlite3.Cursor, subscription: str) -> int:
+        row = cur.execute(
+            "SELECT COUNT(*) AS n FROM leases"
+            " WHERE subscription = ? AND status = 'granted'",
+            (subscription,),
+        ).fetchone()
+        return int(row["n"])
+
     # --- 冷卻 ---
     def cool_get(self, cur: sqlite3.Cursor, subscription: str) -> sqlite3.Row | None:
         return cur.execute(

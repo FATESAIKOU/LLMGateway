@@ -232,11 +232,14 @@ class Gateway:
         self._retired = []
 
     def reload(self) -> None:
-        """SIGHUP：重讀 key 檔與 policy；失敗沿用舊的、記 log（不含值）。"""
+        """SIGHUP：重讀 key 檔與 policy；失敗沿用舊的、記 log（不含值）。
+        兩邊都成功才記一行 INFO。"""
+        keys_ok = True
         try:
             self._keys.reload()
         except KeyFileError as exc:
             _LOG.warning("keys reload failed, keeping old: %s", exc)
+            keys_ok = False
         try:
             new_policy = load_policy(self._config.policy_path)
         except (PolicyError, OSError) as exc:
@@ -256,6 +259,8 @@ class Gateway:
         self._service = fresh
         self.view._service = fresh
         self._retired.append(old)
+        if keys_ok:
+            _LOG.info("reload ok")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -279,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         gateway.reload()
 
     def on_term(signum, frame):
+        _LOG.info("received SIGTERM, shutting down")
         stop.set()
 
     if hasattr(signal, "SIGHUP"):

@@ -571,6 +571,62 @@ class LeaseTest(unittest.TestCase):
         for v in CANARY.values():
             self.assertNotIn(v, names_hashes)
 
+    # --- 撤銷後重送一律 401 ---
+    def test_撤銷後重送每一種動作都回401(self):
+        bodies = {}
+        bodies["request"] = {"worker": "w1", "role": "r", "agent": "claude-code",
+                             "instance": "i", "request_id": "rr"}
+        _, r = self.svc.request_lease("w1", dict(bodies["request"]))
+        lid = r["lease"]["lease_id"]
+        bodies["start"] = {"request_id": "rs"}
+        self.svc.start("w1", lid, dict(bodies["start"]))
+        bodies["exhausted"] = {"signal": "other", "request_id": "re"}
+        _, ex = self.svc.exhausted("w1", lid, dict(bodies["exhausted"]))
+        nxt = ex["next"]["lease_id"]
+        self.svc.start("w1", nxt, {"request_id": "rs2"})
+        bodies["renew"] = {"request_id": "rn"}
+        self.svc.renew("w1", nxt, dict(bodies["renew"]))
+        bodies["usage"] = {"snapshot": {}, "request_id": "ru"}
+        self.svc.report_usage("w1", nxt, dict(bodies["usage"]))
+        bodies["release"] = {"request_id": "rl"}
+        self.svc.revoke_client("w1")
+        calls = [
+            lambda: self.svc.request_lease("w1", dict(bodies["request"])),
+            lambda: self.svc.start("w1", lid, dict(bodies["start"])),
+            lambda: self.svc.exhausted("w1", lid, dict(bodies["exhausted"])),
+            lambda: self.svc.renew("w1", nxt, dict(bodies["renew"])),
+            lambda: self.svc.release("w1", nxt, dict(bodies["release"])),
+            lambda: self.svc.report_usage("w1", nxt, dict(bodies["usage"])),
+        ]
+        for call in calls:
+            with self.assertRaises(ApiError) as cm:
+                call()
+            self.assertEqual(cm.exception.status, 401)
+
+    # --- S4：未確認數量 ---
+    def test_未確認數量(self):
+        board = self.svc.board()
+        personal = [s for s in board["subscriptions"] if s["name"] == "claude-personal"][0]
+        self.assertEqual((personal["count"], personal["pending"]), (0, 0))
+        _, r = self.req(instance="a")
+        personal = [s for s in self.svc.board()["subscriptions"]
+                    if s["name"] == "claude-personal"][0]
+        self.assertEqual((personal["count"], personal["pending"]), (0, 1))
+        self.svc.start("w1", r["lease"]["lease_id"], {"request_id": "s1"})
+        personal = [s for s in self.svc.board()["subscriptions"]
+                    if s["name"] == "claude-personal"][0]
+        self.assertEqual((personal["count"], personal["pending"]), (1, 0))
+
+    # --- S5：exhausted 沿用 preferences ---
+    def test_exhausted沿用preferences(self):
+        prefs = {"preferred_models": ["m1"], "floor_model": "m0"}
+        lid = self.active_lease(instance="a", preferences=prefs)
+        self.svc.exhausted("w1", lid, {"signal": "other", "request_id": "ex1"})
+        granted = [json.loads(e["payload"]) for e in self.events()
+                   if e["type"] == "granted"]
+        self.assertEqual(len(granted), 2)
+        self.assertEqual(granted[1]["preferences"], prefs)
+
     # --- 去重 ---
     def test_request去重(self):
         body = {"worker": "w1", "role": "r", "agent": "claude-code",
@@ -656,6 +712,25 @@ class LeaseTest(unittest.TestCase):
 
     def _store(self):
         return self.svc._store.txn()
+
+    def _db_text(self):
+        """整庫每一張表、每一列的文字（canary 掃描用；表名來自自家 schema）。"""
+        with self.svc._store._lock:
+            conn = self.svc._store._conn
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name NOT LIKE 'sqlite_%'")]
+            parts = []
+            for t in tables:
+                parts.append("TABLE " + t)
+                for row in conn.execute("SELECT * FROM " + t):
+                    parts.append(repr(tuple(row)))
+        return "\n".join(parts)
+
+    def _no_canary(self, *blobs):
+        for v in CANARY.values():
+            for blob in blobs:
+                self.assertNotIn(v, blob)
 
     # --- 狀態板 ---
     def test_有人在用(self):
@@ -774,25 +849,84 @@ class LeaseTest(unittest.TestCase):
             n = cur.execute("SELECT COUNT(*) AS n FROM leases").fetchone()["n"]
         self.assertEqual(n, 2)
 
-    # --- canary ---
-    def test_canary值掃描(self):
-        lid = self.active_lease(instance="a")
-        self.svc.report_usage("w1", lid, {"snapshot": {"x": 1}})
-        self.svc.renew("w1", lid, {"request_id": self._rid("rn")})
-        self.svc.exhausted("w1", lid, {"signal": "other", "request_id": self._rid("ex")})
+    # --- canary：值不進資料庫 ---
+    def test_canary全表掃描(self):
+        mk = lambda rid: {"worker": "w1", "role": "role-1", "agent": "claude-code",
+                          "instance": "a", "request_id": rid}
+        _, r = self.svc.request_lease("w1", mk("rid-a"))
+        lid = r["lease"]["lease_id"]
+        first_env = dict(r["lease"]["env"])
+        _, r2 = self.svc.request_lease("w1", mk("rid-a"))  # 真重送：env 一樣
+        self.assertEqual(r2["lease"]["env"], first_env)
+        self.svc.start("w1", lid, {"request_id": "s1"})
+        self.svc.report_usage("w1", lid, {"snapshot": {"x": 1}, "request_id": "u1"})
+        self.svc.renew("w1", lid, {"request_id": "rn1"})
+        st, ex = self.svc.exhausted("w1", lid, {"signal": "other", "request_id": "ex1"})
+        nxt = ex["next"]["lease_id"]
+        next_env = dict(ex["next"]["env"])
+        # exhausted 重送：next 還在，env 一樣。
+        _, ex2 = self.svc.exhausted("w1", lid, {"signal": "other", "request_id": "ex1"})
+        self.assertEqual(ex2["next"]["env"], next_env)
+        self.svc.start("w1", lid, {"request_id": "s1"})  # 無秘密的重送
+        self.svc.release("w1", nxt, {"request_id": "rel1"})
+        self.svc.release("w1", nxt, {"request_id": "rel1"})
         try:
-            self.req(instance="dup")
-            self.req(instance="dup")
-        except ApiError as e:
-            exc_texts = [str(e)]
-        try:
-            self.svc.start("w1", "nope", {"request_id": "z"})
-        except ApiError as e:
-            exc_texts.append(str(e))
-        blob = json.dumps(self.events()) + json.dumps(self.svc.board()) + "".join(exc_texts)
-        blob += json.dumps(self.svc.list_clients()) + repr(self.keys)
-        for v in CANARY.values():
-            self.assertNotIn(v, blob)
+            self.req(agent="opencode", subscription="claude-personal", instance="z")
+        except ApiError:
+            pass
+        self._no_canary(self._db_text())
+        self._no_canary(json.dumps(self.events()), json.dumps(self.svc.board()),
+                        json.dumps(self.svc.list_clients()), repr(self.keys))
+
+    def test_去重表只留變數名(self):
+        _, r = self.req(instance="a")
+        with self._store() as cur:
+            rows = cur.execute("SELECT body FROM dedup").fetchall()
+        self.assertTrue(rows)
+        for row in rows:
+            body = json.loads(row["body"])
+            for slot in ("lease", "next"):
+                lease = body.get(slot)
+                if isinstance(lease, dict) and isinstance(lease.get("env"), dict):
+                    self.assertEqual(set(lease["env"]), set(r["lease"]["env"]))
+                    self.assertTrue(all(v == "" for v in lease["env"].values()))
+        self._no_canary(self._db_text())
+
+    def test_重送時租約已結束(self):
+        body = {"worker": "w1", "role": "r", "agent": "claude-code",
+                "instance": "i", "request_id": "same"}
+        _, r = self.svc.request_lease("w1", dict(body))
+        lid = r["lease"]["lease_id"]
+        self.svc.release("w1", lid, {"request_id": "rel"})
+        with self.assertRaises(ApiError) as cm:
+            self.svc.request_lease("w1", dict(body))
+        self.assertEqual(cm.exception.code, "lease_not_active")
+        # exhausted 的重送看的是下一張：下一張結束了同樣 409。
+        lid2 = self.active_lease(instance="b")
+        _, ex = self.svc.exhausted("w1", lid2, {"signal": "other", "request_id": "ex9"})
+        self.svc.release("w1", ex["next"]["lease_id"], {"request_id": "rel9"})
+        with self.assertRaises(ApiError) as cm:
+            self.svc.exhausted("w1", lid2, {"signal": "other", "request_id": "ex9"})
+        self.assertEqual(cm.exception.code, "lease_not_active")
+
+    def test_輪替後重送拿新值(self):
+        body = {"worker": "w1", "role": "r", "agent": "claude-code",
+                "instance": "i", "request_id": "same"}
+        _, r1 = self.svc.request_lease("w1", dict(body))
+        self.keys._keys["claude-personal"] = "CANARY-ROTATED-zzzz"
+        _, r2 = self.svc.request_lease("w1", dict(body))
+        self.assertEqual(r2["lease"]["lease_id"], r1["lease"]["lease_id"])
+        self.assertEqual(r2["lease"]["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "CANARY-ROTATED-zzzz")
+        self._no_canary(self._db_text())
+
+    def test_缺key時重送回not_allowed(self):
+        body = {"worker": "w1", "role": "r", "agent": "claude-code",
+                "instance": "i", "request_id": "same"}
+        self.svc.request_lease("w1", dict(body))
+        del self.keys._keys["claude-personal"]
+        with self.assertRaises(ApiError) as cm:
+            self.svc.request_lease("w1", dict(body))
+        self.assertEqual(cm.exception.extra.get("reason"), "not_allowed")
 
 
 if __name__ == "__main__":

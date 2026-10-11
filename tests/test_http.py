@@ -1,5 +1,6 @@
 """lgwd/http.py 的測試：全用假 service（固定值或丟 ApiError），不用真 key。"""
 
+import http.client
 import json
 import threading
 import unittest
@@ -304,6 +305,44 @@ class ApiTest(ServerCase):
         self.assertIn("POST /v1/leases", text)  # 方法、路徑、狀態碼有記
         self.assertIn("401", text)
 
+    def test_body_too_large(self):
+        # 宣告 2 MB，只送 2 bytes：服務不讀 body，直接 413。
+        host, port = self.base.rsplit(":", 1)
+        conn = http.client.HTTPConnection(host.rsplit("/", 1)[-1], int(port), timeout=5)
+        try:
+            conn.putrequest("POST", "/v1/leases")
+            conn.putheader("Authorization", "Bearer " + GOOD_TOKEN)
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", str(2 * 1024 * 1024))
+            conn.endheaders()
+            conn.send(b"{}")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 413)
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["error"], "body_too_large")
+            self.assertEqual(data["api_version"], 1)
+        finally:
+            conn.close()
+        self.assertFalse(self.fake.calls)  # 沒進 service
+
+    def test_body_exactly_1mb_ok(self):
+        status, _ = self.call(self.base, "POST", "/v1/leases", raw=b" " * (1024 * 1024))
+        self.assertEqual(status, 201)  # 邊界：超過才擋，假 service 照常回
+
+    def test_500_logs_kind_not_value(self):
+        secret = "CANARY-500-zz9"
+        self.fake.raise_for["board"] = ValueError(secret)
+        try:
+            with self.assertLogs("lgwd.http", level="INFO") as logs:
+                status, payload = self.call(self.base, "GET", "/v1/board")
+        finally:
+            del self.fake.raise_for["board"]
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload.decode())["error"], "internal")
+        text = "\n".join(logs.output)
+        self.assertIn("ValueError", text)  # 只記種類
+        self.assertNotIn(secret, text)
+
 
 class BoardServerTest(ServerCase):
     def setUp(self):
@@ -350,6 +389,15 @@ class BoardServerTest(ServerCase):
             with self.subTest(method=method, path=path):
                 status, _, _ = self.get(path, method)
                 self.assertEqual(status, 404)
+
+    def test_board_pending(self):
+        sub = dict(BOARD["subscriptions"][0], pending=2)
+        self.fake.board = lambda: dict(BOARD, subscriptions=[sub])
+        status, payload, _ = self.get("/board")
+        self.assertEqual(status, 200)
+        text = payload.decode()
+        self.assertIn("未確認", text)
+        self.assertIn("2", text)
 
 
 if __name__ == "__main__":
