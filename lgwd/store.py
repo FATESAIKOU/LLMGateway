@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS clients (
     name TEXT PRIMARY KEY,
     cred_hash TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    revoked_at TEXT
+    revoked_at TEXT,
+    role TEXT NOT NULL DEFAULT 'client'
 );
 CREATE TABLE IF NOT EXISTS dedup (
     client TEXT NOT NULL,
@@ -72,6 +73,10 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(SCHEMA)
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(clients)")}
+        if "role" not in cols:  # 舊資料庫補欄位
+            self._conn.execute("ALTER TABLE clients ADD COLUMN role TEXT NOT NULL DEFAULT 'client'")
+            self._conn.commit()
         self._lock = threading.RLock()
         self.rebuild()
 
@@ -125,10 +130,11 @@ class Store:
             return [dict(r) for r in rows]
 
     # --- 客戶端 ---
-    def client_add(self, cur: sqlite3.Cursor, name: str, cred_hash: str, created_at: str) -> None:
+    def client_add(self, cur: sqlite3.Cursor, name: str, cred_hash: str, created_at: str,
+                   role: str = "client") -> None:
         cur.execute(
-            "INSERT INTO clients (name, cred_hash, created_at) VALUES (?, ?, ?)",
-            (name, cred_hash, created_at),
+            "INSERT INTO clients (name, cred_hash, created_at, role) VALUES (?, ?, ?, ?)",
+            (name, cred_hash, created_at, role),
         )
 
     def client_get(self, cur: sqlite3.Cursor, name: str) -> sqlite3.Row | None:
@@ -250,12 +256,12 @@ class Store:
         if t == "client_added":
             # 雜湊不可逆，記進事件不洩漏憑證；重建時還原身分。
             cur.execute(
-                "INSERT INTO clients (name, cred_hash, created_at, revoked_at)"
-                " VALUES (?, ?, ?, NULL)"
+                "INSERT INTO clients (name, cred_hash, created_at, revoked_at, role)"
+                " VALUES (?, ?, ?, NULL, ?)"
                 " ON CONFLICT(name) DO UPDATE SET"
                 " cred_hash = excluded.cred_hash, created_at = excluded.created_at,"
-                " revoked_at = NULL",
-                (p["name"], p.get("cred_hash", ""), p["created_at"]),
+                " revoked_at = NULL, role = excluded.role",
+                (p["name"], p.get("cred_hash", ""), p["created_at"], p.get("role", "client")),
             )
         elif t == "client_revoked":
             cur.execute(

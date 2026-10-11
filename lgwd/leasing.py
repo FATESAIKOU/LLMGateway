@@ -22,6 +22,7 @@ import datetime as _dt
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import sqlite3
 import uuid
@@ -32,8 +33,10 @@ from .errors import (
     ApiError,
     bad_request,
     client_mismatch,
+    forbidden_role,
     lease_not_active,
     lease_not_confirmed,
+    name_not_allowed,
     not_found,
     not_owner,
     refusal,
@@ -42,6 +45,9 @@ from .errors import (
 from .keys import KeyStore
 from .policy import Policy
 from .store import Store
+
+ROLES = ("client", "issuer")
+WORKER_NAME = re.compile(r"worker-[A-Za-z0-9._-]{1,57}")
 
 API_VERSION = 1
 
@@ -94,10 +100,13 @@ class LeaseService:
         self._store.close()
 
     # --- 客戶端身分（design 決定 4） ---
-    def add_client(self, name: str) -> str:
-        """新增客戶端，回傳一次性的明文憑證（32 bytes 隨機、urlsafe base64）；只存 SHA-256。名稱重複丟 ValueError。"""
+    def add_client(self, name: str, role: str = "client") -> str:
+        """新增客戶端，回傳一次性的明文憑證（32 bytes 隨機、urlsafe base64）；只存 SHA-256。名稱重複丟 ValueError。
+        role：client（租用）或 issuer（只能用管理 API 發撤 worker-*）。"""
         if not isinstance(name, str) or not name or not name.isprintable():
             raise ValueError("bad client name")
+        if role not in ROLES:
+            raise ValueError("bad role")
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
         now = to_rfc3339(self._clock.now())
@@ -105,19 +114,22 @@ class LeaseService:
             row = self._store.client_get(cur, name)
             if row is not None and row["revoked_at"] is None:
                 raise ValueError("client exists")
-            if row is None:
-                self._store.client_add(cur, name, digest, now)
-            else:
-                cur.execute(
-                    "UPDATE clients SET cred_hash = ?, created_at = ?, revoked_at = NULL"
-                    " WHERE name = ?",
-                    (digest, now, name),
-                )
-            self._store.log(
-                cur, "client_added", now, client=name,
-                payload={"name": name, "cred_hash": digest, "created_at": now},
-            )
+            self._put_client(cur, row, name, digest, now, role)
         return token
+
+    def _put_client(self, cur: sqlite3.Cursor, row, name: str, digest: str, now: str, role: str) -> None:
+        if row is None:
+            self._store.client_add(cur, name, digest, now, role)
+        else:
+            cur.execute(
+                "UPDATE clients SET cred_hash = ?, created_at = ?, revoked_at = NULL, role = ?"
+                " WHERE name = ?",
+                (digest, now, role, name),
+            )
+        self._store.log(
+            cur, "client_added", now, client=name,
+            payload={"name": name, "cred_hash": digest, "created_at": now, "role": role},
+        )
 
     def revoke_client(self, name: str) -> None:
         """撤銷；該客戶端所有未結束的租約記為 revoked。"""
@@ -126,25 +138,73 @@ class LeaseService:
             row = self._store.client_get(cur, name)
             if row is None:
                 raise ValueError("unknown client")
-            if row["revoked_at"] is None:
-                self._store.client_revoke(cur, name, now)
-                self._store.log(cur, "client_revoked", now, client=name,
-                                payload={"name": name, "revoked_at": now})
-            for lease in self._store.leases_unfinished(cur):
-                if lease["client"] == name:
-                    self._store.lease_update(cur, lease["lease_id"], status="revoked")
-                    self._store.log(cur, "lease_revoked", now, client=name,
-                                    lease_id=lease["lease_id"],
-                                    subscription=lease["subscription"],
-                                    payload={"lease_id": lease["lease_id"]})
+            self._revoke_cascade(cur, row, name, now)
+
+    def _revoke_cascade(self, cur: sqlite3.Cursor, row, name: str, now: str) -> None:
+        if row["revoked_at"] is None:
+            self._store.client_revoke(cur, name, now)
+            self._store.log(cur, "client_revoked", now, client=name,
+                            payload={"name": name, "revoked_at": now})
+        for lease in self._store.leases_unfinished(cur):
+            if lease["client"] == name:
+                self._store.lease_update(cur, lease["lease_id"], status="revoked")
+                self._store.log(cur, "lease_revoked", now, client=name,
+                                lease_id=lease["lease_id"],
+                                subscription=lease["subscription"],
+                                payload={"lease_id": lease["lease_id"]})
 
     def list_clients(self) -> list[dict]:
-        """[{name, created_at, revoked_at}]；不含雜湊。"""
+        """[{name, role, created_at, revoked_at}]；不含雜湊。"""
         with self._store.txn() as cur:
             return [
-                {"name": r["name"], "created_at": r["created_at"], "revoked_at": r["revoked_at"]}
+                {"name": r["name"], "role": r["role"], "created_at": r["created_at"],
+                 "revoked_at": r["revoked_at"]}
                 for r in self._store.client_all(cur)
             ]
+
+    def role_of(self, name: str) -> str | None:
+        """有效客戶端的角色；不存在或已撤銷回 None。"""
+        with self._store.txn() as cur:
+            row = self._store.client_get(cur, name)
+            if row is None or row["revoked_at"] is not None:
+                return None
+            return row["role"]
+
+    # --- 管理 API（design 決定 4；只有 issuer、只限 worker-*；loopback 由 HTTP 層檢查） ---
+    def admin_issue(self, issuer: str, body: dict) -> tuple[int, dict]:
+        """POST /v1/admin/clients {name}。同名有效的先撤掉（連同未結束的租約）再發新的。"""
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            raise bad_request(missing=["name"])
+        now = to_rfc3339(self._clock.now())
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        with self._store.txn() as cur:
+            self._require_live_client(cur, issuer, role="issuer")
+            if not WORKER_NAME.fullmatch(name):
+                raise name_not_allowed()
+            row = self._store.client_get(cur, name)
+            if row is not None and row["role"] != "client":
+                raise name_not_allowed()
+            if row is not None:
+                self._revoke_cascade(cur, row, name, now)
+            self._put_client(cur, row, name, digest, now, "client")
+            self._store.log(cur, "client_issued", now, client=issuer,
+                            payload={"name": name, "issuer": issuer, "reissued": row is not None})
+        return 201, {"name": name, "token": token}
+
+    def admin_revoke(self, issuer: str, name: str) -> tuple[int, dict]:
+        """DELETE /v1/admin/clients/{name}。不存在或已撤銷回 404。"""
+        now = to_rfc3339(self._clock.now())
+        with self._store.txn() as cur:
+            self._require_live_client(cur, issuer, role="issuer")
+            if not isinstance(name, str) or not WORKER_NAME.fullmatch(name):
+                raise name_not_allowed()
+            row = self._store.client_get(cur, name)
+            if row is None or row["revoked_at"] is not None or row["role"] != "client":
+                raise not_found()
+            self._revoke_cascade(cur, row, name, now)
+        return 204, {}
 
     def authenticate(self, token: str) -> str | None:
         """回傳客戶端名稱；無效或已撤銷回 None。用 hmac.compare_digest 比對雜湊。"""
@@ -180,10 +240,12 @@ class LeaseService:
                                     payload={"lease_id": lease["lease_id"], "reason": "ttl"})
         self._store.dedup_prune(cur, to_rfc3339(now - _DEDUP_KEEP))
 
-    def _require_live_client(self, cur: sqlite3.Cursor, client: str) -> None:
+    def _require_live_client(self, cur: sqlite3.Cursor, client: str, role: str = "client") -> None:
         row = self._store.client_get(cur, client)
         if row is None or row["revoked_at"] is not None:
             raise unauthorized()
+        if row["role"] != role:
+            raise forbidden_role()
 
     def _dedup_hit(self, cur: sqlite3.Cursor, client: str, request_id: str) -> tuple[int, dict] | None:
         row = self._store.dedup_get(cur, client, request_id)

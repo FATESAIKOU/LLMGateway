@@ -40,6 +40,14 @@ def not_owner() -> ApiError:
     return ApiError(403, "not_owner")
 
 
+def forbidden_role() -> ApiError:
+    return ApiError(403, "forbidden_role")
+
+
+def name_not_allowed() -> ApiError:
+    return ApiError(403, "name_not_allowed")
+
+
 # 404
 def not_found() -> ApiError:
     return ApiError(404, "not_found")

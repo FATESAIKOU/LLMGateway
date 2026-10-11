@@ -18,7 +18,9 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-from .errors import ApiError, bad_request, not_found
+from .errors import ApiError, bad_request, forbidden_role, not_found
+
+_LOOPBACK = ("127.0.0.1", "::1")
 
 API_VERSION = 1
 
@@ -98,6 +100,13 @@ def _match_api(method: str, path: str):
         return ("whoami",)
     if method == "POST" and path == "/v1/leases":
         return ("leases",)
+    if method == "POST" and path == "/v1/admin/clients":
+        return ("admin_issue",)
+    if method == "DELETE":
+        parts = path.split("/")
+        # ["", "v1", "admin", "clients", "{name}"]
+        if len(parts) == 5 and parts[1:4] == ["v1", "admin", "clients"] and parts[4]:
+            return ("admin_revoke", unquote(parts[4]))
     if method == "POST":
         parts = path.split("/")
         # ["", "v1", "leases", "{id}", "{action}"]
@@ -141,11 +150,23 @@ def _api_handler(service):
                 _LOG.info("%s %s -> %s", method, path, 401)
                 _send_json(self, 401, {"error": "unauthorized"})
                 return
+            role_of = getattr(service, "role_of", None)
+            role = role_of(client) if role_of else "client"
             try:
-                if route[0] == "board":
-                    status, payload = 200, service.board()
+                if route[0] in ("admin_issue", "admin_revoke"):
+                    # 管理 API 只從 loopback 收（design 決定 4）
+                    if self.server.server_address[0] not in _LOOPBACK:
+                        raise forbidden_role()
+                    if route[0] == "admin_issue":
+                        status, payload = service.admin_issue(client, _read_json(self))
+                    else:
+                        status, payload = service.admin_revoke(client, route[1])
                 elif route[0] == "whoami":
-                    status, payload = 200, {"client": client}  # 不碰 service、不碰租約
+                    status, payload = 200, {"client": client, "role": role}  # 不碰租約
+                elif role != "client":
+                    raise forbidden_role()
+                elif route[0] == "board":
+                    status, payload = 200, service.board()
                 else:
                     body = _read_json(self)
                     if route[0] == "leases":

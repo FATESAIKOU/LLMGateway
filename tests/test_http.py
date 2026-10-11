@@ -277,7 +277,7 @@ class ApiTest(ServerCase):
     def test_whoami_ok(self):
         status, payload = self.call(self.base, "GET", "/v1/whoami")
         self.assertEqual(status, 200)
-        self.assertEqual(self.body_of(payload), {"client": "worker-a"})
+        self.assertEqual(self.body_of(payload), {"client": "worker-a", "role": "client"})
         self.assertFalse(self.fake.calls)  # 不碰 service、不碰租約
 
     def test_whoami_401(self):

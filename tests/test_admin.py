@@ -84,7 +84,7 @@ class AdminCase(unittest.TestCase):
         self.assertNotIn(token, out)
         self.assertNotIn("cred_hash", out)
         for line in out.strip().split("\n"):
-            self.assertEqual(len(line.split("\t")), 3)
+            self.assertEqual(len(line.split("\t")), 4)  # name、role、created_at、revoked_at
 
     # --- rm 與 whoami ---
     def test_rm之後whoami回401(self):

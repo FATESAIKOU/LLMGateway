@@ -155,7 +155,7 @@ class FullFlowTest(IntegrationCase):
     def test_whoami(self):
         res = self.client.whoami()
         self.assertTrue(res.ok)
-        self.assertEqual(res.data, {"client": "worker-a"})
+        self.assertEqual(res.data, {"client": "worker-a", "role": "client"})
 
 
 class RefusalTest(IntegrationCase):

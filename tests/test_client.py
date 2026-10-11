@@ -194,7 +194,7 @@ class LeaseTest(ClientCase):
         res = self.client.whoami()
         self.assertTrue(res.ok)
         self.assertEqual(res.status, 200)
-        self.assertEqual(res.data, {"client": "worker-a"})
+        self.assertEqual(res.data, {"client": "worker-a", "role": "client"})
 
     def test_400_error(self):
         self.fake.raise_for["renew"] = errors.bad_request(missing=["request_id"])
