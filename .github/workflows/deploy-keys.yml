@@ -3,17 +3,17 @@
 # provider 端由 authorized_keys 強制執行 deploy/remote-deploy-keys.sh（MyLinuxPool#68）。
 # 值只經過環境變數與 stdin，不上命令列、不寫進 log（GitHub 也會自動遮罩 secret）。
 #
-# 需要的 secret（值由本人設，AI 不經手）：
-#   LGW_DEPLOY_SSH_KEY        部署專用私鑰
-#   LGW_DEPLOY_KNOWN_HOSTS    跳板機與 provider 的 host key（known_hosts 格式）
-#   LGW_DEPLOY_JUMP           跳板機，格式 user@host:port
-#   LGW_DEPLOY_TARGET         provider（經跳板看到的位址），格式 user@127.0.0.1:<埠>，
+# 需要的 secret（值由本人設，AI 不經手；命名照本人的規則 <存取方>__<被存取方>__<動作>）：
+#   GH_LLMGATEWAY__POOL_SSH__DEPLOY        部署專用私鑰
+#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS    跳板機與 provider 的 host key（known_hosts 格式）
+#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP           跳板機，格式 user@host:port
+#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET         provider（經跳板看到的位址），格式 user@127.0.0.1:<埠>，
 #                             字面要和跳板機 permitopen 的 "127.0.0.1:<埠>" 一模一樣（MyLinuxPool#68）
-#   LGW_KEY_CLAUDE_PERSONAL、LGW_KEY_CLAUDE_COMPANY、LGW_KEY_OPENROUTER、LGW_KEY_OPENCODE_ZEN、LGW_KEY_OLLAMA
+#   POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM、POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM、POOL_LLMGATEWAY__OPENROUTER_API__LLM、POOL_LLMGATEWAY__OPENCODE_ZEN__LLM、POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM
 # 連線資訊也放 secret，是因為本 repo 是 public，不把池的位址放在公開的 vars；
 # ssh 的錯誤輸出也會把位址換成 [jump]／[target] 再印。
 # repo 設定：environment「llmgateway-deploy」要設本人為 required reviewer；
-# LGW_DEPLOY_KNOWN_HOSTS 由 MyLinuxPool 提供的指紋建立，不要用 ssh-keyscan 現掃。
+# GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS 由 MyLinuxPool 提供的指紋建立，不要用 ssh-keyscan 現掃。
 name: deploy-keys
 
 on:
@@ -33,8 +33,8 @@ jobs:
     steps:
       - name: Prepare SSH identity
         env:
-          SSH_KEY: ${{ secrets.LGW_DEPLOY_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.LGW_DEPLOY_KNOWN_HOSTS }}
+          SSH_KEY: ${{ secrets.GH_LLMGATEWAY__POOL_SSH__DEPLOY }}
+          KNOWN_HOSTS: ${{ secrets.GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS }}
         run: |
           set -eu
           umask 077
@@ -45,13 +45,13 @@ jobs:
 
       - name: Send key file over stdin
         env:
-          JUMP: ${{ secrets.LGW_DEPLOY_JUMP }}
-          TARGET: ${{ secrets.LGW_DEPLOY_TARGET }}
-          K_CLAUDE_PERSONAL: ${{ secrets.LGW_KEY_CLAUDE_PERSONAL }}
-          K_CLAUDE_COMPANY: ${{ secrets.LGW_KEY_CLAUDE_COMPANY }}
-          K_OPENROUTER: ${{ secrets.LGW_KEY_OPENROUTER }}
-          K_OPENCODE_ZEN: ${{ secrets.LGW_KEY_OPENCODE_ZEN }}
-          K_OLLAMA: ${{ secrets.LGW_KEY_OLLAMA }}
+          JUMP: ${{ secrets.GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP }}
+          TARGET: ${{ secrets.GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET }}
+          K_CLAUDE_PERSONAL: ${{ secrets.POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM }}
+          K_CLAUDE_COMPANY: ${{ secrets.POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM }}
+          K_OPENROUTER: ${{ secrets.POOL_LLMGATEWAY__OPENROUTER_API__LLM }}
+          K_OPENCODE_ZEN: ${{ secrets.POOL_LLMGATEWAY__OPENCODE_ZEN__LLM }}
+          K_OLLAMA: ${{ secrets.POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM }}
         run: |
           set -eu -o pipefail
           target_user_host="${TARGET%:*}"
