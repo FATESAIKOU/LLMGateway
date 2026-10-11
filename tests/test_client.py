@@ -1,286 +1,227 @@
-"""lgw/client.py 的測試：LeaseClient 打真 HTTP（假 service＋隨機埠），不用真 key。"""
+"""lgw/client.py 的測試（v4 design 決定 6）：假 service（in-process HTTP）＋隨機埠。
 
-import ast
+- 三個介面：list、get、cooldown；只驗 request 形狀、狀態碼與 Result 語意。
+- 假 service 固定回覆；key 一律是假 canary，不用真 key、不連真機器。
+"""
+
+from __future__ import annotations
+
+import json
 import socket
-import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
-import lgw.client as client_mod
-from lgw.client import LeaseClient
-from lgwd import errors
-from lgwd.http import make_api_server
+from lgw.client import Client, Result
 
 HOST = "127.0.0.1"
-GOOD_TOKEN = "good-token"
-LEASE = {
-    "lease_id": "L1",
-    "subscription": "claude-personal",
-    "agent": "claude-code",
-    "model": "default",
-    "env": {"CLAUDE_CODE_OAUTH_TOKEN": "x"},
-    "unset": ["ANTHROPIC_API_KEY"],
-    "expires_at": "2026-10-11T12:00:00Z",
-    "confirm_by": "2026-10-11T00:10:00Z",
+CANARY = "fake-canary-key-007"
+
+SUBSCRIPTION = {
+    "schema": 1,
+    "id": "claude-personal",
+    "provider": "claude",
+    "kind": "claude-subscription",
+    "agents": ["claude-code"],
+    "priority": 10,
+    "models": {"allow": ["*"], "default": None},
+    "endpoint": None,
+    "cooldown": {"5h": None, "1w": None},
+    "available": True,
 }
 
 
 class FakeService:
-    """假 service：固定回覆；raise_for[方法名] 設例外就丟；記下收到的 body。」"""
+    """假 v4 service：list／get／登錄冷卻；記下每個請求的形狀。"""
 
     def __init__(self):
-        self.bodies = []
-        self.raise_for = {}
-        self.seen_tokens = []
+        self.requests = []  # (method, path, query, body, authorization)
 
-    def authenticate(self, token):
-        self.seen_tokens.append(token)
-        return "worker-a" if token == GOOD_TOKEN else None
+    def handle(self, method, path, query, body, authorization):
+        self.requests.append((method, path, query, body, authorization))
+        if method == "GET" and path == "/v1/subscriptions":
+            return 200, {"schema": 1, "subscriptions": [dict(SUBSCRIPTION)]}
+        if method == "GET" and path.startswith("/v1/subscriptions/"):
+            sub_id = urllib.parse.unquote(path.rsplit("/", 1)[1])
+            if sub_id == "gone":
+                return 404, {"error": "not_found"}
+            if sub_id == "idle":
+                return 409, {"error": "not_deployed"}
+            agent = query.get("agent", [None])[0]
+            if sub_id == "claude-personal" and agent != "claude-code":
+                return 403, {"error": "agent_not_allowed"}
+            payload = dict(SUBSCRIPTION)
+            payload["key"] = CANARY
+            return 200, payload
+        if method == "POST" and path.endswith("/cooldown"):
+            sub_id = urllib.parse.unquote(path.split("/")[3])
+            if sub_id == "gone":
+                return 404, {"error": "not_found"}
+            if body.get("window") not in ("5h", "1w"):
+                return 400, {"error": "bad_request"}
+            return 204, {}
+        return 404, {"error": "not_found"}
 
-    def request_lease(self, client, body):
-        self.bodies.append(("request_lease", body))
-        if "request_lease" in self.raise_for:
-            raise self.raise_for["request_lease"]
-        return 201, dict(LEASE)
 
-    def _op(self, name, client, lease_id, body, code, payload):
-        self.bodies.append((name, lease_id, body))
-        if name in self.raise_for:
-            raise self.raise_for[name]
-        return code, payload
+def make_server(fake):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
 
-    def start(self, client, lease_id, body):
-        return self._op("start", client, lease_id, body, 200,
-                        {"expires_at": LEASE["expires_at"]})
+        def _dispatch(self, method):
+            parsed = urllib.parse.urlsplit(self.path)
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+            status, payload = fake.handle(
+                method,
+                parsed.path,
+                urllib.parse.parse_qs(parsed.query),
+                body,
+                self.headers.get("Authorization"),
+            )
+            if status == 204:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            data = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
-    def exhausted(self, client, lease_id, body):
-        return self._op("exhausted", client, lease_id, body, 200,
-                        {"next": dict(LEASE)})
+        def do_GET(self):
+            self._dispatch("GET")
 
-    def renew(self, client, lease_id, body):
-        return self._op("renew", client, lease_id, body, 200,
-                        {"expires_at": LEASE["expires_at"]})
+        def do_POST(self):
+            self._dispatch("POST")
 
-    def release(self, client, lease_id, body):
-        return self._op("release", client, lease_id, body, 204, {})
-
-    def report_usage(self, client, lease_id, body):
-        return self._op("report_usage", client, lease_id, body, 204, {})
-
-    def board(self):
-        return {"subscriptions": []}
+    server = ThreadingHTTPServer((HOST, 0), Handler)
+    server.daemon_threads = True
+    return server
 
 
 class ClientCase(unittest.TestCase):
     def setUp(self):
         self.fake = FakeService()
-        self.server = make_api_server(self.fake, HOST, 0)
+        self.server = make_server(self.fake)
         self.thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.05},
             daemon=True,
         )
         self.thread.start()
         _, port = self.server.server_address[:2]
-        self.tmp = tempfile.TemporaryDirectory()
-        self.token_path = str(Path(self.tmp.name) / "client-token")
-        Path(self.token_path).write_text(GOOD_TOKEN + "\n", encoding="utf-8")
-        self.client = LeaseClient("http://{0}:{1}".format(HOST, port),
-                                  self.token_path)
+        self.client = Client("http://{0}:{1}".format(HOST, port))
 
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
-        self.tmp.cleanup()
 
 
-class LeaseTest(ClientCase):
-    def test_request_lease_ok(self):
-        res = self.client.request_lease("worker-a", "coder", "claude-code", "i1")
+class ListTest(ClientCase):
+    def test_list_ok(self):
+        res = self.client.list()
         self.assertTrue(res.ok)
-        self.assertEqual(res.status, 201)
-        self.assertEqual(res.data["lease_id"], "L1")
-        self.assertNotIn("api_version", res.data)
-        self.assertIsNone(res.refusal)
-        name, body = self.fake.bodies[-1]
-        self.assertEqual(name, "request_lease")
-        self.assertEqual(len(body["request_id"]), 32)  # 自動帶 uuid4 hex
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.data["schema"], 1)
+        subs = res.data["subscriptions"]
+        self.assertEqual(subs[0]["id"], "claude-personal")
+        self.assertNotIn("key", subs[0])  # list 不含 key
+        method, path, query, body, auth = self.fake.requests[-1]
+        self.assertEqual((method, path, query), ("GET", "/v1/subscriptions", {}))
+        self.assertEqual(body, {})
+        self.assertIsNone(auth)  # 不帶任何認證標頭
 
-    def test_request_id_reuse(self):
-        self.client.request_lease("w", "r", "claude-code", "i", request_id="r1")
-        _, body = self.fake.bodies[-1]
-        self.assertEqual(body["request_id"], "r1")
 
-    def test_optionals_omitted(self):
-        self.client.request_lease("w", "r", "claude-code", "i")
-        _, body = self.fake.bodies[-1]
-        for key in ("model", "subscription", "purpose", "preferences"):
-            self.assertNotIn(key, body)
-        res = self.client.request_lease("w", "r", "claude-code", "i",
-                                        model="m", subscription="s",
-                                        purpose="p", preferences={"floor_model": None})
+class GetTest(ClientCase):
+    def test_get_ok_returns_key(self):
+        res = self.client.get("claude-personal", "claude-code")
         self.assertTrue(res.ok)
-        _, body = self.fake.bodies[-1]
-        self.assertEqual(body["model"], "m")
-        self.assertEqual(body["preferences"], {"floor_model": None})
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.data["key"], CANARY)
+        method, path, query, _, auth = self.fake.requests[-1]
+        self.assertEqual((method, path), ("GET", "/v1/subscriptions/claude-personal"))
+        self.assertEqual(query, {"agent": ["claude-code"]})
+        self.assertIsNone(auth)
 
-    def test_refused(self):
-        self.fake.raise_for["request_lease"] = errors.refusal(
-            "all_cooling", "2026-10-11T03:47:00Z")
-        res = self.client.request_lease("w", "r", "claude-code", "i")
+    def test_get_403_agent_not_allowed(self):
+        res = self.client.get("claude-personal", "opencode")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 403)
+        self.assertEqual(res.error, "agent_not_allowed")
+        self.assertFalse(res.unreachable)
+
+    def test_get_404(self):
+        res = self.client.get("gone", "claude-code")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 404)
+        self.assertEqual(res.error, "not_found")
+
+    def test_get_409_not_deployed(self):
+        res = self.client.get("idle", "claude-code")
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 409)
-        self.assertEqual(res.refusal.reason, "all_cooling")
-        self.assertEqual(res.refusal.earliest_reset, "2026-10-11T03:47:00Z")
+        self.assertEqual(res.error, "not_deployed")
 
-    def test_refused_unknown_reason(self):
-        self.fake.raise_for["request_lease"] = errors.ApiError(
-            409, "refused", reason="future_reason")
-        res = self.client.request_lease("w", "r", "claude-code", "i")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.refusal.reason, "future_reason")  # 不認得也照放
-        self.assertIsNone(res.refusal.earliest_reset)
+    def test_get_encodes_id_and_agent(self):
+        self.client.get("a/b c", "agent x")
+        _, path, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(path, "/v1/subscriptions/a%2Fb%20c")
+        self.assertEqual(query, {"agent": ["agent x"]})
 
-    def test_exhausted_next(self):
-        res = self.client.exhausted("L1", "claude_limit", "2026-10-11T03:45:00Z")
-        self.assertTrue(res.ok)
-        self.assertEqual(res.data["next"]["lease_id"], "L1")
-        _, _, body = self.fake.bodies[-1]
-        self.assertEqual(body["signal"], "claude_limit")
-        self.assertEqual(body["resets_at"], "2026-10-11T03:45:00Z")
 
-    def test_exhausted_refusal(self):
-        self.fake.exhausted = lambda c, i, b: (200, {"next": None, "refusal": {
-            "reason": "all_cooling", "earliest_reset": "2026-10-11T03:47:00Z"}})
-        res = self.client.exhausted("L1", "claude_limit")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.status, 200)
-        self.assertEqual(res.refusal.reason, "all_cooling")
-
-    def test_start_renew(self):
-        res = self.client.start("L1")
-        self.assertTrue(res.ok)
-        self.assertIn("expires_at", res.data)
-        name, _, body = self.fake.bodies[-1]
-        self.assertEqual(name, "start")
-        self.assertEqual(len(body["request_id"]), 32)
-        res = self.client.renew("L1", request_id="rn1")
-        self.assertTrue(res.ok)
-        name, _, body = self.fake.bodies[-1]
-        self.assertEqual((name, body["request_id"]), ("renew", "rn1"))
-
-    def test_release_and_usage(self):
-        res = self.client.release("L1", reason="done")
+class CooldownTest(ClientCase):
+    def test_cooldown_204(self):
+        res = self.client.cooldown("claude-personal", "5h")
         self.assertTrue(res.ok)
         self.assertEqual(res.status, 204)
         self.assertEqual(res.data, {})
-        name, _, body = self.fake.bodies[-1]
-        self.assertEqual((name, body["reason"]), ("release", "done"))
-        res = self.client.report_usage("L1", {"note": "x"})
-        self.assertTrue(res.ok)
-        name, _, body = self.fake.bodies[-1]
-        self.assertEqual(name, "report_usage")
-        self.assertEqual(body, {"snapshot": {"note": "x"}})  # usage 不帶 request_id
+        method, path, _, body, auth = self.fake.requests[-1]
+        self.assertEqual(
+            (method, path), ("POST", "/v1/subscriptions/claude-personal/cooldown")
+        )
+        self.assertEqual(body, {"window": "5h"})  # 沒給 resets_at 就不送
+        self.assertIsNone(auth)
 
-    def test_board(self):
-        res = self.client.board()
+    def test_cooldown_resets_at(self):
+        res = self.client.cooldown(
+            "claude-personal", "1w", resets_at="2026-10-19T00:00:00Z"
+        )
         self.assertTrue(res.ok)
-        self.assertEqual(res.data, {"subscriptions": []})
+        _, _, _, body, _ = self.fake.requests[-1]
+        self.assertEqual(
+            body, {"window": "1w", "resets_at": "2026-10-19T00:00:00Z"}
+        )
 
-    def test_whoami(self):
-        res = self.client.whoami()
-        self.assertTrue(res.ok)
-        self.assertEqual(res.status, 200)
-        self.assertEqual(res.data, {"client": "worker-a", "role": "client"})
-
-    def test_400_error(self):
-        self.fake.raise_for["renew"] = errors.bad_request(missing=["request_id"])
-        res = self.client.renew("L1")
+    def test_cooldown_400_bad_window(self):
+        res = self.client.cooldown("claude-personal", "2h")
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 400)
         self.assertEqual(res.error, "bad_request")
 
-    def test_401(self):
-        Path(self.token_path).write_text("nope\n", encoding="utf-8")
-        bad = LeaseClient(self.client._base_url, self.token_path)
-        res = bad.board()
+    def test_cooldown_404(self):
+        res = self.client.cooldown("gone", "5h")
         self.assertFalse(res.ok)
-        self.assertEqual(res.status, 401)
-        self.assertEqual(res.error, "unauthorized")
-
-    def test_token_newline_stripped(self):
-        self.client.board()
-        self.assertEqual(self.fake.seen_tokens[-1], GOOD_TOKEN)  # 結尾換行已去掉
-
-
-class LocalFileTest(unittest.TestCase):
-    def test_missing_token_file(self):
-        with self.assertRaises(FileNotFoundError):
-            LeaseClient("http://127.0.0.1:1", "/nonexistent-dir/t")
-
-    def test_empty_token(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "t")
-            Path(path).write_text("\n", encoding="utf-8")
-            with self.assertRaises(ValueError):
-                LeaseClient("http://127.0.0.1:1", path)
-
-    def test_repr_no_token(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "t")
-            Path(path).write_text("s3cr3t-token-value\n", encoding="utf-8")
-            client = LeaseClient("http://127.0.0.1:1", path, timeout=3)
-            text = repr(client)
-            self.assertNotIn("s3cr3t-token-value", text)
-            self.assertIn("http://127.0.0.1:1", text)
-
-    def test_result_repr_no_data(self):
-        """repr(Result) 不含 data 內容（S6：canary 不得出現在 log）。"""
-        from lgw.client import Refusal, Result
-
-        canary = "s3cr3t-env-value-zz9"
-        res = Result(ok=True, status=201,
-                     data={"lease_id": "L1",
-                           "env": {"CLAUDE_CODE_OAUTH_TOKEN": canary}},
-                     refusal=Refusal(reason="all_cooling",
-                                     earliest_reset="2026-10-11T01:02:00Z"))
-        text = repr(res)
-        self.assertNotIn(canary, text)
-        self.assertNotIn("lease_id", text)
-        self.assertIn("ok=True", text)
-        self.assertIn("all_cooling", text)  # refusal 理由保留可讀性
-
-    def test_no_agent_tool_imports(self):
-        """lgw 不引用 subprocess、herdr、agora（AST 檢查，docstring 文字不算）。"""
-        tree = ast.parse(Path(client_mod.__file__).read_text(encoding="utf-8"))
-        imported = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(a.name.split(".")[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.split(".")[0])
-        self.assertTrue(imported.isdisjoint({"subprocess", "herdr", "agora"}),
-                        imported)
+        self.assertEqual(res.status, 404)
+        self.assertEqual(res.error, "not_found")
 
 
 class UnreachableTest(unittest.TestCase):
-    def _closed_port_client(self, timeout=2):
+    def _closed_port(self):
         sock = socket.socket()
         sock.bind((HOST, 0))
         port = sock.getsockname()[1]
         sock.close()
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "t")
-            Path(path).write_text(GOOD_TOKEN, encoding="utf-8")
-            return LeaseClient("http://{0}:{1}".format(HOST, port), path,
-                               timeout=timeout)
+        return port
 
     def test_closed_port(self):
-        client = self._closed_port_client()
-        res = client.board()
+        client = Client("http://{0}:{1}".format(HOST, self._closed_port()), timeout=2)
+        res = client.list()
         self.assertFalse(res.ok)
         self.assertTrue(res.unreachable)
         self.assertIsNone(res.status)
@@ -290,38 +231,43 @@ class UnreachableTest(unittest.TestCase):
         class SleepHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 time.sleep(1.0)
-                raw = b"{}"
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                try:
-                    self.wfile.write(raw)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
 
             def log_message(self, *args):
                 pass
 
         server = ThreadingHTTPServer((HOST, 0), SleepHandler)
         server.daemon_threads = True
-        thread = threading.Thread(target=server.serve_forever,
-                                  kwargs={"poll_interval": 0.05}, daemon=True)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
         thread.start()
         try:
             _, port = server.server_address[:2]
-            with tempfile.TemporaryDirectory() as tmp:
-                path = str(Path(tmp) / "t")
-                Path(path).write_text(GOOD_TOKEN, encoding="utf-8")
-                client = LeaseClient("http://{0}:{1}".format(HOST, port), path,
-                                     timeout=0.1)
-                res = client.board()
+            client = Client("http://{0}:{1}".format(HOST, port), timeout=0.1)
+            res = client.list()
             self.assertFalse(res.ok)
             self.assertTrue(res.unreachable)
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+class ResultTest(unittest.TestCase):
+    def test_repr_no_data(self):
+        """repr(Result) 不含 data 內容（get 的 key 不得進 log）。"""
+        res = Result(ok=True, status=200, data={"key": CANARY, "id": "claude-personal"})
+        text = repr(res)
+        self.assertNotIn(CANARY, text)
+        self.assertNotIn("key", text)
+        self.assertIn("ok=True", text)
+        self.assertIn("200", text)
+
+    def test_timeout_defaults_empty_on_error(self):
+        res = Result(ok=False, status=403, error="agent_not_allowed")
+        self.assertEqual(res.data, {})
+        self.assertFalse(res.unreachable)
 
 
 if __name__ == "__main__":
