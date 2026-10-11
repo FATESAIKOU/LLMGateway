@@ -12,6 +12,7 @@ from lgw.signals import (
     Classification,
     Signal,
     classify,
+    from_claude_rate_limit_event,
     from_opencode_status,
 )
 
@@ -302,6 +303,62 @@ class OpencodeStatusTest(unittest.TestCase):
                     "type": "session.status",
                     "properties": {"status": {"type": stype}},
                 }))
+
+
+class ClaudeRateLimitEventTest(unittest.TestCase):
+    def setUp(self):
+        self.sample = {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "resetsAt": 1791748200,
+                "rateLimitType": "five_hour",
+                "overageStatus": "rejected",
+                "overageDisabledReason": "org_level_disabled_until",
+                "isUsingOverage": False,
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0, "resetsAt": 1791748200},
+                    "seven_day": {"utilization": 0.01, "resetsAt": 1792220400},
+                },
+            },
+            "uuid": "FAKE",
+            "session_id": "FAKE",
+        }
+
+    def test_sample_allowed_returns_none(self):
+        self.assertIsNone(from_claude_rate_limit_event(self.sample))
+
+    def test_rejected_status_five_hour(self):
+        event = dict(self.sample)
+        info = dict(self.sample["rate_limit_info"])
+        info["status"] = "rejected"
+        event["rate_limit_info"] = info
+        sig = from_claude_rate_limit_event(event)
+        self.assertIsNotNone(sig)
+        self.assertTrue(sig.exhausted)
+        self.assertEqual(sig.window, "5h")
+        self.assertEqual(sig.source, "claude-code")
+        self.assertEqual(sig.resets_at, at_utc(2026, 10, 11, 19, 50))
+
+    def test_rejected_seven_day(self):
+        info = dict(self.sample["rate_limit_info"])
+        info["status"] = "rejected"
+        info["rateLimitType"] = "seven_day"
+        info["resetsAt"] = 1792220400
+        sig = from_claude_rate_limit_event(info)  # 直接傳 rate_limit_info 層
+        self.assertIsNotNone(sig)
+        self.assertTrue(sig.exhausted)
+        self.assertEqual(sig.window, "1w")
+        self.assertEqual(sig.source, "claude-code")
+        self.assertEqual(sig.resets_at, at_utc(2026, 10, 17, 7, 0))
+
+    def test_other_rate_limit_type_gives_none_window(self):
+        info = dict(self.sample["rate_limit_info"])
+        info["status"] = "rejected"
+        info["rateLimitType"] = "other_window"
+        sig = from_claude_rate_limit_event({"type": "rate_limit_event", "rate_limit_info": info})
+        self.assertIsNotNone(sig)
+        self.assertIsNone(sig.window)
 
 
 if __name__ == "__main__":

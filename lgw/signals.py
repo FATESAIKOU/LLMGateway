@@ -268,3 +268,64 @@ def from_opencode_status(obj: dict) -> Signal | None:
         resets_at=resets_at,
         source="opencode",
     )
+
+
+def from_claude_rate_limit_event(obj: dict) -> Signal | None:
+    """判讀 Claude Code stream-json 中的 rate_limit_event 事件或 rate_limit_info 物件。
+
+    支援傳入整包 rate_limit_event 事件：
+      {"type": "rate_limit_event", "rate_limit_info": {...}}
+    或直接傳入 rate_limit_info 層：
+      {"status": ..., "rateLimitType": ..., ...}
+
+    規則：
+    - rate_limit_info.status != "allowed"：額度用完，回傳 Signal(exhausted=True, window=..., resets_at=..., source="claude-code")。
+    - rate_limit_info.status == "allowed"：回傳 None。
+    - rateLimitType：five_hour -> "5h"、seven_day -> "1w"，其他 -> None。
+    - resetsAt 是 epoch 秒，轉成 UTC datetime。
+    - 欄位缺漏、型別不對、非 dict：回傳 None，不丟例外。
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    if obj.get("type") == "rate_limit_event":
+        info = obj.get("rate_limit_info")
+    elif "type" not in obj and "status" in obj:
+        info = obj
+    else:
+        return None
+
+    if not isinstance(info, dict):
+        return None
+
+    status = info.get("status")
+    if not isinstance(status, str):
+        return None
+
+    if status == "allowed":
+        return None
+
+    rl_type = info.get("rateLimitType")
+    if rl_type == "five_hour":
+        window: str | None = "5h"
+    elif rl_type == "seven_day":
+        window = "1w"
+    else:
+        window = None
+
+    resets_at_raw = info.get("resetsAt")
+    resets_at: datetime | None = None
+    if resets_at_raw is not None:
+        if not isinstance(resets_at_raw, (int, float)) or isinstance(resets_at_raw, bool):
+            return None
+        try:
+            resets_at = datetime.fromtimestamp(resets_at_raw, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    return Signal(
+        exhausted=True,
+        window=window,
+        resets_at=resets_at,
+        source="claude-code",
+    )
