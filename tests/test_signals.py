@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import lgw.signals as signals_mod
-from lgw.signals import RULES, Classification, classify
+from lgw.signals import (
+    OPENCODE_QUOTA_REASONS,
+    RULES,
+    Classification,
+    Signal,
+    classify,
+    from_opencode_status,
+)
 
 UTC = timezone.utc
 TZ8 = timezone(timedelta(hours=8))  # 固定時區，測「轉 UTC」與「隔天」
@@ -225,6 +232,76 @@ class TableTest(unittest.TestCase):
                 self.fail("sys.platform 判断不允许")
         self.assertTrue(imported.isdisjoint({"subprocess", "herdr", "agora", "sys"}),
                         imported)
+
+
+class OpencodeStatusTest(unittest.TestCase):
+    def test_sample_session_status(self):
+        sample = {
+            "type": "session.status",
+            "properties": {
+                "sessionID": "ses_FAKE",
+                "status": {
+                    "type": "retry",
+                    "attempt": 1,
+                    "message": "Free usage exceeded, subscribe to Go",
+                    "action": {
+                        "reason": "free_tier_limit",
+                        "provider": "opencode",
+                        "title": "Free limit reached",
+                        "message": "…",
+                        "label": "subscribe",
+                        "link": "https://opencode.ai/go",
+                    },
+                    "next": 1791763200000,
+                },
+            },
+        }
+        sig = from_opencode_status(sample)
+        self.assertIsNotNone(sig)
+        self.assertTrue(sig.exhausted)
+        self.assertIsNone(sig.window)
+        self.assertEqual(sig.source, "opencode")
+        self.assertEqual(sig.resets_at, at_utc(2026, 10, 12, 0, 0))
+
+    def test_direct_status_layer(self):
+        status = {
+            "type": "retry",
+            "attempt": 1,
+            "message": "Free usage exceeded, subscribe to Go",
+            "action": {
+                "reason": "free_tier_limit",
+                "provider": "opencode",
+            },
+            "next": 1791763200000,
+        }
+        sig = from_opencode_status(status)
+        self.assertIsNotNone(sig)
+        self.assertTrue(sig.exhausted)
+        self.assertIsNone(sig.window)
+        self.assertEqual(sig.source, "opencode")
+        self.assertEqual(sig.resets_at, at_utc(2026, 10, 12, 0, 0))
+
+    def test_non_quota_retry_reason(self):
+        sample = {
+            "type": "session.status",
+            "properties": {
+                "status": {
+                    "type": "retry",
+                    "action": {"reason": "rate_limit"},
+                    "next": 1791763200000,
+                }
+            },
+        }
+        self.assertIsNone(from_opencode_status(sample))
+
+    def test_busy_and_idle(self):
+        for stype in ("busy", "idle"):
+            with self.subTest(stype=stype):
+                self.assertIsNone(from_opencode_status({"type": stype}))
+                self.assertIsNone(from_opencode_status({
+                    "type": "session.status",
+                    "properties": {"status": {"type": stype}},
+                }))
 
 
 if __name__ == "__main__":
