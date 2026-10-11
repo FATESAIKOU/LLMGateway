@@ -5,6 +5,10 @@
 - **Claude 條款**：訂閱的 OAuth 是給原版 Claude Code 這類 Anthropic 原生 app 的一般使用；第三方不得代為路由、收集、存放、中轉 Claude.ai 的 token（`docs/research/claude-failover.md` §7）。LLMGateway 不代轉請求，Claude 訂閱的 key 只給 `agent=claude-code` 的 get。
 - **sidecar v3**（MyAiStorage，aistorage-pm）：一台機器一個 daemon（Mac 也能跑），對外五個操作加 HTTP 控制，不基於 herdr。它用 LLMGateway 的 list／get／登錄冷卻；挑把與換把在它內部；key 變成哪些環境變數由它的 AgentDriver 決定。
 - **服務的位置**（本人裁定）：本人選定的常駐 provider，LLMGateway 跟 MyLinuxPool 無關，用自己的帳號 `llmgw` 跑。
+- **v4**（本人對 v3 的第 5～7 點）：
+  - 部署與啟動不依賴 MyLinuxPool，只依賴「一台連得到的 Linux 機器＋SSH」；
+  - 伺服器端自己用 ssh reverse tunnel 公開埠並維持健康；
+  - LLMGateway 提供客戶端連線程式，支援跳板。
 - **期 1 設計**（已封存為 `openspec/specs/agent-lease`、`usage-record`）：以租約為中心。v3 不再有租約，這兩份規格在本 change 移除。
 
 ## Goals / Non-Goals
@@ -30,46 +34,81 @@
   - 租約（PR #9 上一版）：要多五個介面與一套狀態機，本人要求不要多餘介面。
   - 資料面代轉（第 1 版）：違反 Claude 條款。
 
-### 決定 2：key 的保管與部署（照舊）
+### 決定 2：只依賴「一台連得到的 Linux 機器＋SSH」（v4，本人第 6 點）
 
-- 來源是本 repo 的 GitHub secret，值由本人設，名稱照本人的命名規則（tasks 3.3）。
-- 部署的路：本 repo 的 workflow 經池的 SSH 跳板，以 `llmgw` 登入放服務的那台。
-  - 跳板上的部署金鑰只能轉發到那台的隧道埠（MyLinuxPool#68）。
-  - 那台上 `~llmgw/.ssh/authorized_keys` 以 `command="…/current/deploy/remote-deploy.sh",restrict` 強制執行部署腳本。
-- 部署腳本的動詞（從 `SSH_ORIGINAL_COMMAND` 以白名單解析）：
-  - `keys`：stdin → 驗證 → 暫存檔 0600 → rename → 重讀。v3 起 stdin 除了五把 key，還帶各類機器的讀取 token（決定 4）。
-  - `upgrade <tag>`：固定 tag 取碼、切換 current、重啟。
-- 值用 stdin 傳、不上命令列；workflow 的 log 只有 secret 名稱；ssh 的錯誤輸出會遮掉位址。
+- **會合機（rendezvous）**：一台大家都連得到的 Linux 機器，只要有 sshd。用設定指定主機、埠、帳號；**不依賴 MyLinuxPool**（不用 pool-tunnel、NODE_*、池的帳號）。
+  - 候選是池的跳板機，但只把它當「一台連得到的機器」。要注意它可能整台重建，重建後要重做會合機的開機設定（見 Risks）。
+- 在會合機上**開一個專用帳號**（暫名 `llmgw-relay`），authorized_keys 由 LLMGateway 的開機設定放、不交給池管：
+  - 服務那台的隧道金鑰：`restrict,port-forwarding,permitlisten="127.0.0.1:<API 埠>",permitlisten="127.0.0.1:<SSH 埠>",permitopen="127.0.0.1:<API 埠>"`。permitopen 給健康探針用。
+  - 客戶端金鑰（worker、Mac、之後手機，一類一把）：`restrict,port-forwarding,permitopen="127.0.0.1:<API 埠>"`。
+  - 部署金鑰：`restrict,port-forwarding,permitopen="127.0.0.1:<SSH 埠>"`。
+  - 這些金鑰都不能開 shell，只能做寫明的那幾種轉發。
+- **服務本身只綁那台的 127.0.0.1**。不再綁 docker bridge，同一台的容器也走會合機。
 
-### 決定 3：服務的形狀（照舊，資料更少）
+### 決定 3：伺服器端：隧道守護與健康維持（v4）
 
-- Python 標準函式庫，HTTP 用 `http.server.ThreadingHTTPServer`、資料用 `sqlite3`，沒有第三方套件。
-- 在那台用帳號 `llmgw` 跑 systemd user unit（linger），`llmgw` 不加 docker 群組。安裝、unit、run wrapper、版本、`--check` 在本 repo 的 `deploy/`。
-- 只綁 loopback 與同一台容器看得到的 docker bridge 位址。
-- **資料**：SQLite 只有兩張表：
-  - `cooldowns`（subscription × 窗口 → 結束時刻）；
-  - `audit`（只追加：get 與登錄冷卻的紀錄）。
+- 服務那台跑兩個 systemd user unit（帳號 `llmgw`）：
+  - `llmgateway.service`：lgwd，只綁 127.0.0.1:<本機 API 埠>。
+  - `llmgateway-tunnel.service`：用自己的連線 `ssh -N -R 127.0.0.1:<API 埠>:127.0.0.1:<本機 API 埠> -R 127.0.0.1:<SSH 埠>:127.0.0.1:22 llmgw-relay@<會合機>`，帶 `ExitOnForwardFailure=yes`、`ServerAliveInterval=30`、`ServerAliveCountMax=3`。斷線就結束，由 systemd 立即重啟（`Restart=always`）。**不和池的 pool-tunnel 共用連線**。
+- **健康探針**：只證明 TCP 連著不夠（舊的 listener 可能還在、或被別人佔走），所以探針做端對端的檢查。
+  - 每 60 秒由守護程式經會合機 `ssh -W 127.0.0.1:<API 埠>` 打一次 `GET /v1/subscriptions`，收到任何 HTTP 回應（200 或 401）才算健康。
+  - 連續 3 次失敗就殺掉隧道連線，讓 systemd 重開。
+  - 這個檢查不需要新的介面。
+- 守護程式的設定在 `~/.config/llmgateway/tunnel.env`：會合機（`user@host:port`）、金鑰路徑、known_hosts 路徑、會合機上的 API 埠與 SSH 埠、探針間隔。
+- `--check` 三態加上隧道：0＝兩個 unit 都在跑、版本對、經會合機探得到；1＝確定不成立；2＝無法確認。
+- 舊的 `-R` 還沒被會合機清掉時，新的會因 `ExitOnForwardFailure` 失敗，systemd 會一直重試，直到舊的逾時被清掉（會合機的 `ClientAliveInterval`）。
 
-  key 與 token 只在 key 檔，服務讀進記憶體，token 只存雜湊。
-- `--check` 三態：0＝服務在跑、版本對、`GET /v1/subscriptions` 不帶 token 回 401；1＝確定不成立；2＝無法確認。
+### 決定 4：客戶端：連線程式 `lgw connect`（v4，本人第 7 點）
 
-### 決定 4：認證：一類機器一把讀取 token
+- `lgw` 提供連線程式，函式庫與指令兩種用法。sidecar 的 SubscriptionSource 用函式庫。
+  - 函式庫：`with lgw.connect(cfg) as base_url:`，在本機開一個轉發，回 `http://127.0.0.1:<臨時埠>`；離開時關掉。
+  - 指令：`lgw connect`，前景維持轉發並印出 base URL，給 Mac 與手動除錯用。
+- 做法：`ssh -N -L 127.0.0.1:<臨時埠>:127.0.0.1:<API 埠> [-J <跳板1>,<跳板2>] llmgw-relay@<會合機>`，帶 `ExitOnForwardFailure=yes`、`BatchMode=yes`、`StrictHostKeyChecking=yes`。連不上或中途斷掉就回「無法確認」，由呼叫方等一下再試。
+- 設定（`~/.config/lgw/connect.env`，或 sidecar 設定裡的同名欄位）：
+  - `jumps`：零到多個 `user@host:port`；
+  - `rendezvous`：`llmgw-relay@host:port`；
+  - `identity`：這一類機器的客戶端金鑰路徑；
+  - `known_hosts`：會合機與跳板的 host key；
+  - `remote_api`：會合機上的 API 埠；
+  - `token`：讀取 token 的路徑，只有選 (b) 時才有。
+- worker 與 Mac 都直接連會合機的公開 SSH 埠；需要跳板的環境用 `jumps`。
 
-- 三類：`pool-worker`（池的所有 worker 共用）、`mac`、之後的 `mobile`。
-- token 的值是 GitHub secret，由本人產生並設定，和 key 一起經 `deploy-keys` 放進那台的 key 檔，服務讀進來只存雜湊。換 token＝改 secret＋重新部署，舊的立即失效。
-- 同一個 token 值也要放到用的那一邊：
-  - `pool-worker` 的由 MyLinuxPool 像其他 `POOL_WORKER__*` 一樣掛進 worker（MyLinuxPool#70）；
-  - Mac 的放 `~/.config/lgw/token`（0600）。
-- **沒有發證、撤證的 API**，也沒有角色：持有 token 的就能 list、get、登錄冷卻。
-- **為什麼**：本人要求最少的方式。worker 是拋棄式的，而且每台 worker 本來就拿得到同樣的五把 key，分開發證換不到多少安全性。
-- **代價**：稽核紀錄只分得出類別（`pool-worker`、`mac`），分不出是哪一台 worker（proposal「要本人判斷的」第 3 點）。
+### 決定 5：部署：也走會合機（v4）
 
-### 決定 5：怎麼連到服務（照舊）
+- 本 repo 的 workflow 改成 `ssh -J llmgw-relay@<會合機> -p <SSH 埠> llmgw@127.0.0.1`：
+  - 第一段是會合機上的部署金鑰，只能轉發到 SSH 埠；
+  - 第二段是服務那台 `llmgw` 的 authorized_keys，以 `command="…/current/deploy/remote-deploy.sh",restrict` 強制執行部署腳本，動詞 `keys`／`upgrade <tag>`，照舊。
+- 不再經池的跳板，MyLinuxPool#68 不需要。
+- 一次性開機設定（root，本人做或本人授權）：
+  - 會合機：建 `llmgw-relay`、放三種金鑰；
+  - 服務那台：建 `llmgw`（不加 docker 群組）、linger、放部署公鑰、第一次安裝；
+  - 兩邊確認 sshd 不擋這些帳號。
 
-- Mac：沿用 `mlp` 的 SSH 跳板做本機埠轉送。
-- worker：sidecar 一律連 `http://127.0.0.1:<固定埠>`。同一台走 docker bridge；別台經 MyLinuxPool 的隧道（MyLinuxPool#69）。
-- 手機：之後由 MyAiEntry 的 App 經同一條 SSH 跳板做埠轉送（MyAiEntry#147）。
-- 服務從不對外。
+### 決定 5a：認證，兩案給本人選（本人第 5 點）
+
+| | (a) 去掉應用層認證，安全只靠 SSH | (b) 留一把共用 token（**建議**） |
+|---|---|---|
+| 客戶端要帶的 | 會合機的客戶端金鑰 | 會合機的客戶端金鑰＋共用 token |
+| 誰連得到 API 埠 | 會合機上**所有**能開 TCP 轉發的帳號。若會合機是池的跳板機，包括 sshproxy（所有 provider、worker 的隧道金鑰，以及家人維修機共用的那把）與管理帳號，它們都**沒有** permitopen 限制，都讀得到全部的 key | 同左，但沒有 token 就只回 401 |
+| 要怎麼收窄才安全 | 給會合機上其他能轉發的帳號加 permitopen（池的跳板機上，就是改 MyLinuxPool 的 sshproxy，又回到依賴 MyLinuxPool）；或改用 unix socket 轉發，並調整會合機 sshd 的 `StreamLocalBindUnlink`；或選一台沒有其他人能轉發的會合機 | 不需要；會合機上有誰都不影響 |
+| 換憑證 | 換客戶端金鑰（改會合機的 authorized_keys） | 換 token（改 secret＋重新部署，並更新客戶端） |
+
+- **建議 (b)**：多一把 token，換來「會合機上還有誰」都不影響安全，也不用動 MyLinuxPool。(a) 只有在會合機是一台只給 LLMGateway 用的機器時才划算。
+- token 只有一把，由本人產生，和 key 一起經 `deploy-keys` 放到服務那台（服務只存雜湊），同一個值也放到各客戶端。
+
+### 決定 5b：key 的保管與服務的形狀（照舊）
+
+- **key 的來源**：本 repo 的 GitHub secret，值由本人設，名稱照本人的命名規則（認證方式定了再定 token 的名稱）。
+- **部署腳本**（`remote-deploy.sh`，從 `SSH_ORIGINAL_COMMAND` 以白名單解析）：
+  - `keys`：stdin → 驗證 → 暫存檔 0600 → rename `keys.env` → 重讀。選 (b) 時 stdin 也帶 token。
+  - `upgrade <tag>`：固定 tag 取碼、current 原子切換、重啟。
+  - 值用 stdin 傳、不上命令列；workflow 的 log 只有 secret 名稱；ssh 的錯誤輸出會遮掉位址。
+- **服務**：
+  - Python 標準函式庫，HTTP 用 `ThreadingHTTPServer`、資料用 `sqlite3`，沒有第三方套件；
+  - 帳號 `llmgw` 的 systemd user unit（linger），`llmgw` 不加 docker 群組；
+  - 安裝、unit、run wrapper、版本、`--check` 都在本 repo 的 `deploy/`；
+  - SQLite 只有 `cooldowns`（subscription × 窗口 → 結束時刻）與 `audit`（只追加）；
+  - key 與 token 只在 key 檔，token 只存雜湊。
 
 ### 決定 6：三個介面
 
@@ -135,7 +174,7 @@ JSON over HTTP，`Authorization: Bearer <token>`。
 |---|---|---|
 | 租約五個動作、10 分鐘確認、去重 | 本人要求只有三個介面 | 「誰正在用」、逾期回收 |
 | 同時租用上限 | 沒有租約就算不出「幾個在用」 | 本人先前的風險控管之一（proposal 第 1 點） |
-| 管理 API（issuer）、whoami | 改成一類機器一把 token，部署時放好 | 分辨是哪一台 worker |
+| 管理 API（issuer）、whoami | 改成一把共用 token（或只靠 SSH，見決定 5a），部署時放好 | 分辨是哪一台 worker |
 | 狀態板（JSON／HTML）、用量查詢 | list 已含冷卻與能不能用；用量 % 本人說沒有也行 | 用量 % |
 
 impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢，等 v3 定案後移除或改寫（tasks 1.x）。部署腳本、安裝程式、維運手冊保留。
@@ -143,7 +182,9 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
 ## Risks / Trade-offs
 
 - [公司帳號用完換另一個是灰色地帶，v3 沒有同時上限] → 本人先前已接受灰色地帶；上限的取捨請本人確認（proposal 第 1 點）。冷卻中不硬撞仍成立：sidecar 只挑 `available` 的。
-- [共用 token 外洩 = 所有 worker 能拿的 key 外洩] → 和現在 MyLinuxPool#50 每台 worker 都掛五把 key 的情況相同。換 token 只要改 secret 並重新部署。
+- [共用 token 外洩 = 所有客戶端能拿的 key 外洩] → 和現在 MyLinuxPool#50 每台 worker 都掛五把 key 的情況相同；而且還要有會合機的客戶端金鑰才連得到。換 token 只要改 secret 並重新部署。
+- [會合機若是池的跳板機，可能整台重建] → 重建後 `llmgw-relay` 帳號會不見，要重做會合機的開機設定；隧道守護會一直重試，`--check` 回 1，看得出來。要完全不受影響，就選一台不會被重建的機器當會合機。
+- [舊的 `-R` listener 沒被清掉] → `ExitOnForwardFailure` 讓守護程式重試，直到會合機清掉舊連線；端對端探針確保不是「TCP 通、服務不通」。
 - [sidecar 登錄冷卻依賴它的判讀] → 判讀錯了會讓某把閒置到重置時刻；稽核紀錄看得到是誰登錄的。
 - [key 集中在一台] → 只綁內部介面、只經 SSH 進入、檔案 0600、輪替只要改 secret 並重新部署。
 
@@ -155,8 +196,8 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
    - 移除租約、管理 API、狀態板、用量查詢；
    - `deploy-keys` 加上 token；
    - `lgw` 提供 list／get／登錄冷卻的客戶端。
-3. 本人做一次性的開機設定（決定 3），設 environment 與 secret（tasks 3.3）。
-4. MyLinuxPool：#68、#69 照舊，#70 改成掛 `pool-worker` 的 token。
+3. 本人做一次性的開機設定（決定 5：會合機與服務那台），設 environment 與 secret（tasks 3.3）。
+4. MyLinuxPool：#68、#69 不需要（部署與連線都走會合機）；#70 縮成把客戶端憑證（會合機的客戶端金鑰；選 (b) 時再加 token）掛進 worker。由 PMO 協調。
 5. sidecar v3 接上 list／get／登錄冷卻，在 Mac 與一台 worker 驗收換把。
 6. 另開單把 MyLinuxPool#50 的 key 來源換成 LLMGateway，收掉 MyLinuxPool 裡的 key。
 

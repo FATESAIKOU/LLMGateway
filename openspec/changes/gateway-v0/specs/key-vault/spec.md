@@ -22,25 +22,20 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 - **WHEN** 以憑證樣式掃描 repo、服務資料庫、服務 log 與 list 的回覆
 - **THEN** 沒有任何命中
 
-### Requirement: 一類機器一把讀取 token
-服務 SHALL 以「一類機器一把」的讀取 token 認證客戶端：
-- 池的 worker 共用一把（`pool-worker`）；
-- Mac 一把；
-- 之後的手機一把。
-
-這些 token 與 key 一起由部署流程放到那台，服務只保存雜湊。換掉某一類的 token（改 secret、重新部署）SHALL 讓舊的立即失效。沒有發證或撤證的 API。
+### Requirement: 一把共用的讀取 token
+服務 SHALL 以一把共用的讀取 token 認證所有客戶端（本人在 design 決定 5a 選 (b) 的前提；選 (a) 時本條改為「不做應用層認證」）。token 由本人產生，和 key 一起由部署流程放到服務那台，服務只保存雜湊。換掉 token（改 secret、重新部署）SHALL 讓舊的立即失效。沒有發證或撤證的 API。
 
 #### Scenario: 沒有 token
 - **WHEN** 請求沒有帶 token 或帶錯
 - **THEN** 服務回 401，不回任何 subscription 資料
 
-#### Scenario: 換掉 worker 的 token
-- **WHEN** 本人換掉 `pool-worker` 的 token 並重新部署
+#### Scenario: 換掉 token
+- **WHEN** 本人換掉 token 並重新部署
 - **THEN** 舊 token 之後一律 401，新 token 可以用
 
 ### Requirement: 服務不對外
-服務 SHALL 只綁在那台的 loopback，以及同一台容器看得到的 docker bridge 位址；MUST NOT 對網際網路開放。Mac 與手機 SHALL 經池的 SSH 跳板以埠轉送連入；別台的 worker 經 MyLinuxPool 的隧道連入。
+服務 SHALL 只綁在服務那台的 127.0.0.1；MUST NOT 綁任何對外或容器網路的介面。客戶端只能經會合機（spec `connectivity`）連入。
 
-#### Scenario: 從外部連
-- **WHEN** 從池外直接連服務的埠
+#### Scenario: 從其他介面連
+- **WHEN** 從服務那台以外、或那台的非 loopback 介面連服務的埠
 - **THEN** 連不上
