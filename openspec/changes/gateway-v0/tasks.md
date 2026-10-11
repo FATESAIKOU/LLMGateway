@@ -53,8 +53,13 @@
   - MyLinuxPool#69：worker 連到服務的路；
   - MyLinuxPool#70：worker 客戶端憑證的發、撤、核對。
 - [ ] 3.1a 本人選服務放哪一台常駐 provider（MyLinuxPool#67）
-- [ ] 3.2 `deploy-keys` workflow：手動觸發、用部署專用金鑰經跳板（只能轉發）到 provider（只能跑部署腳本）、以 stdin 傳值；log 只有 secret 名稱
-- [ ] 3.3 本人設五把 secret（PMO 帶本人設，AI 不經手值）→ 跑 `deploy-keys`
+- [ ] 3.2（草稿已寫，branch `impl/gateway-v0-core`）`deploy-keys` workflow：手動觸發、用部署專用金鑰經跳板（只能轉發）到 provider（只能跑部署腳本）、以 stdin 傳值；log 只有 secret 名稱
+- [ ] 3.3 本人設定（PMO 帶本人做，AI 不經手值）：
+  - environment「llmgateway-deploy」，required reviewer 設本人；
+  - secret 的名字照本人的命名規則 `<存取方>__<被存取方>__<動作>`：
+    - 部署 4 個：`GH_LLMGATEWAY__POOL_SSH__DEPLOY`（部署專用私鑰）、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS`（用 MyLinuxPool 提供的指紋，不用 ssh-keyscan）、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP`、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET`（`user@127.0.0.1:<埠>`，和 permitopen 字面一致）；
+    - key 5 個：`POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM`、`POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM`、`POOL_LLMGATEWAY__OPENROUTER_API__LLM`、`POOL_LLMGATEWAY__OPENCODE_ZEN__LLM`、`POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM`；
+  - 之後跑 `deploy-keys`。
 - [ ] 3.4 發客戶端憑證：Mac 一把由 PM 在 provider 上發；worker 的由 create-worker 自動發（MyLinuxPool#70）
 - [ ] 3.5 綁定驗收：從池外與 worker 介面連 HTML 狀態板連不上；從池外連 API 連不上
 
