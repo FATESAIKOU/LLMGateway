@@ -67,6 +67,10 @@ jobs:
         run: |
           set -eu -o pipefail
           test -n "$JUMP" && test -n "$TARGET" || { echo "deploy connection secrets are not set" >&2; exit 2; }
+          if [ -z "$K_CLAUDE_PERSONAL" ] && [ -z "$K_CLAUDE_COMPANY" ] && [ -z "$K_OPENROUTER" ] && [ -z "$K_OPENCODE_ZEN" ] && [ -z "$K_OLLAMA" ]; then
+            echo "all key secrets are empty: POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM, POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM, POOL_LLMGATEWAY__OPENROUTER_API__LLM, POOL_LLMGATEWAY__OPENCODE_ZEN__LLM, POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM" >&2
+            exit 2
+          fi
           target_user_host="${TARGET%:*}"
           target_port="${TARGET##*:}"
           jump_host="${JUMP#*@}"; jump_host="${jump_host%:*}"

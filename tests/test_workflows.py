@@ -158,6 +158,47 @@ class DeployKeysWorkflowTests(WorkflowChecks, unittest.TestCase):
     def test_keys_verb_is_last_argument(self):
         self.assertRegex(ssh_lines(self.text)[0], r"\bkeys \\$")
 
+    def test_all_keys_empty_check(self):
+        send_step = step_lines(self.text, "Send key file over stdin")
+        check_text = "\n".join(send_step)
+        secret_names = [
+            "POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM",
+            "POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM",
+            "POOL_LLMGATEWAY__OPENROUTER_API__LLM",
+            "POOL_LLMGATEWAY__OPENCODE_ZEN__LLM",
+            "POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM",
+        ]
+        for name in secret_names:
+            self.assertIn(name, check_text)
+        self.assertIn("exit 2", check_text)
+
+        # 擷取檢查區塊在 bash 中驗證行為
+        m = re.search(
+            r"(if\s+\[\s+-z\s+\"\$K_CLAUDE_PERSONAL\".*?fi)",
+            check_text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(m, "all keys empty check block not found")
+        block = m.group(1)
+
+        # 情況 A: 全為空值 -> 失敗退出 (rc=2)，訊息含 secret 名稱
+        proc_fail = subprocess.run(
+            ["bash", "-c", f"set -e; K_CLAUDE_PERSONAL='' K_CLAUDE_COMPANY='' K_OPENROUTER='' K_OPENCODE_ZEN='' K_OLLAMA=''; {block}"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc_fail.returncode, 2)
+        for name in secret_names:
+            self.assertIn(name, proc_fail.stderr)
+
+        # 情況 B: 至少一把有值（例如只有 OpenRouter） -> 通過
+        proc_ok = subprocess.run(
+            ["bash", "-c", f"set -e; K_CLAUDE_PERSONAL='' K_CLAUDE_COMPANY='' K_OPENROUTER='sk-test' K_OPENCODE_ZEN='' K_OLLAMA=''; {block}"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc_ok.returncode, 0)
+
 
 class DeployServiceWorkflowTests(WorkflowChecks, unittest.TestCase):
     name = "deploy-service.yml"
