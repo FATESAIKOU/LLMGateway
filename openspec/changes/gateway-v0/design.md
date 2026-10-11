@@ -79,26 +79,47 @@
 
 ### 決定 6：租用 API
 
-JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑證>` 認身分。每個會改變狀態的請求都帶客戶端產生的 `request_id`，用來去重。
+- JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑證>` 認身分。
+- 時刻一律用 RFC 3339 的 UTC 字串。
+- 每個會改變狀態的請求都帶客戶端產生的 `request_id`（去重見決定 12）。
+- 每個回覆都帶 `api_version`（v0 是 `1`）。
+
+**租約物件**（`lease`）：`{lease_id, subscription, agent, model, env, unset, expires_at, confirm_by}`。`env` 與 `unset` 只出現在核准的那一次回覆，之後查詢都不帶。
 
 | 方法 | 路徑 | 請求 | 成功回傳 |
 |---|---|---|---|
-| POST | `/v1/leases` | `worker, role, agent, model?, subscription?, purpose?, preferences?, request_id` | `201 {lease_id, subscription, env, unset, expires_at}` |
-| POST | `/v1/leases/{id}/exhausted` | `signal, resets_at?, request_id` | `200 {next: <同上> }`，或 `200 {next: null, refusal: {...}}` |
+| POST | `/v1/leases` | `worker, role, agent, instance, model?, subscription?, purpose?, preferences?, request_id` | `201 {lease}` |
+| POST | `/v1/leases/{id}/start` | `request_id` | `200 {expires_at}`：確認 agent 已經開起來，granted → active |
+| POST | `/v1/leases/{id}/exhausted` | `signal, resets_at?, request_id` | `200 {next: lease}`，或 `200 {next: null, refusal}` |
 | POST | `/v1/leases/{id}/renew` | `request_id` | `200 {expires_at}` |
 | POST | `/v1/leases/{id}/usage` | `snapshot` | `204` |
-| POST | `/v1/leases/{id}/release` | `reason?, request_id` | `204` |
+| POST | `/v1/leases/{id}/release` | `reason?, request_id` | `204`（重複 release 也回 204） |
 | GET | `/v1/board` | — | `200 {subscriptions: [...]}` |
-| GET | `/board` | — | 唯讀 HTML |
 
-- **拒絕**：`409 {reason, earliest_reset?}`。`reason` 是以下其中之一：
-  - `all_cooling`：可選的都在冷卻；
-  - `cap_reached`：可選的都達同時租用上限；
-  - `not_allowed`：政策不允許；
-  - `below_floor`：保留給「之後」的底線模型；
-  - `client_mismatch`：worker 與客戶端憑證不符。
-- **逾期與續期**：租約效期預設 12 小時，客戶端每小時 renew。過期的租約在下一次任何往來時補記為 expired（期 1 的延後結算，服務常駐後也照用，邏輯比較單純）。
-- **`agent`**：值為 `claude-code` 或 `opencode`。sidecar 內部的 `claude`、`opencode` 由它自己對應。
+**欄位說明**
+- `agent`：`claude-code` 或 `opencode`。sidecar 內部的 `claude`、`opencode` 由它自己對應。
+- `instance`：客戶端給每個 agent 的 id，例如 sidecar registry 裡的 agent id。同一個客戶端的同一個 `instance` 只能有一張未結束的租約。
+- `model`：可空；空的就是該訂閱在政策檔裡的預設模型。
+- `signal`（列舉）：`claude_limit`、`zen_free_limit`、`zen_go_limit`、`credit_limit`、`openrouter_limit`、`ollama_limit`、`other`。
+
+**錯誤**
+- `400 bad_request`：欄位缺漏或格式不合，附缺的欄位。
+- `401`：沒有或錯誤的客戶端憑證。
+- `403 client_mismatch`：worker 與客戶端憑證登記的名稱不符。
+- `403 not_owner`：動到別的客戶端的租約。
+- `404 not_found`：租約不存在。
+- `409 lease_not_active`：對已結束的租約做 start、renew、exhausted。
+- `409 {reason, earliest_reset?}`（**拒絕**）：
+  - `not_allowed`：政策不允許這個組合，或模型不在允許清單；
+  - `instance_busy`：同一個 `instance` 已有未結束的租約；
+  - `cap_reached`：可選的訂閱裡至少有一個不在冷卻，但這些都已達上限；
+  - `all_cooling`：可選的訂閱全在冷卻，附最早的冷卻結束時刻；
+  - `below_floor`：保留給「之後」的底線模型，v0 不會出現。
+  - 判定順序：先看 `not_allowed`，再看 `instance_busy`，最後才看可用性（`cap_reached` 或 `all_cooling`）。
+
+**有效期限**
+- 租約效期預設 12 小時，客戶端每小時 renew。
+- granted 之後 10 分鐘內沒有 `start`，租約記為 expired（理由：未確認）。這樣「換把時已發出新租約、agent 卻沒開起來」的租約不會占著名額 12 小時。
 
 ### 決定 7：env 的內容
 
@@ -115,34 +136,45 @@ JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑�
 ### 決定 8：選把、冷卻、同時租用上限
 
 - **政策檔** `policy/default.json`（repo 內，不含秘密）：
-  - 每種 agent 的訂閱順序：`claude-code: [claude-personal, claude-company]`、`opencode: [opencode-zen, openrouter, ollama-cloud]`；
-  - 每個訂閱允許的模型：`openrouter` 只允許 `:free`；
-  - 每個訂閱的同時租用上限：Claude 兩把各 2，其他不設；
-  - 每個訂閱的預設冷卻時間。
-- **選把**：申請沒有指定訂閱時，照順序取第一個「沒有冷卻、未達上限、政策允許」的；都不行就拒絕，`earliest_reset` 填最早的重置時間。指定了訂閱的，只看那一把。
+  - 每種 agent 的訂閱順序：`claude-code: [claude-personal, claude-company]`、`opencode: [opencode-zen, openrouter, ollama-cloud]`。v0 的 `claude-code` 順序**不含** `openrouter`、`ollama-cloud`，有測試鎖住。
+  - 每個訂閱允許的模型與預設模型：`openrouter` 只允許名稱以 `:free` 結尾的模型。
+  - 每個訂閱的同時租用上限：Claude 兩把各 2，其他不設。
+  - 每個訂閱的預設冷卻時間（見下）。
+- **選把**：申請沒有指定訂閱時，照順序取第一個「沒有冷卻、未達上限、政策允許」的；都不行就拒絕（理由與判定順序見決定 6）。指定了訂閱的，只看那一把。
 - **冷卻**：
-  - 冷卻到 `resets_at` 再加 2 分鐘緩衝。沒有 `resets_at` 時用政策檔的預設：Claude 5 小時、Ollama 5 小時、Zen 依 `retry-after`（沒有就 1 小時）、OpenRouter 1 小時。寧可等久一點，也不在冷卻中硬撞。
-  - 冷卻中的訂閱一律不出租、不試探。
-- **只有額度用完才觸發**：客戶端只在判讀為「額度用完」時呼叫 `exhausted`。短暫的 429 由 agent 自己重試。
-- **同一個 agent 不同時拿兩把**：`exhausted` 會先結束原租約，再發新的。
-- **擴充點**：`preferences: {preferred_models, floor_model}` 存進 granted 事件，v0 的選把邏輯不看它。之後選把改成「在底線之上照優先順序選」，介面不變。
+  - 冷卻到 `resets_at` 再加 2 分鐘緩衝。
+  - 沒有 `resets_at` 時用政策檔的預設，寧可等久一點，也不在冷卻中硬撞：
+    - Claude 5 小時：官方 status line 的 `five_hour` 窗口，<https://code.claude.com/docs/en/statusline>；
+    - Ollama 5 小時：官方 session 用量窗口，<https://ollama.com/blog/launch>；
+    - Zen 依 `retry-after`，上限 24 小時，沒有就 1 小時：<https://github.com/anomalyco/opencode/pull/49195>；
+    - OpenRouter 1 小時。
+  - `resets_at` 若在過去，或在 8 天以後（看起來不合理），就忽略它、改用預設。
+  - 冷卻中的訂閱一律不出租、不試探。冷卻只影響新的出租：冷卻中訂閱上已經 active 的其他租約照常可以 renew（它們可能還在正常使用另一個 session）。
+- **只有額度用完才觸發**：客戶端只在判讀為「額度用完」時呼叫 `exhausted`（規則見決定 9）。短暫的 402／429 由 agent 自己重試。
+- **同一個 agent 不同時拿兩把**：靠 `instance`（決定 6）擋住直接申請兩次；`exhausted` 先結束原租約，再發新的。
+- **擴充點**：`preferences: {preferred_models, floor_model}` 存進 granted 事件，v0 的選把邏輯不看它。之後選把改成「在底線之上照優先順序選，沒有就拒絕 `below_floor`」，介面不變。「平均分攤」留在政策檔的選項裡（期 1 的設計），v0 的初始政策不用它。
 
 ### 決定 9：換把程序只有一份，放在 sidecar 的 agent 宿主；`lgw` 只給 API 客戶端與訊號規則
 
 - **本 repo 的 `lgw`**：Python 套件，只用標準函式庫，不綁 herdr、agora。內容：
   1. **API 客戶端**：base URL 與客戶端憑證路徑可設定；連不上時回報「無法確認」，不丟例外讓呼叫方當掉。
-  2. **訊號規則**：輸入 agent 的畫面文字，輸出「額度用完（含重置時刻或無）」「暫時錯誤」或「正常」。規則照 `quota-signals.md`：
-     - Claude Code 的 `You've hit your … limit · resets …`；
-     - opencode 的 `Free usage exceeded`、`usage limit reached` 與 402／429。
+  2. **訊號規則**：輸入 agent 的畫面文字，輸出「額度用完（含 `signal` 與重置時刻或無）」「暫時錯誤」或「正常」。規則照 `quota-signals.md`：
+     - Claude Code：`You've hit your (session|weekly|Opus|Sonnet) limit · resets …` → `claude_limit`；
+     - opencode 對 Zen：`FreeUsageLimitError`／`Free usage exceeded` → `zen_free_limit`；`GoUsageLimitError`／`usage limit reached. It will reset in …` → `zen_go_limit`；`CreditLimitExceeded` → `credit_limit`。訊息內容的標記優先於狀態碼。
+     - OpenRouter：402 且 `limit_source` 不是 in-flight 預算 → `openrouter_limit`。in-flight 預算的 402 是暫時錯誤。
+     - Ollama Cloud：429 且訊息含 `session usage limit` 或 `weekly usage limit` → `ollama_limit`。
+     - **沒有額度標記的 402／429 一律判為「暫時錯誤」**，不換把。
 
-     規則放資料表，可以單獨更新與測試。
-  3. **管理命令**：`lgw admin client add|revoke|list`，在 provider 上用。
-- **換把程序在 MyAiStorage 的 sidecar 裡（agent 宿主）**：
+     規則放資料表，正反兩面都用 `quota-signals.md` 的樣本測試。
+  3. **opencode 設定**：`client/opencode.json`（模型清單、base URL，key 用 `{env:...}` 讀）隨 `lgw` 一起打包，sidecar 用 `lgw` 提供的路徑把它指給 opencode（`OPENCODE_CONFIG`）。
+  4. **管理命令**：`lgw admin client add|revoke|list`，在 provider 上用。
+- **換把程序在 MyAiStorage 的 sidecar 裡（agent 宿主）**。以下是轉述，規格以 MyAiStorage#31 為準，那邊改了以那邊為準：
   - 開 agent：`herdr tab create --env` 帶 env；unset 用 `env -u NAME`；Claude Code 加 `--settings` 關掉 `autoContinueAtUsageLimit`。
   - 判讀：用 `herdr agent read` 讀畫面，交給 `lgw` 的規則判讀。
   - 安全結束：`herdr agent send-keys <name> ctrl+c` 讓 agent 收尾，由 agora continue 做最後寫回；5 秒後還在就對 process group 送 SIGTERM，再 5 秒送 SIGKILL，最後才 `pane close`。
   - 打斷一輪而不結束 agent 時用 Esc（Claude Code 1 次、opencode 2 次）。
-  - 接回：`agora continue session <Session> --agent <agent> --sync-period <分鐘>`，不用 `--fork`。
+  - 開起來之後呼叫 `start` 確認租約。
+  - 接回：`agora continue session <Session> --agent <agent> --sync-period <分鐘>`，不用 `--fork`；session id 的寫法照 sidecar 既有的慣例。
   - 這些都是 sidecar 已有、已審過的生命週期程式（MyAiStorage#31 的 D4 與 10-11 的 spike）。
 - **誰呼叫**：
   - worker：sidecar 常駐，依賴 `lgw`（從本 repo 的固定 ref 裝進 sidecar 的 venv）。
@@ -165,14 +197,33 @@ JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑�
 
 ### 決定 11：狀態板
 
-- `GET /v1/board` 對每把回傳：
+- `GET /v1/board`（要客戶端憑證）對每把回傳：
   - 使用中的租約（worker、角色、agent、開始時刻）；
   - 數量／上限；
   - 是否冷卻與冷卻到何時；
-  - 用量（有就給）：OpenRouter 由服務每 5 分鐘查一次 `GET /api/v1/key`；Ollama 每 5 分鐘查一次 `GET /api/balance`（上限每分鐘 10 次）；Claude 與 Zen 顯示「未知」。
-- `/board` 是同一份資料的唯讀 HTML。
-- 從不顯示 key 的值。
+  - 部署狀態：key 檔裡沒有這把就是「未部署」；
+  - 用量：
+    - OpenRouter：服務每 5 分鐘查一次 `GET /api/v1/key`；
+    - Ollama：每 5 分鐘查一次 `GET /api/balance`（官方上限每分鐘 10 次）；
+    - 兩個查詢都有 10 秒逾時、在獨立的執行緒，失敗不影響租用；上游回 401 時顯示「key 無效」；查詢失敗時顯示「未知」與最後一次成功的時刻；
+    - Claude 與 Zen 顯示「未知」。
+- **HTML 版**（`/board`）只綁在 provider 的 **loopback**（不開在 worker 看得到的介面），不要客戶端憑證、唯讀。Mac 經 SSH 埠轉送後用瀏覽器開。客戶端憑證永遠不放進 URL。
+- 從不顯示 key 的值。狀態板含 worker 名稱（Mac 是主機名），只在池內、經 SSH 通道看得到。
 - 期 1 `usage-record` 的 token 回報（OTel、opencode export）不在 v0，`report_usage` 介面先留著。
+
+### 決定 12：一致性、邊界與錯誤處理
+
+- **交易**：每個會改變狀態的 API 動作是一筆 SQLite 交易（`BEGIN IMMEDIATE`）。例如 `exhausted` 的「設冷卻＋原租約 superseded＋發下一張」要嘛全成、要嘛全不成，服務中途當掉也不會留下一半。搶最後一個上限名額也在同一筆交易裡判定。
+- **去重**：以（客戶端，`request_id`）為鍵，把第一次的回覆存進資料庫保留 7 天；重送時回同一份回覆，跨重啟也有效。同一張租約用不同的 `request_id` 再回報 `exhausted`，回 `409 lease_not_active`，不會發出第二張。
+- **時鐘**：服務的「現在」經可替換的 clock 介面取得（測試用假時鐘）。冷卻在 `now < 結束時刻` 時算冷卻中，等於就算結束。
+- **逾期結算**：任何一次經過認證的請求（包含讀狀態板）都先補記已過期的租約，再處理該請求。
+- **key 檔重讀**：`deploy-keys` 以「寫暫存檔再 rename」原子替換。SIGHUP 重讀失敗時（檔案損壞、格式錯）沿用舊的 key，並在狀態板與 log 標示重讀失敗。值是空字串視同沒部署。已經發出的租約不受重讀影響。
+- **撤銷客戶端**：撤銷時，該客戶端所有未結束的租約一起記為 revoked。
+- **拒絕的紀錄**：經過認證的申請被拒時，記一筆 `denied` 事件（不含任何值），供 PMO 追溯。`400`、`401` 不算租約，只記在服務 log，而且不記請求內容。
+- **輸入限制**：`worker` ≤ 64 字、`role` ≤ 128 字、`purpose` ≤ 256 字，只收可列印字元。HTML 輸出一律跳脫。
+- **事件的保存**：`events` 只追加；超過 180 天的事件每月匯出成壓縮檔、再從資料庫刪除。匯出檔同樣不含值。
+- **政策檔**：啟動與 SIGHUP 時驗證；不合法就拒絕套用、沿用舊的（啟動時則不啟動）。
+- **版本**：`lgw` 用 git tag（`lgw-vX.Y.Z`）發版，sidecar 固定在某個 tag。API 不相容的改變要升 `api_version`，並事先通知 aistorage-pm。`lgw` 遇到不認得的拒絕理由，一律當一般拒絕處理。
 
 ## Risks / Trade-offs
 
@@ -202,4 +253,3 @@ JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑�
 ## Open Questions
 
 - opencode 讀各上游 key 的確切變數名，以及 Ollama 的 Anthropic 相容位址：照官方文件，實作時實打確認。不影響形狀。
-- `agora continue` 接 agent 自己的 session id 的寫法（id 前綴）：實作時確認。

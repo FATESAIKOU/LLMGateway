@@ -8,7 +8,8 @@
 - 角色（不透明字串；格式待 Angareion 的身分表示定案後對齊）；
 - 訂閱（`claude-personal`、`claude-company`、`openrouter`、`opencode-zen`、`ollama-cloud` 其中之一）；
 - coding agent（`claude-code` 或 `opencode`）；
-- 模型；
+- agent 實例（客戶端給每個 agent 的 id；同一個客戶端的同一個實例只能有一張未結束的租約）；
+- 模型（申請時可空，空的就是該訂閱在政策檔裡的預設模型）；
 - 來由（工單參照，可空）；
 - preferences（可空）；
 - 申請時刻、有效期限、狀態。
@@ -27,6 +28,10 @@
 - **WHEN** 申請帶有優先模型清單與底線模型
 - **THEN** granted 事件記下 preferences，選到的訂閱與沒帶 preferences 時相同
 
+#### Scenario: 同一個 agent 實例申請兩次
+- **WHEN** 某個 agent 實例已有一張未結束的租約，同一個客戶端又以同一個實例申請
+- **THEN** LLMGateway 拒絕，理由為 `instance_busy`
+
 #### Scenario: 客戶端冒用 worker 名稱
 - **WHEN** 客戶端憑證登記的名稱與申請的 worker 不符
 - **THEN** LLMGateway 拒絕申請，理由為 `client_mismatch`
@@ -36,7 +41,7 @@
 - `claude-code`：`claude-personal` → `claude-company`；
 - `opencode`：`opencode-zen` → `openrouter`（只允許免費模型）→ `ollama-cloud`。
 
-選出的訂閱與選定理由 MUST 記在 granted 事件。
+v0 的 `claude-code` 順序 MUST NOT 含 `openrouter` 或 `ollama-cloud`。申請的模型不在該訂閱的允許清單時，MUST 拒絕（`not_allowed`）。選出的訂閱與選定理由 MUST 記在 granted 事件。
 
 #### Scenario: 不指定訂閱
 - **WHEN** coding agent 為 `claude-code`，申請沒有指定訂閱，且 `claude-personal` 不在冷卻中、未達上限
@@ -49,6 +54,10 @@
 #### Scenario: 全部都在冷卻中
 - **WHEN** 該 coding agent 順序中的訂閱全部在冷卻中
 - **THEN** 租約狀態為 denied，理由為 `all_cooling`，並附最早的冷卻結束時刻
+
+#### Scenario: 模型不在允許清單
+- **WHEN** coding agent 為 `opencode`，申請指定 `openrouter` 與一個名稱不以 `:free` 結尾的模型
+- **THEN** LLMGateway 拒絕，理由為 `not_allowed`
 
 #### Scenario: 冷卻結束後回到第一順位
 - **WHEN** `claude-personal` 的冷卻結束時刻已過，之後有新的 `claude-code` 申請
@@ -106,7 +115,7 @@
 - **THEN** 原租約記為 superseded，`claude-personal` 冷卻到 3:47pm，下一張租約訂閱為 `claude-company`，agent 以新 env 重開並接回原 session
 
 #### Scenario: 短暫限流不換把
-- **WHEN** agent 出現暫時性的 429 並自行重試
+- **WHEN** agent 出現沒有額度標記的 429，或 OpenRouter 因 in-flight 預算回 402，並自行重試
 - **THEN** launcher 不回報額度用完，租約不變
 
 #### Scenario: 可用的訂閱都用完
@@ -152,3 +161,14 @@
 #### Scenario: 結束後釋出
 - **WHEN** `claude-personal` 的一張租約 released 或 expired
 - **THEN** 下一個 `claude-code` 申請可以再拿到 `claude-personal`
+
+### Requirement: 租約要在啟動後確認
+launcher SHALL 在 agent 開起來之後呼叫 start 確認租約，租約才從 granted 變成 active。granted 之後 10 分鐘內沒有確認的租約，MUST 記為 expired（理由：未確認），並釋出它占用的同時租用名額。
+
+#### Scenario: 正常確認
+- **WHEN** launcher 拿到租約、開起 agent，並在 10 分鐘內呼叫 start
+- **THEN** 租約變成 active，有效期限從確認時起算
+
+#### Scenario: 換把後沒開起來
+- **WHEN** 回報額度用完後拿到下一張租約，但重開 agent 失敗，10 分鐘內沒有呼叫 start
+- **THEN** 那張租約記為 expired（理由：未確認），不再占用 `claude-company` 的同時租用名額

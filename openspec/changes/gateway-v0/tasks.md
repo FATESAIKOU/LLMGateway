@@ -1,45 +1,75 @@
-## 1. 租用服務（本 repo，假 key、假上游）
+## 1. 租用服務（本 repo；假 key、假上游、假時鐘）
 
-- [ ] 1.1 專案骨架：`server/`（服務）、`lgw/`（客戶端模組）、`policy/default.json`、`client/opencode.json`；只用 Python 標準函式庫；測試用 `unittest`
-- [ ] 1.2 SQLite：`events`（只追加、單調序號）、`leases`、`cooldowns`、`clients`；重啟時從 `events` 重建
-- [ ] 1.3 客戶端憑證：`lgw admin client add|revoke|list`，只存雜湊；請求認身分；worker 名稱與客戶端相符的檢查
-- [ ] 1.4 `POST /v1/leases`：欄位檢查、依政策選定（順序、冷卻、上限）、回 `env`／`unset`、`preferences` 只記錄；拒絕的理由與 `earliest_reset`
-- [ ] 1.5 `POST /v1/leases/{id}/exhausted`：設冷卻（重置時刻＋2 分鐘，或政策的預設）、原租約 superseded、同一次回覆給下一張或拒絕
-- [ ] 1.6 `renew`、`release`、`usage`；延後結算的逾期；`request_id` 去重
-- [ ] 1.7 key 檔讀取與 SIGHUP 重讀；值不進事件、log、錯誤訊息
-- [ ] 1.8 env 對照表（設計決定 7）：Claude 兩把只給 `claude-code`；Zen 只給 `opencode`；`unset` 清單
-- [ ] 1.9 狀態板：`GET /v1/board`（JSON）與 `/board`（唯讀 HTML）；OpenRouter `/api/v1/key` 與 Ollama `/api/balance` 的定期查詢（可關、失敗不影響租用）；Claude 與 Zen 顯示「未知」
-- [ ] 1.10 測試：spec 的每個 Scenario 都有對應測試；憑證樣式掃描事件、log、狀態板輸出
+- [ ] 1.1 專案骨架：`server/`（服務）、`lgw/`（API 客戶端、訊號規則、管理命令）、`policy/default.json`（內容照設計決定 8）、`client/opencode.json`；只用 Python 標準函式庫；測試用 `unittest`；「現在」經可替換的 clock 介面
+- [ ] 1.2 SQLite：`events`（只追加、單調序號）、`leases`、`cooldowns`、`clients`、去重表；每個改變狀態的動作一筆 `BEGIN IMMEDIATE` 交易；重啟時從 `events` 重建
+- [ ] 1.3 客戶端憑證：`lgw admin client add|revoke|list`；32 bytes 隨機值，只存 SHA-256；撤銷時一併 revoke 該客戶端未結束的租約；worker 名稱與客戶端相符的檢查
+- [ ] 1.4 `POST /v1/leases`：
+  - 欄位與長度檢查；`instance` 唯一；
+  - 依政策選定（順序、冷卻、上限、模型允許清單）；
+  - 拒絕的判定順序：`not_allowed` → `instance_busy` → `cap_reached`／`all_cooling`；被拒時記 `denied` 事件；
+  - 回租約物件；`preferences` 只記錄。
+- [ ] 1.5 `POST /v1/leases/{id}/start`：granted → active；10 分鐘未確認的記為 expired
+- [ ] 1.6 `POST /v1/leases/{id}/exhausted`：同一筆交易內設冷卻（重置時刻＋2 分鐘；不合理或沒有時用預設）、原租約 superseded、給下一張或拒絕
+- [ ] 1.7 `renew`、`release`（重複也回 204）、`usage`；延後結算的逾期（任何經認證的請求都先結算）；（客戶端，`request_id`）去重存 7 天、跨重啟有效；錯誤碼照設計決定 6
+- [ ] 1.8 key 檔：讀取、SIGHUP 重讀（失敗沿用舊的、空字串視同沒部署）；值不進事件、log、錯誤訊息
+- [ ] 1.9 env 對照表（設計決定 7）：Claude 兩把只給 `claude-code`；Zen 只給 `opencode`；`unset` 清單；`claude-code` 的順序不含 `openrouter`、`ollama-cloud`（測試鎖住）
+- [ ] 1.10 狀態板：
+  - `GET /v1/board`（要憑證）；`/board` HTML 只綁 loopback、不要憑證、輸出跳脫；
+  - 顯示未部署、key 無效、未知與最後成功時刻；
+  - OpenRouter `/api/v1/key` 與 Ollama `/api/balance` 的定期查詢：10 秒逾時、獨立執行緒、可關、失敗不影響租用。
+- [ ] 1.11 政策檔驗證（不合法就不套用）；`events` 超過 180 天每月匯出壓縮檔再刪除
+- [ ] 1.12 測試：
+  - spec 中**服務端**的每個 Scenario 都有測試（launcher 端的由 2.4 交接與 4.5 驗收）；
+  - `exhausted` 併發與中途當掉的一致性；
+  - 冷卻邊界（等於結束時刻即結束）；
+  - canary 值掃描事件、log、狀態板輸出。
 
-## 2. 客戶端模組 `lgw`（API 客戶端＋訊號規則；換把程序在 sidecar）
+## 2. `lgw`（API 客戶端＋訊號規則；換把程序在 sidecar）
 
-- [ ] 2.1 API 客戶端：base URL 與客戶端憑證路徑可設定；連不上時回「無法確認」，不丟例外
-- [ ] 2.2 訊號判讀：規則用資料表（Claude Code 的 `You've hit your … limit · resets …`、opencode 的 `Free usage exceeded`、`usage limit reached`、402／429）；解析重置時刻；用 `quota-signals.md` 的樣本寫測試
-- [ ] 2.3 把 `lgw` 打包成可從固定 ref 安裝（給 sidecar 的 venv 與 Mac），標準函式庫以外沒有依賴
-- [ ] 2.4 和 aistorage-pm 交接：sidecar 的換把程序（開 agent 帶 env、`--settings` 關掉 autoContinue、判讀、安全結束、`exhausted`、接回）改用 `lgw`；`sidecar agent run claude|opencode` 作為 Mac 的入口，沒有 Mac 專用分支（MyAiStorage 那邊實作）
-- [ ] 2.5 測試：`lgw` 的 API 客戶端對假服務的每種回覆（核准、各種拒絕、連不上）；訊號規則用 `quota-signals.md` 的樣本
+- [ ] 2.1 API 客戶端：base URL 與客戶端憑證路徑可設定；連不上時回「無法確認」，不丟例外；不認得的拒絕理由當一般拒絕
+- [ ] 2.2 訊號規則（設計決定 9），用資料表、帶 `signal`：
+  - Claude：`You've hit your … limit · resets …`；
+  - Zen：`FreeUsageLimitError`／`GoUsageLimitError`／`CreditLimitExceeded`（訊息標記優先於狀態碼）；
+  - OpenRouter：402 且 `limit_source` 不是 in-flight；
+  - Ollama：429 且含 session／weekly usage limit；
+  - **沒有額度標記的 402／429 判為暫時錯誤**；
+  - 正反兩面都用 `quota-signals.md` 的樣本測試。
+- [ ] 2.3 打包與版本：以 git tag `lgw-vX.Y.Z` 發版，可從 tag 安裝，標準函式庫以外沒有依賴；`client/opencode.json` 隨套件提供路徑；測試鎖住 `lgw` 不引用 `subprocess`、herdr、agora
+- [ ] 2.4 和 aistorage-pm 交接（MyAiStorage 那邊實作）：
+  - sidecar 的換把程序改用 `lgw`：開 agent 帶 env、`--settings` 關掉 autoContinue、開起後呼叫 `start`、判讀、安全結束、`exhausted`、接回；
+  - session id 寫法照 sidecar 慣例；
+  - 通知失敗留在本機重試、補送恰一則；
+  - 冷卻結束不主動重開；
+  - `sidecar agent run claude|opencode` 作為 Mac 的入口，沒有 Mac 專用分支，同一套測試參數化兩種模式。
+  - **Mac 的驗收（4.1～4.3）blocked by 這一項。**
+- [ ] 2.5 測試：`lgw` 的 API 客戶端對假服務的每種回覆（核准、各種拒絕、各種錯誤、連不上）
 
 ## 3. 部署（需要 MyLinuxPool 的工單）
 
-- [ ] 3.1 開 MyLinuxPool 的單：服務的 shared-config 單元、本 repo Actions 的 client 身分、worker 容器連到服務的路、客戶端憑證放進 `/run/mlp-secrets/`
-- [ ] 3.2 `deploy-keys` workflow：手動觸發、經跳板寫 key 檔（stdin 傳值）、送 SIGHUP；log 只有 secret 名稱
+- [ ] 3.1 開 MyLinuxPool 的單：
+  - 服務的 shared-config 單元（API 綁 loopback 與 worker 看得到的內部介面，HTML 只綁 loopback）；
+  - 本 repo Actions 的 client 身分；
+  - worker 容器連到服務的路；
+  - 客戶端憑證放進 `/run/mlp-secrets/`。
+- [ ] 3.2 `deploy-keys` workflow：手動觸發、經跳板以 stdin 傳值、寫暫存檔再 rename、送 SIGHUP；log 只有 secret 名稱
 - [ ] 3.3 本人設五把 secret（PMO 帶本人設，AI 不經手值）→ 跑 `deploy-keys`
 - [ ] 3.4 在 provider 上發客戶端憑證：Mac 一把、每台 worker 一把
+- [ ] 3.5 綁定驗收：從池外與 worker 介面連 HTML 狀態板連不上；從池外連 API 連不上
 
 ## 4. 驗收
 
-- [ ] 4.1 Mac：`sidecar agent run claude` 開出的 Claude Code 回得了一則最短的訊息；事件與 release 齊全；agent 環境只有那一把
-- [ ] 4.2 Mac：用假的額度用完訊號換把（`claude-personal` → `claude-company`），自動重開並接回；冷卻到期後新開的回到 `claude-personal`
+- [ ] 4.1 Mac：`sidecar agent run claude` 開出的 Claude Code 回得了一則最短的訊息；事件（含 start、release）齊全；agent 環境只有那一把
+- [ ] 4.2 Mac：用假的額度用完訊號換把（`claude-personal` → `claude-company`），自動重開並接回；冷卻到期後新開的回到 `claude-personal`；短暫 429 不換把
 - [ ] 4.3 Mac：`sidecar agent run opencode` 對 Zen、OpenRouter（免費模型）、Ollama Cloud 各跑通一次
 - [ ] 4.4 要用 key 的驗證（PM 或本人）：OpenRouter、Ollama Cloud 讓 Claude Code 跑一則最短的訊息；Ollama `GET /api/balance` 回哪一種欄位；opencode 讀 key 的變數名
-- [ ] 4.5 sidecar：aistorage-pm 把假 broker 換成 `lgw` 的 API 客戶端；在一台 worker 驗收換把；在 worker 的 herdr 0.9.3 驗 `tab create --env` 不留值
-- [ ] 4.6 狀態板：五把的使用者、數量／上限、冷卻、用量（拿不到的顯示「未知」）
-- [ ] 4.7 秘密掃描：repo、事件、log、狀態板沒有任何 key 的值
+- [ ] 4.5 sidecar：aistorage-pm 把假 broker 換成 `lgw`；在一台 worker 驗收換把；在 worker 的 herdr 0.9.3 驗 `tab create --env` 不留值（不過就改用 0600 暫存 env 檔、讀完即刪）
+- [ ] 4.6 狀態板：五把的使用者、數量／上限、冷卻、部署狀態、用量（拿不到的顯示「未知」）；URL 與 log 裡沒有客戶端憑證
+- [ ] 4.7 秘密掃描：repo、事件、log、狀態板、匯出檔沒有任何 key 的值
 - [ ] 4.8 退回演練：停服務、Mac 改回原本的指令
 
 ## 5. 銜接
 
 - [ ] 5.1 把最後的欄位與錯誤碼交給 aistorage-pm（設計決定 6）
 - [x] 5.2 請 MyAiEntry 開「手機 App 經 SSH 跳板埠轉送到租用服務」的單（本人選 (2)）→ MyAiEntry#147
-- [ ] 5.4 租約欄位定案後通知 MyAiEntry PM；決定給 App 的 agent 種類值
 - [ ] 5.3 另開單：把 MyLinuxPool#50 的 key 來源換成租用，收掉 MyLinuxPool 裡的 key
+- [ ] 5.4 租約欄位定案後通知 MyAiEntry PM；決定給 App 的 agent 種類值
