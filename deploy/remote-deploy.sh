@@ -1,10 +1,34 @@
 #!/bin/sh
-# LLMGateway：provider 上的部署腳本（design 決定 2；MyLinuxPool#68）。
-# 由部署專用金鑰的 authorized_keys 以 command="…/remote-deploy-keys.sh",restrict 強制執行；
-# 不看 SSH_ORIGINAL_COMMAND，只從 stdin 讀 key 檔內容。
-# 流程：stdin（上限 64 KiB）→ 驗證格式 → 同目錄暫存檔（0600）→ rename 成 keys.env → 通知服務重讀。
+# LLMGateway：放服務那台的部署腳本（design 決定 2）。
+# 由 ~llmgw/.ssh/authorized_keys 的 command="…/current/deploy/remote-deploy.sh",restrict 強制執行。
+# 動詞只從 SSH_ORIGINAL_COMMAND 以白名單解析：
+#   keys            stdin（上限 64 KiB）→ 驗證 → 同目錄暫存檔（0600）→ rename 成 keys.env → 通知服務重讀
+#   upgrade <tag>   tag 必須是 lgw-vX.Y.Z → 交給 install.sh 以固定 tag 取碼、切換 current、重啟服務
 # 任何輸出都不含值。
 set -eu
+
+verb="${SSH_ORIGINAL_COMMAND:-}"
+nl='
+'
+case "$verb" in
+  *"$nl"*) echo "deploy: command must be a single line" >&2; exit 2 ;;
+esac
+case "$verb" in
+  keys) ;;
+  "upgrade "*)
+    tag="${verb#upgrade }"
+    if ! printf '%s' "$tag" | grep -Eq '^lgw-v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'; then
+      echo "deploy: invalid tag" >&2
+      exit 2
+    fi
+    installer="${LGW_INSTALLER:-$(dirname "$0")/install.sh}"
+    exec "$installer" --tag "$tag" </dev/null
+    ;;
+  *)
+    echo "deploy: unknown or missing command (expected: keys | upgrade lgw-vX.Y.Z)" >&2
+    exit 2
+    ;;
+esac
 
 STATE_DIR="${LGW_STATE_DIR:-$HOME/.local/state/llmgateway}"
 KEYS_FILE="$STATE_DIR/keys.env"

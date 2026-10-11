@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = os.path.join(os.path.dirname(__file__), "..", "deploy", "remote-deploy-keys.sh")
+SCRIPT = os.path.join(os.path.dirname(__file__), "..", "deploy", "remote-deploy.sh")
 CANARY = "CANARY-deploy-value-9z8y7x"
 
 
@@ -13,8 +13,12 @@ def read(path):
         return f.read()
 
 
-def run(stdin: bytes, state_dir: str, reload_cmd: str = "true"):
+def run(stdin: bytes, state_dir: str, reload_cmd: str = "true", command: str | None = "keys", installer: str | None = None):
     env = {"PATH": os.environ["PATH"], "HOME": state_dir, "LGW_STATE_DIR": state_dir, "LGW_RELOAD_CMD": reload_cmd}
+    if command is not None:
+        env["SSH_ORIGINAL_COMMAND"] = command
+    if installer is not None:
+        env["LGW_INSTALLER"] = installer
     return subprocess.run(["sh", SCRIPT], input=stdin, env=env, capture_output=True, timeout=10)
 
 
@@ -93,14 +97,34 @@ class DeployScriptTests(unittest.TestCase):
         self.assertEqual(read(self.keys), GOOD)
         self.assertNoLeak(proc)
 
-    def test_ignores_ssh_original_command(self):
-        env_cmd = os.environ.copy()
-        proc = subprocess.run(
-            ["sh", SCRIPT], input=GOOD, capture_output=True, timeout=10,
-            env={"PATH": env_cmd["PATH"], "HOME": self.dir, "LGW_STATE_DIR": self.dir,
-                 "LGW_RELOAD_CMD": "true", "SSH_ORIGINAL_COMMAND": "rm -rf /"},
-        )
-        self.assertEqual(proc.returncode, 0)
+    def _fake_installer(self):
+        log = os.path.join(self.dir, "installer.argv")
+        path = os.path.join(self.dir, "fake-install.sh")
+        with open(path, "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > {log}\n')
+        os.chmod(path, 0o755)
+        return path, log
+
+    def test_unknown_or_missing_command_rejected(self):
+        for command in (None, "", "rm -rf /", "keys extra", "upgrade", "sh", "KEYS"):
+            proc = run(GOOD, self.dir, command=command)
+            self.assertEqual(proc.returncode, 2, (command, proc.stderr))
+            self.assertFalse(os.path.exists(self.keys))
+
+    def test_upgrade_valid_tag_runs_installer(self):
+        installer, log = self._fake_installer()
+        proc = run(b"", self.dir, command="upgrade lgw-v0.1.0", installer=installer)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(read(log), b"--tag\nlgw-v0.1.0\n")
+
+    def test_upgrade_invalid_tags_rejected(self):
+        installer, log = self._fake_installer()
+        bad = ["lgw-v0.1", "lgw-v0.1.0;rm -rf /", "lgw-v0.1.0 x", "../lgw-v0.1.0", "v0.1.0",
+               "lgw-v0.1.0\nrm -rf /", "lgw-v0.1.0$(id)", "lgw-v99999.1.1"]
+        for tag in bad:
+            proc = run(b"", self.dir, command=f"upgrade {tag}", installer=installer)
+            self.assertEqual(proc.returncode, 2, (tag, proc.stderr))
+            self.assertFalse(os.path.exists(log), tag)
 
     def test_output_written_by_lgwd_keystore_is_readable(self):
         from lgwd.keys import KeyStore
