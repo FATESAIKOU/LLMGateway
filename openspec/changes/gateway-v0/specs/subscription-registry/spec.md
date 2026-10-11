@@ -72,8 +72,8 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 - **THEN** 1w 窗口冷卻 7 天
 
 ### Requirement: 稽核紀錄
-每次 get 與登錄冷卻 SHALL 記一筆只追加的紀錄：時刻、客戶端類別、subscription id、agent 種類（get）、窗口與結束時刻（登錄冷卻）。紀錄 MUST NOT 含 key 的值。
+每次 get 與登錄冷卻 SHALL 記一筆只追加的紀錄：時刻、subscription id、agent 種類（get）、窗口與結束時刻（登錄冷卻）。不做認證，所以紀錄不分是哪個客戶端。紀錄 MUST NOT 含 key 的值。
 
-#### Scenario: 看誰拿過哪一把
-- **WHEN** `pool-worker` 以 `agent=claude-code` get `claude-personal`
+#### Scenario: get 留下紀錄
+- **WHEN** 有客戶端以 `agent=claude-code` get `claude-personal`
 - **THEN** 稽核紀錄有一筆，內容沒有 key 的值

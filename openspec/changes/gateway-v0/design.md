@@ -1,6 +1,6 @@
 ## Context
 
-動機與範圍見 proposal.md（v3）。影響做法的現況與限制：
+動機與範圍見 proposal.md（v4 定案）。影響做法的現況與限制：
 
 - **Claude 條款**：訂閱的 OAuth 是給原版 Claude Code 這類 Anthropic 原生 app 的一般使用；第三方不得代為路由、收集、存放、中轉 Claude.ai 的 token（`docs/research/claude-failover.md` §7）。LLMGateway 不代轉請求，Claude 訂閱的 key 只給 `agent=claude-code` 的 get。
 - **sidecar v3**（MyAiStorage，aistorage-pm）：一台機器一個 daemon（Mac 也能跑），對外五個操作加 HTTP 控制，不基於 herdr。它用 LLMGateway 的 list／get／登錄冷卻；挑把與換把在它內部；key 變成哪些環境變數由它的 AgentDriver 決定。
@@ -45,6 +45,9 @@
   - 部署金鑰：私鑰是本 repo 的 secret，登記公鑰。
   - 能帶選項就收窄：隧道金鑰只准 `-R` 那兩個埠並探 API 埠，部署金鑰只准轉發到 SSH 埠。不能帶也可以，本人已接受 sshproxy 不收窄。
 - **服務本身只綁那台的 127.0.0.1**，不綁 docker bridge；同一台的容器也走會合點。
+- **附註**：
+  - sshproxy 要登記兩把公鑰（隧道與部署）。
+  - 4711 會讓服務那台的 sshd 出現在跳板機的 loopback 上，但要進去仍然得通過 `llmgw` 帳號的 SSH 認證，而且只會跑 forced command 的部署腳本（`keys`／`upgrade`）。
 
 ### 決定 3：伺服器端：隧道守護與健康維持
 
@@ -172,18 +175,18 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 | 拿掉的 | 理由 | 會失去的 |
 |---|---|---|
 | 租約五個動作、10 分鐘確認、去重 | 本人要求只有三個介面 | 「誰正在用」、逾期回收 |
-| 同時租用上限 | 沒有租約就算不出「幾個在用」 | 本人先前的風險控管之一（proposal 第 1 點） |
+| 同時租用上限 | 沒有租約就算不出「幾個在用」；本人定案 v0 不做 | 本人先前提過的風險控管之一 |
 | 管理 API（issuer）、whoami、應用層 token | 本人選 (a)：只靠 SSH | 分辨是哪一台 worker |
 | 狀態板（JSON／HTML）、用量查詢 | list 已含冷卻與能不能用；用量 % 本人說沒有也行 | 用量 % |
 
-impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢，等 v3 定案後移除或改寫（tasks 1.x）。部署腳本、安裝程式、維運手冊保留。
+impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢，照 v4 移除或改寫（tasks 1.x）。部署腳本、安裝程式、維運手冊保留。
 
 ## Risks / Trade-offs
 
-- [公司帳號用完換另一個是灰色地帶，v3 沒有同時上限] → 本人先前已接受灰色地帶；上限的取捨請本人確認（proposal 第 1 點）。冷卻中不硬撞仍成立：sidecar 只挑 `available` 的。
+- [公司帳號用完換另一個是灰色地帶，v0 沒有同時上限] → 本人已接受灰色地帶，也定案 v0 不做上限。冷卻中不硬撞仍成立：sidecar 只挑 `available` 的。
 - [sshproxy 上任何金鑰都讀得到全部 key] → 本人已接受（決定 5a）；外洩時換五把 key 並重新部署，客戶端不用動。
 - [跳板機整台重建] → sshproxy 會由 MyLinuxPool 重建，兩把公鑰只要在 MyLinuxPool 的登記裡就會回來；重建期間隧道守護會一直重試，`--check` 回 1。
-- [舊的 `-R` listener 沒被清掉] → `ExitOnForwardFailure` 讓守護程式重試，直到會合機清掉舊連線；端對端探針確保不是「TCP 通、服務不通」。
+- [舊的 `-R` listener 沒被清掉] → `ExitOnForwardFailure` 讓守護程式重試，直到會合點清掉舊連線；端對端探針確保不是「TCP 通、服務不通」。
 - [sidecar 登錄冷卻依賴它的判讀] → 判讀錯了會讓某把閒置到重置時刻；稽核紀錄看得到是誰登錄的。
 - [key 集中在一台] → 只綁內部介面、只經 SSH 進入、檔案 0600、輪替只要改 secret 並重新部署。
 

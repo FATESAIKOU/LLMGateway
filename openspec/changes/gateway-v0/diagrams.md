@@ -55,12 +55,10 @@
 3. 之後的 list／get／登錄冷卻都打這個位址（不帶 token）。
 
 ### 2.1 開一個 agent
-1. 控制者 → sidecar：`open {id 或 agent 種類}`。
-2. sidecar → `lgwd`（經 2.0a 的連線）：list（看 `available`、`agents`、`priority`）。
-3. sidecar 挑出一把（`available` 而且 `agents` 含要開的種類、`priority` 最前）。
-4. sidecar → `lgwd`：get(id, agent)。`lgwd` 回共通 JSON（含 key），記一筆稽核。
-5. sidecar → AgentDriver：由 JSON 推出 env，launch 子行程。
-6. sidecar → agora：繼承指定的 Session。
+1. 控制者 → sidecar：`open {subscription 的 id、agent 種類、Session}`。控制者只給 id，key 不經過控制者。
+2. sidecar → `lgwd`（經 2.0a 的連線）：get(id, agent)。`lgwd` 回共通 JSON（含 key），記一筆稽核。
+3. sidecar → AgentDriver：由 JSON 推出 env，launch 子行程。
+4. sidecar → agora：繼承指定的 Session。
 
 ### 2.2 額度用完、換一把（全部在 sidecar 內部，LLMGateway 只被呼叫）
 1. AgentDriver → sidecar：狀態＝額度用完（窗口 5h 或 1w，有重置時刻就帶）。
