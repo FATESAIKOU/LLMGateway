@@ -1,4 +1,18 @@
-"""API 錯誤（design 決定 6 的錯誤表）。HTTP 層把 ApiError 轉成狀態碼與 JSON。"""
+"""API 錯誤（design 決定 6 的錯誤表）。HTTP 層把 ApiError 轉成狀態碼與 JSON。
+
+訊息只用固定字串；不回顯請求裡的值（值永不進例外或 log）。
+
+完整錯誤碼表（回覆 JSON 一律為 {"error": "<碼>", ...}）：
+- 400 bad_request：JSON 解析失敗、body 不是物件、缺必填（保留 "missing": [...] 欄位）
+- 400 invalid_window：window 不是 "5h" 或 "1w"
+- 400 invalid_resets_at：resets_at 不是 RFC 3339 字串（或型別不對）
+- 400 resets_at_out_of_range：resets_at 在過去或超過 8 天以後
+- 403 agent_not_allowed：agent 不在該筆的 agents 裡
+- 404 not_found：不存在的 id 或未知路徑
+- 409 not_deployed：key 尚未部署
+- 413 body_too_large：body 超過 1 MB
+- 500 internal：伺服器內部非預期錯誤
+"""
 
 from __future__ import annotations
 
@@ -16,59 +30,44 @@ class ApiError(Exception):
         return {"error": self.code, **self.extra}
 
 
-# 400
-def bad_request(missing: list[str] | None = None, detail: str | None = None) -> ApiError:
+# 400：JSON 解析失敗、body 不是物件、缺必填（保留 missing 欄位，不含 detail 自由文字）
+def bad_request(missing: list[str] | None = None) -> ApiError:
     extra = {}
     if missing:
         extra["missing"] = sorted(missing)
-    if detail:
-        extra["detail"] = detail
     return ApiError(400, "bad_request", **extra)
 
 
-# 401
-def unauthorized() -> ApiError:
-    return ApiError(401, "unauthorized")
+# 400：window 不是 "5h" 或 "1w"
+def invalid_window() -> ApiError:
+    return ApiError(400, "invalid_window")
 
 
-# 403
-def client_mismatch() -> ApiError:
-    return ApiError(403, "client_mismatch")
+# 400：resets_at 不是 RFC 3339 字串（或型別不對）
+def invalid_resets_at() -> ApiError:
+    return ApiError(400, "invalid_resets_at")
 
 
-def not_owner() -> ApiError:
-    return ApiError(403, "not_owner")
+# 400：resets_at 在過去或超過 8 天以後
+def resets_at_out_of_range() -> ApiError:
+    return ApiError(400, "resets_at_out_of_range")
 
 
-def forbidden_role() -> ApiError:
-    return ApiError(403, "forbidden_role")
+# 403：agent 不在該筆的 agents 裡
+def agent_not_allowed() -> ApiError:
+    return ApiError(403, "agent_not_allowed")
 
 
-def name_not_allowed() -> ApiError:
-    return ApiError(403, "name_not_allowed")
-
-
-# 404
+# 404：不存在的 id 或未知路徑
 def not_found() -> ApiError:
     return ApiError(404, "not_found")
 
 
-# 409（生命週期）
-def lease_not_active() -> ApiError:
-    return ApiError(409, "lease_not_active")
+# 409：key 沒部署
+def not_deployed() -> ApiError:
+    return ApiError(409, "not_deployed")
 
 
-def lease_not_confirmed() -> ApiError:
-    return ApiError(409, "lease_not_confirmed")
-
-
-# 409（拒絕）：reason ∈ not_allowed | instance_busy | cap_reached | all_cooling | below_floor
-REFUSAL_REASONS = ("not_allowed", "instance_busy", "cap_reached", "all_cooling", "below_floor")
-
-
-def refusal(reason: str, earliest_reset: str | None = None) -> ApiError:
-    assert reason in REFUSAL_REASONS, reason
-    extra = {"reason": reason}
-    if reason == "all_cooling" and earliest_reset:
-        extra["earliest_reset"] = earliest_reset
-    return ApiError(409, "refused", **extra)
+# 413：body 超過 1 MB
+def body_too_large() -> ApiError:
+    return ApiError(413, "body_too_large")

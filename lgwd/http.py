@@ -1,49 +1,28 @@
-"""HTTP 層（design 決定 6、11）。由 test 實作。
+"""HTTP 層（design 決定 6、5a）。由 test 實作。
 
-- make_api_server(service, host, port) → ThreadingHTTPServer：路由 /v1/*；Bearer 認身分（service.authenticate），
-  沒有或錯誤 → 401；JSON 解析失敗 → 400；ApiError → 對應狀態碼＋body()；每個回覆加 "api_version": 1。
-  路由：POST /v1/leases、POST /v1/leases/{id}/(start|exhausted|renew|release|usage)、GET /v1/board、
-  GET /v1/whoami（只驗 Bearer，回 {"client": 名稱}，不碰 service）。
-- make_board_server(service, host="127.0.0.1", port) → 只服務 GET /board 的唯讀 HTML（不要憑證、全部輸出跳脫）。
-  host 不是 loopback 時丟 ValueError（HTML 只綁 loopback）。
+- make_api_server(service, host, port) → ThreadingHTTPServer。只有三個路由：
+  GET  /v1/subscriptions                      → service.list_subscriptions()
+  GET  /v1/subscriptions/{id}?agent=<種類>     → service.get_subscription(id, agent)
+  POST /v1/subscriptions/{id}/cooldown        → service.register_cooldown(id, body)（204）
+  其他路徑與方法一律 404。沒有應用層認證（本人選 (a)）；存取控制只靠 SSH。
+- JSON 解析失敗或 body 不是物件 → 400；ApiError → 對應狀態碼＋body()；204 不帶 body。
 - body 超過 1 MB 直接回 413，不讀 body。
-- log 只記方法、路徑（租約 id 可）、狀態碼；500 另記一行例外種類；不記標頭、body 與值。
+- log 只記方法、路徑、狀態碼；500 另記一行例外種類；不記標頭、body 與值。
 """
 
 from __future__ import annotations
 
-import html
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-from .errors import ApiError, bad_request, forbidden_role, not_found
-
-_LOOPBACK = ("127.0.0.1", "::1")
-
-API_VERSION = 1
+from .errors import ApiError, bad_request, body_too_large, not_found
 
 _LOG = logging.getLogger("lgwd.http")
 
-# 只允許 127.0.0.1（fail closed；::1、localhost 也不收）
-_BOARD_HOST = "127.0.0.1"
-
-_LEASE_ACTIONS = ("start", "exhausted", "renew", "release", "usage")
-
 # body 上限：超過直接 413，不讀 body。
 _MAX_BODY_BYTES = 1024 * 1024
-
-
-def _bearer(handler: BaseHTTPRequestHandler) -> str | None:
-    """取 Authorization: Bearer 的值；格式不對回 None。"""
-    auth = handler.headers.get("Authorization")
-    if not auth:
-        return None
-    scheme, _, value = auth.partition(" ")
-    if scheme.lower() != "bearer" or not value.strip():
-        return None
-    return value.strip()
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> dict:
@@ -54,24 +33,21 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
     except ValueError:
         size = 0
     if size > _MAX_BODY_BYTES:
-        raise ApiError(413, "body_too_large")
+        raise body_too_large()
     raw = handler.rfile.read(size) if size > 0 else b""
     if not raw.strip():
         return {}
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        raise bad_request()
+        raise bad_request() from None
     if not isinstance(data, dict):
         raise bad_request()
     return data
 
 
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
-    """送 JSON 回覆，一律帶 api_version。"""
-    body = dict(payload)
-    body["api_version"] = API_VERSION
-    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
         handler.send_response(status)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
@@ -83,7 +59,7 @@ def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> N
 
 
 def _send_empty(handler: BaseHTTPRequestHandler, status: int) -> None:
-    """204 專用：不帶 body（所以也沒有 api_version）。"""
+    """204 專用：不帶 body。"""
     try:
         handler.send_response(status)
         handler.send_header("Content-Length", "0")
@@ -92,32 +68,25 @@ def _send_empty(handler: BaseHTTPRequestHandler, status: int) -> None:
         pass
 
 
-def _match_api(method: str, path: str):
-    """回傳 ("leases",) ｜ ("lease_action", lease_id, action) ｜ ("board",) ｜ ("whoami",) ｜ None。"""
-    if method == "GET" and path == "/v1/board":
-        return ("board",)
-    if method == "GET" and path == "/v1/whoami":
-        return ("whoami",)
-    if method == "POST" and path == "/v1/leases":
-        return ("leases",)
-    if method == "POST" and path == "/v1/admin/clients":
-        return ("admin_issue",)
-    if method == "DELETE":
-        parts = path.split("/")
-        # ["", "v1", "admin", "clients", "{name}"]
-        if len(parts) == 5 and parts[1:4] == ["v1", "admin", "clients"] and parts[4]:
-            return ("admin_revoke", unquote(parts[4]))
-    if method == "POST":
-        parts = path.split("/")
-        # ["", "v1", "leases", "{id}", "{action}"]
-        if len(parts) == 5 and parts[1] == "v1" and parts[2] == "leases" and parts[3]:
-            if parts[4] in _LEASE_ACTIONS:
-                return ("lease_action", unquote(parts[3]), parts[4])
+def _match_route(method: str, path: str):
+    """回 ("list",) ｜ ("get", id) ｜ ("cooldown", id) ｜ None。"""
+    if path == "/v1/subscriptions":
+        return ("list",) if method == "GET" else None
+    parts = path.split("/")
+    # ["", "v1", "subscriptions", "{id}"]
+    if (method == "GET" and len(parts) == 4
+            and parts[1] == "v1" and parts[2] == "subscriptions" and parts[3]):
+        return ("get", unquote(parts[3]))
+    # ["", "v1", "subscriptions", "{id}", "cooldown"]
+    if (method == "POST" and len(parts) == 5
+            and parts[1] == "v1" and parts[2] == "subscriptions" and parts[3]
+            and parts[4] == "cooldown"):
+        return ("cooldown", unquote(parts[3]))
     return None
 
 
 def _api_handler(service):
-    """依 service 產生 handler 類別（service 是 LeaseService 或測試替身）。"""
+    """依 service 產生 handler 類別（service 是 RegistryService 或測試替身）。"""
 
     class ApiHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # stderr 太吵，轉進 logger（debug，不影響測試斷言）
@@ -139,43 +108,23 @@ def _api_handler(service):
             self._dispatch("PATCH")
 
         def _dispatch(self, method: str):
-            path = urlsplit(self.path).path  # query 不參與路由
-            route = _match_api(method, path)
+            split = urlsplit(self.path)
+            path = split.path  # query 不參與路由
+            route = _match_route(method, path)
             if route is None:
                 _LOG.info("%s %s -> %s", method, path, 404)
                 _send_json(self, 404, not_found().body())
                 return
-            client = service.authenticate(_bearer(self) or "")
-            if client is None:
-                _LOG.info("%s %s -> %s", method, path, 401)
-                _send_json(self, 401, {"error": "unauthorized"})
-                return
-            role_of = getattr(service, "role_of", None)
-            role = role_of(client) if role_of else "client"
             try:
-                if route[0] in ("admin_issue", "admin_revoke"):
-                    # 管理 API 只從 loopback 收（design 決定 4）
-                    if self.server.server_address[0] not in _LOOPBACK:
-                        raise forbidden_role()
-                    if route[0] == "admin_issue":
-                        status, payload = service.admin_issue(client, _read_json(self))
-                    else:
-                        status, payload = service.admin_revoke(client, route[1])
-                elif route[0] == "whoami":
-                    status, payload = 200, {"client": client, "role": role}  # 不碰租約
-                elif role != "client":
-                    raise forbidden_role()
-                elif route[0] == "board":
-                    status, payload = 200, service.board()
+                if route[0] == "list":
+                    status, payload = 200, service.list_subscriptions()
+                elif route[0] == "get":
+                    agents = parse_qs(split.query).get("agent") or [None]
+                    status, payload = 200, service.get_subscription(route[1], agents[0])
                 else:
                     body = _read_json(self)
-                    if route[0] == "leases":
-                        status, payload = service.request_lease(client, body)
-                    else:
-                        _, lease_id, action = route
-                        # 路由名 usage 對應 service 的 report_usage 方法
-                        name = "report_usage" if action == "usage" else action
-                        status, payload = getattr(service, name)(client, lease_id, body)
+                    service.register_cooldown(route[1], body)
+                    status, payload = 204, {}
             except ApiError as exc:
                 _LOG.info("%s %s -> %s", method, path, exc.status)
                 _send_json(self, exc.status, exc.body())
@@ -198,129 +147,4 @@ def make_api_server(service, host: str, port: int) -> ThreadingHTTPServer:
     """建 /v1/* 的 API 伺服器（尚未 serve_forever）。"""
     server = ThreadingHTTPServer((host, port), _api_handler(service))
     server.daemon_threads = True  # 測試結束不卡住
-    return server
-
-
-def _esc(value) -> str:
-    """HTML 跳脫；None 轉成「未知」（spec status-board：拿不到顯示未知）。"""
-    if value is None:
-        return "未知"
-    if isinstance(value, bool):
-        return "是" if value else "否"
-    if isinstance(value, (dict, list)):
-        return html.escape(json.dumps(value, ensure_ascii=False, sort_keys=True), quote=True)
-    return html.escape(str(value), quote=True)
-
-
-def _render_board(data: dict) -> str:
-    """board dict 轉唯讀 HTML；全部輸出經 _esc。"""
-    subs = data.get("subscriptions", []) if isinstance(data, dict) else []
-    rows = []
-    for sub in subs:
-        actives = sub.get("active") or []
-        leases = "".join(
-            "<li>{worker} ／ {role} ／ {agent} ／自 {since}</li>".format(
-                worker=_esc(a.get("worker")),
-                role=_esc(a.get("role")),
-                agent=_esc(a.get("agent")),
-                since=_esc(a.get("since")),
-            )
-            for a in actives
-        )
-        cap = sub.get("cap")
-        rows.append(
-            "<section><h2>{name}</h2><ul>"
-            "<li>部署：{deployed}</li>"
-            "<li>使用中：{count}／{cap}</li>"
-            "<li>未確認：{pending}</li>"
-            "<li>冷卻：{cooling}{until}</li>"
-            "<li>用量：{usage}</li>"
-            "<li>租約：<ul>{leases}</ul></li>"
-            "</ul></section>".format(
-                name=_esc(sub.get("name")),
-                deployed="已部署" if sub.get("deployed") else "未部署",
-                count=_esc(sub.get("count")),
-                cap=_esc(cap) if cap is not None else "無上限",
-                pending=_esc(sub.get("pending")),
-                cooling=_esc(sub.get("cooling")),
-                until="（到 {t}）".format(t=_esc(sub.get("cooling_until")))
-                if sub.get("cooling_until")
-                else "",
-                usage=_esc(sub.get("usage")),
-                leases=leases or "<li>無</li>",
-            )
-        )
-    return (
-        "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">"
-        "<title>LLMGateway 狀態板</title></head><body>"
-        "<h1>LLMGateway 狀態板</h1><p>產生於：{gen}</p>{rows}</body></html>".format(
-            gen=_esc(data.get("generated_at") if isinstance(data, dict) else None),
-            rows="".join(rows),
-        )
-    )
-
-
-def make_board_server(service, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
-    """建唯讀 HTML 伺服器；host 非 127.0.0.1 直接丟 ValueError。"""
-    if host != _BOARD_HOST:
-        raise ValueError("board server only binds loopback")
-    parent = service
-
-    class BoardHandler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            _LOG.debug("%s %s", self.command, self.path)
-
-        def do_GET(self):
-            path = urlsplit(self.path).path
-            if path != "/board":
-                _LOG.info("GET %s -> %s", path, 404)
-                self._send_text(404, "not found")
-                return
-            try:
-                page = _render_board(parent.board())
-            except Exception:  # 板壞了也不洩漏細節
-                _LOG.info("GET %s -> %s", path, 500)
-                self._send_text(500, "internal error")
-                return
-            _LOG.info("GET %s -> %s", path, 200)
-            raw = page.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
-        # 非 GET 一律 404（唯讀，不提供其他方法）
-        def do_POST(self):
-            _LOG.info("POST %s -> %s", urlsplit(self.path).path, 404)
-            self._send_text(404, "not found")
-
-        def do_PUT(self):
-            _LOG.info("PUT %s -> %s", urlsplit(self.path).path, 404)
-            self._send_text(404, "not found")
-
-        def do_DELETE(self):
-            _LOG.info("DELETE %s -> %s", urlsplit(self.path).path, 404)
-            self._send_text(404, "not found")
-
-        def do_PATCH(self):
-            _LOG.info("PATCH %s -> %s", urlsplit(self.path).path, 404)
-            self._send_text(404, "not found")
-
-        def _send_text(self, status: int, text: str) -> None:
-            raw = text.encode("utf-8")
-            try:
-                self.send_response(status)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
-    server = ThreadingHTTPServer((host, port), BoardHandler)
-    server.daemon_threads = True
     return server
