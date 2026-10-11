@@ -28,6 +28,41 @@ class Classification:
     resets_at: datetime | None = None  # UTC aware；判讀不出為 None
 
 
+@dataclass(frozen=True)
+class Signal:
+    """結構化額度事件的判讀結果。
+
+    欄位設計直接對應 LLMGateway 的 POST /v1/subscriptions/{id}/cooldown {window, resets_at}：
+    - exhausted: 是否額度用完。
+    - window: 冷卻窗口（"5h" | "1w" | None）。若為 None（例如 opencode 未提供窗口資訊），
+      由呼叫方（例如 sidecar）自行決定要登錄哪個窗口（例如依訂閱政策預設）。
+    - resets_at: UTC aware 的 datetime，或 None（判讀不出或無重置時間）。
+    - source: 事件來源識別字串（如 "opencode"、"claude-code"）。
+    """
+
+    exhausted: bool
+    window: str | None  # "5h" | "1w" | None
+    resets_at: datetime | None  # UTC aware
+    source: str
+
+    def to_cooldown_body(self, fallback_window: str | None = None) -> dict[str, str]:
+        """產生 POST /v1/subscriptions/{id}/cooldown 的 body 字典。
+
+        若 window 為 None 且提供了 fallback_window，則使用 fallback_window。
+        若 window 與 fallback_window 皆為 None，丟出 ValueError。
+        resets_at 會轉為 RFC 3339 UTC 字串。
+        """
+        win = self.window if self.window is not None else fallback_window
+        if win is None:
+            raise ValueError("window is None and no fallback_window provided")
+        body: dict[str, str] = {"window": win}
+        if self.resets_at is not None:
+            body["resets_at"] = (
+                self.resets_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+        return body
+
+
 def _to_utc(moment: datetime) -> datetime:
     return moment.astimezone(UTC)
 
@@ -171,3 +206,126 @@ def classify(agent: str, text: str | None, now: datetime | None = None,
         return Classification(kind=rule["kind"], signal=rule["signal"],
                               resets_at=resets_at)
     return Classification(kind="normal")
+
+
+OPENCODE_QUOTA_REASONS: frozenset[str] = frozenset({"free_tier_limit"})
+
+
+def from_opencode_status(obj: dict) -> Signal | None:
+    """判讀 opencode server 的 session.status 事件或 status 物件。
+
+    支援傳入整包 session.status 事件：
+      {"type": "session.status", "properties": {"status": {...}}}
+    或直接傳入 status 層：
+      {"type": "retry", ...}
+
+    規則：
+    - status.type == "retry" 且 status.action.reason 為額度類（OPENCODE_QUOTA_REASONS）：
+      額度用完，回傳 Signal(exhausted=True, window=None, resets_at=..., source="opencode")。
+      status.next 是 epoch 毫秒，轉成 UTC datetime；window 為 None（opencode 沒給窗口）。
+    - status.type 為 "busy"、"idle" 或其他 retry 原因：回傳 None。
+    - 欄位缺漏、型別不對、非 dict：回傳 None，不丟例外。
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    if obj.get("type") == "session.status":
+        props = obj.get("properties")
+        if not isinstance(props, dict):
+            return None
+        status = props.get("status")
+    else:
+        status = obj
+
+    if not isinstance(status, dict):
+        return None
+
+    stype = status.get("type")
+    if stype != "retry":
+        return None
+
+    action = status.get("action")
+    if not isinstance(action, dict):
+        return None
+
+    reason = action.get("reason")
+    if not isinstance(reason, str) or reason not in OPENCODE_QUOTA_REASONS:
+        return None
+
+    next_val = status.get("next")
+    resets_at: datetime | None = None
+    if next_val is not None:
+        if not isinstance(next_val, (int, float)) or isinstance(next_val, bool):
+            return None
+        try:
+            resets_at = datetime.fromtimestamp(next_val / 1000.0, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    return Signal(
+        exhausted=True,
+        window=None,
+        resets_at=resets_at,
+        source="opencode",
+    )
+
+
+def from_claude_rate_limit_event(obj: dict) -> Signal | None:
+    """判讀 Claude Code stream-json 中的 rate_limit_event 事件或 rate_limit_info 物件。
+
+    支援傳入整包 rate_limit_event 事件：
+      {"type": "rate_limit_event", "rate_limit_info": {...}}
+    或直接傳入 rate_limit_info 層：
+      {"status": ..., "rateLimitType": ..., ...}
+
+    規則：
+    - rate_limit_info.status != "allowed"：額度用完，回傳 Signal(exhausted=True, window=..., resets_at=..., source="claude-code")。
+    - rate_limit_info.status == "allowed"：回傳 None。
+    - rateLimitType：five_hour -> "5h"、seven_day -> "1w"，其他 -> None。
+    - resetsAt 是 epoch 秒，轉成 UTC datetime。
+    - 欄位缺漏、型別不對、非 dict：回傳 None，不丟例外。
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    if obj.get("type") == "rate_limit_event":
+        info = obj.get("rate_limit_info")
+    elif "type" not in obj and "status" in obj:
+        info = obj
+    else:
+        return None
+
+    if not isinstance(info, dict):
+        return None
+
+    status = info.get("status")
+    if not isinstance(status, str):
+        return None
+
+    if status == "allowed":
+        return None
+
+    rl_type = info.get("rateLimitType")
+    if rl_type == "five_hour":
+        window: str | None = "5h"
+    elif rl_type == "seven_day":
+        window = "1w"
+    else:
+        window = None
+
+    resets_at_raw = info.get("resetsAt")
+    resets_at: datetime | None = None
+    if resets_at_raw is not None:
+        if not isinstance(resets_at_raw, (int, float)) or isinstance(resets_at_raw, bool):
+            return None
+        try:
+            resets_at = datetime.fromtimestamp(resets_at_raw, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    return Signal(
+        exhausted=True,
+        window=window,
+        resets_at=resets_at,
+        source="claude-code",
+    )
