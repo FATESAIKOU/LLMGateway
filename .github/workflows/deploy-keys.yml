@@ -67,6 +67,10 @@ jobs:
         run: |
           set -eu -o pipefail
           test -n "$JUMP" && test -n "$TARGET" || { echo "deploy connection secrets are not set" >&2; exit 2; }
+          if [ -z "$K_CLAUDE_PERSONAL" ] && [ -z "$K_CLAUDE_COMPANY" ] && [ -z "$K_OPENROUTER" ] && [ -z "$K_OPENCODE_ZEN" ] && [ -z "$K_OLLAMA" ]; then
+            echo "all key secrets are empty: POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM, POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM, POOL_LLMGATEWAY__OPENROUTER_API__LLM, POOL_LLMGATEWAY__OPENCODE_ZEN__LLM, POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM" >&2
+            exit 2
+          fi
           target_user_host="${TARGET%:*}"
           target_port="${TARGET##*:}"
           jump_host="${JUMP#*@}"; jump_host="${jump_host%:*}"
@@ -79,7 +83,7 @@ jobs:
             printf 'OPENCODE_ZEN_API_KEY=%s\n' "$K_OPENCODE_ZEN"
             printf 'OLLAMA_API_KEY=%s\n' "$K_OLLAMA"
           } | ssh -F ~/.ssh/lgw_ssh_config -T -J "$JUMP" -p "$target_port" "$target_user_host" keys \
-              2> >(sed -e "s|${jump_host}|[jump]|g; s|${target_host}|[target]|g" >&2)
+              2> >(while IFS= read -r line; do line=${line//"$jump_host"/[jump]}; line=${line//"$target_host"/[target]}; printf '%s\n' "$line"; done >&2)
           # 尾端的 keys 是動詞；那台若少了 command= 強制命令，sh -c keys 會失敗，stdin 不會被當指令執行
 
       - name: Remove SSH identity
