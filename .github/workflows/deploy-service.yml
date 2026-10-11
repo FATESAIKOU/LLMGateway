@@ -73,7 +73,7 @@ jobs:
           jump_host="${JUMP#*@}"; jump_host="${jump_host%:*}"
           target_host="${target_user_host#*@}"
           ssh -F ~/.ssh/lgw_ssh_config -T -J "$JUMP" -p "$target_port" "$target_user_host" "upgrade $TAG" \
-              2> >(sed -e "s|${jump_host}|[jump]|g; s|${target_host}|[target]|g" >&2)
+              2> >(while IFS= read -r line; do line=${line//"$jump_host"/[jump]}; line=${line//"$target_host"/[target]}; printf '%s\n' "$line"; done >&2)
 
       - name: Remove SSH identity
         if: always()

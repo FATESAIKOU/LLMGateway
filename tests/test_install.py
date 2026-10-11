@@ -103,6 +103,8 @@ if [[ "$*" == *"is-active"* ]]; then
     state="${SYS_STATE:-inactive}"
     if [[ "$*" == *"llmgateway-tunnel.service"* ]]; then
         state="${SYS_TUNNEL_STATE:-$state}"
+    elif [[ "$*" == *"llmgateway-tunnel-restart.timer"* ]]; then
+        state="${SYS_TIMER_STATE:-inactive}"
     fi
     if [[ "$state" == "active" ]]; then
         exit 0
@@ -114,6 +116,10 @@ exit 0
 """
         systemd_run_script = """#!/usr/bin/env bash
 echo "systemd-run $*" >> "${SANDBOX:?}/systemd-run-argv.log"
+if [[ "${SYSTEMD_RUN_FAIL:-0}" == "1" ]]; then
+    echo "fake systemd-run: failed" >&2
+    exit 1
+fi
 exit 0
 """
         curl_script = """#!/usr/bin/env bash
@@ -614,6 +620,40 @@ exit "${CURL_RC:-0}"
         )
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.read_log("systemd-run"), "")
+
+    def test_tunnel_restart_already_scheduled_skips_and_logs(self):
+        first = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = self.run_install(
+            ["--tag", "lgw-v0.2.0", "--home", self.home],
+            env_overrides={
+                "SYS_STATE": "active",
+                "SYS_TIMER_STATE": "active",
+                "TUNNEL_MARKER": "TEST_TUNNEL_V2_CHANGED",
+                "TUNNEL_UNIT_MARKER": "TEST_TUNNEL_UNIT_V2_CHANGED",
+            },
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("已排程", second.stdout)
+        self.assertEqual(self.read_log("systemd-run"), "")
+
+    def test_tunnel_restart_systemd_run_failure_warns_only_install_succeeds(self):
+        first = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = self.run_install(
+            ["--tag", "lgw-v0.2.0", "--home", self.home],
+            env_overrides={
+                "SYS_STATE": "active",
+                "SYSTEMD_RUN_FAIL": "1",
+                "TUNNEL_MARKER": "TEST_TUNNEL_V2_CHANGED",
+                "TUNNEL_UNIT_MARKER": "TEST_TUNNEL_UNIT_V2_CHANGED",
+            },
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("WARN", second.stderr)
+        self.assertIn("--user --on-active=60 --unit=llmgateway-tunnel-restart", self.read_log("systemd-run"))
 
     def test_tunnel_inactive_is_started_but_install_still_succeeds(self):
         # 第一次安裝時 tunnel.env 還是空範本，守護程式以 78 結束是預期；

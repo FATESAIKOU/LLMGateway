@@ -370,9 +370,12 @@ if ! "$SYSTEMCTL" --user is-active --quiet "$TUNNEL_SERVICE_NAME" >/dev/null 2>&
     "$SYSTEMCTL" --user start "$TUNNEL_SERVICE_NAME" || \
         log INFO "llmgateway-tunnel: start 未成功（設定未填或未就緒時為預期）"
 elif [[ "$tunnel_changed" -eq 1 ]]; then
-    "$SYSTEMD_RUN" --user --on-active=60 --unit=llmgateway-tunnel-restart \
-        "$SYSTEMCTL" --user restart "$TUNNEL_SERVICE_NAME" || {
-        log ERROR "排程隧道重啟失敗"; exit 1; }
+    if "$SYSTEMCTL" --user is-active --quiet llmgateway-tunnel-restart.timer >/dev/null 2>&1; then
+        log INFO "llmgateway-tunnel: 已排程"
+    elif ! "$SYSTEMD_RUN" --user --on-active=60 --unit=llmgateway-tunnel-restart \
+        "$SYSTEMCTL" --user restart "$TUNNEL_SERVICE_NAME" 2>/dev/null; then
+        log WARN "llmgateway-tunnel: 排程重啟失敗（忽略）"
+    fi
 fi
 
 log INFO "installed llmgateway ${LGW_TAG}"

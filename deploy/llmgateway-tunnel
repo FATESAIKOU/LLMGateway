@@ -131,6 +131,8 @@ def _ssh_common(cfg):
     return [
         "-i", cfg["identity"],
         "-o", "UserKnownHostsFile=" + cfg["known_hosts"],
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=yes",
         "-o", "BatchMode=yes",
         "-p", str(cfg["ssh_port"]),

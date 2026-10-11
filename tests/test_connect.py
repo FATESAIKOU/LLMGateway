@@ -108,6 +108,52 @@ Path(__file__ + ".pid").write_text(str(os.getpid()), encoding="utf-8")
 signal.pause()
 '''
 
+FAKE_CHECK_KNOWN_HOSTS = '''#!/usr/bin/env python3
+"""假的 ssh（測試用）：讀 -F 檔中的 UserKnownHostsFile，若缺少 hop1 key 則 exit 255。"""
+import json
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+LOG = Path(__file__ + ".argv")
+PID = Path(__file__ + ".pid")
+
+def get_config_path(argv):
+    return Path(argv[argv.index("-F") + 1])
+
+def get_known_hosts_path(config_path):
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("UserKnownHostsFile"):
+            val = line[len("UserKnownHostsFile"):].strip()
+            return Path(val.strip('"\\''))
+    return None
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"schema": 1, "subscriptions": []}')
+
+argv = sys.argv
+LOG.write_text(json.dumps(argv), encoding="utf-8")
+PID.write_text(str(os.getpid()), encoding="utf-8")
+
+cfg_path = get_config_path(argv)
+kh_path = get_known_hosts_path(cfg_path)
+kh_text = kh_path.read_text(encoding="utf-8") if kh_path and kh_path.exists() else ""
+
+if "hop1" not in kh_text:
+    sys.exit(255)
+
+port = int(argv[argv.index("-L") + 1].split(":")[1])
+ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
 
 class ConnectCase(unittest.TestCase):
     def setUp(self):
@@ -203,8 +249,8 @@ class ConnectTest(ConnectCase):
             self.assertEqual(argv[argv.index("-p") + 1], "2222")
             self.assertEqual(argv[-1], "tester@fake-rendezvous")
             self.assertNotIn("-i", argv)
+            self.assertNotIn("-o", argv)
             self.assertFalse([a for a in argv if "=" in a and "UserKnownHosts" in a])
-            self.assertNotIn("StrictHostKeyChecking=yes", argv)
             self.assertNotIn("accept-new", " ".join(argv))
             # ssh_config：內容、0700 目錄、0600 檔
             self.assertEqual(
@@ -258,6 +304,63 @@ class ConnectTest(ConnectCase):
             ) as resp:
                 self.assertEqual(resp.status, 200)
         self._assert_dead(self.ssh_ok)
+
+    def test_jump_host_key_checked_via_ssh_config(self):
+        """假 ssh 讀 -F 檔的 UserKnownHostsFile：缺跳板 host key 則 exit 255 (ssh_exited)，有則正常。"""
+        ssh_script = self._script("fake-ssh-check-kh", FAKE_CHECK_KNOWN_HOSTS)
+
+        # 情境 A：host_keys 只有 rendezvous 的 key，缺少跳板 hop1 的 key
+        cfg_missing_jump = ConnectConfig(
+            jumps=["jump1@hop1:2200"],
+            rendezvous="tester@fake-rendezvous:2222",
+            identity=str(self.root / "id_fake"),
+            host_keys=["[fake-rendezvous]:2222 ssh-ed25519 AAAAFAKEKEY0001"],
+            ssh_path=str(ssh_script),
+        )
+        with self.assertRaises(Unavailable) as ctx:
+            with connect(cfg_missing_jump):
+                pass
+        self.assertEqual(ctx.exception.kind, "ssh_exited")
+
+        # 情境 B：host_keys 包含跳板 hop1 的 key
+        cfg_with_jump = ConnectConfig(
+            jumps=["jump1@hop1:2200"],
+            rendezvous="tester@fake-rendezvous:2222",
+            identity=str(self.root / "id_fake"),
+            host_keys=[
+                "[fake-rendezvous]:2222 ssh-ed25519 AAAAFAKEKEY0001",
+                "[hop1]:2200 ssh-ed25519 AAAAFAKEKEY0002",
+            ],
+            ssh_path=str(ssh_script),
+        )
+        with connect(cfg_with_jump) as base_url:
+            with urllib.request.urlopen(base_url + "/v1/subscriptions", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+        self._assert_dead(ssh_script)
+
+    def test_switch_rendezvous_updates_destination_in_argv(self):
+        """改設定中的會合點後，argv 的目的地跟著改（spec connectivity「換一個會合點」）。"""
+        cfg1 = ConnectConfig(
+            rendezvous="user1@rendezvous1.example:2201",
+            identity=str(self.root / "id_fake"),
+            known_hosts=str(self.root / "known_hosts_fake"),
+            ssh_path=str(self.ssh_ok),
+        )
+        with connect(cfg1) as base_url1:
+            argv1 = self._argv_of(self.ssh_ok)
+            self.assertEqual(argv1[argv1.index("-p") + 1], "2201")
+            self.assertEqual(argv1[-1], "user1@rendezvous1.example")
+
+        cfg2 = ConnectConfig(
+            rendezvous="user2@rendezvous2.example:3302",
+            identity=str(self.root / "id_fake"),
+            known_hosts=str(self.root / "known_hosts_fake"),
+            ssh_path=str(self.ssh_ok),
+        )
+        with connect(cfg2) as base_url2:
+            argv2 = self._argv_of(self.ssh_ok)
+            self.assertEqual(argv2[argv2.index("-p") + 1], "3302")
+            self.assertEqual(argv2[-1], "user2@rendezvous2.example")
 
     def test_host_keys_temp_file_0600_and_cleanup(self):
         host_keys = [
@@ -626,6 +729,30 @@ class CliTest(ConnectCase):
             proc.stderr.close()
         self.assertEqual(err, "")
         self._assert_dead(self.root / "bin" / "ssh")
+
+    def test_cli_stops_on_sigterm_and_cleans_up(self):
+        config_path = self._config_env("tester@fake-rendezvous:2222")
+        proc = self._run_cli(config_path, self.ssh_ok)
+        temp_dir = None
+        try:
+            line = proc.stdout.readline()
+            self.assertRegex(line.strip(), r"^http://127\.0\.0\.1:\d+$")
+            argv = self._argv_of(self.root / "bin" / "ssh")
+            temp_dir = self._config_path(argv).parent
+            self.assertTrue(temp_dir.exists())
+            proc.send_signal(signal.SIGTERM)
+            self.assertEqual(proc.wait(timeout=10), 0)
+            err = proc.stderr.read()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertEqual(err, "")
+        self._assert_dead(self.root / "bin" / "ssh")
+        self.assertIsNotNone(temp_dir)
+        self.assertFalse(temp_dir.exists())
 
     def test_cli_unavailable(self):
         config_path = self._config_env("tester@fake-secret-host:2222")

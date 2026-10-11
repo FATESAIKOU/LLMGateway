@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import unittest
 
 WORKFLOWS = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows")
@@ -115,12 +116,88 @@ class WorkflowChecks:
             for line in self.text.splitlines()
         ))
 
+    def test_address_masking_uses_bash_literal_replacement(self):
+        m = re.search(r"2>\s*>\((while\s+IFS=\s*read\s+-r\s+line;.*?done)\s*>&2\)", self.text)
+        self.assertIsNotNone(m, f"mask loop not found in {self.name}")
+        loop = m.group(1)
+        self.assertIn('${line//"$jump_host"/[jump]}', loop)
+        self.assertIn('${line//"$target_host"/[target]}', loop)
+        self.assertNotIn("sed", loop)
+
+        # 抽出這段 bash 實際跑一次，餵 jump[1].example 與 2001:db8::7 這類位址，確認整段都被換掉
+        script = f"""
+set -euo pipefail
+jump_host='jump[1].example'
+target_host='2001:db8::7'
+{loop}
+"""
+        sample_input = (
+            "ssh: connect to jump[1].example: Connection refused\n"
+            "debug1: Next authentication to 2001:db8::7\n"
+            "error: jump[1].example and 2001:db8::7 failed\n"
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            input=sample_input,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        output = proc.stdout
+        self.assertNotIn("jump[1].example", output)
+        self.assertNotIn("2001:db8::7", output)
+        self.assertIn("ssh: connect to [jump]: Connection refused\n", output)
+        self.assertIn("debug1: Next authentication to [target]\n", output)
+        self.assertIn("error: [jump] and [target] failed\n", output)
+
+
 
 class DeployKeysWorkflowTests(WorkflowChecks, unittest.TestCase):
     name = "deploy-keys.yml"
 
     def test_keys_verb_is_last_argument(self):
         self.assertRegex(ssh_lines(self.text)[0], r"\bkeys \\$")
+
+    def test_all_keys_empty_check(self):
+        send_step = step_lines(self.text, "Send key file over stdin")
+        check_text = "\n".join(send_step)
+        secret_names = [
+            "POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM",
+            "POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM",
+            "POOL_LLMGATEWAY__OPENROUTER_API__LLM",
+            "POOL_LLMGATEWAY__OPENCODE_ZEN__LLM",
+            "POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM",
+        ]
+        for name in secret_names:
+            self.assertIn(name, check_text)
+        self.assertIn("exit 2", check_text)
+
+        # 擷取檢查區塊在 bash 中驗證行為
+        m = re.search(
+            r"(if\s+\[\s+-z\s+\"\$K_CLAUDE_PERSONAL\".*?fi)",
+            check_text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(m, "all keys empty check block not found")
+        block = m.group(1)
+
+        # 情況 A: 全為空值 -> 失敗退出 (rc=2)，訊息含 secret 名稱
+        proc_fail = subprocess.run(
+            ["bash", "-c", f"set -e; K_CLAUDE_PERSONAL='' K_CLAUDE_COMPANY='' K_OPENROUTER='' K_OPENCODE_ZEN='' K_OLLAMA=''; {block}"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc_fail.returncode, 2)
+        for name in secret_names:
+            self.assertIn(name, proc_fail.stderr)
+
+        # 情況 B: 至少一把有值（例如只有 OpenRouter） -> 通過
+        proc_ok = subprocess.run(
+            ["bash", "-c", f"set -e; K_CLAUDE_PERSONAL='' K_CLAUDE_COMPANY='' K_OPENROUTER='sk-test' K_OPENCODE_ZEN='' K_OLLAMA=''; {block}"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc_ok.returncode, 0)
 
 
 class DeployServiceWorkflowTests(WorkflowChecks, unittest.TestCase):

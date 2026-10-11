@@ -33,7 +33,128 @@
 
 ## 1. 一次性開機設定（放服務的那台）
 
-需要 root。依 tasks 3.3，由本人做或本人授權後做。
+依 tasks 3.3，由本人或本人授權的人（PMO）做。**主要做法是 `deploy/bootstrap.sh`（1.A）**：用一個有 sudo 權限的一般帳號（下稱管理帳號）登入放服務的那台執行，一個指令做完建帳號到安裝、金鑰、設定。1.1–1.10 是同一批動作的手動版：腳本做了什麼、腳本出 `todo` 或 `fail` 時怎麼手動補，以及沒辦法用腳本時的備援。
+
+### 1.A 用 `bootstrap.sh`（主要做法）
+
+#### 1.A.1 前提
+
+- 登入放服務的那台，用的是有 sudo 權限的管理帳號（不是 `llmgw`，也不要直接用 root）。
+- 那台是 Linux、有 systemd，並且有 `python3`（3.10 以上）、`git`、`curl`、`ssh`、`ssh-keygen`；缺了腳本第一步就 `fail`。
+- 要裝的版本已經打好 tag `lgw-vX.Y.Z` 並 push（腳本在 release tag 裡，見 1.A.2）。
+- 那台連得到 GitHub（`git clone`）。
+- 管理帳號的 sudo 密碼：互動輸入，或放進一個只有你讀得到的密碼檔（`<密碼檔>`，權限 0600，建在你的家目錄底下）。用完就刪。密碼只用來驗證 sudo，不會出現在命令列、輸出或 log 裡；**不要把密碼檔的內容或路徑貼到工單、對話或 repo**。
+- 部署公鑰檔（`<部署公鑰檔>`，單行 OpenSSH 公鑰）：由本人產生（見 1.9、2.2）。第一次執行可以先不給。
+- 會合點資訊：`sshproxy@<跳板機>:<埠>`，和一個含跳板機 host key 的 known_hosts 檔（`<檔>`，格式見 1.7，**不要用 `ssh-keyscan` 現掃**）。這些由 MyLinuxPool 提供；第一次執行可以先不給。
+
+#### 1.A.2 取得腳本
+
+腳本在 release tag 裡，所以先把那個 tag clone 到管理帳號家目錄底下的暫存目錄（不要放 `/tmp`）：
+
+```bash
+git clone --depth 1 --branch lgw-vX.Y.Z https://github.com/FATESAIKOU/LLMGateway.git ~/lgw-boot
+```
+
+#### 1.A.3 執行
+
+```bash
+bash ~/lgw-boot/deploy/bootstrap.sh \
+  --tag lgw-vX.Y.Z \
+  --sudo-pass-file <密碼檔> \
+  [--deploy-pubkey-file <部署公鑰檔>] \
+  [--rendezvous sshproxy@<跳板機>:<埠> --rendezvous-known-hosts <檔>]
+```
+
+- `--tag`：要裝的版本，格式 `lgw-vX.Y.Z`；不是 `--check` 時必填。
+- `--sudo-pass-file`：選填；沒給就用一般互動的 `sudo`（會問一次密碼）。
+- `--deploy-pubkey-file`：選填；給了才會把部署公鑰放進 `~llmgw/.ssh/authorized_keys`（1.9 第 2 點）。
+- `--rendezvous` 與 `--rendezvous-known-hosts`：選填，**要一起給**；給了才會填 `tunnel.env`（1.8）並重啟隧道守護。
+- `--check`：只檢查、不改任何東西，印出每一步的狀態。
+- `--reinstall`：已經是同一個 tag 也重跑 `install.sh`。
+- 路徑請用絕對路徑。
+
+**可以重複執行**：每一步先看現狀，已經是目標狀態就印 `ok` 不動它。絕不刪除或覆蓋既有的隧道金鑰、`keys.env`、資料庫。所以中途失敗、補了條件之後，同樣的指令再跑一次就好。
+
+#### 1.A.4 建議的執行順序
+
+隧道金鑰要先產生，才能拿去給 MyLinuxPool 登記；MyLinuxPool 登記完才能接通。所以分兩次跑，最後再 `--check`：
+
+1. **第一次：不帶部署公鑰與會合點。**
+
+   ```bash
+   bash ~/lgw-boot/deploy/bootstrap.sh --tag lgw-vX.Y.Z --sudo-pass-file <密碼檔>
+   ```
+
+   做完建帳號、linger、檢查 sshd、第一次安裝、產隧道金鑰。結尾摘要會印兩樣東西，各自交給對的人：
+   - **隧道公鑰**（一行 `ssh-ed25519 … llmgateway-tunnel`）：經 PMO 交給 mylinuxpool-pm，登記到 MyLinuxPool 的 `TUNNEL_EXTRA_PUBKEYS`（MyLinuxPool#77）。部署公鑰也要一併請他登記（1.9 第 1 點）。
+   - **`[127.0.0.1]:4711 ssh-ed25519 …` 那一行**：給本人，放進 secret `GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS`（2.2）。那個 secret 共兩行，另一行是跳板機的，由 MyLinuxPool 提供。
+
+   第一次一定會有 `todo`（還沒給部署公鑰與會合點），結束碼是 3，這是預期的。
+2. **等 MyLinuxPool 登記好兩把公鑰（隧道公鑰、部署公鑰）後，第二次：補上部署公鑰與會合點。**
+
+   ```bash
+   bash ~/lgw-boot/deploy/bootstrap.sh --tag lgw-vX.Y.Z --sudo-pass-file <密碼檔> \
+     --deploy-pubkey-file <部署公鑰檔> \
+     --rendezvous sshproxy@<跳板機>:<埠> --rendezvous-known-hosts <檔>
+   ```
+
+   這次會寫 `authorized_keys`、複製 known_hosts、填 `tunnel.env`，然後重啟 `llmgateway-tunnel.service`。
+3. **`--check` 確認**：帶和第二次一樣的參數再加 `--check`（沒帶的參數，對應的那一步會被當成 `todo`）。
+
+   ```bash
+   bash ~/lgw-boot/deploy/bootstrap.sh --tag lgw-vX.Y.Z --sudo-pass-file <密碼檔> \
+     --deploy-pubkey-file <部署公鑰檔> \
+     --rendezvous sshproxy@<跳板機>:<埠> --rendezvous-known-hosts <檔> --check
+   ```
+
+   全部 `ok`、結束碼 0，再照 1.10 驗證，並從 Mac 照 3.1 連一次。確認完把 `~/lgw-boot` 與 `<密碼檔>` 刪掉。
+
+#### 1.A.5 看懂輸出
+
+每一步印一行 `[步驟] 狀態 說明`。步驟依序是 `prereq`（前提）、`user`（帳號）、`linger`、`sshd`、`install`（安裝）、`tunnel-key`（隧道金鑰）、`deploy-key`（部署公鑰）、`rendezvous`（會合點）、`check`（`install.sh --check`）。
+
+| 狀態 | 意思 |
+|---|---|
+| `ok` | 已經是目標狀態，沒動它 |
+| `changed` | 這次改了東西 |
+| `todo` | 需要人做（或缺參數）；腳本不會擅自處理，結尾摘要會再列一次 |
+| `fail` | 這一步失敗，腳本停在這裡，說明裡有原因 |
+
+結束碼：
+
+| 碼 | 意思 | 怎麼辦 |
+|---|---|---|
+| 0 | 全部完成，沒有 `todo` | 沒事了 |
+| 1 | 某一步 `fail` | 看那一行的說明，排除後重跑 |
+| 2 | 參數錯 | 看錯誤訊息（例如 `--rendezvous` 與 `--rendezvous-known-hosts` 沒有一起給、檔案不存在、tag 格式不對） |
+| 3 | 完成了，但還有 `todo` | 照 1.A.6 處理後重跑 |
+
+第二次起，條件沒變時 `changed` 應該是 0。
+
+#### 1.A.6 每種 `todo`、`fail` 怎麼辦
+
+| 步驟 | 訊息 | 怎麼辦 |
+|---|---|---|
+| `sshd` | `todo`：未啟用 `PubkeyAuthentication`、`AllowUsers`／`DenyUsers` 擋了 `llmgw`、沒在 `127.0.0.1:22` 聽 | 腳本**只檢查、不改 `sshd_config`**。照 1.3 自己改 `/etc/ssh/sshd_config` 或 `sshd_config.d/*.conf`，`sshd -t` 通過後 reload，再重跑腳本。 |
+| `user` | `todo`（`--check` 時）：帳號不存在，或在 `docker` 群組 | 不加 `--check` 重跑，腳本會建帳號或把 `llmgw` 移出 `docker` 群組（1.1）。 |
+| `linger` | `fail`：等 `/run/user/<uid>` 逾時 | `loginctl show-user llmgw -p Linger` 看是否 `yes`；等一下再重跑。 |
+| `install` | `fail` | 多半是 clone 不到 tag（tag 沒 push、網路）或 `install.sh` 出錯；看輸出裡 `ERROR` 那行，排除後重跑；已經裝好卻想重裝加 `--reinstall`。 |
+| `deploy-key` | `todo`：未給 `--deploy-pubkey-file` | 等部署公鑰就緒，第二次帶上。 |
+| `deploy-key` | `fail`：不是單行公鑰 | 檔案只能有一行 OpenSSH 公鑰（`ssh-keygen -l -f <部署公鑰檔>` 要能讀）；不要給私鑰、不要多行。 |
+| `rendezvous` | `todo`：未給會合點 | 等 MyLinuxPool 登記好，第二次帶上 `--rendezvous` 與 `--rendezvous-known-hosts`。 |
+| `check` | `fail`：`install.sh --check` 不是 0 | 看 4.4 的三態。隧道還沒設定時隧道守護停在 failed（`config_missing`，見 1.5），所以第一次執行時 `check` 不通過是預期的；全部步驟做完後仍不通過，照 5.4 排錯。 |
+
+摘要最後有一份剩餘 `todo` 清單，照著一條條做完再跑一次即可。
+
+#### 1.A.7 腳本沒做的事
+
+- 不改 `sshd_config`（只檢查）。
+- 不碰 `keys.env` 的內容（key 由 `deploy-keys` workflow 部署，4.1）。
+- 不登記 MyLinuxPool 的 `TUNNEL_EXTRA_PUBKEYS`、不設 GitHub secrets（2.2）：這些由本人或 mylinuxpool-pm 做。
+
+### 手動步驟（備援與說明）
+
+以下 1.1–1.10 是 `bootstrap.sh` 自動化的動作，需要 root。腳本壞掉、或腳本回報 `todo`／`fail` 需要手動補時照這裡做。
 
 ### 1.1 建帳號 `llmgw`（不加 docker 群組）
 
@@ -81,7 +202,7 @@ rm -rf ~/lgw-bootstrap
 3. 原子切換 `current`、裝 `llmgateway-run`、`llmgateway-tunnel` 與兩個 unit；
 4. `daemon-reload`；`llmgateway.service` 在跑就重啟、沒跑就啟用並啟動；`llmgateway-tunnel.service` 只 `enable`，沒在跑才 `start`，**不會當場重啟它**（部署連線本身走這條隧道，見 4.2 第 4 點）。
 
-這時 key 還沒部署，list 裡每一把的 `available` 都是 false；`tunnel.env` 的必填三項（`RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS`）還是空的，隧道守護起來後在 log 寫一行 `config_missing` 就以結束碼 78 結束。unit 有 `RestartPreventExitStatus=78`，78 不會觸發自動重開，所以不會在設定填好前反覆重啟，`systemctl --user status llmgateway-tunnel` 會看到它停在 failed。這是預期的，1.8 填好設定後手動重啟即可。（bootstrap 腳本帶 `--rendezvous` 時會代做 1.8 的填設定與重啟。）
+這時 key 還沒部署，list 裡每一把的 `available` 都是 false；`tunnel.env` 的必填三項（`RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS`）還是空的，隧道守護起來後在 log 寫一行 `config_missing` 就以結束碼 78 結束。unit 有 `RestartPreventExitStatus=78`，78 不會觸發自動重開，所以不會在設定填好前反覆重啟，`systemctl --user status llmgateway-tunnel` 會看到它停在 failed。這是預期的，1.8 填好設定後手動重啟即可。（`bootstrap.sh` 帶 `--rendezvous` 時會代做 1.8 的填設定與重啟，見 1.A.4。）
 
 ### 1.6 產生隧道金鑰（私鑰不離開那台）
 
