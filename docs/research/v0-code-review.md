@@ -156,3 +156,46 @@
   sidecar 重送邏輯須按此寫，建議 5.1 加兩行（重播 409 → 重申請；重播 refusal 原樣）。
 - `_replay` 的 not_allowed 不記 denied 事件是對的（重播非新申請），同請在 5.1 寫明，避免 sidecar 誤告警。
 - 嚴重度：建議。
+
+## F. 複驗（修正後，針對 2205820，impl/gateway-v0-core 最新）
+
+> 方法：以 `git show` 取 HEAD 各檔（本輪 Read 工具曾回傳舊快取，改道取 HEAD；工作樹乾淨）；
+> 全套測試 `python3 -m unittest discover -s tests -t .` 207 個全過；PM 冒煙結論（表無值、撤銷重送 401、
+> exhausted 重送同 env）與程式一致。
+> 記號：✅已解 ／ ➡️待他人動作 ／ ⬜未處理 ／ 🔍新殘留（低）。
+> 結論：R1、R2、E1、E2、S2–S7 皆已解；S1 未動；新殘留 2 處皆微。
+
+### F-0. 必修兩條
+
+- R1（去重表 key 值）：✅已解。`_dedup_put` 統一經 `_redact`（env 值清空、留變數名與 unset）；
+  重播經 `_replay` 用現行 KeyStore 重組 env；轮替後重播拿新 key（不再是舊值）。PM 表無值的冒煙結論成立。
+- R2（認證在去重後）：✅已解，且比建議更彻底——六處一律 auth → settle → dedup，连同 settle 位置一併合乎
+  design「經過認證的請求先補記」字面。撤銷後重送回 401，PM 冒煙結論成立。
+
+### F-1. E 節三條
+
+- E1（exhausted 重播漏接）：✅已解。這版 `exhausted` 已接 `_replay(cur, stored, "next")`；
+  重送拿回同 env（key 未換的前提下），PM 冒煙結論成立；租約已結束的重播回 409（需重申請，合約變化見 E3）。
+- E2（settle 位置）：✅已解。上式即答案。
+- E3（合約進 5.1）：➡️待 PM（PM 已承諾寫進交接版）。程式側行為已定：重播非位元組一致（env 重組）、
+  租約結束的重播 409、`_replay` 的 not_allowed 不記 denied 事件。
+
+### F-2. S 條
+
+- S1（whoami 未進 design）：⬜未處理。程式與 client 自洽，design 決定 6 仍無該端點。維持原建議。
+- S2（body 上限）：✅已解。`_MAX_BODY_BYTES` 1MB，超限不讀 body 直接 413（`{"error":"body_too_large"}`，
+  client 照一般錯誤處理）。🔍微殘留：design 錯誤表無 413，補一行即可。
+- S3（500 無迹）：✅已解。記 `type(exc).__name__`（種類無值，traceback 不印 locals，無通道）。
+- S4（pending 顯示）：✅已解。`count_granted_for_sub`＋board JSON／HTML 同步顯示（含跳脫）。
+- S5（preferences 帶到下一張）：✅已解。`exhausted` 從租約列還原（`json.loads`，本機寫本機讀）。
+- S6（Result repr）：✅已解（e97f254：repr 藏 data＋docstring 警語＋test_client 斷言）。
+- S7（_deny 死分支）：✅已解。`request_id` 穿進 ctx，內層申請由外層存，註解寫明分工。
+
+### F-3. 修正引入的新問題檢查（逐項看過，無必修）
+
+- `_replay` 的三個出口皆 fail-closed：租約不在／已結束→409；key 撤下→not_allowed；`build_env` 失敗→not_allowed；
+  皆在原交易內、皆不寫新事件。無值通道（`lease_id` 取不到時以 `""` 查，回 None→409）。
+- 重播不再位元組一致屬有意改變（E3 已列交接）；`start`／`renew`／`release`／`usage` 重播無 env，本來就一致，不受影響。
+- `_redact` 留 env 變數名：名稱非秘密；deepcopy 無別名污染（存檔即 `json.dumps`）。
+- `pending`、`413`、`INFO` 三處 log／顯示皆無值（種類、計數、固定字串）。
+- 另：`exhausted` 還原 preferences 若遇損毀文字會 500——該欄位只由本機 `json.dumps` 寫入，實務到不了；不列條目。
