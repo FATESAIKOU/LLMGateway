@@ -338,6 +338,30 @@ class ConnectTest(ConnectCase):
                 self.assertEqual(resp.status, 200)
         self._assert_dead(ssh_script)
 
+    def test_switch_rendezvous_updates_destination_in_argv(self):
+        """改設定中的會合點後，argv 的目的地跟著改（spec connectivity「換一個會合點」）。"""
+        cfg1 = ConnectConfig(
+            rendezvous="user1@rendezvous1.example:2201",
+            identity=str(self.root / "id_fake"),
+            known_hosts=str(self.root / "known_hosts_fake"),
+            ssh_path=str(self.ssh_ok),
+        )
+        with connect(cfg1) as base_url1:
+            argv1 = self._argv_of(self.ssh_ok)
+            self.assertEqual(argv1[argv1.index("-p") + 1], "2201")
+            self.assertEqual(argv1[-1], "user1@rendezvous1.example")
+
+        cfg2 = ConnectConfig(
+            rendezvous="user2@rendezvous2.example:3302",
+            identity=str(self.root / "id_fake"),
+            known_hosts=str(self.root / "known_hosts_fake"),
+            ssh_path=str(self.ssh_ok),
+        )
+        with connect(cfg2) as base_url2:
+            argv2 = self._argv_of(self.ssh_ok)
+            self.assertEqual(argv2[argv2.index("-p") + 1], "3302")
+            self.assertEqual(argv2[-1], "user2@rendezvous2.example")
+
     def test_host_keys_temp_file_0600_and_cleanup(self):
         host_keys = [
             "[fake-rendezvous]:2222 ssh-ed25519 AAAAFAKEKEY0001",
