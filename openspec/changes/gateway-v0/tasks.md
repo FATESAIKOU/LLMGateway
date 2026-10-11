@@ -2,7 +2,7 @@
 
 - [ ] 1.1 專案骨架：`server/`（服務）、`lgw/`（API 客戶端、訊號規則、管理命令）、`policy/default.json`（內容照設計決定 8）、`client/opencode.json`；只用 Python 標準函式庫；測試用 `unittest`；「現在」經可替換的 clock 介面
 - [ ] 1.2 SQLite：`events`（只追加、單調序號）、`leases`、`cooldowns`、`clients`、去重表；每個改變狀態的動作一筆 `BEGIN IMMEDIATE` 交易；重啟時從 `events` 重建
-- [ ] 1.3 客戶端憑證：`lgw admin client add|revoke|list`；32 bytes 隨機值，只存 SHA-256；撤銷時一併 revoke 該客戶端未結束的租約；worker 名稱與客戶端相符的檢查
+- [ ] 1.3 客戶端憑證：`lgw admin client add|rm|list`（rm 等同 revoke）、`GET /v1/whoami`；32 bytes 隨機值，只存 SHA-256；撤銷時一併 revoke 該客戶端未結束的租約；worker 名稱與客戶端相符的檢查
 - [ ] 1.4 `POST /v1/leases`：
   - 欄位與長度檢查（`instance` 必填）；`instance` 唯一；`preferences`、`usage` 的格式檢查；
   - 依政策選定（順序、冷卻、上限、模型允許清單）；
@@ -47,14 +47,15 @@
 
 ## 3. 部署（需要 MyLinuxPool 的工單）
 
-- [ ] 3.1 開 MyLinuxPool 的單：
-  - 服務的 shared-config 單元（API 綁 loopback 與 worker 看得到的內部介面，HTML 只綁 loopback）；
-  - 本 repo Actions 的 client 身分；
-  - worker 容器連到服務的路；
-  - 客戶端憑證放進 `/run/mlp-secrets/`。
-- [ ] 3.2 `deploy-keys` workflow：手動觸發、經跳板以 stdin 傳值、寫暫存檔再 rename、送 SIGHUP；log 只有 secret 名稱
+- [x] 3.1 開 MyLinuxPool 的單（mylinuxpool-pm 已開，都 blocked by #8）：
+  - MyLinuxPool#67：服務的 shared-config 單元；
+  - MyLinuxPool#68：部署專用的受限金鑰；
+  - MyLinuxPool#69：worker 連到服務的路；
+  - MyLinuxPool#70：worker 客戶端憑證的發、撤、核對。
+- [ ] 3.1a 本人選服務放哪一台常駐 provider（MyLinuxPool#67）
+- [ ] 3.2 `deploy-keys` workflow：手動觸發、用部署專用金鑰經跳板（只能轉發）到 provider（只能跑部署腳本）、以 stdin 傳值；log 只有 secret 名稱
 - [ ] 3.3 本人設五把 secret（PMO 帶本人設，AI 不經手值）→ 跑 `deploy-keys`
-- [ ] 3.4 在 provider 上發客戶端憑證：Mac 一把、每台 worker 一把
+- [ ] 3.4 發客戶端憑證：Mac 一把由 PM 在 provider 上發；worker 的由 create-worker 自動發（MyLinuxPool#70）
 - [ ] 3.5 綁定驗收：從池外與 worker 介面連 HTML 狀態板連不上；從池外連 API 連不上
 
 ## 4. 驗收
