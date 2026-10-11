@@ -9,14 +9,16 @@
 #   LGW_DEPLOY_JUMP           跳板機，格式 user@host:port
 #   LGW_DEPLOY_TARGET         provider（經跳板看到的位址），格式 user@host:port
 #   LGW_KEY_CLAUDE_PERSONAL、LGW_KEY_CLAUDE_COMPANY、LGW_KEY_OPENROUTER、LGW_KEY_OPENCODE_ZEN、LGW_KEY_OLLAMA
-# 連線資訊也放 secret，是因為本 repo 是 public，不把池的位址放在公開的 vars。
+# 連線資訊也放 secret，是因為本 repo 是 public，不把池的位址放在公開的 vars；
+# ssh 的錯誤輸出也會把位址換成 [jump]／[target] 再印。
+# repo 設定：environment「llmgateway-deploy」要設本人為 required reviewer；
+# LGW_DEPLOY_KNOWN_HOSTS 由 MyLinuxPool 提供的指紋建立，不要用 ssh-keyscan 現掃。
 name: deploy-keys
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: deploy-keys
@@ -50,9 +52,11 @@ jobs:
           K_OPENCODE_ZEN: ${{ secrets.LGW_KEY_OPENCODE_ZEN }}
           K_OLLAMA: ${{ secrets.LGW_KEY_OLLAMA }}
         run: |
-          set -eu
+          set -eu -o pipefail
           target_user_host="${TARGET%:*}"
           target_port="${TARGET##*:}"
+          jump_host="${JUMP#*@}"; jump_host="${jump_host%:*}"
+          target_host="${target_user_host#*@}"
           # printf 是 shell 內建指令，值不會出現在任何程序的命令列
           {
             printf 'CLAUDE_PERSONAL_OAUTH_TOKEN=%s\n' "$K_CLAUDE_PERSONAL"
@@ -60,11 +64,13 @@ jobs:
             printf 'OPENROUTER_API_KEY=%s\n' "$K_OPENROUTER"
             printf 'OPENCODE_ZEN_API_KEY=%s\n' "$K_OPENCODE_ZEN"
             printf 'OLLAMA_API_KEY=%s\n' "$K_OLLAMA"
-          } | ssh \
+          } | ssh -T \
               -i ~/.ssh/lgw_deploy -o IdentitiesOnly=yes \
               -o UserKnownHostsFile=~/.ssh/lgw_known_hosts -o StrictHostKeyChecking=yes \
               -o BatchMode=yes -o ConnectTimeout=20 \
-              -J "$JUMP" -p "$target_port" "$target_user_host" deploy
+              -J "$JUMP" -p "$target_port" "$target_user_host" deploy \
+              2> >(sed -e "s|${jump_host}|[jump]|g; s|${target_host}|[target]|g" >&2)
+          # 尾端的 deploy 是保險：provider 端若少了 command= 強制命令，sh -c deploy 會失敗，stdin 不會被當指令執行
 
       - name: Remove SSH identity
         if: always()

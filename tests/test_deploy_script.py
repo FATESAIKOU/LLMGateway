@@ -72,6 +72,21 @@ class DeployScriptTests(unittest.TestCase):
     def test_too_large_rejected(self):
         self._assert_rejected_keeps_old(b"#" * 70000, 3)
 
+    def test_missing_key_name_rejected(self):
+        self._assert_rejected_keeps_old(b"CLAUDE_PERSONAL_OAUTH_TOKEN=a\nOPENROUTER_API_KEY=b\nOLLAMA_API_KEY=c\n", 4)
+
+    def test_value_with_base64_padding_accepted(self):
+        payload = GOOD.replace(b"OLLAMA_API_KEY=x5", b"OLLAMA_API_KEY=abc+/de==")
+        proc = run(payload, self.dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(read(self.keys), payload)
+
+    def test_script_and_keystore_agree_on_key_names(self):
+        from lgwd.keys import KEY_NAMES
+        payload = "".join(f"{name}=v{i}\n" for i, name in enumerate(KEY_NAMES.values())).encode()
+        proc = run(payload, self.dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_reload_failure_reported_but_file_written(self):
         proc = run(GOOD, self.dir, "false")
         self.assertEqual(proc.returncode, 5)

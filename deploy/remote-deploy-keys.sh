@@ -61,6 +61,13 @@ while IFS= read -r line || [ -n "$line" ]; do
   esac
 done < "$tmp"
 
+for required in $ALLOWED; do
+  case " $seen " in
+    *" $required "*) ;;
+    *) echo "deploy-keys: missing key name $required" >&2; exit 4 ;;
+  esac
+done
+
 chmod 600 "$tmp"
 mv -f "$tmp" "$KEYS_FILE"
 trap - EXIT
