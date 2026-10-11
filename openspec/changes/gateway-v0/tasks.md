@@ -53,8 +53,12 @@
   - MyLinuxPool#69：worker 連到服務的路；
   - MyLinuxPool#70：worker 客戶端憑證的發、撤、核對。
 - [ ] 3.1a 本人選服務放哪一台常駐 provider（MyLinuxPool#67）
-- [ ] 3.2 `deploy-keys` workflow：手動觸發、用部署專用金鑰經跳板（只能轉發）到 provider（只能跑部署腳本）、以 stdin 傳值；log 只有 secret 名稱
-- [ ] 3.3 本人設五把 secret（PMO 帶本人設，AI 不經手值）→ 跑 `deploy-keys`
+- [ ] 3.2（草稿已寫，branch `impl/gateway-v0-core`）`deploy-keys` workflow：手動觸發、用部署專用金鑰經跳板（只能轉發）到 provider（只能跑部署腳本）、以 stdin 傳值；log 只有 secret 名稱
+- [ ] 3.3 本人設定（PMO 帶本人做，AI 不經手值）：
+  - environment「llmgateway-deploy」，required reviewer 設本人；
+  - 連線 4 個 secret：`LGW_DEPLOY_SSH_KEY`、`LGW_DEPLOY_KNOWN_HOSTS`（用 MyLinuxPool 提供的指紋，不用 ssh-keyscan）、`LGW_DEPLOY_JUMP`、`LGW_DEPLOY_TARGET`；
+  - key 5 個 secret：`LGW_KEY_CLAUDE_PERSONAL`、`LGW_KEY_CLAUDE_COMPANY`、`LGW_KEY_OPENROUTER`、`LGW_KEY_OPENCODE_ZEN`、`LGW_KEY_OLLAMA`；
+  - 之後跑 `deploy-keys`。
 - [ ] 3.4 發客戶端憑證：Mac 一把由 PM 在 provider 上發；worker 的由 create-worker 自動發（MyLinuxPool#70）
 - [ ] 3.5 綁定驗收：從池外與 worker 介面連 HTML 狀態板連不上；從池外連 API 連不上
 
