@@ -1,0 +1,71 @@
+# LLMGateway：把五把 key 從本 repo 的 secret 部署到池內常駐 provider（design 決定 2）。
+# 只能手動觸發。經池的 SSH 跳板（部署專用金鑰在跳板機上只能轉發）連到 provider，
+# provider 端由 authorized_keys 強制執行 deploy/remote-deploy-keys.sh（MyLinuxPool#68）。
+# 值只經過環境變數與 stdin，不上命令列、不寫進 log（GitHub 也會自動遮罩 secret）。
+#
+# 需要的 secret（值由本人設，AI 不經手）：
+#   LGW_DEPLOY_SSH_KEY        部署專用私鑰
+#   LGW_DEPLOY_KNOWN_HOSTS    跳板機與 provider 的 host key（known_hosts 格式）
+#   LGW_DEPLOY_JUMP           跳板機，格式 user@host:port
+#   LGW_DEPLOY_TARGET         provider（經跳板看到的位址），格式 user@host:port
+#   LGW_KEY_CLAUDE_PERSONAL、LGW_KEY_CLAUDE_COMPANY、LGW_KEY_OPENROUTER、LGW_KEY_OPENCODE_ZEN、LGW_KEY_OLLAMA
+# 連線資訊也放 secret，是因為本 repo 是 public，不把池的位址放在公開的 vars。
+name: deploy-keys
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-keys
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: llmgateway-deploy
+    timeout-minutes: 5
+    steps:
+      - name: Prepare SSH identity
+        env:
+          SSH_KEY: ${{ secrets.LGW_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.LGW_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/lgw_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/lgw_known_hosts
+          test -s ~/.ssh/lgw_deploy && test -s ~/.ssh/lgw_known_hosts
+
+      - name: Send key file over stdin
+        env:
+          JUMP: ${{ secrets.LGW_DEPLOY_JUMP }}
+          TARGET: ${{ secrets.LGW_DEPLOY_TARGET }}
+          K_CLAUDE_PERSONAL: ${{ secrets.LGW_KEY_CLAUDE_PERSONAL }}
+          K_CLAUDE_COMPANY: ${{ secrets.LGW_KEY_CLAUDE_COMPANY }}
+          K_OPENROUTER: ${{ secrets.LGW_KEY_OPENROUTER }}
+          K_OPENCODE_ZEN: ${{ secrets.LGW_KEY_OPENCODE_ZEN }}
+          K_OLLAMA: ${{ secrets.LGW_KEY_OLLAMA }}
+        run: |
+          set -eu
+          target_user_host="${TARGET%:*}"
+          target_port="${TARGET##*:}"
+          # printf 是 shell 內建指令，值不會出現在任何程序的命令列
+          {
+            printf 'CLAUDE_PERSONAL_OAUTH_TOKEN=%s\n' "$K_CLAUDE_PERSONAL"
+            printf 'CLAUDE_COMPANY_OAUTH_TOKEN=%s\n' "$K_CLAUDE_COMPANY"
+            printf 'OPENROUTER_API_KEY=%s\n' "$K_OPENROUTER"
+            printf 'OPENCODE_ZEN_API_KEY=%s\n' "$K_OPENCODE_ZEN"
+            printf 'OLLAMA_API_KEY=%s\n' "$K_OLLAMA"
+          } | ssh \
+              -i ~/.ssh/lgw_deploy -o IdentitiesOnly=yes \
+              -o UserKnownHostsFile=~/.ssh/lgw_known_hosts -o StrictHostKeyChecking=yes \
+              -o BatchMode=yes -o ConnectTimeout=20 \
+              -J "$JUMP" -p "$target_port" "$target_user_host" deploy
+
+      - name: Remove SSH identity
+        if: always()
+        run: rm -f ~/.ssh/lgw_deploy ~/.ssh/lgw_known_hosts
