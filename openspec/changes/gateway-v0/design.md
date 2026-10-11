@@ -1,299 +1,211 @@
 ## Context
 
-動機與範圍見 proposal.md（第 3 版，本人已確認）。這裡只列影響做法的現況與限制：
+動機與範圍見 proposal.md（v4 定案）。影響做法的現況與限制：
 
-- **Claude 條款**：訂閱的 OAuth 是給原版 Claude Code 這類 Anthropic 原生 app 的一般使用；第三方不得代為路由、收集、存放、中轉 Claude.ai 的 token（`docs/research/claude-failover.md` §7）。所以 LLMGateway 不能代轉 Claude 的請求，只能把 `CLAUDE_CODE_OAUTH_TOKEN` 交給本人自己的原版 Claude Code。
-- **期 1 設計**（已封存為 `openspec/specs/agent-lease`、`openspec/specs/usage-record`）：控制面、租約、只追加事件、launcher 注入、切換留紀錄。v0 延伸它；差別見決定 1、2、3。
-- **池**：池內有常駐的 provider，Mac 已經有經 SSH 跳板連入池內的身分。worker 是跑在 provider 上的容器。對外只有跳板機的 SSH 埠，其餘服務都不對外。
-- **sidecar**（MyAiStorage#31，範圍 B，已開工）：用 herdr 開關 agent，用 `agora continue` 接回 session，用假的 `ModelBroker` 頂著。介面形狀已和 aistorage-pm 對齊（proposal 第 2 節）。
-- **各上游**：OpenRouter、Ollama Cloud 有官方的 Claude Code 接法；Zen 只有 opencode（`upstream-claude-code-compat.md`）。額度訊號見 `quota-signals.md`。
-- **Claude Code**：`--settings <file-or-json>` 可以在啟動時給設定；互動模式有 `autoContinueAtUsageLimit`，會在額度重置後自己續跑。
+- **Claude 條款**：訂閱的 OAuth 是給原版 Claude Code 這類 Anthropic 原生 app 的一般使用；第三方不得代為路由、收集、存放、中轉 Claude.ai 的 token（`docs/research/claude-failover.md` §7）。LLMGateway 不代轉請求，Claude 訂閱的 key 只給 `agent=claude-code` 的 get。
+- **sidecar v3**（MyAiStorage，aistorage-pm）：一台機器一個 daemon（Mac 也能跑），對外五個操作加 HTTP 控制，不基於 herdr。它用 LLMGateway 的 list／get／登錄冷卻；挑把與換把在它內部；key 變成哪些環境變數由它的 AgentDriver 決定。
+- **服務的位置**（本人裁定）：本人選定的常駐 provider，LLMGateway 跟 MyLinuxPool 無關，用自己的帳號 `llmgw` 跑。
+- **v4（本人定案）**（本人對 v3 的第 5～7 點與後續的裁定）：
+  - 部署與啟動不依賴 MyLinuxPool，只依賴「一台連得到的 Linux 機器＋SSH」；
+  - 伺服器端自己用 ssh reverse tunnel 公開埠並維持健康；
+  - LLMGateway 提供客戶端連線程式，支援跳板。
+- **期 1 設計**（已封存為 `openspec/specs/agent-lease`、`usage-record`）：以租約為中心。v3 不再有租約，這兩份規格在本 change 移除。
 
 ## Goals / Non-Goals
 
 **Goals**
-- 五把 key 只放一處，客戶端只在租約期間拿到其中一把。
-- 換把的判斷只有一份（服務端），換把的程序也只有一份（sidecar 的 agent 宿主），worker 與 Mac 共用。
-- 第三方依賴越少越好：服務與 `lgw` 都只用 Python 標準函式庫。
+- 對外只有 list、get、登錄冷卻三個介面（本人：「不需要多餘介面」）。
+- 五把 key 只放一處；值只出現在 get 的回覆。
+- 服務只用 Python 標準函式庫＋SQLite。
 
 **Non-Goals**
-- 不轉送任何模型請求（沒有資料面）。
-- 不做 token／成本的計量；期 1 `usage-record` 的 token 回報不在 v0（見決定 11）。
-- 不做依內容或依效能的改送（#3、#4）。
+- 不轉送模型請求；不挑把（由 sidecar 挑）；不計量 token／成本；不做 agent 專用的環境變數對應。
 
 ## Decisions
 
-### 決定 1：LLMGateway＝保管處＋租用服務，沒有資料面
+### 決定 1：LLMGateway＝保管＋列出＋記冷卻
 
-- 服務只做：保管 key、依政策出租、記錄、冷卻、狀態板。模型請求由 agent 直接打上游。
-- **為什麼**：Claude 條款不允許代轉訂閱 token；其他三把也不需要代轉，因為 agent 本來就能直接用。少一層代轉，也就少一個集中處理所有請求內容的地方。
-- **放棄的選項**：
-  - 資料面閘道（PR #9 第 1 版）：Gateway 持有 Claude 訂閱 token 代轉，違反條款。
-  - sub2api：它的價值正是代轉與訂閱帳號池。
-  - LiteLLM 當核心：只在某個上游非要格式轉換才加，而且要固定版本並查核供應鏈（`litellm-supply-chain.md`）。
-
-### 決定 2：key 的保管與部署、服務的部署
-
-- **來源**：本 repo 的 GitHub secret，五把各一個，名稱照本人的命名規則（tasks 3.3），值由本人設。
-- **部署的路**：本 repo 的 workflow 經池的 SSH 跳板，以服務帳號 `llmgw` 登入放服務的那台。
-  - 跳板機上：部署金鑰只能轉發到那台的隧道埠（`restrict,port-forwarding,permitopen="127.0.0.1:<埠>"`），不能開 shell。這一行由 MyLinuxPool 管（MyLinuxPool#68）。
-  - 那台上：`~llmgw/.ssh/authorized_keys` 用 `command="<…>/current/deploy/remote-deploy.sh",restrict` 強制執行部署腳本。這一行由 LLMGateway 管，池的 pool-sync 不會碰其他帳號。
-  - 跳板與那台用同一把部署金鑰；私鑰放本 repo 的 secret，由本人設。
-- **部署腳本的兩個動詞**（從 `SSH_ORIGINAL_COMMAND` 以白名單解析，其他一律拒絕）：
-  - `keys`：從 stdin 讀 key 檔內容 → 驗證 → 寫暫存檔、0600、rename 成 `keys.env` → 通知服務重讀。由 workflow `deploy-keys` 使用。
-  - `upgrade <tag>`：tag 必須符合 `lgw-vX.Y.Z` → 以固定 tag 取碼、切換 current、重啟服務。由 workflow `deploy-service` 使用。
-- workflow 的 log 只出現 secret 名稱；值用 stdin 傳，不上命令列；ssh 的錯誤輸出會把位址遮掉。
-- **為什麼**：本人已同意把來源放在這裡；GitHub secret 加上 Actions 是本人既有的做法。服務帳號自己管部署的那一行，就不必依賴 MyLinuxPool 的 authkeys 組裝。
-- **放棄的選項**：
-  - 繼續放 MyLinuxPool 的 `POOL_WORKER__*`：本人裁定那只是過渡。
-  - 本人手動把檔案放到那台：不能重現，輪替也容易漏。
-  - 用池的管理帳號跑服務：本人裁定 LLMGateway 跟 MyLinuxPool 無關；而且管理帳號的 authorized_keys 由池整份取代。
-
-### 決定 3：服務的形狀
-
-- **程式**：Python 標準函式庫，HTTP 用 `http.server.ThreadingHTTPServer`、資料用 `sqlite3`，沒有第三方套件。
-- **位置**：本人選定的常駐 provider（機器名稱不寫在 public repo）。本人的裁定是：「這東西跟 mlp 無關，說到底就是那台跑了兩個服務。」所以 LLMGateway 是**獨立的服務**，不是 MyLinuxPool 的單元：
-  - 在那台用**自己的系統帳號 `llmgw`** 跑，是 systemd user unit（帳號開了 linger）。`llmgw` **不加進 docker 群組**，因為 docker 群組等同 root，加了就打破隔離。
-  - 安裝程式、unit、run wrapper、版本、`--check` 都在本 repo 的 `deploy/`。版本 tag 只在部署時指定一次（`upgrade <tag>`）。
-  - 只綁 loopback，以及同一台容器看得到的 docker bridge 位址；管理 API 與 HTML 狀態板只綁 loopback。
-  - `--check` 三態：0＝服務在跑、版本對、`GET /v1/board` 不帶憑證時回 401；1＝確定不成立；2＝無法確認。
-- **一次性的開機設定**（要 root，由本人做或本人授權）：
-  - 建 `llmgw` 帳號、`loginctl enable-linger llmgw`；
-  - 確認 sshd 沒有擋 `llmgw`；
-  - 放部署公鑰；
-  - 第一次安裝；
-  - 發「發證用」的管理憑證（決定 4），由本人直接設進 MyLinuxPool 的 secret。
-- **資料**：同一個 SQLite 檔，表有 `events`（只追加，單調序號）、`leases`、`cooldowns`、`clients`（憑證雜湊與角色）、去重表。
-- **重啟**：從 `events` 重建現況。
+- 服務只做三件事：保管 key、列出 subscription（含冷卻與能不能用）、記冷卻。誰用哪一把、什麼時候換，都由 sidecar 決定。
 - **為什麼**：
-  - 流量很小（一個 agent 一小時幾次），不需要框架；
-  - 少一個供應鏈風險；
-  - 獨立帳號讓 key 只有服務讀得到，和池的管理帳號隔開；那台的 auditd 也會稽核這個帳號。
+  - 本人的新方向；
+  - 換把需要的資訊（額度用完、重置時刻）本來就在 sidecar 手上；
+  - LLMGateway 不必知道 agent、租約、機器。
 - **放棄的選項**：
-  - Go 單一執行檔：sidecar 與 MyAiStorage 都是 Python，共用模型與測試慣例比較省事。
-  - FastAPI 之類的框架：多一串依賴。
-  - 做成 MyLinuxPool 的 shared-config 單元（MyLinuxPool#67，已作廢）：本人裁定不是池的一部分。
+  - 租約（PR #9 上一版）：要多五個介面與一套狀態機，本人要求不要多餘介面。
+  - 資料面代轉（第 1 版）：違反 Claude 條款。
 
-### 決定 4：客戶端身分
+### 決定 2：會合點＝池跳板機上現有的 sshproxy 帳號（v4 定案）
 
-- 每個客戶端一把隨機的客戶端憑證（32 bytes），服務只存 SHA-256，可以單獨撤銷。客戶端有兩種角色：
-  - `client`：worker 的 sidecar、Mac、之後的手機。只能用租用 API。
-  - `issuer`：發證用的管理憑證。只能用管理 API，不能租用。
-- **管理 API**（只綁 loopback）：
-  - `POST /v1/admin/clients {name}`：回 `201 {name, token}`；
-  - `DELETE /v1/admin/clients/{name}`：回 204；不存在的名字回 404。
-  - issuer 只能發撤名字符合 `worker-[A-Za-z0-9._-]{1,57}` 的客戶端。
-  - 同名重複發證時，先撤掉舊的（連同它未結束的租約）再回新的，不會同時有兩把有效的。
-  - 從非 loopback 介面來的管理請求一律 403。
-- **worker 的客戶端憑證由 MyLinuxPool 自動發撤**（MyLinuxPool#70）：
-  - create-worker 經 pool-ssh 的 stdin 通道，在那台以 curl 打 127.0.0.1 的管理 API。發證憑證從 stdin 讀、不上 argv；回來的 token 直接寫進 worker 的掛載目錄，不經 log 與 output。
-  - delete-worker 撤證，失敗時明確報錯。
-  - 發證憑證存成 MyLinuxPool 的 secret `GH_MYLINUXPOOL__LLMGATEWAY_ADMIN__ISSUE`。
-- **其他客戶端**（Mac、手機）由 PM 在那台以 `llmgw` 帳號用 `lgw admin client add <名稱>` 發，值只印一次；`lgw admin client rm <名稱>` 撤銷。
-- **客戶端憑證放的地方**：
-  - worker：`/run/mlp-secrets/llmgateway-client-token`（0400），由 MyLinuxPool 放進去；
-  - Mac：`~/.config/lgw/client-token`（0600）。
-- 租約的 `worker` 欄位必須和客戶端憑證登記的名稱一致，服務端檢查，所以一個客戶端不能冒用別台機器的名字。
-- `GET /v1/whoami`：回 `200 {client, role}`，不花任何額度，給 MyLinuxPool 的驗證程式核對憑證用。
-- **為什麼**：池內只能經 SSH 進來，SSH 已經擋掉外人；客戶端憑證是為了區分身分、撤銷、記錄，不靠它擋外人。MyLinuxPool 透過 API 發證，就不用碰 LLMGateway 的資料庫。
+- LLMGateway 只依賴「一台連得到的 Linux 機器＋SSH」，用設定指定。本人指定用池跳板機上**現有的 sshproxy 帳號**（「直接用 sshproxy 吧」），不另開帳號。
+  - LLMGateway 不用 pool-tunnel、NODE_*，只是把 sshproxy 當成一個會合點。
+  - 跳板機的 `GatewayPorts` 是 no，`-R` 只綁 loopback，正好符合需要。
+- **遠端埠**：避開 2220–2499（池的隧道）與 3000–3999（公開服務預留）。預設 API 埠 4710、SSH 埠 4711，用設定改。MyLinuxPool 會把它保留成 `NODE_GATEWAY.ports.llmgateway: [4710, 4711]`（只保留，不配發）。
+- **金鑰的登記**（mylinuxpool-pm 提的最小做法）：MyLinuxPool 新增 repo var `TUNNEL_EXTRA_PUBKEYS`（JSON：名字 → 一行公鑰），由 sshproxy 的組裝一起收進去（refresh 與 rotate 共用同一個函式，所以重建後也還在）。第一版只放裸公鑰；帶選項的收窄另開 MyLinuxPool 的 d 單，不擋第一版。var 由本人或 PMO 設，設好後 dispatch refresh-authorized-keys 套用。兩把是：
+  - 服務那台的隧道金鑰：在 `llmgw` 帳號產生，私鑰不離開那台，只登記公鑰；
+  - 部署金鑰：私鑰是本 repo 的 secret，登記公鑰。
+  - 能帶選項就收窄：隧道金鑰只准 `-R` 那兩個埠並探 API 埠，部署金鑰只准轉發到 SSH 埠。不能帶也可以，本人已接受 sshproxy 不收窄。
+- **服務本身只綁那台的 127.0.0.1**，不綁 docker bridge；同一台的容器也走會合點。
+- **附註**：
+  - sshproxy 要登記兩把公鑰（隧道與部署）。
+  - 4711 會讓服務那台的 sshd 出現在跳板機的 loopback 上，但要進去仍然得通過 `llmgw` 帳號的 SSH 認證，而且只會跑 forced command 的部署腳本（`keys`／`upgrade`）。
 
-### 決定 5：怎麼連到服務
+### 決定 3：伺服器端：隧道守護與健康維持
 
-- **Mac**：沿用 `mlp` 的 SSH 跳板做本機埠轉送（`ssh -L`）。`lgw` 的 base URL 指向本機那個埠。
-- **worker**（MyLinuxPool#69）：sidecar 一律連 `http://127.0.0.1:<固定埠>`，不必管服務在哪一台。
-  - 同一台 provider 上的容器：經 docker bridge 的位址連。
-  - 其他 provider 上的容器：放服務的那台在既有隧道上多掛一條 `-R`，把服務放到跳板機本機的固定埠；worker 在既有隧道上多掛一條 `-L`，接到自己本機的固定埠。
-  - 全程只綁 loopback，不改 sshd；埠宣告在 MyLinuxPool 的設定裡。
-- **手機**：之後由 MyAiEntry 的 App 經同一條 SSH 跳板做埠轉送（本人選 (2)）。
-- 服務本身從不對外。
+- 服務那台跑兩個 systemd user unit（帳號 `llmgw`）：
+  - `llmgateway.service`：lgwd，只綁 127.0.0.1:<本機 API 埠>。
+  - `llmgateway-tunnel.service`：用**自己的金鑰與自己的連線** `ssh -N -R 127.0.0.1:4710:127.0.0.1:<本機 API 埠> -R 127.0.0.1:4711:127.0.0.1:22 sshproxy@<跳板機>`，帶 `ExitOnForwardFailure=yes`、`ServerAliveInterval=30`、`ServerAliveCountMax=3`。斷線就結束，由 systemd 立即重啟（`Restart=always`）。**不和池的 pool-tunnel 共用連線**。
+- **健康探針**：只證明 TCP 連著不夠（舊的 listener 可能還在、或被別人佔走），所以探針做端對端的檢查。
+  - 每 60 秒經跳板機 `ssh -W 127.0.0.1:4710` 打一次 `GET /v1/subscriptions`，收到 HTTP 200 才算健康。
+  - 連續 3 次失敗就殺掉隧道連線，讓 systemd 重開。
+  - 這個檢查不需要新的介面。
+- 設定 `~/.config/llmgateway/tunnel.env`：會合點（`sshproxy@host:port`）、金鑰路徑、known_hosts 路徑、兩個遠端埠、探針間隔。
+- `--check` 三態加上隧道：0＝兩個 unit 都在跑、版本對、經會合點探得到；1＝確定不成立；2＝無法確認。
+- 舊的 `-R` 還沒被清掉時，新的會因 `ExitOnForwardFailure` 失敗，systemd 會一直重試，直到舊的逾時被清掉。
 
-### 決定 6：租用 API
+### 決定 4：客戶端：連線程式 `lgw connect`
 
-- JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑證>` 認身分。
-- 時刻一律用 RFC 3339 的 UTC 字串。
-- 每個會改變狀態的請求都帶客戶端產生的 `request_id`（去重見決定 12）。
-- 每個回覆都帶 `api_version`（v0 是 `1`）。
+- `lgw` 提供連線程式，函式庫與指令兩種用法。sidecar 的 SubscriptionSource 用函式庫。
+  - 函式庫：`with lgw.connect(cfg) as base_url:`，在本機開一個轉發，回 `http://127.0.0.1:<臨時埠>`；離開時關掉。
+  - 指令：`lgw connect`，前景維持轉發並印出 base URL。
+- 做法：`ssh -N -L 127.0.0.1:<臨時埠>:127.0.0.1:4710 [-J <跳板…>] sshproxy@<跳板機>`，帶 `ExitOnForwardFailure=yes`、`BatchMode=yes`、`StrictHostKeyChecking=yes`。連不上或中途斷掉就回「無法確認」，由呼叫方等一下再試。
+- 設定（`~/.config/lgw/connect.env`，或 sidecar 設定裡的同名欄位）：
+  - `jumps`：零到多個 `user@host:port`；
+  - `rendezvous`：`sshproxy@host:port`；
+  - `identity`：金鑰路徑；
+  - `known_hosts`；
+  - `remote_api`：預設 4710。
+- 用哪把金鑰：
+  - worker 用 **pool-tunnel 既有的 sshproxy 金鑰** `/home/worker/.ssh/id_tunnel`。擁有者 worker、權限 0600；sidecar 也以 worker 身分跑，讀得到（mylinuxpool-pm 確認）。
+  - worker 上的 connect 設定由 sidecar 從 MyLinuxPool 提供的 `/run/mlp-gateway/gateway.json` 填入：`ip`、`tunnel_user`、`ssh_port`、`host_key`。rotate 後會重新發布，不用會過期的環境變數。
+    - host key 釘在 LLMGateway 自己的 known_hosts，不和 pool-tunnel 共用，也不用 accept-new。
+    - `lgw` 本身只吃 connect 設定，不讀 MyLinuxPool 的檔，維持不依賴 MyLinuxPool。
+  - Mac 用它自己能登入 sshproxy 的金鑰。
+  - LLMGateway 不另外發金鑰給客戶端。
 
-**租約物件**（`lease`）：`{lease_id, subscription, agent, model, env, unset, expires_at, confirm_by}`。`env` 與 `unset` 只出現在核准的那一次回覆，之後查詢都不帶。回覆一律把租約物件包在鍵裡：申請回 `{"lease": …}`，`exhausted` 回 `{"next": …}`。
+### 決定 5：部署：也走會合點
 
-| 方法 | 路徑 | 請求 | 成功回傳 |
+- 本 repo 的 workflow：`ssh -J sshproxy@<跳板機> -p 4711 llmgw@127.0.0.1`。
+  - 第一段用部署金鑰登入 sshproxy，只做轉發；
+  - 第二段由服務那台 `llmgw` 的 authorized_keys 以 `command="…/current/deploy/remote-deploy.sh",restrict` 強制執行部署腳本，動詞 `keys`／`upgrade <tag>`，照舊。
+- 一次性開機設定（root，本人做或本人授權）：
+  - 服務那台：建 `llmgw`（不加 docker 群組）、linger、產生隧道金鑰並把公鑰交給 MyLinuxPool 登記、放部署公鑰、第一次安裝；
+  - 跳板機：由 MyLinuxPool 登記兩把公鑰（決定 2）。
+
+### 決定 5a：認證：不做應用層認證，只靠 SSH（本人選 (a)）
+
+- 本人：「沒事，我選 a，反正洩漏我換 key 很簡單」。
+- **本人已接受的風險**：sshproxy 上的所有金鑰都連得到 API 埠，也就讀得到全部五把 key。這包括所有 provider、worker 的隧道金鑰，以及家人維修機共用的那把。
+- **發現外洩時**：在 LLMGateway 的 secret 換掉五把 key，重新部署。換 key 不需要動任何客戶端，因為客戶端不持有 key。
+- 稽核紀錄只看得到「從會合點來的連線」，分不出是哪一把 SSH 金鑰（本人接受，v0 不分辨是哪台 worker）。
+
+### 決定 5b：key 的保管與服務的形狀
+
+- **key 的來源**：本 repo 的 GitHub secret，五把，值由本人設，名稱照本人的命名規則（tasks 3.4）。
+- **部署腳本**（`remote-deploy.sh`，從 `SSH_ORIGINAL_COMMAND` 以白名單解析）：
+  - `keys`：stdin → 驗證 → 暫存檔 0600 → rename `keys.env` → 重讀。
+  - `upgrade <tag>`：固定 tag 取碼、current 原子切換、重啟。
+  - 值用 stdin 傳、不上命令列；workflow 的 log 只有 secret 名稱；ssh 的錯誤輸出會遮掉位址。
+- **服務**：
+  - Python 標準函式庫，HTTP 用 `ThreadingHTTPServer`、資料用 `sqlite3`，沒有第三方套件；
+  - 帳號 `llmgw` 的 systemd user unit（linger），`llmgw` 不加 docker 群組；
+  - 安裝、unit、run wrapper、版本、`--check` 都在本 repo 的 `deploy/`；
+  - SQLite 只有 `cooldowns`（subscription × 窗口 → 結束時刻）與 `audit`（只追加）；
+  - key 只在 key 檔。
+
+### 決定 6：三個介面
+
+JSON over HTTP，沒有應用層認證（決定 5a）。
+
+| 方法 | 路徑 | 成功 | 錯誤 |
 |---|---|---|---|
-| POST | `/v1/leases` | `worker, role, agent, instance, model?, subscription?, purpose?, preferences?, request_id` | `201 {"lease": <租約物件>}` |
-| POST | `/v1/leases/{id}/start` | `request_id` | `200 {expires_at}`：確認 agent 已經開起來，granted → active；對已 active 的租約重送也回 200 |
-| POST | `/v1/leases/{id}/exhausted` | `signal, resets_at?, request_id` | `200 {next: lease}`，或 `200 {next: null, refusal}` |
-| POST | `/v1/leases/{id}/renew` | `request_id` | `200 {expires_at}` |
-| POST | `/v1/leases/{id}/usage` | `snapshot` | `204` |
-| POST | `/v1/leases/{id}/release` | `reason?, request_id` | `204`（重複 release 也回 204） |
-| GET | `/v1/board` | — | `200 {subscriptions: [...]}` |
-| GET | `/v1/whoami` | — | `200 {client, role}`（核對憑證用，不花額度） |
-| POST | `/v1/admin/clients` | `name` | `201 {name, token}`（只有 issuer、只綁 loopback、只限 `worker-*`；同名就撤舊發新） |
-| DELETE | `/v1/admin/clients/{name}` | — | `204`；不存在回 404 |
+| GET | `/v1/subscriptions` | `200 {schema, subscriptions: [ … ]}`，依 `priority` 排序，不含 `key` | — |
+| GET | `/v1/subscriptions/{id}?agent=claude-code\|opencode` | `200 { … , key}` | 400（缺 `agent`）、403 `agent_not_allowed`、404、409 `not_deployed` |
+| POST | `/v1/subscriptions/{id}/cooldown` | `204`；body `{window: "5h"\|"1w", resets_at?}` | 400（窗口不對、時刻不合理）、404 |
 
-**欄位說明**
-- `agent`：`claude-code` 或 `opencode`。sidecar 內部的 `claude`、`opencode` 由它自己對應。
-- `instance`（必填）：客戶端給每個 agent 的 id，例如 sidecar registry 裡的 agent id。同一個客戶端的同一個 `instance` 只能有一張未結束的租約。
-- `model`：可空；空的就是該訂閱在政策檔裡的預設模型。
-- `signal`（列舉）：`claude_limit`、`zen_free_limit`、`zen_go_limit`、`credit_limit`、`openrouter_limit`、`ollama_limit`、`other`。
+- 時刻一律是 RFC 3339 UTC。
+- 請求 body 上限 1 MB。
+- 冷卻中的 subscription 仍可 get，`available` 為 false，由呼叫方決定。
 
-**錯誤**
-- `400 bad_request`：欄位缺漏或格式不合，附缺的欄位。
-- `401`：沒有或錯誤的客戶端憑證。
-- `413 body_too_large`：請求 body 超過 1 MB，不讀內容。
-- `403 client_mismatch`：worker 與客戶端憑證登記的名稱不符。
-- `403 not_owner`：動到別的客戶端的租約。
-- `403 forbidden_role`：client 打管理 API、issuer 打租用 API，或管理 API 不是從 loopback 來的。
-- `403 name_not_allowed`：issuer 發撤不符合 `worker-*` 的名字。
-- `404 not_found`：租約不存在。
-- `409 lease_not_active`：對已結束的租約做 start、renew、exhausted。
-- `409 lease_not_confirmed`：對還沒 start 的租約做 renew、exhausted；還沒 start 的租約只接受 start 與 release。
-- `409 {reason, earliest_reset?}`（**拒絕**）：
-  - `not_allowed`：政策不允許這個組合，或模型不在允許清單；
-  - `instance_busy`：同一個 `instance` 已有未結束的租約；
-  - `cap_reached`：可選的訂閱裡至少有一個不在冷卻，但這些都已達上限；
-  - `all_cooling`：可選的訂閱全在冷卻，附最早的冷卻結束時刻；
-  - `below_floor`：保留給「之後」的底線模型，v0 不會出現。
-  - `earliest_reset` 只在 `all_cooling` 時附上。
-  - 判定順序：`400` → `401` → `403`（`client_mismatch`、`not_owner`）→ `404` → `409`。`409` 的拒絕之間：先看 `not_allowed`，再看 `instance_busy`，最後才看可用性（`cap_reached` 或 `all_cooling`）。
+### 決定 7：共通 JSON schema（和 aistorage-pm 一致）
 
-**有效期限**
-- 租約效期預設 12 小時，從 `start` 確認時起算；客戶端每小時 renew。
-- granted 之後 10 分鐘內沒有 `start`，租約記為 expired（理由：未確認）。這樣「換把時已發出新租約、agent 卻沒開起來」的租約不會占著名額 12 小時。
+```json
+{
+  "schema": 1,
+  "id": "openrouter",
+  "provider": "openrouter",
+  "kind": "api-key",
+  "agents": ["claude-code", "opencode"],
+  "priority": 30,
+  "models": {"allow": ["*:free"], "default": null},
+  "endpoint": "https://openrouter.ai/api",
+  "key": "（只在 get 回）",
+  "cooldown": {"5h": null, "1w": {"until": "2026-10-18T00:02:00Z"}},
+  "available": false
+}
+```
 
-### 決定 7：env 的內容
+- `kind` 是 `claude-subscription` 或 `api-key`。
+- Claude 訂閱的 `agents` 只有 `claude-code`；Zen 只有 `opencode`（沒有官方的 Claude Code 接法）。
+- `priority` 是預設挑選順序。本人說之後可能改成外部注入的函式計算；挑選本來就在 sidecar（可替換的小介面），LLMGateway 照樣回這個欄位。claude-code 是個人 10 → 公司 20；opencode 是 Zen 10 → OpenRouter 20（只允許免費模型）→ Ollama 30。這些定義在政策檔，不是介面。
+- **不帶環境變數名**：由 sidecar 的 AgentDriver 依 `provider`、`kind`、`endpoint`、`key`、`models.default` 推出。例如 Claude 訂閱推出 `CLAUDE_CODE_OAUTH_TOKEN`，OpenRouter 給 claude-code 推出 `ANTHROPIC_BASE_URL`＋`ANTHROPIC_AUTH_TOKEN`＋`ANTHROPIC_API_KEY=""`。理由是環境變數名跟著 agent 版本變，而 agent 和 sidecar 一起釘在映像裡。
+- 內部仍分兩個介面（實作分離）：
+  - `CredentialProvider`：每種 provider 一個實作，負責 schema 中與 provider 有關的欄位；
+  - 政策檔：priority、models、agents。
 
-| 訂閱 | `agent: claude-code` | `agent: opencode` |
+### 決定 8：冷卻
+
+- 窗口只有 `5h` 與 `1w`（Claude 的 five_hour／seven_day、Ollama 的 session／weekly，其他 provider 的限制也歸到這兩個窗口）。
+- 有 `resets_at` 時冷卻到它加 2 分鐘；沒有時用窗口的預設長度（5 小時、7 天）。過去或 8 天以後的時刻拒收。同一窗口取較晚的結束時刻；到時自動解除。
+- `available` = key 已部署，而且兩個窗口都沒在冷卻。
+
+### 決定 9：換把由 sidecar 做（MyAiStorage v3）
+
+- sidecar 的 AgentDriver 偵測到額度用完 → sidecar 登錄冷卻 → 從 list 挑 `available` 而且 `agents` 含自己種類、`priority` 最前的 → get → 停掉 agent（寫回 agora）→ 用新 key 重開並 continue 同一個 Session。
+- 之後依 harness 的優先模型與底線挑，也在 sidecar 這一層。
+- `lgw.signals`（只有帶額度標記的 402／429 才算用完）可以給 AgentDriver 當函式庫用。
+- LLMGateway 不參與挑選，也不知道誰正在用哪一把。
+
+### 決定 10：稽核紀錄
+
+- 每次 get 與登錄冷卻記一筆，內容是時刻、subscription id、agent（get）、窗口與結束時刻（冷卻）。不記 key。
+- 這是「紀錄全留」在 v3 能做到的部分：看得到誰在何時拿過哪一把、誰登錄過冷卻；看不到現在還在用（沒有租約）。
+
+### 決定 11：拿掉的與理由
+
+| 拿掉的 | 理由 | 會失去的 |
 |---|---|---|
-| `claude-personal`／`claude-company` | `env: {CLAUDE_CODE_OAUTH_TOKEN}`；`unset: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL]` | 拒絕 `not_allowed`（條款） |
-| `openrouter` | `env: {ANTHROPIC_BASE_URL=https://openrouter.ai/api, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY=""}`，加上模型覆寫變數；`unset: [CLAUDE_CODE_OAUTH_TOKEN]` | `env: {OPENROUTER_API_KEY}` |
-| `ollama-cloud` | `env: {ANTHROPIC_BASE_URL=<Ollama 的 Anthropic 相容位址>, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY=""}`；`unset: [CLAUDE_CODE_OAUTH_TOKEN]` | `env: {OLLAMA_API_KEY}` |
-| `opencode-zen` | 拒絕 `not_allowed`（沒有官方接法） | `env: {OPENCODE_API_KEY}` |
+| 租約五個動作、10 分鐘確認、去重 | 本人要求只有三個介面 | 「誰正在用」、逾期回收 |
+| 同時租用上限 | 沒有租約就算不出「幾個在用」；本人定案 v0 不做 | 本人先前提過的風險控管之一 |
+| 管理 API（issuer）、whoami、應用層 token | 本人選 (a)：只靠 SSH | 分辨是哪一台 worker |
+| 狀態板（JSON／HTML）、用量查詢 | list 已含冷卻與能不能用；用量 % 本人說沒有也行 | 用量 % |
 
-- opencode 用的 provider 設定（模型清單、base URL）放在 repo 的 `client/opencode.json`，由模組帶 `OPENCODE_CONFIG` 指給 opencode；key 用 `{env:...}` 讀，設定檔不含值。各變數名以實作時的實打結果定案。
-- 回傳的值只在記憶體裡交給 agent，`lgw` 與 sidecar 都不寫檔、不寫 log。
-
-### 決定 8：選把、冷卻、同時租用上限
-
-- **政策檔** `policy/default.json`（repo 內，不含秘密）：
-  - 每種 agent 的訂閱順序：`claude-code: [claude-personal, claude-company]`、`opencode: [opencode-zen, openrouter, ollama-cloud]`。v0 的 `claude-code` 順序**不含** `openrouter`、`ollama-cloud`，有測試鎖住。
-  - 每個訂閱允許的模型與預設模型：`openrouter` 只允許名稱以 `:free` 結尾的模型。
-  - 每個訂閱的同時租用上限：Claude 兩把各 2，其他不設。
-  - 每個訂閱的預設冷卻時間（見下）。
-- **選把**：申請沒有指定訂閱時，照順序取第一個「沒有冷卻、未達上限、政策允許」的；都不行就拒絕（理由與判定順序見決定 6）。指定了訂閱的，只看那一把。
-- **冷卻**：
-  - 冷卻到 `resets_at` 再加 2 分鐘緩衝。
-  - 沒有 `resets_at` 時用政策檔的預設，寧可等久一點，也不在冷卻中硬撞：
-    - Claude 5 小時：官方 status line 的 `five_hour` 窗口，<https://code.claude.com/docs/en/statusline>；
-    - Ollama 5 小時：官方 session 用量窗口，<https://ollama.com/blog/launch>；
-    - Zen 依 `retry-after`，上限 24 小時，沒有就 1 小時：<https://github.com/anomalyco/opencode/pull/49195>；
-    - OpenRouter 1 小時。
-  - `resets_at` 若在過去，或在 8 天以後（看起來不合理），就忽略它、改用預設。
-  - 冷卻中的訂閱一律不出租、不試探。冷卻只影響新的出租：冷卻中訂閱上已經 active 的其他租約照常可以 renew（它們可能還在正常使用另一個 session）。
-- **只有額度用完才觸發**：客戶端只在判讀為「額度用完」時呼叫 `exhausted`（規則見決定 9）。短暫的 402／429 由 agent 自己重試。
-- **同一個 agent 不同時拿兩把**：靠 `instance`（決定 6）擋住直接申請兩次；`exhausted` 先結束原租約，再發新的。
-- **擴充點**：`preferences: {preferred_models, floor_model}` 存進 granted 事件，v0 的選把邏輯不看它。之後選把改成「在底線之上照優先順序選，沒有就拒絕 `below_floor`」，介面不變。「平均分攤」留在政策檔的選項裡（期 1 的設計），v0 的初始政策不用它。
-
-### 決定 9：換把程序只有一份，放在 sidecar 的 agent 宿主；`lgw` 只給 API 客戶端與訊號規則
-
-- **本 repo 的 `lgw`**：Python 套件，只用標準函式庫，不綁 herdr、agora。內容：
-  1. **API 客戶端**：base URL 與客戶端憑證路徑可設定；連不上時回報「無法確認」，不丟例外讓呼叫方當掉。
-  2. **訊號規則**：輸入 agent 的畫面文字，輸出「額度用完（含 `signal` 與重置時刻或無）」「暫時錯誤」或「正常」。規則照 `quota-signals.md`：
-     - Claude Code：`You've hit your (session|weekly|Opus|Sonnet) limit · resets …` → `claude_limit`；
-     - opencode 對 Zen：`FreeUsageLimitError`／`Free usage exceeded` → `zen_free_limit`；`GoUsageLimitError`／`usage limit reached. It will reset in …` → `zen_go_limit`；`CreditLimitExceeded` → `credit_limit`。訊息內容的標記優先於狀態碼。
-     - OpenRouter：402 且 `limit_source` 不是 in-flight 預算 → `openrouter_limit`。in-flight 預算的 402 是暫時錯誤。
-     - Ollama Cloud：429 且訊息含 `session usage limit` 或 `weekly usage limit` → `ollama_limit`。
-     - Claude Code 的 spend limit 類訊息（月額度、額外用量上限，不會隨 5 小時窗口重置）→ `claude_limit`、不帶重置時刻，於是用政策檔的預設冷卻；寧可冷卻久一點也不空轉重試。
-     - **沒有額度標記的 402／429 一律判為「暫時錯誤」**，不換把。
-
-     規則放資料表，正反兩面都用 `quota-signals.md` 的樣本測試。
-  3. **opencode 設定**：`client/opencode.json`（模型清單、base URL，key 用 `{env:...}` 讀）隨 `lgw` 一起打包，sidecar 用 `lgw` 提供的路徑把它指給 opencode（`OPENCODE_CONFIG`）。
-  4. **管理命令**：`lgw admin client add|revoke|list`，在 provider 上用。
-- **換把程序在 MyAiStorage 的 sidecar 裡（agent 宿主）**。以下是轉述，規格以 MyAiStorage#31 為準，那邊改了以那邊為準：
-  - 開 agent：`herdr tab create --env` 帶 env；unset 用 `env -u NAME`；Claude Code 加 `--settings` 關掉 `autoContinueAtUsageLimit`。
-  - 判讀：用 `herdr agent read` 讀畫面，交給 `lgw` 的規則判讀。
-  - 安全結束：`herdr agent send-keys <name> ctrl+c` 讓 agent 收尾，由 agora continue 做最後寫回；5 秒後還在就對 process group 送 SIGTERM，再 5 秒送 SIGKILL，最後才 `pane close`。
-  - 打斷一輪而不結束 agent 時用 Esc（Claude Code 1 次、opencode 2 次）。
-  - 開起來之後呼叫 `start` 確認租約：時機在 agent 的 prompt 出現之後、送 harness 之前；agent 開不起來就不呼叫 `start`，直接 `release`。
-  - 接回：`agora continue session <Session> --agent <agent> --sync-period <分鐘>`，不用 `--fork`；session id 的寫法照 sidecar 既有的慣例。
-  - 這些都是 sidecar 已有、已審過的生命週期程式（MyAiStorage#31 的 D4 與 10-11 的 spike）。
-- **誰呼叫**：
-  - worker：sidecar 常駐，依賴 `lgw`（從本 repo 的固定 ref 裝進 sidecar 的 venv）。
-  - Mac：`sidecar agent run claude|opencode`（sidecar 與 agora 是同一個 Python distribution，Mac 已經裝了 agora），在前景跑同一段程序。
-  - 兩邊只差「常駐或前景」，換把程序完全同一份，沒有 Mac 專用的分支（本人要求）。
-- **為什麼**（和 aistorage-pm 2026-10-11 談定）：
-  - 開關 agent、三段終止、重啟後找回、agora continue 這段 sidecar 已經有了；LLMGateway 再寫一份就會變成兩份。
-  - `lgw` 不綁 agent 工具，agent 工具換了，服務與 `lgw` 都不必改。
-- **放棄的選項**：
-  - 換把程序放在 `lgw`（PR #9 先前的寫法）：sidecar 要把已審過的那段改成呼叫 `lgw`，等於重寫一份。
-  - 各自實作：會有兩份程序與兩份判讀規則。
-- **依賴**：v0 在 Mac 上的驗收要等 sidecar 提供 `sidecar agent run`。
-
-### 決定 10：通知
-
-- 每次冷卻、換把、兩把都冷卻而停下，都寫進事件與狀態板。
-- Angareion 可用之後，由 sidecar 以 team 的身分通知 PMO（sidecar 本來就有 Angareion）。
-- Mac 上由 `sidecar agent run` 在終端機印出（Mac 沒有常駐的 sidecar，也沒有 A2A token）。
-- 服務端不直接連 Angareion，所以服務不需要 A2A token。
-
-### 決定 11：狀態板
-
-- `GET /v1/board`（要客戶端憑證）對每把回傳：
-  - 使用中的租約（worker、角色、agent、開始時刻）；
-  - 數量／上限；
-  - 是否冷卻與冷卻到何時；
-  - 部署狀態：key 檔裡沒有這把就是「未部署」；
-  - 用量：
-    - OpenRouter：服務每 5 分鐘查一次 `GET /api/v1/key`；
-    - Ollama：每 5 分鐘查一次 `GET /api/balance`（官方上限每分鐘 10 次）；
-    - 兩個查詢都有 10 秒逾時、在獨立的執行緒，失敗不影響租用；上游回 401 時顯示「key 無效」；查詢失敗時顯示「未知」與最後一次成功的時刻；
-    - Claude 與 Zen 顯示「未知」。
-- **HTML 版**（`/board`）只綁在 provider 的 **loopback**（不開在 worker 看得到的介面），不要客戶端憑證、唯讀。Mac 經 SSH 埠轉送後用瀏覽器開。客戶端憑證永遠不放進 URL。
-- 從不顯示 key 的值。狀態板含 worker 名稱（Mac 是主機名），只在池內、經 SSH 通道看得到。
-- 期 1 `usage-record` 的 token 回報（OTel、opencode export）不在 v0，`report_usage` 介面先留著。
-
-### 決定 12：一致性、邊界與錯誤處理
-
-- **交易**：每個會改變狀態的 API 動作是一筆 SQLite 交易（`BEGIN IMMEDIATE`）。例如 `exhausted` 的「設冷卻＋原租約 superseded＋發下一張」要嘛全成、要嘛全不成，服務中途當掉也不會留下一半。搶最後一個上限名額也在同一筆交易裡判定。
-- **去重**：以（客戶端，`request_id`）為鍵，把第一次的回覆存進資料庫保留 7 天；重送時回同一份回覆，跨重啟也有效。
-  - **存進去的回覆不含 `env` 的值**，只留變數名。重送時若回覆含租約，依那張租約的訂閱與目前的 key 檔重新組出 `env`；那張租約已結束就回 `409 lease_not_active`。
-  - 這樣資料庫的任何一張表都沒有 key 的值，key 只存在 key 檔（2026-10-11 實作冒煙測試時發現：原本的寫法會把值存進去重表）。
-  - 重送不保證位元組一致：重組的 `env` 依當下的 key 檔（輪替後拿到新值）；租約已結束 → `409 lease_not_active`，客戶端要重新申請；key 已撤下 → `409 not_allowed`；原本是拒絕的就照原樣回。重送不是新申請，不記 `denied` 事件。
-  - **順序**：認證 → 延後結算 → 去重 → 業務邏輯。撤銷後拿舊 `request_id` 重送一律回 401。
-  - 請求 body 超過 1 MB 回 413，不讀內容。同一張租約用不同的 `request_id` 再回報 `exhausted`，回 `409 lease_not_active`，不會發出第二張。
-- **時鐘**：服務的「現在」經可替換的 clock 介面取得（測試用假時鐘）。冷卻在 `now < 結束時刻` 時算冷卻中，等於就算結束。
-- **逾期結算**：任何一次經過認證的請求（包含讀狀態板）都先補記已過期的租約，再處理該請求。
-- **key 檔重讀**：`deploy-keys` 以「寫暫存檔再 rename」原子替換。SIGHUP 重讀失敗時（檔案損壞、格式錯）沿用舊的 key，並在狀態板與 log 標示重讀失敗。值是空字串視同沒部署。已經發出的租約不受重讀影響。
-- **撤銷客戶端**：撤銷時，該客戶端所有未結束的租約一起記為 revoked。
-- **拒絕的紀錄**：經過認證的申請被拒時，記一筆 `denied` 事件（不含任何值），供 PMO 追溯。`400`、`401` 不算租約，只記在服務 log，而且不記請求內容。
-- **輸入限制**：`worker` ≤ 64 字、`role` ≤ 128 字、`purpose` ≤ 256 字，只收可列印字元。HTML 輸出一律跳脫。
-- **事件的保存**：`events` 只追加；超過 180 天的事件每月匯出成壓縮檔、再從資料庫刪除。匯出檔同樣不含值。
-- **政策檔**：啟動與 SIGHUP 時驗證；不合法就拒絕套用、沿用舊的（啟動時則不啟動）。
-- **版本**：`lgw` 用 git tag（`lgw-vX.Y.Z`）發版，sidecar 固定在某個 tag。API 不相容的改變要升 `api_version`，並事先通知 aistorage-pm。`lgw` 遇到不認得的拒絕理由，一律當一般拒絕處理。
+impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢，照 v4 移除或改寫（tasks 1.x）。部署腳本、安裝程式、維運手冊保留。
 
 ## Risks / Trade-offs
 
-- [公司帳號用完換另一帳號是灰色地帶] → 本人已接受。設計上做到：冷卻中不出租不試探；Claude 兩把各最多 2 個同時；只有額度用完才換；事件全留。
-- [key 集中在一台 provider] → 只綁內部介面、只經 SSH 進入；檔案 0600；事件、log、狀態板都不含值；輪替只要改 secret 並重跑 workflow。
-- [訊號判讀靠畫面文字，agent 改版會失效] → 規則是資料表，有單元測試，用 `quota-signals.md` 的樣本與實際碰到的輸出當測試資料；判讀不出時就不換，只記錄。
-- [`herdr tab create --env` 的行為在 worker 的 herdr 0.9.3 上還沒驗] → sidecar 驗收時再驗，不過就改用 0600 暫存 env 檔、讀完即刪。
-- [換把會中斷正在跑的那一輪] → 本人已知；靠 `agora continue` 接回。
-- [服務掛掉] → systemd 拉起並從 events 重建。客戶端拿不到租約時不開新 agent；已經在跑的 agent 不受影響，因為 env 已經給了。
-- [GitHub Actions 能登入放服務的那台] → 部署金鑰在跳板機上只能轉發、在那台只能跑部署腳本的兩個動詞；workflow 只能手動觸發，而且要本人在 environment 核准；跳板那一行可在 MyLinuxPool 單獨撤銷，那台那一行由 llmgw 帳號撤銷。
-- [發證用的管理憑證外洩] → 只能發撤 `worker-*`、只從 loopback 收；可以用 `lgw admin client rm` 撤銷後重發。
+- [公司帳號用完換另一個是灰色地帶，v0 沒有同時上限] → 本人已接受灰色地帶，也定案 v0 不做上限。冷卻中不硬撞仍成立：sidecar 只挑 `available` 的。
+- [sshproxy 上任何金鑰都讀得到全部 key] → 本人已接受（決定 5a）；外洩時換五把 key 並重新部署，客戶端不用動。
+- [跳板機整台重建] → sshproxy 會由 MyLinuxPool 重建，兩把公鑰只要在 MyLinuxPool 的登記裡就會回來；重建期間隧道守護會一直重試，`--check` 回 1。
+- [舊的 `-R` listener 沒被清掉] → `ExitOnForwardFailure` 讓守護程式重試，直到會合點清掉舊連線；端對端探針確保不是「TCP 通、服務不通」。
+- [sidecar 登錄冷卻依賴它的判讀] → 判讀錯了會讓某把閒置到重置時刻；稽核紀錄看得到是誰登錄的。
+- [key 集中在一台] → 只綁內部介面、只經 SSH 進入、檔案 0600、輪替只要改 secret 並重新部署。
 
 ## Migration Plan
 
-1. 服務、政策檔、`lgw`（API 客戶端、訊號規則、管理命令）在本 repo 寫好，含測試（假 key、假上游、假時鐘）。
-2. 本人做一次性的開機設定（決定 3）：建 `llmgw`、linger、放部署公鑰、第一次安裝、發發證用的管理憑證。
-3. MyLinuxPool：
-   - MyLinuxPool#68：跳板機上的轉發專用條目與 host key 指紋；
-   - MyLinuxPool#69：worker 怎麼連到服務；
-   - MyLinuxPool#70：create-／delete-worker 透過管理 API 發撤 worker 的客戶端憑證。
-4. 本人設 environment 與 secret，跑 `deploy-service`（`upgrade <tag>`）與 `deploy-keys`。
-5. Mac：`sidecar agent run claude`、`sidecar agent run opencode` 驗收，包含用假訊號換把（等 sidecar 提供這個命令）。
-6. sidecar：aistorage-pm 把假 broker 換成 `lgw` 的 API 客戶端，在一台 worker 驗收。
-7. 另開單把 MyLinuxPool#50 的 key 來源換成租用，收掉 MyLinuxPool 裡的 key。
-- **退回**：停服務、Mac 改回原本的指令；worker 在第 7 步之前仍有 MyLinuxPool#50 的 key，可以照舊。
+1. 本人已定案 v4（2026-10-11 深夜）。
+2. 本 repo：
+   - 服務改成三個介面、只綁 127.0.0.1；
+   - 移除租約、管理 API、狀態板、用量查詢；
+   - 加上隧道守護與 `lgw connect`；
+   - workflow 改走會合點；
+   - `lgw` 提供 list／get／登錄冷卻的客戶端。
+3. 本人做一次性的開機設定（決定 5），設 environment 與 secret（tasks 3.4）。
+4. MyLinuxPool：`TUNNEL_EXTRA_PUBKEYS` 與 `NODE_GATEWAY.ports.llmgateway`（mylinuxpool-pm 開 d 單；var 的值由本人或 PMO 設）。#67～#70 已作廢。
+5. sidecar v3 接上 list／get／登錄冷卻，在 Mac 與一台 worker 驗收換把。
+6. 另開單把 MyLinuxPool#50 的 key 來源換成 LLMGateway，收掉 MyLinuxPool 裡的 key。
+
+- **退回**：停服務；worker 在第 6 步之前仍有 MyLinuxPool#50 的 key。
 
 ## Open Questions
 
-- opencode 讀各上游 key 的確切變數名，以及 Ollama 的 Anthropic 相容位址：照官方文件，實作時實打確認。不影響形狀。
+- opencode 讀 key 與 baseURL 的方式（例如 `OPENCODE_CONFIG_CONTENT`）：屬於 sidecar 的 AgentDriver，實作時在 opencode 1.18.35 上驗證。

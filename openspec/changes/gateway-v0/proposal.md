@@ -1,199 +1,83 @@
 對應工單：#8「LLMGateway v0：切 scope、接上訂閱，讓 Mac 的 opencode／Claude Code 經由 Gateway 使用」；上層：MyPMO#4。
 
-> scope 提案第 3 版（2026-10-11）。照本人對第 2 版的回答定案（回答全文見 #8 的留言），design、specs、tasks 都照這份寫。第 1 版「Gateway 持有 Claude 訂閱 token 代轉」因為 Claude 條款不採用，理由見 `docs/research/claude-failover.md` §7。
+> **v4 定案（本人，2026-10-11 深夜）**：三個介面；不依賴 MyLinuxPool；服務自己用 reverse tunnel 公開到會合點並維持健康；提供客戶端連線程式（含跳板）；會合點用池跳板機上現有的 sshproxy 帳號；不做應用層認證。之前的版本（資料面代轉、租約）見 git 歷史與 #8 的留言。sidecar 那一側見 MyAiStorage 的 `docs/proposals/aicompany-design-v3.md`（aistorage-pm），兩邊的共通 JSON schema 已一致。
 
 ## Why
 
 本人的原始需求：AI 在 worker 上工作到一半 token 用完時，由外部的確定性程式自動換一把。可以換的有五把：
 
-| 訂閱 id | 是什麼 |
-|---|---|
-| `claude-personal` | Claude Code 個人訂閱 |
-| `claude-company` | Claude Code 公司訂閱 |
-| `openrouter` | OpenRouter key |
-| `opencode-zen` | OpenCode Zen key |
-| `ollama-cloud` | Ollama Cloud key |
-
-Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第三方代轉。所以 LLMGateway 不轉送模型請求，而是**保管 key、出租 key、決定換哪一把、記錄誰在用**。換的動作由 worker 上的 sidecar（MyAiStorage#31）執行。這是期 1 設計「租約＋紀錄」的延伸。
-
-## v0 做什麼
-
-### 1. 保管處：五把 key 只放在 LLMGateway 一處
-
-- 來源是本 repo 的 GitHub secret，值由本人設。
-- 一支部署 workflow 經池的 SSH 跳板，把 key 寫進池內常駐 provider 上的一個 0600 檔，只有 LLMGateway 服務讀得到。
-- repo、log、紀錄、狀態板都不出現值。
-- 其他地方（MyLinuxPool、Mac 的設定檔）之後都不再放 key。收掉的時機見「銜接」。
-
-### 2. 租用服務：跑在池內常駐的 provider，只綁 loopback
-
-- 一個小 HTTP 服務，加上 SQLite 的只追加事件紀錄。池內有常駐主機以後，期 1 設計「後端用 private GitHub repo」改成本機 SQLite，因為冷卻與同時租用上限都要即時判斷。
-- 客戶端各持一把「客戶端憑證」，只用來認身分，不是上游 key：worker 的 sidecar 一把、Mac 一把、之後手機一把。客戶端都經 SSH 埠轉送連入。
-- 介面（sidecar 與 Mac 共用，見第 5 節）：
-
-| 動作 | 輸入 | 回傳 |
+| subscription id | provider | 是什麼 |
 |---|---|---|
-| `request_lease` | worker、角色、coding agent、模型（可空）、訂閱（可空，空的就照順序選）、來由；**擴充點**：`preferences`（優先模型清單＋底線模型），v0 收下並記錄、不影響選把 | `{lease_id, subscription, env, unset, expires_at}`；或拒絕 `{reason: all_cooling\|cap_reached\|not_allowed, earliest_reset}` |
-| `report_exhausted` | 租約 id、偵測到的訊號、重置時間（有就給） | 那一把進冷卻，原租約結束；**順便回傳下一張租約**（或拒絕） |
-| `renew` | 租約 id | 新效期 |
-| `report_usage` | 租約 id、用量快照（例如 Claude status line 的 `rate_limits`） | — |
-| `release` | 租約 id | — |
-| `board` | — | 狀態板（JSON；另有一頁唯讀 HTML） |
+| `claude-personal` | anthropic | Claude Code 個人訂閱（setup-token） |
+| `claude-company` | anthropic | Claude Code 公司訂閱（setup-token） |
+| `openrouter` | openrouter | OpenRouter key |
+| `opencode-zen` | opencode-zen | OpenCode Zen key |
+| `ollama-cloud` | ollama-cloud | Ollama Cloud key |
 
-- 回傳的環境變數（實際變數名以試做 c 的結果定案）：
+本人的新方向：
 
-| 訂閱 | 給 Claude Code | 給 opencode |
-|---|---|---|
-| `claude-personal`／`claude-company` | `CLAUDE_CODE_OAUTH_TOKEN`（Claude Code 直接連 Anthropic，Gateway 不代轉） | 不提供（條款） |
-| `openrouter`、`ollama-cloud` | `ANTHROPIC_BASE_URL`＋`ANTHROPIC_AUTH_TOKEN`（`ANTHROPIC_API_KEY` 設成空字串）。兩家都有官方的 Claude Code 接法 | 各自的連線位址與 key |
-| `opencode-zen` | 不提供：官方沒有 Claude Code 接法，只有社群做法 | 連線位址與 key（opencode 官方支援） |
+> 「LLMGateway 我想現在應該需要的介面是（不需要多餘介面喔）：
+> - 列出 Provider-Subscription 一覽
+> - 取得 Provider-Subscription 的詳細情報（共通 schema 的 json），sidecar 的 aiagent 生命週期控制介面吃這個共通 json schema 開 aiagent
+> - 登錄這 subscription 的 1w／5h 冷卻時間，這樣 list 才能列出這資訊（現在能不能用）」
 
-- sidecar 和包裝指令只把環境變數交給 agent，**不保存**，租約結束或換把時就丟掉。
-  - 回傳裡有一份 `unset` 清單，啟動前從 agent 的環境裡明確去掉。例如 `ANTHROPIC_API_KEY` 會蓋過訂閱 token，一律去掉；herdr server 繼承來的環境裡也可能有。
-  - **值不能出現在命令列上**，否則會出現在 `ps` 和 herdr 的 pane 資訊裡。
-    - sidecar 的做法：用 `herdr tab create --env` 交值；unset 在啟動命令裡用 `env -u NAME`，命令列上只有變數名。
-    - aistorage-pm 在 Mac 的 herdr 0.8.0 上用假值實測：值不出現在 herdr 的輸出、pane／tab 資訊、狀態目錄與任何命令列，關掉 tab 就沒了。
-    - worker 上是 herdr 0.9.3，要在 worker 上再驗一次；驗不過就退回「0600 暫存 env 檔，讀完即刪」。
-- 和 sidecar 已對齊的部分（aistorage-pm，2026-10-11）：
-  - 用上表的命名；
-  - renew 由 sidecar 的常駐迴圈每小時做；
-  - report_usage 之後再接；
-  - 拒絕時把 `earliest_reset` 記進 sidecar 的 registry，到時間再申請；
-  - 客戶端憑證放 `/run/mlp-secrets/llmgateway-client-token`（0400），比照 A2A token；
-  - 服務的 base URL 可以設定，連不上時 sidecar 回報「無法確認」，不會掛掉；
-  - agent 種類對應 sidecar 內部的 claude／opencode。
+相依只有 sidecar→agora、sidecar→LLMGateway；LLMGateway 本身只依賴「一台連得到的 Linux 機器＋SSH」（會合機）。
 
-### 3. 選把與切換（判斷在 LLMGateway，執行在 sidecar）
+## What Changes
 
-- **順序**（本人同意，政策檔可以改）：
-  - Claude Code：`claude-personal` → `claude-company`。個人優先，因為那是本人自己的訂閱；公司那把用在個人的 agent 上比較灰，所以只在個人冷卻時才用。兩把都冷卻就拒絕並通知。Claude Code 也接得上 OpenRouter、Ollama Cloud，但那會換掉模型（OpenRouter 上的 Claude 模型還要付費），所以預設不接在 Claude 後面；要接由政策檔打開。
-  - opencode：`opencode-zen`（免費模型）→ `openrouter`（只用 `:free` 模型）→ `ollama-cloud`。照本人的用量原則，Ollama 最後才用。
-- **切換流程**：
-  1. sidecar 偵測到額度用完的訊號（試做 d）。
-  2. `report_exhausted`：那一把進冷卻，有重置時間就記下。
-  3. LLMGateway 照順序回下一張租約。
-  4. sidecar 安全結束 agent，以新環境變數重開。
-  5. `agora continue` 接回同一個 session。
-  - 正在跑的那一輪會中斷（本人已知）。
-- **和 Claude Code 自己的等待重疊**：互動模式的 Claude Code 碰到額度上限時，可以自己等到重置再繼續（`autoContinueAtUsageLimit`）。sidecar 換把時要以自己的判斷為準：由 sidecar 開的 agent 關掉這個設定，免得兩邊都在等。這一點進 design 時再確認設定方式。
-- **換回**：冷卻結束後，**下一次新開或重開** agent 時照順序選，所以會回到優先度高的那一把。正在順利跑的 agent 不會為了換回而被打斷。
-- **降低風險的做法**（本人要求寫進設計）：
-  - 冷卻中不硬撞：在重置時間（再加一點緩衝）之前，那一把一律不出租，也不重試。拿不到重置時間的，用保守的預設冷卻時間。
-  - 只有「額度用完」才切換。短暫的 429 由 agent 自己重試，不觸發切換，避免來回跳。
-  - 每把有同時租用的上限（政策檔設；Claude 兩把預設各 2，本人同意；其他三把先不設），超過就拒絕。
-  - 同一個 agent 不會同時拿兩把 Claude。
-  - 每一次出租、冷卻、切換、拒絕都留下紀錄，並通知 PMO（Angareion 可用後走 Angareion；之前寫在狀態板與 log）。
-
-### 4. 狀態板
-
-- 每把 key 一定有：誰在用（worker、角色、agent、從何時開始）、幾個在用／上限、是否冷卻、冷卻何時結束。這些都來自 LLMGateway 自己的紀錄。
-- 用量 %，有更好、沒有也行：
-  - Claude：顯示「未知」。本人的印象是 setup-token 拿不到用量 %，v0 以此為前提，不做 status line 回報。`report_usage` 介面留著，之後拿得到時再接。
-  - OpenRouter：服務定期查 `GET /api/v1/key`。
-  - Ollama Cloud：官方文件有 `GET /api/balance`，每分鐘最多 10 次。剩餘 % 與重置時間只出現在 legacy 方案的欄位，現行方案回的是美元額度。我們的方案回哪一種，實作時用 key 確認（reviewer 已查證文件，見 `review-notes-v0.md`）；拿不到 % 就顯示美元額度或「未知」。
-  - OpenCode Zen：截至 2026-10-11 查無公開的用量 API，顯示「未知」。
-
-### 5. Mac 和 worker 走同一套，沒有 Mac 專用的分支
-
-- 換把的程序只有一份，放在 sidecar 的 agent 宿主（MyAiStorage）：安全結束 agent → 拿下一張 → 帶新 env 開 agent → `agora continue` 接回。
-  - 本 repo 的 `lgw` 只提供租用 API 客戶端與額度訊號的判讀規則，只用 Python 標準函式庫，sidecar 依賴它。
-  - 這是和 aistorage-pm 談定的：開關 agent 與接回的程式 sidecar 已經有、也審過，不再寫第二份。
-- worker 上由常駐的 sidecar 執行。Mac 上用 `sidecar agent run claude|opencode` 在前景執行同一段程序（sidecar 和 agora 同一個套件，Mac 已經裝了 agora）。兩邊只差常駐或前景，換把流程完全一樣，Mac 一樣會自動重開。
-- 原本的 `claude`、`opencode` 不動，隨時可以退回。
-
-### 6. 程式
-
-- 核心（保管處、租用、冷卻、狀態板、包裝指令）自己寫。
-- 不用 sub2api：它的價值在持有訂閱 token 代轉，對 Claude 不能用。
-- LiteLLM 只在「某個上游接不上 Claude Code、又一定要用 Claude Code」時才加，做格式轉換。要加就固定版本、用雜湊或 image digest 查核，因為 PyPI 上曾有被植入的版本（`docs/research/litellm-supply-chain.md`，查證中）。
+- **LLMGateway 對外只有三個介面**（spec `subscription-registry`）：
+  - `list`：所有 subscription 的共通 JSON，不含 key，含冷卻與 `available`；
+  - `get(id, agent)`：一筆的共通 JSON，含 key。`agent` 必填，不在該筆的 `agents` 裡就拒絕；這是 Claude 條款的守門：Claude 訂閱只給 `claude-code`。
+  - 登錄冷卻：`5h`／`1w` 的重置時刻，過了自動解除。
+- **共通 JSON schema**（和 aistorage-pm 一致）：`schema`、`id`、`provider`、`kind`、`agents`、`priority`、`models`、`endpoint`、`key`（只在 get）、`cooldown`（`5h`、`1w`）、`available`。**不帶 agent 專用的環境變數**：把 key 變成哪些環境變數，由 sidecar 的 agent driver 決定，跟著 agent 版本走。
+- **換把由 sidecar 做**：偵測到用完 → 登錄冷卻 → 從 list 挑 `available` 而且 `agents` 含自己種類、`priority` 最前的 → get → 重開並 continue 同一個 Session。LLMGateway 只保管、列出、記冷卻。
+- **連線**（spec `connectivity`）：
+  - 服務只綁 127.0.0.1，由自己的隧道守護程式以 ssh reverse tunnel 公開到會合點（sshproxy；API 埠 4710、SSH 埠 4711），並用端對端探針維持健康；
+  - 客戶端用 LLMGateway 提供的 `lgw connect`（可經跳板）連過去；worker 用 pool-tunnel 既有的 sshproxy 金鑰，Mac 用自己的；
+  - 部署也走會合點；
+  - 不用 pool-tunnel、NODE_*。
+- **認證**：**不做應用層認證，只靠 SSH**（本人選 (a)：「反正洩漏我換 key 很簡單」）。沒有 token、沒有發證或撤證的 API。
+- **部署**（spec `key-vault`）：獨立帳號 `llmgw`、`deploy-keys`／`deploy-service`、`remote-deploy.sh` 的 `keys`／`upgrade` 動詞、forced command；路徑改走會合機。
+- **拿掉**：租約（request／start／renew／exhausted／release）、同時租用上限、10 分鐘確認、狀態板、管理 API（issuer）、用量查詢。期 1 的 `agent-lease`、`usage-record` 規格一併移除。
 
 ## Capabilities
 
 ### New Capabilities
 
-- `key-vault`：五把 key 只保管在 LLMGateway；部署、不外洩、客戶端憑證、服務不對外。
-- `status-board`：每把 key 的使用者、數量／上限、冷卻與用量。
+- `subscription-registry`：list、get、登錄冷卻、共通 JSON schema、稽核紀錄。
+- `key-vault`：key 只放一處、部署、值不外洩、不做應用層認證、服務只綁 127.0.0.1。
+- `connectivity`：會合點與遠端埠、服務端的隧道守護與健康探針、客戶端連線程式。
 
 ### Modified Capabilities
 
-- `agent-lease`：租約欄位加上 `env`／`unset`／客戶端／`preferences`；選定改成固定順序＋冷卻＋同時租用上限；key 改由租用取得；換把由 `exhausted` 回報並直接拿下一張；Mac 與 worker 共用同一段換把程序（sidecar 的 agent 宿主）。
-- `usage-record`：不改。token 回報不在 v0（design 決定 11）。
+- `agent-lease`：全部移除（REMOVED），改由 `subscription-registry` 與 sidecar 取代。
+- `usage-record`：全部移除（REMOVED）。
 
-## 試做的結果與留到實作的驗證
+## 本人的決定（2026-10-11 深夜）
 
-| 項目 | 結果 |
-|---|---|
-| (a) setup-token 下 status line 有沒有 `rate_limits` | 不做。以「拿不到」為前提，Claude 的用量 % 顯示「未知」（本人裁定） |
-| (b) Ollama Cloud、Zen 有沒有查用量的 API | 文件：Ollama 有 `GET /api/balance`；Zen 截至 2026-10-11 查無（`quota-signals.md`，已查證）。Ollama 的實打留到實作 |
-| (c) 三家能不能讓 Claude Code 直接接 | 文件：OpenRouter、Ollama Cloud 有官方接法；Zen 沒有（`upstream-claude-code-compat.md`，已查證）。實打一則訊息留到實作 |
-| (d) 各 agent 額度用完的訊息格式、能不能拿到重置時間 | 文件：Claude Code 的 `You've hit your … limit · resets …`、opencode 的 `session.error`（402／429 與 `retry-after`）、agy 的 `Individual quota reached … Resets in …`，大多拿得到重置時間（`quota-signals.md`）。實際用完當下的輸出，等真的碰到時記錄 |
+- **認證**：選 (a)，不做應用層認證。本人知道 sshproxy 上所有金鑰（provider、worker、家人維修機共用的那把）都讀得到全部 key，並接受這個風險。
+- **會合點**：直接用池跳板機上的 sshproxy 帳號。
+- **控制者只給 id**，sidecar 自己 get。
+- **priority** 之後可能改成外部注入的函式計算；挑選在 sidecar，LLMGateway 照樣回這個欄位。
 
-隊員不碰憑證，也不打需要 key 的 API；要用 key 的驗證由 PM 或本人做。
+## 不做（v0）與理由
 
-## 手機 App 怎麼連上（本人選 (2)；v0 不實作）
-
-前提：在新方向下，手機**不需要讓模型流量經過 Gateway**。OpenRouter、Ollama Cloud、Zen 本身就是 OpenAI 相容，手機租到 key 就直接打上游；Claude 訂閱不能給手機 App 用（條款）。所以手機只需要連到**租用服務**，流量很小。
-
-| | (1) 另寫一個等同 mlp 的手機 App，把機器池控制整個拆出來，在裡面做 port forward | (2) 擴充既有 App（MyAiEntry）的機器池功能，加上 port forward |
-|---|---|---|
-| 可沿用的 | 要重做 SSH、池的解析、私鑰保管 | 既有 App 已有 SSH（jsch，本身支援本機埠轉送）、池的解析、私鑰保管、機器池控制畫面 |
-| 連線 | AI App 連另一個 App 開的本機埠；兩個 App 都要活著，Android 背景限制要處理兩次 | 同一個 App 內：開轉送、租用、打上游都在一起 |
-| 職責 | 機器池控制和 AI 對話分開，比較乾淨；之後其他 App 也能用這條轉送 | AI App 變得更大；但機器池控制本來就在裡面 |
-| 成本 | 新 App 的建置、簽章、發佈、測試全套 | 長時間開著的轉送、前景服務、斷線重連都要新做。既有的 jsch 轉送只在每次執行指令時串接跳板，用完就拆（MyAiEntry PM 核對原始碼） |
-
-**本人選 (2)**：成本最低，而且需要轉送的只有這個 App。等出現第二個需要池內服務的手機 App，再把轉送拆成 (1)。實作已在 MyAiEntry#147 開單（blocked by #8）；本 repo 只提供租用介面與手機用的客戶端憑證。
-
-## v0 不做
-
-| 項目 | 進不進 v0 | 理由 |
-|---|---|---|
-| #2 多訂閱無縫切換 | **部分進** | 自動換把會做（本提案的核心），但不是無縫：那一輪會中斷，靠 `agora continue` 接回 |
-| #3 免費模型依效能自動切換 | 不進 | blocked by #4 |
-| #4 隱私界線 | 不進 | v0 只照固定順序換把，不依內容改送別的模型。opencode 那條鏈本來就以免費模型為主，等 #4 定案再收斂 |
-| #6 和 sidecar 對齊 | **進** | 本提案的租用介面就是 `ModelBroker` 要對齊的形狀；草擬好後直接和 aistorage-pm 對齊 |
-| #7 手機 App 的入口 | 只定方向 | 走 (2)，實作在 MyAiEntry#147 |
-| Antigravity（agy） | 不進 | 不在這五把裡（用 Google 帳號登入） |
-| 資料面代轉、格式轉換 | 不進 | 只在試做 c 證明「非加不可」時才另外提 |
-
-## 和期 1 設計的差別
-
-- **決定 2「上游憑證值不經過 LLMGateway」→ 改成「上游 key 只放在 LLMGateway 一處，出租給 launcher」。** launcher 仍然只注入租約指定的那一把；差別在 key 的來源從各機器的能力掛載，改成向 LLMGateway 租用。
-- **決定 3「v0 後端用 private GitHub repo」→ 改成常駐 provider 上的服務＋SQLite。**
-- **決定 4（切換）不變**：launcher 執行、紀錄與通知照舊；選把加上「順序＋冷卻＋同時租用上限」。
-- **決定 1（不做資料面）不變。**
-- 期 1 的 change 在 v0 的 design 裡以 MODIFIED 改。
-
-## 驗收
-
-1. **租用**：Mac 上 `sidecar agent run claude` 開出的 Claude Code 回得了一則最短的訊息。紀錄有租約（客戶端＝Mac、訂閱＝`claude-personal`）與 release；agent 環境裡只有那一把。
-2. **切換**：用假的額度用完訊號（不真的燒額度）→ `claude-personal` 進冷卻 → 下一張是 `claude-company` → agent 自動重開並接回 session → 狀態板顯示冷卻與重置時間 → 冷卻到期後新開的租約回到 `claude-personal`。Mac 的 `sidecar agent run` 與 worker 上的 sidecar 各跑一次，走的是同一段程式。
-3. **sidecar**：sidecar 的假 broker 換成真的租用服務後，跑一次「額度用完 → 換把 → `agora continue` 接回」。可以在一台 worker 上做，或用測試替身做。
-4. **opencode**：`sidecar agent run opencode` 對三家 key 型上游各跑通一次。
-5. **狀態板**：顯示五把的使用者、數量／上限、冷卻、用量 %（拿不到的顯示「未知」）。
-6. **秘密**：repo、log、紀錄、狀態板掃描不到任何 key 的值。
-7. **退回**：停用服務、Mac 改回用原本的指令，一切照舊。
-8. **要用 key 的驗證**（實作時由 PM 或本人做）：OpenRouter、Ollama Cloud 各讓 Claude Code 跑一則最短的訊息；Ollama 的 `GET /api/balance` 打一次，看回哪一種欄位。
+- **同時租用上限**：沒有租約就算不出一把正被幾個 agent 用；本人要最少的介面。
+- **「誰正在用哪一把」**：看各 sidecar 的 status（裡面有 subscription 名）；LLMGateway 的稽核紀錄看得到「誰在何時 get 過哪一把」。
+- **分辨是哪一台 worker**：認證不分機器，所以分不出來；要分就得多一套發撤憑證的介面。
 
 ## 銜接
 
-- **MyLinuxPool#50**：先照原樣做，當過渡（本人裁定）。租用做好後另開單，把 worker 的 key 來源換成租用，並收掉 MyLinuxPool 裡的 key；屆時 #50 大概縮成「確認 worker 連得到 LLMGateway」。
-- **服務的歸屬**（本人裁定，2026-10-11 晚）：LLMGateway 是獨立的服務，只是和池的服務跑在同一台；在那台用自己的帳號 `llmgw` 跑，安裝與部署都在本 repo（design 決定 2、3）。
-- **MyLinuxPool** 只留池的部分：#68 跳板機上的轉發專用條目、#69 worker 連到服務的路、#70 透過管理 API 發撤 worker 的客戶端憑證。
-- **MyAiStorage#31**：照上面的租用介面和 aistorage-pm 對齊 `ModelBroker` 的形狀（`request_lease` 回傳環境變數、`report_exhausted`、`release`）。
-- **MyAiEntry#147**：手機用的轉送（照 (2)），接 MyAiEntry#31、#33；租約欄位定案與 agent 種類要加給 App 的值時，通知 MyAiEntry PM。
-- **MyAiStorage#32（Atelier）**：harness 的能力需求要能寫「優先模型」與「底線模型」（PMO 會轉告 aistorage-pm）；LLMGateway 這邊見「之後」。
+- **MyAiStorage（sidecar v3）**：用 list、get、登錄冷卻；挑選與換把在 sidecar 內部；env 對應在 AgentDriver。
+- **MyLinuxPool**（mylinuxpool-pm 提最小的做法，PMO 協調）：
+  - 在 sshproxy 登記 LLMGateway 的兩把公鑰（隧道、部署）；
+  - 確認 worker 的 sidecar 讀得到 id_tunnel；
+  - #69、#70 不需要。
+- **MyAiEntry#147**：手機一樣經會合點連線（App 內做 SSH 轉發），用 list／get。
 
-## 之後（v0 不做，但介面留了擴充點）
+## 不做
 
-- **依 harness 的模型偏好選把**：Atelier 的 harness 設定「可接受的底線模型」與「優先模型」，sidecar 盡量滿足，滿足不了就停（本人要求）。
-  - v0 的 `request_lease` 已接受 `preferences: {preferred_models: [...], floor_model: ...}`，先記錄、不影響選把。
-  - 之後選把邏輯換成「在底線之上照優先順序選，沒有就拒絕（`reason: below_floor`）」，客戶端不用改。
-- **Claude 的用量 %**：拿得到時經 `report_usage` 接上狀態板。
-- **跨 agent 的接續**：Claude 兩把都冷卻時，改用 opencode 接同一個 session（agora 支援換 agent 接續），要等 #4 隱私界線與本人同意。
-
-## 本人的回答（第 2 版的確認事項，2026-10-11）
-
-1. 換把順序照提案；之後要能由 Atelier 設定優先與底線模型（寫進「之後」）。
-2. 同時租用上限 Claude 兩把各 2：同意。Mac 不要專用寫法，和 worker 走同一套換把流程（改成第 5 節）。
-3. 手機 App 走 (2)。
-4. Claude 的用量 % 顯示「未知」；試做 a 不做；要用 key 的驗證留到實作。
+- 資料面代轉、格式轉換（LiteLLM）。
+- 依內容或效能改送（#3、#4）。
+- token／成本計量、用量 %。
+- Antigravity（agy）。
