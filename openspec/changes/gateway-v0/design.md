@@ -118,6 +118,7 @@
 **錯誤**
 - `400 bad_request`：欄位缺漏或格式不合，附缺的欄位。
 - `401`：沒有或錯誤的客戶端憑證。
+- `413 body_too_large`：請求 body 超過 1 MB，不讀內容。
 - `403 client_mismatch`：worker 與客戶端憑證登記的名稱不符。
 - `403 not_owner`：動到別的客戶端的租約。
 - `404 not_found`：租約不存在。
