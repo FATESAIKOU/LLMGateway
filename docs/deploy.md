@@ -1,386 +1,316 @@
-# LLMGateway 部署與維運手冊
+# LLMGateway 部署與維運手冊（v4）
 
-本手冊供本人進行「放服務的那台」之一致性開機設定、GitHub 部署環境配置、日常運作維護及故障排除。全文件嚴格遵守本公開儲存庫（public repo）之隱私與安全規範：
-- 不記錄任何實際主機名稱、IP 位址、連接埠號或敏感金鑰值（皆以 `<埠>`、`<跳板機位址>` 等佔位符表示）。
-- 實體機器一律稱為「放服務的那台」。
-- 服務完全無資料面中轉，僅負責金鑰保管、租用分配與狀態追蹤。
+給本人（或本人授權的人）做「放服務的那台」的一次性設定、GitHub 的設定、日常維運與排錯。設計見 `openspec/changes/gateway-v0/`（design 決定 2、3、4、5a、5b）。
 
----
+這是 public repo，本手冊：
+- 不寫實際的機器名、IP、key 的值；位址一律用 `<跳板機>`、`<埠>` 這類佔位；
+- 機器一律稱為「放服務的那台」；
+- 「會合點」指池跳板機上現有的 `sshproxy` 帳號（本人指定）。
+
+## 0. 全貌
+
+服務只做三件事：list、get、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。**不做應用層認證**，存取控制只靠 SSH：
+
+- `lgwd` 只綁放服務那台的 `127.0.0.1:<API 埠>`（預設 8480），不綁任何對外或容器網路的介面。
+- 隧道守護 `llmgateway-tunnel.service` 用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：
+  - `127.0.0.1:4710` → `lgwd` 的 API；
+  - `127.0.0.1:4711` → 放服務那台的 sshd（部署用）。
+- 客戶端（Mac、worker 的 sidecar）用 `lgw connect` 經會合點轉發到 4710。
+- GitHub 的部署 workflow 用 `ssh -J sshproxy@<跳板機>:<埠> -p 4711 llmgw@127.0.0.1` 登入，只能跑 `remote-deploy.sh`。
+
+放服務的那台上，帳號 `llmgw` 底下有：
+
+| 東西 | 位置 |
+|---|---|
+| 服務 `lgwd` | `~/.config/systemd/user/llmgateway.service`，執行 `~/.local/bin/llmgateway-run` |
+| 隧道守護 | `~/.config/systemd/user/llmgateway-tunnel.service`，執行 `~/.local/bin/llmgateway-tunnel` |
+| 程式 | `~/.local/share/llmgateway/<tag>/`，`current` 指著用中的版本 |
+| 服務設定 | `~/.config/llmgateway/llmgateway.env`（`LGW_API_PORT`） |
+| 隧道設定 | `~/.config/llmgateway/tunnel.env` |
+| 五把 key | `~/.local/state/llmgateway/keys.env`（0600） |
+| 冷卻與稽核 | `~/.local/state/llmgateway/llm.db`（SQLite，只有 `cooldowns` 與 `audit`，不含 key） |
+| 部署入口 | `~/.ssh/authorized_keys` 的 forced command → `current/deploy/remote-deploy.sh` |
 
 ## 1. 一次性開機設定（放服務的那台）
 
-本節操作須具備放服務那台的 `root` 權限（或具備 `sudo`），旨在為 LLMGateway 建立專用低權限帳號與運行基底。
+需要 root。依 tasks 3.3，由本人做或本人授權後做。
 
-### 步驟 1.1：建立系統帳號 `llmgw`（不加進 docker 群組）
-
-以 root 身分建立獨立的系統服務使用者：
+### 1.1 建帳號 `llmgw`（不加 docker 群組）
 
 ```bash
 useradd -m -s /bin/bash llmgw
 ```
 
-- **為什麼要獨立帳號**：LLMGateway 集中保管模型存取金鑰（如 Claude OAuth token、OpenRouter API key 等），必須將金鑰檔案權限（`0600`）與執行權限嚴格限制在專用帳號下，與池管理帳號及其他服務完全隔離。
-- **為什麼絕對不加進 docker 群組**：
-  > [!CAUTION]
-  > 在 Linux 系統中，具有存取 Docker daemon socket（即加入 `docker` 群組）權限之使用者，可藉由掛載宿主機根目錄或啟動特權容器輕易取得宿主機實質 `root` 權限。加進 `docker` 群組等同直接賦予 root 權限，將徹底打破系統帳號間的權限隔離防護。
+- 獨立帳號，key 檔只有它讀得到，和池的管理帳號分開。
+- **不要加進 `docker` 群組**：能用 docker socket 就等於 root，隔離就沒了。
 
----
-
-### 步驟 1.2：開啟使用者 Session 常駐（Linger）
-
-以 root 執行：
+### 1.2 開 linger
 
 ```bash
 loginctl enable-linger llmgw
 ```
 
-- **為什麼**：LLMGateway 作為 `llmgw` 的 systemd user unit（`systemctl --user`）運行。在 systemd 預設機制下，非登入使用者的 user manager 只會在互動登入時啟動，登出時隨即停止。開啟 `linger` 後，系統開機時即會為 `llmgw` 啟動 user manager 並持續常駐，確保服務在開機時自動執行且無使用者登入時仍穩定常駐。
+兩個服務都是 `llmgw` 的 systemd user unit。開了 linger，開機就會起 user manager，沒人登入也常駐。
 
----
+### 1.3 sshd 允許 `llmgw` 從 loopback 用公鑰登入
 
-### 步驟 1.3：確認 SSH 伺服器允許 `llmgw` 登入
+部署連線經隧道進來，在那台看起來是**從 127.0.0.1 連到 127.0.0.1:22**。檢查 `/etc/ssh/sshd_config` 與 `sshd_config.d/*.conf`：
 
-檢查 `/etc/ssh/sshd_config` 或 `/etc/ssh/sshd_config.d/*.conf`：
+1. sshd 有在 `127.0.0.1:22` 聽（`ListenAddress` 有設時要包含它）；
+2. `AllowUsers`／`AllowGroups` 有設時要放行 `llmgw`；`DenyUsers` 不能擋它；
+3. `PubkeyAuthentication yes`；
+4. 有改就 `systemctl reload sshd`（有的發行版叫 `ssh`）。
 
-1. 若設定有 `AllowUsers` 白名單，確認已包含 `llmgw`（例如：`AllowUsers ... llmgw`）。
-2. 若設定有 `DenyUsers`，確認未封鎖 `llmgw`。
-3. 確認已啟用公鑰認證（`PubkeyAuthentication yes`）。
-4. 若有修改設定，重載 SSH 服務：
-   ```bash
-   systemctl reload sshd
-   ```
+### 1.4 確認工具
 
-- **為什麼**：GitHub Actions 自動化部署工作流程（`deploy-keys` 與 `deploy-service`）必須經由跳板機以 `llmgw` 使用者身分透過 SSH 連線至放服務的那台。若 sshd 存取控制阻擋該使用者，部署連線將直接被拒絕。
+`python3 --version` 要 3.10 以上（程式只用標準函式庫）；另外要有 `git`、`curl`、`ssh`。
 
----
-
-### 步驟 1.4：確認 Python 執行環境版本（>= 3.10）
-
-檢查系統 Python 3 版本：
-
-```bash
-python3 --version
-```
-
-- **為什麼**：LLMGateway 伺服器與管理模組（`lgwd`、`lgw.admin`）完全依賴 Python 標準函式庫，並採用了 Python 3.10 引入之型別聯合語法（如 `str | None`，PEP 604）及標準模組能力。若 Python 版本低於 3.10，程式將在語法解析階段直接失敗。
-
----
-
-### 步驟 1.5：首次安裝服務（以 `llmgw` 身分）
-
-切換為 `llmgw` 使用者進行安裝：
+### 1.5 第一次安裝（以 `llmgw` 身分）
 
 ```bash
 sudo -u llmgw -i
+mkdir -p ~/.local/share/llmgateway
+git clone --depth 1 --branch <tag> https://github.com/FATESAIKOU/LLMGateway.git ~/lgw-bootstrap
+~/lgw-bootstrap/deploy/install.sh --tag <tag>
+rm -rf ~/lgw-bootstrap
 ```
 
-拉取指定之固定發行版本（Git tag，例如 `lgw-v0.1.0`）：
+`install.sh` 會自己再抓一次固定 tag 放進 `~/.local/share/llmgateway/<tag>/`，然後：
+1. 建 `~/.local/state/llmgateway/`（0700）、空的 `keys.env`（0600）；
+2. 沒有設定檔時建範本：`llmgateway.env`、`tunnel.env`（值留空，不含任何位址）；
+3. 原子切換 `current`、裝 `llmgateway-run`、`llmgateway-tunnel` 與兩個 unit；
+4. `daemon-reload`；啟用並重啟 `llmgateway.service`；啟用 `llmgateway-tunnel.service`。
+
+這時 key 還沒部署，list 裡每一把的 `available` 都是 false；隧道設定也還是空的，隧道守護起不來，這是預期的，1.8 填好就好。
+
+### 1.6 產生隧道金鑰（私鑰不離開那台）
+
+以 `llmgw` 身分：
 
 ```bash
-mkdir -p ~/.local/share/llmgateway/releases
-git clone --depth 1 --branch <tag> https://github.com/FATESAIKOU/LLMGateway.git ~/.local/share/llmgateway/releases/<tag>
+ssh-keygen -t ed25519 -N '' -C llmgateway-tunnel -f ~/.ssh/id_llmgw_tunnel
+cat ~/.ssh/id_llmgw_tunnel.pub
 ```
 
-執行安裝腳本進行原子切換與服務初始化：
+- 私鑰只放在這台，**不是** GitHub secret（照 MyLinuxPool 的原則）。
+- 把 `.pub` 那一行交給 mylinuxpool-pm（經 PMO），登記到 MyLinuxPool 的 `TUNNEL_EXTRA_PUBKEYS`（MyLinuxPool#77）；由本人或 PMO 設 var 並 dispatch `refresh-authorized-keys`。公鑰本身不是秘密，但註解只寫 `llmgateway-tunnel`，不要帶機器名。
 
-```bash
-~/.local/share/llmgateway/releases/<tag>/deploy/install.sh --tag <tag>
-```
+### 1.7 準備會合點的 known_hosts
 
-安裝腳本會完成：
-1. 建立資料狀態目錄 `~/.local/state/llmgateway/`（權限 `0700`）。
-2. 將 `current` 符號連結原子切換至該發行版：`~/.local/share/llmgateway/current -> ~/.local/share/llmgateway/releases/<tag>`。
-3. 安裝 systemd user unit 檔案至 `~/.config/systemd/user/llmgateway.service`。
-4. 載入並啟用服務：`systemctl --user daemon-reload && systemctl --user enable --now llmgateway.service`。
-
-- **為什麼**：以服務帳號身分拉取固定發行標籤（tag），保證所有目錄與檔案擁有者皆為 `llmgw`。透過符號連結 `current` 指向版本，可確保部署切換與事後版本回滾的原子性。
-
----
-
-> **綁定位址**：`~/.config/llmgateway/llmgateway.env` 的 `LGW_API_HOSTS` 要分別列出 `127.0.0.1` 與 docker bridge 的位址，**不要用 `0.0.0.0`**。管理 API 只接受綁在 loopback 上收到的請求，綁 `0.0.0.0` 時一律拒絕；v0 只支援 IPv4。
-
-### 步驟 1.6：配置部署專用公鑰至 `authorized_keys`
-
-在放服務的那台，切換為 `llmgw` 身分：
-
-```bash
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-```
-
-編輯 `~/.ssh/authorized_keys`（權限 `0600`），填入以下單一行格式：
+用 MyLinuxPool 提供的跳板機 host key 建 `~/.ssh/known_hosts_rendezvous`，一行的格式：
 
 ```text
-command="/home/llmgw/.local/share/llmgateway/current/deploy/remote-deploy.sh",restrict <部署公鑰內容>
+[<跳板機>]:<埠> ssh-ed25519 <跳板機的 host key>
 ```
 
-- **為什麼**：
-  - `command="/home/llmgw/.../remote-deploy.sh"`：強制此公鑰登入時僅能執行專用部署腳本，不開放互動式 shell 或任意指令執行，徹底限縮部署通道之暴露面。腳本內部亦對 `SSH_ORIGINAL_COMMAND` 進行白名單檢查（僅放行 `keys` 與 `upgrade lgw-vX.Y.Z`）。
-  - `restrict`：OpenSSH 限制旗標，停用 port-forwarding、agent-forwarding、X11-forwarding、pty 分配等所有非必要能力，符合最小特權原則。
-  - 跳板機端與放服務的那台使用同一把部署金鑰，跳板端僅允許轉發至放服務那台的隧道埠，那台則強制綁定部署腳本。
+**不要用 `ssh-keyscan` 現掃、不要用 `accept-new`**；隧道守護是 `StrictHostKeyChecking=yes`，對不上就不連。
 
----
+### 1.8 填 `tunnel.env`，啟動隧道守護
 
-### 步驟 1.7：簽發發證管理憑證（Issuer Token）
+編輯 `~/.config/llmgateway/tunnel.env`：
 
-在放服務的那台，以 `llmgw` 身分執行管理工具，為 MyLinuxPool 建立發證者：
+```sh
+RENDEZVOUS=sshproxy@<跳板機>:<埠>
+IDENTITY=/home/llmgw/.ssh/id_llmgw_tunnel
+KNOWN_HOSTS=/home/llmgw/.ssh/known_hosts_rendezvous
+REMOTE_API=4710
+REMOTE_SSH=4711
+LOCAL_API=8480
+PROBE_INTERVAL=60
+PROBE_FAILS=3
+```
+
+- `LOCAL_API` 要和 `llmgateway.env` 的 `LGW_API_PORT` 一樣。
+- 4710、4711 是 MyLinuxPool 在會合點上替 LLMGateway 保留的埠（`NODE_GATEWAY.ports.llmgateway`），避開 2220–2499 與 3000–3999。
 
 ```bash
-cd ~/.local/share/llmgateway/current
-python3 -m lgw.admin client add mlp-issuer --role issuer
+systemctl --user enable --now llmgateway-tunnel.service
+journalctl --user -u llmgateway-tunnel -n 20
 ```
 
-執行後標準輸出僅會印出一次憑證字串（32 bytes URL-safe 隨機字串）：
+看到 `tunnel_up`、之後沒有 `probe_fail` 就是通了。守護程式的行為：
+- 隧道用 `ExitOnForwardFailure=yes`：遠端埠公開不了，ssh 直接結束，systemd 10 秒後重開；
+- 每 `PROBE_INTERVAL` 秒經會合點 `ssh -W 127.0.0.1:4710` 打一次 `GET /v1/subscriptions`，**只有 HTTP 200 算健康**；
+- 連續 `PROBE_FAILS` 次不健康，就殺掉隧道、以非零結束，讓 systemd 重建。
 
-> [!IMPORTANT]
-> **安全警示**：此發證憑證的明文僅在此印出唯一一次，資料庫內僅保存其 SHA-256 雜湊值。請本人立即複製並設為 MyLinuxPool 的 GitHub secret `GH_MYLINUXPOOL__LLMGATEWAY_ADMIN__ISSUE`，**絕對不要貼進任何對話紀錄、issue、PR、工單或檔案中**。
+### 1.9 放部署公鑰
 
-- **為什麼**：MyLinuxPool 的 `create-worker` 在建立 worker 容器時，需自動向 LLMGateway 管理 API 發行客戶端憑證，並在 `delete-worker` 時撤銷。`issuer` 角色僅能呼叫管理 API（且白名單限制只能簽發撤銷符合 `worker-*` 命名的客戶端），不具備租用模型的權限，落實職權劃分。
+部署金鑰由本人產生：私鑰設成 GitHub secret（見 2.2），公鑰放兩個地方。
 
----
+1. **會合點**：一樣經 mylinuxpool-pm 登記到 `TUNNEL_EXTRA_PUBKEYS`，workflow 才能用 `-J` 經過 sshproxy。
+2. **放服務那台的 `~llmgw/.ssh/authorized_keys`**（目錄 0700、檔案 0600），只有一行：
 
-### 步驟 1.8：簽發 Mac 客戶端憑證
+```text
+command="/home/llmgw/.local/share/llmgateway/current/deploy/remote-deploy.sh",restrict <部署公鑰>
+```
 
-在放服務的那台，以 `llmgw` 身分簽發 Mac 本機使用的客戶端憑證：
+- `command=`：這把公鑰登入時只能跑部署腳本，腳本只接受 `keys` 與 `upgrade lgw-vX.Y.Z` 兩個動詞（單行、tag 格式也檢查）。
+- `restrict`：關掉轉發、agent forwarding、pty 等全部額外能力。
+
+### 1.10 驗證
+
+在放服務的那台：
 
 ```bash
-cd ~/.local/share/llmgateway/current
-python3 -m lgw.admin client add mac-client --role client
+~/.local/share/llmgateway/current/deploy/install.sh --check; echo $?
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8480/v1/subscriptions
 ```
 
-將終端機印出的憑證明文妥善複製到 Mac 本機，存入設定檔並限定權限：
-
-```bash
-mkdir -p ~/.config/lgw
-printf '%s' '<憑證明文>' > ~/.config/lgw/client-token
-chmod 600 ~/.config/lgw/client-token
-```
-
-- **為什麼**：Mac 本地執行 `sidecar agent run claude` 或 `sidecar agent run opencode` 時，內部 `lgw` 客戶端讀取 `~/.config/lgw/client-token` 進行 Bearer 身分驗證。權限設為 `0600` 可防止同機其他未授權使用者讀取。
-
----
+`--check` 回 0、`curl` 印 200。接著從 Mac 照 3.1 連一次。
 
 ## 2. 本人在 GitHub 的設定
 
-為了讓 GitHub Actions 能夠安全連線放服務的那台以更新金鑰與程式碼，本人須在本 repo（public repo）的 Settings 進行環境保護與 Secrets 設定。
+### 2.1 Environment `llmgateway-deploy`
 
-### 2.1 建立 Environment「`llmgateway-deploy`」
+Settings → Environments → New environment，名稱 `llmgateway-deploy`，勾 **Required reviewers** 並加本人。兩個 workflow 都只能手動觸發（`workflow_dispatch`），每次都要本人核准才會拿到 secret。
 
-1. 前往本 repo 的 **Settings** -> **Environments**。
-2. 點選 **New environment**，名稱填入 `llmgateway-deploy`。
-3. 勾選 **Required reviewers**，並將**本人**加入審核者名單。
+### 2.2 Secrets（放在 `llmgateway-deploy` environment）
 
-- **為什麼**：部署工作流程涉及伺服器登入私鑰與真實付費 API 金鑰。設定 Required reviewer 為本人，能確保每次工作流程觸發（手動 `workflow_dispatch`）時，皆須本人確認無誤後才釋放秘密與執行連線，防止意外或未經授權之秘密派發。
+命名照本人的規則 `<存取方>__<被存取方>__<動作>`。值由本人設，AI 不經手。
 
----
+**部署連線（4 個）**
 
-### 2.2 設定 9 個 Secrets
-
-依據 tasks 3.3 與命名規範 `<存取方>__<被存取方>__<動作>`，在 `llmgateway-deploy` environment（或 repo secrets）中設定下列 9 個 secret：
-
-#### (A) 部署連線設定（4 個）
-
-| Secret 名稱 | 格式範例 / 規範 | 說明與為什麼 |
+| Secret | 格式 | 說明 |
 |---|---|---|
-| `GH_LLMGATEWAY__POOL_SSH__DEPLOY` | OpenSSH 私鑰 PEM 文字<br>（以 `-----BEGIN ... PRIVATE KEY-----` 開頭） | 部署專用私鑰。對應放服務那台 `~llmgw/.ssh/authorized_keys` 與跳板機授權之公鑰。 |
-| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS` | 標準 known_hosts 格式文字<br>（每行一個主機指紋條目） | 跳板機與放服務那台之 SSH host key 指紋。**必須使用 MyLinuxPool 事先提供的可信指紋建立，切勿使用 `ssh-keyscan` 現掃**（防止初次連線遭中間人攻擊 TOFU 缺陷）。 |
-| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP` | `user@host:port` | 跳板機連線資訊，供 SSH `-J` 代理跳轉使用。 |
-| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET` | `llmgw@127.0.0.1:<埠>` | 放服務那台經由跳板看到的目標位址。**字面必須與跳板機 `permitopen` 設定之 `"127.0.0.1:<埠>"` 一模一樣**，OpenSSH 比對不一致將拒絕轉發。 |
+| `GH_LLMGATEWAY__POOL_SSH__DEPLOY` | OpenSSH 私鑰全文 | 部署私鑰，公鑰見 1.9。 |
+| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS` | known_hosts，兩行 | `[<跳板機>]:<埠> <跳板機的 host key>`，與 `[127.0.0.1]:4711 <放服務那台的 host key>`。用 MyLinuxPool 提供的指紋與那台的 `/etc/ssh/ssh_host_ed25519_key.pub` 建，不要現掃。 |
+| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP` | `sshproxy@<跳板機>:<埠>` | 會合點。 |
+| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET` | `llmgw@127.0.0.1:4711` | 固定值：經會合點看到的、放服務那台的 sshd。 |
 
-> [!NOTE]
-> 連線資訊之所以一併放入 GitHub Secrets 而非公開的 Repository Variables，是因為本 repo 為公開倉庫，不得洩漏私人基礎架構之跳板機位址與內部轉發埠口。
+連線資訊也放 secret，是因為 repo 是 public，不把池的位址放在公開的 vars；workflow 印 ssh 錯誤時也會把位址換成 `[jump]`／`[target]`。
 
-#### (B) 模型存取金鑰（5 個）
+**五把 key（5 個）**
 
-金鑰值由本人直接輸入，不可包含任何換行、空白字元或引號：
+值不能有空白、換行、引號。**還沒有的那把就不要建 secret**：workflow 會送出空值，服務視為「沒部署」（list 的 `available` 為 false，get 回 409）。
 
-| Secret 名稱 | 內容與格式 | 說明 |
+| Secret | 內容 | 寫進 `keys.env` 的名字 |
 |---|---|---|
-| `POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM` | Claude 個人訂閱 OAuth token | 對應 `CLAUDE_PERSONAL_OAUTH_TOKEN`。 |
-| `POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM` | Claude 公司訂閱 OAuth token | 對應 `CLAUDE_COMPANY_OAUTH_TOKEN`。 |
-| `POOL_LLMGATEWAY__OPENROUTER_API__LLM` | OpenRouter API 金鑰 | 對應 `OPENROUTER_API_KEY`。 |
-| `POOL_LLMGATEWAY__OPENCODE_ZEN__LLM` | OpenCode Zen API 金鑰 | 對應 `OPENCODE_ZEN_API_KEY`（若尚未開通可填空字串，系統將視為未部署）。 |
-| `POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM` | Ollama Cloud API 金鑰 | 對應 `OLLAMA_API_KEY`。 |
+| `POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM` | Claude 個人訂閱的 setup-token | `CLAUDE_PERSONAL_OAUTH_TOKEN` |
+| `POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM` | Claude 公司訂閱的 setup-token | `CLAUDE_COMPANY_OAUTH_TOKEN` |
+| `POOL_LLMGATEWAY__OPENROUTER_API__LLM` | OpenRouter key | `OPENROUTER_API_KEY` |
+| `POOL_LLMGATEWAY__OPENCODE_ZEN__LLM` | OpenCode Zen key | `OPENCODE_ZEN_API_KEY` |
+| `POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM` | Ollama Cloud key | `OLLAMA_API_KEY` |
 
----
+`keys.env` 的名字只是檔案裡的鍵名，不是給 agent 用的環境變數；agent 的環境變數由 sidecar 的 AgentDriver 從 get 的結果推出。
 
-## 3. 日常維運
+## 3. 客戶端
 
-### 3.1 部署金鑰（執行 `deploy-keys`）
+### 3.1 Mac
 
-當需要更新或輪替任何模型 API 金鑰時：
+Mac 用自己已經能登入 sshproxy 的金鑰。建 `~/.config/lgw/connect.env`：
 
-1. 更新 GitHub 中對應的 `POOL_LLMGATEWAY__*` Secret。
-2. 至 GitHub Actions 頁面，選擇 **deploy-keys** 工作流程，點擊 **Run workflow**。
-3. 本人收到審核通知，確認後點擊核准執行。
-4. 工作流程透過 SSH 將 5 把 key 經由標準輸入（stdin）安全傳入放服務的那台：
-   - `remote-deploy.sh` 進行格式驗證。
-   - 以 `0600` 權限寫入暫存檔，原子更名（rename）覆寫 `~/.local/state/llmgateway/keys.env`。
-   - 送出 `SIGHUP` 訊號通知常駐服務熱重讀金鑰。
-
-- **為什麼**：金鑰值不經過命令列參數（不暴露於 `ps` 程序表）、不記錄於 GitHub Actions 日誌、落盤採原子更名避免讀取到半寫入狀態，重讀亦不中斷現有服務連線。
-
----
-
-### 3.2 升級服務程式碼（執行 `deploy-service`）
-
-當本 repo 發布新版並打上發行標籤（格式 `lgw-vX.Y.Z`）時：
-
-1. 至 GitHub Actions 頁面，選擇 **deploy-service** 工作流程，點擊 **Run workflow**。
-2. 在輸入框填入欲部署的標籤名稱（例如 `lgw-v0.2.0`）。
-3. 本人核准後，工作流程以 SSH 呼叫 `upgrade lgw-vX.Y.Z`：
-   - 遠端腳本驗證標籤正規表示式。
-   - 呼叫 `install.sh` 下載該標籤程式碼、切換 `current` 符號連結並重啟 user unit。
-
----
-
-### 3.3 檢視 HTML 狀態板（Mac 經 SSH 埠轉送）
-
-LLMGateway 內建只讀 HTML 狀態板（預設埠 8481），用於即時監控金鑰部署狀況、各訂閱租約數與冷卻倒數。
-
-- **網路隔離策略**：狀態板 HTTP 伺服器嚴格僅綁定在放服務那台的 **loopback（`127.0.0.1`）**，不向池外公開，亦不開放給 worker 容器存取。
-- **檢視方式（本機埠轉送）**：
-  在 Mac 終端機執行 SSH 轉發：
-  ```bash
-  ssh -J <跳板機連線字串> -L 8481:127.0.0.1:8481 <放服務那台的使用者@主機>
-  ```
-  連線建立後，在 Mac 本機瀏覽器開啟：
-  ```text
-  http://127.0.0.1:8481/board
-  ```
-
-- **為什麼**：狀態板顯示 worker 機器名稱、使用中的租約與額度資訊，限制在 loopback 可確保僅具備跳板 SSH 存取身分之本人可觀看；且 HTML 狀態板不需代入客戶端 token，杜絕 token 洩漏於瀏覽器網址列或 Proxy 存取日誌之風險。
-
----
-
-### 3.4 服務健康檢查（`--check` 三態）
-
-在放服務的那台，可直接透過部署腳本的檢查介面檢驗服務運行狀態：
-
-```bash
-/home/llmgw/.local/share/llmgateway/current/deploy/install.sh --check
+```sh
+JUMPS=
+RENDEZVOUS=sshproxy@<跳板機>:<埠>
+IDENTITY=/Users/<你>/.ssh/<能登入 sshproxy 的金鑰>
+KNOWN_HOSTS=/Users/<你>/.ssh/known_hosts_rendezvous
+REMOTE_API=4710
 ```
 
-檢查結果以 Exit Code 表示三態語義：
-
-| 狀態碼 | 狀態語義 | 意義與判定標準 |
-|---|---|---|
-| **0** | 健康正常 | 服務正在執行、版本與 current 一致，且本機測試 `GET /v1/board` 在不帶憑證情況下正確回傳 `401 Unauthorized`（表示服務正在監聽且身分驗證機制正常）。 |
-| **1** | 確定不成立 | 服務明確異常：程序未運行、systemd unit 處於 failed 狀態、連接埠無法連線，或伺服器回應非預期狀態（例如未驗證請求未回 401）。 |
-| **2** | 無法確認 | 因環境干擾或未明原因無法判定，例如檢查指令超時、無法連接本機 user bus 等。 |
-
-- **為什麼**：定義嚴謹的三態語義可讓自動化監控與維運工具準確辨認「確定服務失效（1）」與「檢測環境未定（2）」，避免盲目重啟。
-
----
-
-### 3.5 撤銷客戶端憑證
-
-若某台機器退役、憑證洩漏或不再授權，在放服務的那台以 `llmgw` 身分執行撤銷：
+- `JUMPS`：要先經過其他跳板時，用逗號分隔的 `user@host:port`；直接連得到會合點就留空。
+- `KNOWN_HOSTS` 和 1.7 一樣，用 MyLinuxPool 提供的 host key。
 
 ```bash
-cd ~/.local/share/llmgateway/current
-python3 -m lgw.admin client rm <客戶端名稱>
+python3 -m lgw.connect --config ~/.config/lgw/connect.env
+# 印出一行 http://127.0.0.1:<臨時埠>，Ctrl-C 結束
+curl -s http://127.0.0.1:<臨時埠>/v1/subscriptions
 ```
 
-查看目前已註冊之客戶端清單與撤銷時刻：
+程式裡則是 `with lgw.connect.connect(cfg) as base_url:`，再用 `lgw.client` 的 list／get／cooldown。
+
+### 3.2 worker
+
+worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`，連線資訊從 `/run/mlp-gateway/gateway.json`（位址、帳號、埠、host key）填進 `ConnectConfig`，並固定 host key。這部分在 sidecar 那一側（MyAiStorage），LLMGateway 不需要知道有新 worker。
+
+## 4. 日常維運
+
+### 4.1 換 key（`deploy-keys`）
+
+1. 更新對應的 `POOL_LLMGATEWAY__*` secret。
+2. Actions → **deploy-keys** → Run workflow，本人核准。
+3. workflow 把五行 `NAME=value` 從 stdin 送到 `remote-deploy.sh keys`：
+   - 驗格式（只收五個名字、都要有、不重複、值不含空白或引號）；
+   - 寫暫存檔（0600）→ rename 成 `keys.env`；
+   - 送 `SIGHUP` 給 `lgwd` 重讀。
+
+值不上命令列、不進 log。客戶端不持有 key，換 key 後不用改任何客戶端設定。
+
+### 4.2 升級（`deploy-service`）
+
+1. 打 tag `lgw-vX.Y.Z` 並 push。
+2. Actions → **deploy-service** → Run workflow，輸入 tag，本人核准。
+3. 那台跑 `install.sh --tag <tag>`：已有完整的就重用、沒有就抓到暫存再搬；原子切換 `current`；重裝兩個 unit 與執行檔；重啟 `lgwd`。只留用中與前一個版本。
+4. 隧道守護有變更時，`install.sh` 不當場重啟它（部署連線本身就走這條隧道，當場重啟會切斷部署），而是排一個約 60 秒後的重啟；這段時間 list／get 會斷一下，客戶端重連即可。
+
+### 4.3 看狀態
+
+- 誰能不能用：在那台 `curl -s http://127.0.0.1:8480/v1/subscriptions`，或從 Mac 照 3.1。每一筆有 `cooldown`（`5h`、`1w` 各為 `{until}` 或 null）與 `available`。
+- 誰在何時 get 過哪一把、誰登錄過冷卻：`llm.db` 的 `audit` 表（不分客戶端，因為不做認證）。
+- 「誰正在用哪一把」：看各 sidecar 的 status，LLMGateway 不追蹤。
+- log：`journalctl --user -u llmgateway -u llmgateway-tunnel`。log 裡不會有 key 的值，也不會有主機名。
+
+### 4.4 `install.sh --check`（三態）
+
+| 結果 | 意思 |
+|---|---|
+| 0 | 兩個 unit 都 active、版本與 `current` 一致（有給 `--tag` 時）、本機 `GET /v1/subscriptions` 回 200 |
+| 1 | 確定不正常：unit 沒在跑或 failed、版本不對、探針不是 200 |
+| 2 | 無法確認：連不上 user bus、curl 逾時等 |
+
+### 4.5 外洩時
+
+- **key 外洩**（或懷疑）：在上游作廢並換新 → 更新 secret → `deploy-keys`。本人已接受「能登入 sshproxy 的金鑰都讀得到全部 key」（design 決定 5a），換 key 是這種情況的標準處理。
+- **隧道私鑰外洩**：請 mylinuxpool-pm 從 `TUNNEL_EXTRA_PUBKEYS` 拿掉舊公鑰，照 1.6 重產並登記新的，改 `tunnel.env` 後 `systemctl --user restart llmgateway-tunnel`。
+- **部署私鑰外洩**：從 `TUNNEL_EXTRA_PUBKEYS` 與 `~llmgw/.ssh/authorized_keys` 拿掉，重產一對，更新 secret。
+
+### 4.6 退回前一版
+
+在那台以 `llmgw` 身分：
 
 ```bash
-python3 -m lgw.admin client list
+~/.local/share/llmgateway/current/deploy/install.sh --tag <前一個 tag>
+~/.local/share/llmgateway/current/deploy/install.sh --check; echo $?
 ```
 
-- **為什麼**：撤銷客戶端除了將其標記為失效阻斷未來的請求外，服務核心會啟動聯動清理（cascade），將該客戶端名下所有尚未結束的 active/granted 租約一併終止並釋放佔用配額。
+前一版還在 `~/.local/share/llmgateway/<tag>/`，`install.sh` 會直接重用，不用連網；執行檔與 unit 也會換回那一版的。也可以從 GitHub 用 `deploy-service` 輸入前一個 tag。
 
----
+## 5. 排錯
 
-### 3.6 版本回滾（Rollback）
+### 5.1 `deploy-keys` 結束碼 4（格式錯誤）
 
-若升級後發生相容性問題，可直接在放服務的那台執行秒級回滾：
+`remote-deploy.sh` 拒收：行不是 `NAME=value`、名字不在五個裡、重複、缺名字、值有空白／換行／引號。檢查五個 `POOL_LLMGATEWAY__*` secret 有沒有夾到前後空白或換行。沒有的那把不要建 secret（見 2.2）。
 
-1. 切換為 `llmgw` 身分：
-   ```bash
-   sudo -u llmgw -i
-   ```
-2. 將 `current` 符號連結指回前一個發行版本：
-   ```bash
-   ln -sfn ~/.local/share/llmgateway/releases/<前一個tag> ~/.local/share/llmgateway/current
-   ```
-3. 重啟服務單元：
-   ```bash
-   systemctl --user restart llmgateway.service
-   ```
-4. 執行健康檢查驗證：
-   ```bash
-   ~/.local/share/llmgateway/current/deploy/install.sh --check
-   ```
+### 5.2 `deploy-keys` 結束碼 5（寫好了但重讀失敗）
 
-- **為什麼**：過往版本均完整保留在 `releases/` 目錄中，透過原子符號連結更換與重啟即可迅速回到先前穩定版本，不需重新連網下載或重建設定。
+`keys.env` 已經寫好，但 `systemctl --user kill -s HUP llmgateway.service` 失敗，通常是非互動 SSH 沒有 `XDG_RUNTIME_DIR`，連不上 user bus。服務照常跑，下次重啟會讀到新的。
 
----
+- 馬上要生效：登入那台以 `llmgw` 跑 `systemctl --user kill -s HUP llmgateway.service`。
+- 根本處理：確認 `/etc/pam.d/sshd` 有 `pam_systemd.so`。
 
-## 4. 故障排除
+### 5.3 workflow 的 ssh 連不上（結束碼 255）
 
-### 4.1 `deploy-keys` 回傳 Exit Code 4（格式錯誤）
+- `Host key verification failed`：`…_DEPLOY_KNOWN_HOSTS` 少了 `[<跳板機>]:<埠>` 或 `[127.0.0.1]:4711` 那行，或那台重裝後 host key 變了。
+- 跳板那一段 `Permission denied`：部署公鑰還沒登記到 sshproxy（1.9 第 1 點）。
+- 跳板過了但 `Connection refused`／`channel open failed`：會合點的 4711 沒人在聽，表示隧道斷了，看 5.4。這時部署也進不去，要另外登入那台處理。
+- 目標那一段 `Permission denied`：`authorized_keys` 沒有部署公鑰，或 sshd 擋了 `llmgw`（1.3）。
 
-- **現象**：GitHub Actions 的 `deploy-keys` 工作流程執行失敗，Log 印出 `deploy-keys: ...` 錯誤且 exit code 為 `4`。
-- **根本原因**：傳入的金鑰資料未通過 `remote-deploy.sh` 嚴格的防禦性格式檢驗：
-  1. 行格式不符合 `KEY=VALUE`。
-  2. 含有非預期的鍵名（不在允許的 5 把白名單內）。
-  3. 出現重複定義的鍵名。
-  4. 金鑰值包含空白字元、換行符號、單引號（`'`）或雙引號（`"`）。
-  5. 缺少了 5 把必要金鑰名稱中的任何一把（即使未啟用也必須提供鍵名，值留空）。
-- **處理方式**：
-  1. 檢查 GitHub repository 中的 5 個 `POOL_LLMGATEWAY__*` Secret。
-  2. 確保複製金鑰時未夾帶前後空格、換行或引號。
-  3. 確認全部 5 個 Secret 皆已建立；若某金鑰暫無（如 Zen），請將該 Secret 內容設為空字串，勿留空未建。
+### 5.4 隧道守護一直重開
 
----
+`journalctl --user -u llmgateway-tunnel` 看事件：
 
-### 4.2 `deploy-keys` 回傳 Exit Code 5（重讀失敗）
+- 一起來就結束、反覆重開：多半是遠端埠被佔住（會合點上還留著舊的隧道連線），`ExitOnForwardFailure` 讓 ssh 直接結束。舊連線在 ServerAlive 逾時（約 90 秒）後會被會合點清掉，之後自動恢復；一直不恢復就請 mylinuxpool-pm 看會合點上 4710／4711 是誰在聽。
+- `probe_fail` 連續出現後重開：隧道在，但端對端打不通 `lgwd`。先看 `systemctl --user status llmgateway`，以及 `tunnel.env` 的 `LOCAL_API` 是否等於 `LGW_API_PORT`。
+- 認證或 host key 失敗：隧道公鑰還沒登記（1.6），或 `KNOWN_HOSTS` 不對（1.7）。
 
-- **現象**：GitHub Actions 顯示紅燈，Log 印出：
-  `deploy-keys: written, but reload failed (service will read it on next start)`
-- **根本原因**：
-  - 新的 `keys.env` 檔案已成功以 `0600` 權限寫入磁碟。
-  - 但腳本執行重載指令 `systemctl --user kill -s HUP llmgateway.service` 失敗。
-  - 此情況通常發生在非互動式（non-interactive）SSH session 中，系統未自動注入 user session 環境變數 `XDG_RUNTIME_DIR`（例如 `/run/user/<uid>`），導致 `systemctl --user` 無法與 user D-Bus 溝通。
-- **處理方式**：
-  - **安全性保證**：此為 safe-failure 機制，新金鑰已安全落盤，現有服務依然維持運行，並會在下次重啟時自動讀取新金鑰。
-  - **手動介入重載**：本人或管理員登入放服務的那台，手動發送重讀訊號：
-    ```bash
-    systemctl --user kill -s HUP llmgateway.service
-    ```
-    或重啟服務：
-    ```bash
-    systemctl --user restart llmgateway.service
-    ```
-  - **根本改善**：檢查該機器的 `/etc/pam.d/sshd`，確保啟用 `pam_systemd.so`，以確保 SSH session 正確建立 systemd runtime 環境。
+### 5.5 `lgw connect` 回「無法確認」（`Unavailable`）
 
----
+訊息只有錯誤種類，不含位址。依序檢查：`connect.env` 的 `RENDEZVOUS`／`IDENTITY`／`KNOWN_HOSTS`；手動 `ssh -i <金鑰> -p <埠> sshproxy@<跳板機>` 能不能過；伺服器端隧道（5.4）。
 
-### 4.3 請求租約遭拒：`403 client_mismatch`
+### 5.6 get 回 403 `agent_not_allowed`
 
-- **現象**：客戶端申請租約（`POST /v1/leases`）時收到 HTTP 狀態碼 `403`，錯誤碼為 `client_mismatch`。
-- **根本原因**：
-  - 客戶端在請求 JSON body 中提供的 `worker` 欄位值，與其攜帶的 `Authorization: Bearer <token>` 在伺服器端資料庫中登記的客戶端名稱（client name）**不一致**。
-  - 設計決定 4 規範：客戶端不能冒用其他機器的名字租用模型。
-- **處理方式**：
-  1. 在客戶端使用 `whoami` 端點核對憑證身分：
-     ```bash
-     curl -H "Authorization: Bearer $(cat <憑證路徑>)" http://127.0.0.1:<埠>/v1/whoami
-     ```
-     伺服器將回傳 `{"client": "<登記名稱>", "role": "client"}`。
-  2. 確認呼叫租約 API 時傳入之 `worker` 參數值與登記之 `<登記名稱>` 完全吻合。
+`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403，這是預期的。其他組合要改 `policy/default.json` 並發新版。
 
----
+### 5.7 `available` 為 false，或 get 回 409 `not_deployed`
 
-### 4.4 狀態板顯示「未部署」或租約申請收到 `409 not_allowed`
-
-- **現象**：
-  - 在狀態板上某個訂閱的部署狀態顯示為「未部署」。
-  - 客戶端指定該訂閱（或候選訂閱皆為此狀態）申請租約時，伺服器回傳 `409 {"error": {"reason": "not_allowed"}}`。
-- **根本原因**：
-  - 在 `~/.local/state/llmgateway/keys.env` 檔案中，該訂閱對應的環境變數值為空（例如 `OPENCODE_ZEN_API_KEY=`）或該鍵未在檔案中。
-  - 服務端原則：未部署的金鑰一律不出租，並從候選順序中跳過；若無任何可用金鑰則拒絕。
-- **處理方式**：
-  1. 若該訂閱本來就尚未開通（例如暫無 Zen 帳號），此為預期中的防禦性降級行為。
-  2. 若已擁有該金鑰但忘記派發，前往 GitHub 更新對應的 `POOL_LLMGATEWAY__*` Secret，並重新執行 `deploy-keys` 工作流程。
+- `cooldown` 有值：在冷卻中，到 `until` 自動解除，不用做任何事。冷卻中仍然 get 得到，要不要用由 sidecar 決定。
+- `cooldown` 都是 null：那把的 key 沒部署（`keys.env` 裡是空值）。有 key 的話更新 secret 再跑 `deploy-keys`。

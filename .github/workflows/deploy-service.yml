@@ -1,14 +1,13 @@
 # LLMGateway：把服務升級（或第一次之後的重裝）到指定的 tag（design 決定 2、3）。
-# 只能手動觸發。經池的 SSH 跳板（部署專用金鑰在跳板機上只能轉發，MyLinuxPool#68）連過去，
-# 那台以服務帳號 llmgw 登入，由 ~llmgw/.ssh/authorized_keys 強制執行 deploy/remote-deploy.sh 的 upgrade 動詞。
+# 只能手動觸發。經會合點（池跳板機上的 sshproxy；部署公鑰由 MyLinuxPool#77 的 TUNNEL_EXTRA_PUBKEYS 登記）轉發，
+# 到隧道守護公開在會合點 127.0.0.1:4711 的、服務那台的 sshd，以服務帳號 llmgw 登入，由 ~llmgw/.ssh/authorized_keys 強制執行 deploy/remote-deploy.sh 的 upgrade 動詞。
 # 值只經過環境變數與 stdin，不上命令列、不寫進 log（GitHub 也會自動遮罩 secret）。
 #
 # 需要的 secret（值由本人設，AI 不經手；命名照本人的規則 <存取方>__<被存取方>__<動作>）：
 #   GH_LLMGATEWAY__POOL_SSH__DEPLOY        部署專用私鑰
-#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS    跳板機與 provider 的 host key（known_hosts 格式）
-#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP           跳板機，格式 user@host:port
-#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET         那台（經跳板看到的位址），格式 llmgw@127.0.0.1:<埠>，
-#                             字面要和跳板機 permitopen 的 "127.0.0.1:<埠>" 一模一樣（MyLinuxPool#68）
+#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS    跳板機與服務那台的 host key（known_hosts 格式）
+#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP           會合點，格式 sshproxy@<跳板機>:<埠>
+#   GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET         服務那台的 sshd（經會合點看到的位址），固定是 llmgw@127.0.0.1:4711
 # 連線資訊也放 secret，是因為本 repo 是 public，不把池的位址放在公開的 vars；
 # ssh 的錯誤輸出也會把位址換成 [jump]／[target] 再印。
 # repo 設定：environment「llmgateway-deploy」要設本人為 required reviewer；
