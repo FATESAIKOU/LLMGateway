@@ -112,6 +112,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -476,6 +477,11 @@ def connect(cfg: ConnectConfig, timeout: float = DEFAULT_TIMEOUT):
     `Unavailable` 只在**進入 with 時**（建立隧道期間）丟，kind 是 ssh_missing｜
     bad_config｜temp_failed｜ssh_exited｜timeout。進入之後 ssh 若斷掉不會丟例外：
     `lgw.client` 的後續呼叫回 unreachable（「無法確認」），呼叫方重新 connect 即可。
+
+    呼叫方注意事項：函式庫本身不裝全域 signal handler（避免覆蓋呼叫方的
+    signal 處理）；若行程可能收到 SIGTERM，呼叫方要把 SIGTERM 轉成例外
+    （例如 signal handler 丟 SystemExit），with 的清理（關閉 ssh 子行程、
+    刪除暫存目錄）才會跑。
     """
     with _connected(cfg, timeout=timeout) as (_proc, base_url):
         yield base_url
@@ -498,19 +504,35 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ConfigError) as exc:
         print("lgw.connect: {0}".format(exc), file=sys.stderr)
         return 2
+
+    def _sig_handler(signum, frame):
+        raise SystemExit(0)
+
     try:
-        with _connected(cfg, timeout=args.timeout) as (proc, base_url):
-            print(base_url, flush=True)
-            returncode = proc.wait()
-    except Unavailable as exc:
-        print("lgw.connect: unavailable: {0}".format(exc.kind), file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:  # Ctrl-C：__exit__ 已關掉 ssh
+        prev_term = signal.signal(signal.SIGTERM, _sig_handler)
+        prev_hup = signal.signal(signal.SIGHUP, _sig_handler)
+        signals_installed = True
+    except (ValueError, AttributeError):
+        signals_installed = False
+
+    try:
+        try:
+            with _connected(cfg, timeout=args.timeout) as (proc, base_url):
+                print(base_url, flush=True)
+                returncode = proc.wait()
+        except Unavailable as exc:
+            print("lgw.connect: unavailable: {0}".format(exc.kind), file=sys.stderr)
+            return 1
+        except (KeyboardInterrupt, SystemExit):  # Ctrl-C 或 SIGTERM/SIGHUP：__exit__ 已關掉 ssh
+            return 0
+        if returncode != 0:
+            print("lgw.connect: unavailable: ssh_exited", file=sys.stderr)
+            return 1
         return 0
-    if returncode != 0:
-        print("lgw.connect: unavailable: ssh_exited", file=sys.stderr)
-        return 1
-    return 0
+    finally:
+        if signals_installed:
+            signal.signal(signal.SIGTERM, prev_term)
+            signal.signal(signal.SIGHUP, prev_hup)
 
 
 if __name__ == "__main__":

@@ -627,6 +627,30 @@ class CliTest(ConnectCase):
         self.assertEqual(err, "")
         self._assert_dead(self.root / "bin" / "ssh")
 
+    def test_cli_stops_on_sigterm_and_cleans_up(self):
+        config_path = self._config_env("tester@fake-rendezvous:2222")
+        proc = self._run_cli(config_path, self.ssh_ok)
+        temp_dir = None
+        try:
+            line = proc.stdout.readline()
+            self.assertRegex(line.strip(), r"^http://127\.0\.0\.1:\d+$")
+            argv = self._argv_of(self.root / "bin" / "ssh")
+            temp_dir = self._config_path(argv).parent
+            self.assertTrue(temp_dir.exists())
+            proc.send_signal(signal.SIGTERM)
+            self.assertEqual(proc.wait(timeout=10), 0)
+            err = proc.stderr.read()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertEqual(err, "")
+        self._assert_dead(self.root / "bin" / "ssh")
+        self.assertIsNotNone(temp_dir)
+        self.assertFalse(temp_dir.exists())
+
     def test_cli_unavailable(self):
         config_path = self._config_env("tester@fake-secret-host:2222")
         proc = self._run_cli(config_path, self.ssh_fail)
