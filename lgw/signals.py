@@ -5,6 +5,8 @@ classify(agent, text, now=None, tz=None) → Classification(kind, signal, resets
 - 規則放 RULES（list of dict：agent、pattern、signal、kind、reset 解析法，可另帶
   require／exclude）；第一個命中的生效；順序即優先順序（額度標記一律在暫時錯誤之前）。
 - resets_at 一律回 UTC 的 aware datetime；判讀不出就回 None（不斷言）。
+- 注意：Claude Code 的 resets 時刻是 agent 所在機器的本地時間，呼叫方（sidecar）
+  要傳那台機器的 tz；沒傳時用本機時區（在本機跑 sidecar 時兩者相同）。
 - 只用 re、datetime；不引用 subprocess、herdr、agora，不做平台判斷。
 """
 
