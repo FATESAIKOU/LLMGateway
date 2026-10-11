@@ -89,7 +89,7 @@
 | 方法 | 路徑 | 請求 | 成功回傳 |
 |---|---|---|---|
 | POST | `/v1/leases` | `worker, role, agent, instance, model?, subscription?, purpose?, preferences?, request_id` | `201 {lease}` |
-| POST | `/v1/leases/{id}/start` | `request_id` | `200 {expires_at}`：確認 agent 已經開起來，granted → active |
+| POST | `/v1/leases/{id}/start` | `request_id` | `200 {expires_at}`：確認 agent 已經開起來，granted → active；對已 active 的租約重送也回 200 |
 | POST | `/v1/leases/{id}/exhausted` | `signal, resets_at?, request_id` | `200 {next: lease}`，或 `200 {next: null, refusal}` |
 | POST | `/v1/leases/{id}/renew` | `request_id` | `200 {expires_at}` |
 | POST | `/v1/leases/{id}/usage` | `snapshot` | `204` |
@@ -98,7 +98,7 @@
 
 **欄位說明**
 - `agent`：`claude-code` 或 `opencode`。sidecar 內部的 `claude`、`opencode` 由它自己對應。
-- `instance`：客戶端給每個 agent 的 id，例如 sidecar registry 裡的 agent id。同一個客戶端的同一個 `instance` 只能有一張未結束的租約。
+- `instance`（必填）：客戶端給每個 agent 的 id，例如 sidecar registry 裡的 agent id。同一個客戶端的同一個 `instance` 只能有一張未結束的租約。
 - `model`：可空；空的就是該訂閱在政策檔裡的預設模型。
 - `signal`（列舉）：`claude_limit`、`zen_free_limit`、`zen_go_limit`、`credit_limit`、`openrouter_limit`、`ollama_limit`、`other`。
 
@@ -109,16 +109,18 @@
 - `403 not_owner`：動到別的客戶端的租約。
 - `404 not_found`：租約不存在。
 - `409 lease_not_active`：對已結束的租約做 start、renew、exhausted。
+- `409 lease_not_confirmed`：對還沒 start 的租約做 renew、exhausted；還沒 start 的租約只接受 start 與 release。
 - `409 {reason, earliest_reset?}`（**拒絕**）：
   - `not_allowed`：政策不允許這個組合，或模型不在允許清單；
   - `instance_busy`：同一個 `instance` 已有未結束的租約；
   - `cap_reached`：可選的訂閱裡至少有一個不在冷卻，但這些都已達上限；
   - `all_cooling`：可選的訂閱全在冷卻，附最早的冷卻結束時刻；
   - `below_floor`：保留給「之後」的底線模型，v0 不會出現。
-  - 判定順序：先看 `not_allowed`，再看 `instance_busy`，最後才看可用性（`cap_reached` 或 `all_cooling`）。
+  - `earliest_reset` 只在 `all_cooling` 時附上。
+  - 判定順序：`400` → `401` → `403`（`client_mismatch`、`not_owner`）→ `404` → `409`。`409` 的拒絕之間：先看 `not_allowed`，再看 `instance_busy`，最後才看可用性（`cap_reached` 或 `all_cooling`）。
 
 **有效期限**
-- 租約效期預設 12 小時，客戶端每小時 renew。
+- 租約效期預設 12 小時，從 `start` 確認時起算；客戶端每小時 renew。
 - granted 之後 10 分鐘內沒有 `start`，租約記為 expired（理由：未確認）。這樣「換把時已發出新租約、agent 卻沒開起來」的租約不會占著名額 12 小時。
 
 ### 決定 7：env 的內容
@@ -163,6 +165,7 @@
      - opencode 對 Zen：`FreeUsageLimitError`／`Free usage exceeded` → `zen_free_limit`；`GoUsageLimitError`／`usage limit reached. It will reset in …` → `zen_go_limit`；`CreditLimitExceeded` → `credit_limit`。訊息內容的標記優先於狀態碼。
      - OpenRouter：402 且 `limit_source` 不是 in-flight 預算 → `openrouter_limit`。in-flight 預算的 402 是暫時錯誤。
      - Ollama Cloud：429 且訊息含 `session usage limit` 或 `weekly usage limit` → `ollama_limit`。
+     - Claude Code 的 spend limit 類訊息（月額度、額外用量上限，不會隨 5 小時窗口重置）→ `claude_limit`、不帶重置時刻，於是用政策檔的預設冷卻；寧可冷卻久一點也不空轉重試。
      - **沒有額度標記的 402／429 一律判為「暫時錯誤」**，不換把。
 
      規則放資料表，正反兩面都用 `quota-signals.md` 的樣本測試。

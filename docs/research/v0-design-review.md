@@ -260,3 +260,87 @@
 - 對外 Issue／PR 連結只出現在本審查文件與 research，不在 change 內；change 內無外部私人連結。✅
 - 新版新增字串（`herdr agent send-keys …`、`agora continue session <Session> --agent <agent> --sync-period <分鐘>`、`lgw admin client add`、MyAiEntry#147）皆為命令形狀與公開 issue 號，無值、無拓撲。✅
 - 結論：hygiene 通過，無必修；S17 為唯一附帶提醒。
+
+---
+
+## 複查（針對 3d34c02，scope/gateway-v0 分支最新；test 的 v0-spec-testability.md 一併對照）
+
+> 方法：以 `git show HEAD:` 取三份最新版（design、agent-lease spec、tasks）並以 git 狀態確認工作樹乾淨；key-vault、status-board、proposal 以同法核對。注意：本輪初讀時 Read 工具對讀過的檔案回傳了舊版內容（47e9cbf 版），已改道取 HEAD；S25 的誤報即源於此（見末）。
+> 記號：✅已處理 ／ ➡️刻意留在實作或 sidecar ／ ⚠️部分處理（有殘留）／ ❌撤回（審查誤報）／ ⬜沒處理。
+> 結論：B1、B2 皆已解；S1–S26 除 S25 撤回外全數已處理或刻意留下；M、N 大致處理，殘留 5 處小項；新缺口 8 處皆低嚴重度。
+
+### R-0. B1、B2
+
+- B1（quota 型 402／429 才換把）：✅已處理。design 決定 9 規則重寫（含 signal 映射、`FreeUsageLimitError`／`GoUsageLimitError`／`CreditLimitExceeded` 標記優先於狀態碼、OpenRouter in-flight 除外、Ollama 限 session／weekly 字串、「無標記一律暫時錯誤」）；tasks 2.2 同步改寫＋正反面測試；spec 短暫限流 Scenario 跟進；4.2 加「短暫 429 不換把」驗收。
+- B2（board HTML 認證）：✅已處理。spec 改為 JSON 要憑證／HTML 只綁 loopback 免憑證／憑證永不進 URL；design 決定 11 跟進；tasks 1.10、3.1、3.5（綁定驗收）、4.6（URL／log 無憑證）跟進。
+
+### R-1. S1–S26 逐條
+
+- S1（wire 詞彙）：✅已處理。決定 6 新增 RFC 3339 UTC、租約物件、`signal` 七值枚舉、`api_version`、錯誤表＋判定順序；S16（`{next: lease}`）併入。殘留小：`purpose`（design）vs 來由（spec）名稱未統一。
+- S2（model 可空）：✅已處理。spec＋design 雙寫「可空，空即政策預設模型」。
+- S3（opencode 變數名待實打）：➡️刻意留實作。Open Questions 僅存此條＋Ollama 位址；4.4 保留。
+- S4（below_floor／平均分攤）：✅已處理。design 寫明 below_floor v0 不出現、平均分攤留選項 v0 不用（M-12 的 :free Scenario 亦補，見 R-2）。
+- S5（併發原子性）：✅已處理。1.2 `BEGIN IMMEDIATE`＋1.12 併發測試。
+- S6（renew vs 冷卻）：✅已處理。design 明寫冷卻只擋新出租，active 照常 renew。
+- S7（雙持）：✅已處理。`instance`＋`instance_busy`（design／spec／1.4）。
+- S8（未部署／最後成功時刻）：✅已處理。spec 兩 Scenario＋決定 11（另加 401→「key 無效」）＋1.10。
+- S9（401 稽核）：✅已處理。決定 12：認證後被拒記 `denied` 事件；400／401 只記 log 不記內容（與 key-vault「不留租約事件」相容）。
+- S10（雜湊／熵）：✅已處理。1.3：32 bytes 隨機、只存 SHA-256。
+- S11（事件保存）：✅已處理。1.11：180 天匯出壓縮刪除；4.7 含匯出檔。
+- S12（綁定驗收）：✅已處理。3.5＋3.1 寫明 HTML 只綁 loopback。
+- S13（通知恰一則）：✅已處理。2.4 交接含本機重試補送恰一則。
+- S14（policy 預設值）：✅已處理。1.1「內容照設計決定 8」。
+- S15（v0 政策否定約束）：✅已處理。spec MUST NOT＋1.9 測試鎖住。
+- S16：✅已處理（併 S1）。
+- S17（主機名）：✅已處理。決定 11 明記僅池內＋SSH。
+- S18（冷卻引文）：✅已處理。決定 8 附三 URL。
+- S19（轉述聲明）：✅已處理。決定 9 加「規格以 MyAiStorage#31 為準」。
+- S20（opencode.json 消費者）：✅已處理。2.3 隨套件提供路徑＋決定 9(3)。
+- S21（agora 前綴孤兒）：✅已處理。2.4 照 sidecar 慣例＋Open Question 刪除。
+- S22（固定 ref 版本）：✅已處理。2.3 tag＋決定 12 版本段＋2.1 未知理由 fallback。
+- S23（外部依賴追蹤）：✅已處理。2.4 明記 Mac 驗收 blocked by 此項。
+- S24（1.10 範圍）：✅已處理。1.12 限服務端，launcher 由 2.4／4.5。
+- S25（proposal 過時）：❌撤回，見 R-4。
+- S26（5.3／5.4 順序）：✅已處理，現為 5.3→5.4。
+
+### R-2. M-1～M-18（test）逐條
+
+- M-1（當機中途／去重跨重啟）：✅服務半邊（交易＋去重 7 天跨重啟）。殘留小：通知重試佇列落盤與否屬 sidecar，2.4 未寫。
+- M-2（重複 exhausted）：✅（去重＋`409 lease_not_active`）。
+- M-3（邊界／時鐘）：✅（等於即結束＋clock 介面＋1.12）。
+- M-4（key 重讀）：✅（rename＋失敗沿用＋標示＋空字串＝沒部署＋已發租約不受影響）。
+- M-5（拒絕優先順序）：✅（判定順序＋1.4）。
+- M-6（延後結算範圍）：✅（任何經認證請求，含讀板）。
+- M-7（request_id 範圍／TTL／重啟）：✅（（客戶端，request_id）＋7 天＋跨重啟）。
+- M-8（撤銷既有租約）：✅（key-vault spec 記 revoked＋1.3）。
+- M-9（孤兒租約）：✅（`start`＋10 分鐘確認＋1.5）。
+- M-10（拒絕紀錄）：✅（`denied` 事件）。
+- M-11（HTML 認證）：✅。
+- M-12（below_floor／:free）：⚠️部分。`:free` Scenario 已補；below_floor 完整性測試未見（僅 design 表＋2.1 fallback）。
+- M-13（輸入驗證）：⚠️大致。長度／可列印／HTML 跳脫／`resets_at` 過去與 8 天規則✅；`usage` snapshot 非法、`preferences` 格式錯誤未見。
+- M-14（非法生命週期）：✅（409／403／404＋重複 204＋1.7）。
+- M-15（用量形狀）：✅大致（10 秒逾時＋獨立執行緒＋401→key 無效；balance 新舊欄位仍 4.4＝刻意留實作）。
+- M-16（併發／持久化）：⚠️大致（交易＋政策驗證✅；磁碟滿／event 損壞重建未見）。
+- M-17（0600 退回 Scenario）：⚠️留 sidecar。4.5 仍列驗收；spec 無 Scenario（design Risks 有）。
+- M-18（Open Questions）：agora✅已解（慣例）；opencode 變數＋Ollama 位址➡️留實作（4.4）。
+
+### R-3. N-1～N-6（test）逐條
+
+- N-1（三段終止超時）：⚠️留 sidecar。2.4 未列超時值／時鐘／誤殺範圍。
+- N-2（Esc 次數）：⚠️留 sidecar（僅 design 轉述，spec 無；轉述聲明覆蓋）。
+- N-3（agora 形狀測試）：⚠️部分。2.4 有接回；形狀斷言／`--fork` 禁用測試未見。
+- N-4（版本漂移）：✅（tag＋api_version＋fallback）。
+- N-5（同一套證明）：✅（2.4 參數化，sidecar 側）。
+- N-6（冷卻結束不重開）：✅（2.4 明記）。
+
+### R-4. 新缺口（3d34c02 引入，皆低嚴重度）與一處撤回
+
+- C1（低）：granted 未確認租約的 renew／exhausted／release 語義未定。`lease_not_active` 只覆「已結束」；granted 未確認既非 active 亦非結束。建議：granted 租約的 renew／exhausted 視為可操作（或明定拒絕），補進 1.5／1.7。
+- C2（低）：`instance` 是否必填未寫。設計表無 `?`，spec 欄位缺漏 Scenario 只列 worker／role／agent。建議：標必填並補 Scenario，或標可空並定義缺席語義。
+- C3（低）：401→403→409 的層次未寫。1.4 只排 409 系理由；`client_mismatch`／`not_owner`（403）應先於 409 判定。建議 1.4 補一句。
+- C4（低）：`start` 重送語義未定。同 request_id 冪等（去重表覆蓋）；不同 request_id 對已 active 租約再 start，建議冪等回 `expires_at`。
+- C5（低）：`earliest_reset` 附帶規則未細。all_cooling 附；cap／instance_busy／not_allowed 附不附未寫（M-5 殘留）。建議：僅時間型附帶，寫進 1.4。
+- C6（低）：效期起算點 design 未同步。spec 寫「從確認時起算」，design 只寫預設 12h。建議 design 補半句。
+- C7（低）：Claude spend-limit 類訊息無 signal 映射。月／個人 spend limit 與 gateway 小寫 `spend limit reached` 不隨時間 reset：判暫時錯誤會空轉，判額度用完會進預設冷卻，皆不理想。建議規則表加一條（映 `other`＋不自動冷卻，或映 `credit_limit`，需決定）。
+- C8（微）：test §5-5 的「鎖死無 Mac 分支」（`sys.platform`／`darwin` 出現即失敗）未進 tasks（2.3 只有 subprocess／herdr／agora 鎖）。建議 2.3 補半句或接受現狀。
+- S25 撤回：本審查 S25 指 proposal §5 仍寫 `lgw run` 舊歸屬，係基於改版前的讀數；以 git 確認 proposal 在 47e9cbf 已同步為 `sidecar agent run`（3d34c02 未動 proposal）。S25 作廢，非文件問題，是審查方法瑕疵：複查文件應以 commit 為準，後續照此辦理。

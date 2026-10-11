@@ -21,7 +21,7 @@
 - **THEN** LLMGateway 回覆租約 id、選到的訂閱、`env`、`unset` 與有效期限，而事件紀錄裡沒有 `env` 的值
 
 #### Scenario: 欄位缺漏
-- **WHEN** 申請缺少 worker、角色或 coding agent 其中之一
+- **WHEN** 申請缺少 worker、角色、coding agent 或 agent 實例其中之一
 - **THEN** LLMGateway 拒絕申請、指出缺少的欄位集合，且不留下任何租約事件
 
 #### Scenario: 帶 preferences
@@ -168,6 +168,10 @@ launcher SHALL 在 agent 開起來之後呼叫 start 確認租約，租約才從
 #### Scenario: 正常確認
 - **WHEN** launcher 拿到租約、開起 agent，並在 10 分鐘內呼叫 start
 - **THEN** 租約變成 active，有效期限從確認時起算
+
+#### Scenario: 確認前不能續期或回報額度
+- **WHEN** 對還沒 start 的租約呼叫 renew 或 exhausted
+- **THEN** LLMGateway 回 `lease_not_confirmed`；這張租約只接受 start 與 release
 
 #### Scenario: 換把後沒開起來
 - **WHEN** 回報額度用完後拿到下一張租約，但重開 agent 失敗，10 分鐘內沒有呼叫 start
