@@ -14,7 +14,15 @@ from __future__ import annotations
 import datetime as _dt
 
 from .clock import Clock, from_rfc3339, to_rfc3339
-from .errors import agent_not_allowed, bad_request, not_deployed, not_found
+from .errors import (
+    agent_not_allowed,
+    bad_request,
+    invalid_resets_at,
+    invalid_window,
+    not_deployed,
+    not_found,
+    resets_at_out_of_range,
+)
 from .keys import KeyStore
 from .policy import Policy
 from .providers import PROVIDERS, provider_for
@@ -77,9 +85,11 @@ class RegistryService:
         """POST /v1/subscriptions/{id}/cooldown：成功為 None（HTTP 204）。"""
         if subscription not in self._policy.subscriptions:
             raise not_found()
-        window = body.get("window")
+        if "window" not in body:
+            raise bad_request(missing=["window"])
+        window = body["window"]
         if window not in WINDOWS:
-            raise bad_request(detail="window must be 5h or 1w")
+            raise invalid_window()
         now = self._clock.now()
         until = self._cooldown_until(window, body.get("resets_at"), now)
         stamp = to_rfc3339(now)
@@ -100,16 +110,16 @@ class RegistryService:
         buffer = _dt.timedelta(seconds=self._policy.cooldown_buffer_seconds)
         if resets_at not in (None, ""):
             if not isinstance(resets_at, str):
-                raise bad_request(detail="resets_at must be RFC 3339")
+                raise invalid_resets_at()
             try:
                 resets = from_rfc3339(resets_at)
             except ValueError:
-                raise bad_request(detail="resets_at must be RFC 3339") from None
+                raise invalid_resets_at() from None
             if resets < now:
-                raise bad_request(detail="resets_at is in the past")
+                raise resets_at_out_of_range()
             max_ahead = _dt.timedelta(seconds=self._policy.resets_at_max_ahead_seconds)
             if resets > now + max_ahead:
-                raise bad_request(detail="resets_at is too far ahead")
+                raise resets_at_out_of_range()
             return resets + buffer
         return now + _dt.timedelta(seconds=WINDOW_DEFAULT_SECONDS[window])
 

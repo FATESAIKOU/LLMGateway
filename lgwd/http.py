@@ -17,7 +17,7 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .errors import ApiError, bad_request, not_found
+from .errors import ApiError, bad_request, body_too_large, not_found
 
 _LOG = logging.getLogger("lgwd.http")
 
@@ -33,7 +33,7 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
     except ValueError:
         size = 0
     if size > _MAX_BODY_BYTES:
-        raise ApiError(413, "body_too_large")
+        raise body_too_large()
     raw = handler.rfile.read(size) if size > 0 else b""
     if not raw.strip():
         return {}
