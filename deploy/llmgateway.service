@@ -1,5 +1,5 @@
 [Unit]
-Description=LLMGateway lease service (lgwd)
+Description=LLMGateway subscription registry (lgwd)
 After=network-online.target
 
 [Service]
