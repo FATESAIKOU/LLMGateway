@@ -45,22 +45,21 @@
   - **Mac 的驗收（4.1～4.3）blocked by 這一項。**
 - [ ] 2.5 測試：`lgw` 的 API 客戶端對假服務的每種回覆（核准、各種拒絕、各種錯誤、連不上）
 
-## 3. 部署（需要 MyLinuxPool 的工單）
+## 3. 部署（LLMGateway 自己的服務帳號；MyLinuxPool 只管連線與 worker 的掛載）
 
-- [x] 3.1 開 MyLinuxPool 的單（mylinuxpool-pm 已開，都 blocked by #8）：
-  - MyLinuxPool#67：服務的 shared-config 單元；
-  - MyLinuxPool#68：部署專用的受限金鑰；
-  - MyLinuxPool#69：worker 連到服務的路；
-  - MyLinuxPool#70：worker 客戶端憑證的發、撤、核對。
-- [ ] 3.1a 本人選服務放哪一台常駐 provider（MyLinuxPool#67）
-- [ ] 3.2（草稿已寫，branch `impl/gateway-v0-core`）`deploy-keys` workflow：手動觸發、用部署專用金鑰經跳板（只能轉發）到 provider（只能跑部署腳本）、以 stdin 傳值；log 只有 secret 名稱
+- [x] 3.1 本人選服務放哪一台常駐 provider（已選，機器名不寫在 repo）；本人裁定 LLMGateway 是獨立服務，不是 MyLinuxPool 的單元（MyLinuxPool#67 作廢、PR #72 關閉）
+- [ ] 3.1a `deploy/`：安裝程式（以固定 tag 取碼、current 原子切換、systemd user unit、run wrapper、`--check` 三態）與部署腳本 `remote-deploy.sh`（`keys`、`upgrade <tag>` 兩個動詞、白名單解析）；用假資料測試
+- [ ] 3.1b 管理 API：issuer 角色、`POST`／`DELETE /v1/admin/clients`、只綁 loopback、只限 `worker-*`、同名撤舊發新；`lgw admin client add --role issuer`
+- [ ] 3.1c MyLinuxPool 的單（mylinuxpool-pm 開與做）：#68 跳板機上的轉發專用條目＋host key 指紋；#69 worker 連服務的路；#70 透過管理 API 發撤 worker 憑證
+- [ ] 3.1d 一次性開機設定（root，本人做或本人授權；PMO 帶本人看 PR #9 時一起問）：建 `llmgw`（不加 docker 群組）、`loginctl enable-linger llmgw`、確認 sshd 不擋 `llmgw`、放部署公鑰（`command="…/current/deploy/remote-deploy.sh",restrict`）、第一次安裝、發 issuer 憑證並由本人設成 MyLinuxPool 的 secret `GH_MYLINUXPOOL__LLMGATEWAY_ADMIN__ISSUE`
+- [ ] 3.2（`deploy-keys` 草稿已寫，branch `impl/gateway-v0-core`）workflow `deploy-keys`（動詞 `keys`）與 `deploy-service`（動詞 `upgrade <tag>`）：手動觸發、environment 核准、經跳板以 `llmgw` 登入、值用 stdin 傳；log 只有 secret 名稱
 - [ ] 3.3 本人設定（PMO 帶本人做，AI 不經手值）：
   - environment「llmgateway-deploy」，required reviewer 設本人；
   - secret 的名字照本人的命名規則 `<存取方>__<被存取方>__<動作>`：
-    - 部署 4 個：`GH_LLMGATEWAY__POOL_SSH__DEPLOY`（部署專用私鑰）、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS`（用 MyLinuxPool 提供的指紋，不用 ssh-keyscan）、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP`、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET`（`user@127.0.0.1:<埠>`，和 permitopen 字面一致）；
+    - 部署 4 個：`GH_LLMGATEWAY__POOL_SSH__DEPLOY`（部署專用私鑰）、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS`（用 MyLinuxPool 提供的指紋，不用 ssh-keyscan）、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP`、`GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET`（`llmgw@127.0.0.1:<埠>`，和 permitopen 字面一致）；
     - key 5 個：`POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM`、`POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM`、`POOL_LLMGATEWAY__OPENROUTER_API__LLM`、`POOL_LLMGATEWAY__OPENCODE_ZEN__LLM`、`POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM`；
   - 之後跑 `deploy-keys`。
-- [ ] 3.4 發客戶端憑證：Mac 一把由 PM 在 provider 上發；worker 的由 create-worker 自動發（MyLinuxPool#70）
+- [ ] 3.4 發客戶端憑證：Mac 一把由 PM 以 `llmgw` 帳號用 `lgw admin client add` 發；worker 的由 create-worker 透過管理 API 自動發（MyLinuxPool#70）
 - [ ] 3.5 綁定驗收：從池外與 worker 介面連 HTML 狀態板連不上；從池外連 API 連不上
 
 ## 4. 驗收

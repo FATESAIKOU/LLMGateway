@@ -32,52 +32,70 @@
   - sub2api：它的價值正是代轉與訂閱帳號池。
   - LiteLLM 當核心：只在某個上游非要格式轉換才加，而且要固定版本並查核供應鏈（`litellm-supply-chain.md`）。
 
-### 決定 2：key 的保管與部署
+### 決定 2：key 的保管與部署、服務的部署
 
-- **來源**：本 repo 的 GitHub secret，五把各一個，名稱只寫在設定與文件，值由本人設。
-- **部署**：
-  - 手動觸發的 workflow `deploy-keys`：經池的 SSH 跳板登入那台 provider，把五把寫進 `~/.local/state/llmgateway/keys.env`（0600，擁有者是服務帳號）；寫完送 SIGHUP 讓服務重讀。
-  - 輪替 key 的流程：改 secret → 跑 workflow。
-- **workflow 的登入身分**（MyLinuxPool#68）：一把**部署專用**的金鑰，不沿用 MyLinuxPool 的管理身分（管理身分在跳板機上權限太大）。
-  - 在跳板機上只允許轉發到那台 provider 的隧道埠（`restrict,port-forwarding,permitopen=…`），不能開 shell。
-  - 在 provider 上用 `command="<部署腳本>",restrict` 限定只能跑部署腳本。腳本只做：從 stdin 讀 → 寫暫存檔 → chmod 0600 → rename 成 keys.env → 送 SIGHUP。
-  - 私鑰放本 repo 的 secret，由本人設。
-- workflow 的 log 只出現 secret 名稱；寫檔用 stdin 傳值，不上命令列。
-- **為什麼**：本人已同意把來源放在這裡；GitHub secret 加上 Actions 是本人既有的做法（MyPMO、MyLinuxPool 都這樣）。
+- **來源**：本 repo 的 GitHub secret，五把各一個，名稱照本人的命名規則（tasks 3.3），值由本人設。
+- **部署的路**：本 repo 的 workflow 經池的 SSH 跳板，以服務帳號 `llmgw` 登入放服務的那台。
+  - 跳板機上：部署金鑰只能轉發到那台的隧道埠（`restrict,port-forwarding,permitopen="127.0.0.1:<埠>"`），不能開 shell。這一行由 MyLinuxPool 管（MyLinuxPool#68）。
+  - 那台上：`~llmgw/.ssh/authorized_keys` 用 `command="<…>/current/deploy/remote-deploy.sh",restrict` 強制執行部署腳本。這一行由 LLMGateway 管，池的 pool-sync 不會碰其他帳號。
+  - 跳板與那台用同一把部署金鑰；私鑰放本 repo 的 secret，由本人設。
+- **部署腳本的兩個動詞**（從 `SSH_ORIGINAL_COMMAND` 以白名單解析，其他一律拒絕）：
+  - `keys`：從 stdin 讀 key 檔內容 → 驗證 → 寫暫存檔、0600、rename 成 `keys.env` → 通知服務重讀。由 workflow `deploy-keys` 使用。
+  - `upgrade <tag>`：tag 必須符合 `lgw-vX.Y.Z` → 以固定 tag 取碼、切換 current、重啟服務。由 workflow `deploy-service` 使用。
+- workflow 的 log 只出現 secret 名稱；值用 stdin 傳，不上命令列；ssh 的錯誤輸出會把位址遮掉。
+- **為什麼**：本人已同意把來源放在這裡；GitHub secret 加上 Actions 是本人既有的做法。服務帳號自己管部署的那一行，就不必依賴 MyLinuxPool 的 authkeys 組裝。
 - **放棄的選項**：
   - 繼續放 MyLinuxPool 的 `POOL_WORKER__*`：本人裁定那只是過渡。
-  - 本人手動把檔案放到 provider：不能重現，輪替也容易漏。
+  - 本人手動把檔案放到那台：不能重現，輪替也容易漏。
+  - 用池的管理帳號跑服務：本人裁定 LLMGateway 跟 MyLinuxPool 無關；而且管理帳號的 authorized_keys 由池整份取代。
 
 ### 決定 3：服務的形狀
 
 - **程式**：Python 標準函式庫，HTTP 用 `http.server.ThreadingHTTPServer`、資料用 `sqlite3`，沒有第三方套件。
-- **位置**：池內常駐的 provider，做成 MyLinuxPool 的一個 shared-config 單元（systemd user unit，MyLinuxPool#67）。只綁 loopback，以及同一台 provider 上容器看得到的 docker bridge 位址。
-  - 平常關機的 provider 不適合放常駐服務。常駐的候選有兩台，**由本人選一台**（機器名稱不寫在 public repo，見 MyLinuxPool#67）。
-  - 單元裡只在一處寫版本 tag；`--check` 檢查三件事：服務在跑、版本對、`GET /v1/board` 不帶憑證時回 401。
-- **資料**：同一個 SQLite 檔，表有 `events`（只追加，單調序號）、`leases`（由 events 推出的現況）、`cooldowns`、`clients`（客戶端憑證的雜湊）。
+- **位置**：本人選定的常駐 provider（機器名稱不寫在 public repo）。本人的裁定是：「這東西跟 mlp 無關，說到底就是那台跑了兩個服務。」所以 LLMGateway 是**獨立的服務**，不是 MyLinuxPool 的單元：
+  - 在那台用**自己的系統帳號 `llmgw`** 跑，是 systemd user unit（帳號開了 linger）。`llmgw` **不加進 docker 群組**，因為 docker 群組等同 root，加了就打破隔離。
+  - 安裝程式、unit、run wrapper、版本、`--check` 都在本 repo 的 `deploy/`。版本 tag 只在部署時指定一次（`upgrade <tag>`）。
+  - 只綁 loopback，以及同一台容器看得到的 docker bridge 位址；管理 API 與 HTML 狀態板只綁 loopback。
+  - `--check` 三態：0＝服務在跑、版本對、`GET /v1/board` 不帶憑證時回 401；1＝確定不成立；2＝無法確認。
+- **一次性的開機設定**（要 root，由本人做或本人授權）：
+  - 建 `llmgw` 帳號、`loginctl enable-linger llmgw`；
+  - 確認 sshd 沒有擋 `llmgw`；
+  - 放部署公鑰；
+  - 第一次安裝；
+  - 發「發證用」的管理憑證（決定 4），由本人直接設進 MyLinuxPool 的 secret。
+- **資料**：同一個 SQLite 檔，表有 `events`（只追加，單調序號）、`leases`、`cooldowns`、`clients`（憑證雜湊與角色）、去重表。
 - **重啟**：從 `events` 重建現況。
 - **為什麼**：
   - 流量很小（一個 agent 一小時幾次），不需要框架；
   - 少一個供應鏈風險；
-  - 期 1 設計說要有常駐主機才換掉 GitHub repo 後端，現在本人已同意放在常駐 provider。
+  - 獨立帳號讓 key 只有服務讀得到，和池的管理帳號隔開；那台的 auditd 也會稽核這個帳號。
 - **放棄的選項**：
   - Go 單一執行檔：sidecar 與 MyAiStorage 都是 Python，共用模型與測試慣例比較省事。
   - FastAPI 之類的框架：多一串依賴。
-  - 期 1 的「private GitHub repo 後端」：冷卻與同時租用上限都要即時判斷。
+  - 做成 MyLinuxPool 的 shared-config 單元（MyLinuxPool#67，已作廢）：本人裁定不是池的一部分。
 
 ### 決定 4：客戶端身分
 
-- 每個客戶端一把隨機的客戶端憑證，服務只存雜湊，可以單獨撤銷。客戶端是：每台 worker 的 sidecar、Mac、之後的手機。
-- 由 PM 在 provider 上用 `lgw admin client add <名稱>` 發，值只印一次。用 `lgw admin client rm <名稱>` 撤銷（等同 revoke，紀錄保留）。
-- worker 的客戶端憑證由 MyLinuxPool 的 create-worker 自動發，delete-worker 自動撤銷（MyLinuxPool#70）：
-  - create-worker 經 SSH 到服務那台跑 `lgw admin client add <worker 名>`，輸出經唯讀掛載通道寫進 worker；
-  - 值只經過 runner 的記憶體，先 add-mask，不進 log 與 output。
-- 客戶端憑證放的地方：
-  - worker：`/run/mlp-secrets/llmgateway-client-token`（0400），由 MyLinuxPool 的能力放進去，和 A2A token 同一種做法；
+- 每個客戶端一把隨機的客戶端憑證（32 bytes），服務只存 SHA-256，可以單獨撤銷。客戶端有兩種角色：
+  - `client`：worker 的 sidecar、Mac、之後的手機。只能用租用 API。
+  - `issuer`：發證用的管理憑證。只能用管理 API，不能租用。
+- **管理 API**（只綁 loopback）：
+  - `POST /v1/admin/clients {name}`：回 `201 {name, token}`；
+  - `DELETE /v1/admin/clients/{name}`：回 204；不存在的名字回 404。
+  - issuer 只能發撤名字符合 `worker-[A-Za-z0-9._-]{1,57}` 的客戶端。
+  - 同名重複發證時，先撤掉舊的（連同它未結束的租約）再回新的，不會同時有兩把有效的。
+  - 從非 loopback 介面來的管理請求一律 403。
+- **worker 的客戶端憑證由 MyLinuxPool 自動發撤**（MyLinuxPool#70）：
+  - create-worker 經 pool-ssh 的 stdin 通道，在那台以 curl 打 127.0.0.1 的管理 API。發證憑證從 stdin 讀、不上 argv；回來的 token 直接寫進 worker 的掛載目錄，不經 log 與 output。
+  - delete-worker 撤證，失敗時明確報錯。
+  - 發證憑證存成 MyLinuxPool 的 secret `GH_MYLINUXPOOL__LLMGATEWAY_ADMIN__ISSUE`。
+- **其他客戶端**（Mac、手機）由 PM 在那台以 `llmgw` 帳號用 `lgw admin client add <名稱>` 發，值只印一次；`lgw admin client rm <名稱>` 撤銷。
+- **客戶端憑證放的地方**：
+  - worker：`/run/mlp-secrets/llmgateway-client-token`（0400），由 MyLinuxPool 放進去；
   - Mac：`~/.config/lgw/client-token`（0600）。
 - 租約的 `worker` 欄位必須和客戶端憑證登記的名稱一致，服務端檢查，所以一個客戶端不能冒用別台機器的名字。
-- `GET /v1/whoami`：回 `200 {client}`，不花任何額度，給 MyLinuxPool 的驗證程式核對憑證用。
-- **為什麼**：池內只能經 SSH 進來，SSH 已經擋掉外人；客戶端憑證是為了區分身分、撤銷、記錄，不靠它擋外人。
+- `GET /v1/whoami`：回 `200 {client, role}`，不花任何額度，給 MyLinuxPool 的驗證程式核對憑證用。
+- **為什麼**：池內只能經 SSH 進來，SSH 已經擋掉外人；客戶端憑證是為了區分身分、撤銷、記錄，不靠它擋外人。MyLinuxPool 透過 API 發證，就不用碰 LLMGateway 的資料庫。
 
 ### 決定 5：怎麼連到服務
 
@@ -107,7 +125,9 @@
 | POST | `/v1/leases/{id}/usage` | `snapshot` | `204` |
 | POST | `/v1/leases/{id}/release` | `reason?, request_id` | `204`（重複 release 也回 204） |
 | GET | `/v1/board` | — | `200 {subscriptions: [...]}` |
-| GET | `/v1/whoami` | — | `200 {client}`（核對憑證用，不花額度） |
+| GET | `/v1/whoami` | — | `200 {client, role}`（核對憑證用，不花額度） |
+| POST | `/v1/admin/clients` | `name` | `201 {name, token}`（只有 issuer、只綁 loopback、只限 `worker-*`；同名就撤舊發新） |
+| DELETE | `/v1/admin/clients/{name}` | — | `204`；不存在回 404 |
 
 **欄位說明**
 - `agent`：`claude-code` 或 `opencode`。sidecar 內部的 `claude`、`opencode` 由它自己對應。
@@ -121,6 +141,8 @@
 - `413 body_too_large`：請求 body 超過 1 MB，不讀內容。
 - `403 client_mismatch`：worker 與客戶端憑證登記的名稱不符。
 - `403 not_owner`：動到別的客戶端的租約。
+- `403 forbidden_role`：client 打管理 API、issuer 打租用 API，或管理 API 不是從 loopback 來的。
+- `403 name_not_allowed`：issuer 發撤不符合 `worker-*` 的名字。
 - `404 not_found`：租約不存在。
 - `409 lease_not_active`：對已結束的租約做 start、renew、exhausted。
 - `409 lease_not_confirmed`：對還沒 start 的租約做 renew、exhausted；還沒 start 的租約只接受 start 與 release。
@@ -255,22 +277,22 @@
 - [`herdr tab create --env` 的行為在 worker 的 herdr 0.9.3 上還沒驗] → sidecar 驗收時再驗，不過就改用 0600 暫存 env 檔、讀完即刪。
 - [換把會中斷正在跑的那一輪] → 本人已知；靠 `agora continue` 接回。
 - [服務掛掉] → systemd 拉起並從 events 重建。客戶端拿不到租約時不開新 agent；已經在跑的 agent 不受影響，因為 env 已經給了。
-- [GitHub Actions 能登入 provider] → 這把身分只用在 `deploy-keys`，workflow 只能手動觸發；身分可以在 MyLinuxPool 單獨撤銷。
+- [GitHub Actions 能登入放服務的那台] → 部署金鑰在跳板機上只能轉發、在那台只能跑部署腳本的兩個動詞；workflow 只能手動觸發，而且要本人在 environment 核准；跳板那一行可在 MyLinuxPool 單獨撤銷，那台那一行由 llmgw 帳號撤銷。
+- [發證用的管理憑證外洩] → 只能發撤 `worker-*`、只從 loopback 收；可以用 `lgw admin client rm` 撤銷後重發。
 
 ## Migration Plan
 
 1. 服務、政策檔、`lgw`（API 客戶端、訊號規則、管理命令）在本 repo 寫好，含測試（假 key、假上游、假時鐘）。
-2. MyLinuxPool：
-   - 服務的單元；
-   - Actions 的 client 身分；
-   - worker 怎麼連到服務；
-   - 客戶端憑證放進 `/run/mlp-secrets/`。
-   這四件另開 MyLinuxPool 的單。
-3. 本人設五把 secret，跑 `deploy-keys`。
-4. Mac：`sidecar agent run claude`、`sidecar agent run opencode` 驗收，包含用假訊號換把（等 sidecar 提供這個命令）。
-5. sidecar：aistorage-pm 把假 broker 換成 `lgw` 的 API 客戶端，在一台 worker 驗收。
-6. 另開單把 MyLinuxPool#50 的 key 來源換成租用，收掉 MyLinuxPool 裡的 key。
-- **退回**：停服務、Mac 改回原本的指令；worker 在第 6 步之前仍有 MyLinuxPool#50 的 key，可以照舊。
+2. 本人做一次性的開機設定（決定 3）：建 `llmgw`、linger、放部署公鑰、第一次安裝、發發證用的管理憑證。
+3. MyLinuxPool：
+   - MyLinuxPool#68：跳板機上的轉發專用條目與 host key 指紋；
+   - MyLinuxPool#69：worker 怎麼連到服務；
+   - MyLinuxPool#70：create-／delete-worker 透過管理 API 發撤 worker 的客戶端憑證。
+4. 本人設 environment 與 secret，跑 `deploy-service`（`upgrade <tag>`）與 `deploy-keys`。
+5. Mac：`sidecar agent run claude`、`sidecar agent run opencode` 驗收，包含用假訊號換把（等 sidecar 提供這個命令）。
+6. sidecar：aistorage-pm 把假 broker 換成 `lgw` 的 API 客戶端，在一台 worker 驗收。
+7. 另開單把 MyLinuxPool#50 的 key 來源換成租用，收掉 MyLinuxPool 裡的 key。
+- **退回**：停服務、Mac 改回原本的指令；worker 在第 7 步之前仍有 MyLinuxPool#50 的 key，可以照舊。
 
 ## Open Questions
 
