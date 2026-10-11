@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lgw"
+version = "0.1.0"
+description = "LLMGateway client: connect (ssh -L), subscriptions list/get/cooldown, quota signals"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools]
+packages = ["lgw"]

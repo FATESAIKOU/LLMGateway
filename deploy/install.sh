@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # deploy/install.sh
 #
-# 在常駐機器上安裝 LLMGateway 租用服務 (lgwd)：固定 tag 取碼、
-# current symlink 原子切換、systemd user unit。放哪一台由安裝的人決定，
-# 這裡不寫機器名或 IP。
+# 在常駐機器上安裝 LLMGateway：固定 tag 取碼、current symlink 原子切換、
+# systemd user unit（租用服務 lgwd 與隧道守護 llmgateway-tunnel）。放哪一台
+# 由安裝的人決定，這裡不寫機器名或 IP。
+#
+# 隧道守護承載部署連線本身，所以這裡絕不當場 restart／stop 它：沒在跑就
+# start，有更新時用 systemd-run 排一個約 60 秒後的重啟。
 set -uo pipefail
 
 LGW_REPO="https://github.com/FATESAIKOU/LLMGateway"
@@ -58,16 +61,20 @@ CURRENT_LINK="${SHARE_DIR}/current"
 TAG_FILE="${CURRENT_LINK}/.lgw-tag"
 CONF_DIR="${HOME_DIR}/.config/llmgateway"
 ENV_FILE="${CONF_DIR}/llmgateway.env"
+TUNNEL_ENV_FILE="${CONF_DIR}/tunnel.env"
 STATE_DIR="${HOME_DIR}/.local/state/llmgateway"
 KEYS_FILE="${STATE_DIR}/keys.env"
 BIN_DIR="${HOME_DIR}/.local/bin"
 UNIT_DIR="${HOME_DIR}/.config/systemd/user"
 SERVICE_NAME="llmgateway.service"
+TUNNEL_SERVICE_NAME="llmgateway-tunnel.service"
+TUNNEL_BIN="llmgateway-tunnel"
 
-DEFAULT_API_HOSTS="127.0.0.1"
+# 測試可換成假指令。
+SYSTEMCTL="${LGW_SYSTEMCTL:-systemctl}"
+SYSTEMD_RUN="${LGW_SYSTEMD_RUN:-systemd-run}"
+
 DEFAULT_API_PORT="8480"
-DEFAULT_BOARD_PORT="8481"
-DEFAULT_USAGE="1"
 
 # install_file <source> <target> <mode>：同目錄暫存 → chmod → mv（原子，不留暫存）。
 install_file() {
@@ -155,6 +162,11 @@ fetch_code() {
         rm -rf "$tag_tmp"
         return 1
     fi
+    if [[ ! -f "${tag_tmp}/deploy/${TUNNEL_BIN}" ]] || [[ ! -f "${tag_tmp}/deploy/${TUNNEL_SERVICE_NAME}" ]]; then
+        log ERROR "取到的版本缺 deploy/${TUNNEL_BIN} 或 deploy/${TUNNEL_SERVICE_NAME}"
+        rm -rf "$tag_tmp"
+        return 1
+    fi
     printf '%s\n' "$LGW_TAG" | install_text "${tag_tmp}/.lgw-tag" 644 || {
         log ERROR "寫版本標記失敗"
         rm -rf "$tag_tmp"
@@ -182,19 +194,19 @@ fetch_code() {
 
 # check_unit：0 成立、1 確定不成立、2 無法確認。
 check_unit() {
-    command -v systemctl >/dev/null 2>&1 || { log INFO "llmgateway: systemctl 不能用"; return 2; }
-    local rc
-    systemctl --user is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1
-    rc=$?
-    if [[ "$rc" -eq 0 ]]; then
-        :
-    elif [[ "$rc" -eq 3 ]]; then
-        log INFO "llmgateway: 服務沒在跑"
-        return 1
-    else
-        log INFO "llmgateway: systemctl 不能用（rc=${rc}）"
-        return 2
-    fi
+    command -v "$SYSTEMCTL" >/dev/null 2>&1 || { log INFO "llmgateway: systemctl 不能用"; return 2; }
+    local unit rc
+    for unit in "$SERVICE_NAME" "$TUNNEL_SERVICE_NAME"; do
+        "$SYSTEMCTL" --user is-active --quiet "$unit" >/dev/null 2>&1
+        rc=$?
+        if [[ "$rc" -eq 3 ]]; then
+            log INFO "llmgateway: ${unit} 沒在跑"
+            return 1
+        elif [[ "$rc" -ne 0 ]]; then
+            log INFO "llmgateway: systemctl 不能用（rc=${rc}）"
+            return 2
+        fi
+    done
     if [[ -n "$LGW_TAG" ]]; then
         local installed_tag=""
         [[ -f "$TAG_FILE" ]] && installed_tag="$(cat "$TAG_FILE" 2>/dev/null)"
@@ -206,21 +218,21 @@ check_unit() {
     local port code
     port="$(check_port)"
     code=""
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/v1/board" 2>/dev/null)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/v1/subscriptions" 2>/dev/null)"
     rc=$?
     if [[ "$rc" -ne 0 ]]; then
         log INFO "llmgateway: curl 連不上或逾時（rc=${rc}）"
         return 2
     fi
-    if [[ "$code" == "401" ]]; then
+    if [[ "$code" == "200" ]]; then
         if [[ -n "$LGW_TAG" ]]; then
-            log INFO "llmgateway 正常（${LGW_TAG}，未授權探針回 401）"
+            log INFO "llmgateway 正常（${LGW_TAG}，list 探針回 200）"
         else
-            log INFO "llmgateway 正常（未授權探針回 401）"
+            log INFO "llmgateway 正常（list 探針回 200）"
         fi
         return 0
     fi
-    log INFO "llmgateway: board 探針回 ${code}，不是 401"
+    log INFO "llmgateway: list 探針回 ${code}，不是 200"
     return 1
 }
 
@@ -286,12 +298,23 @@ mkdir -p "$SHARE_DIR" "$CONF_DIR" "$STATE_DIR" "$BIN_DIR" "$UNIT_DIR" || {
 chmod 0700 "$STATE_DIR" || { log ERROR "chmod 狀態目錄失敗"; exit 1; }
 
 if [[ ! -f "$ENV_FILE" ]]; then
+    printf 'LGW_API_PORT="%s"\n' "$DEFAULT_API_PORT" | install_text "$ENV_FILE" 644 || {
+        log ERROR "寫 env 檔失敗"; exit 1; }
+fi
+
+if [[ ! -f "$TUNNEL_ENV_FILE" ]]; then
     {
-        printf 'LGW_API_HOSTS="%s"\n' "$DEFAULT_API_HOSTS"
-        printf 'LGW_API_PORT="%s"\n' "$DEFAULT_API_PORT"
-        printf 'LGW_BOARD_PORT="%s"\n' "$DEFAULT_BOARD_PORT"
-        printf 'LGW_USAGE="%s"\n' "$DEFAULT_USAGE"
-    } | install_text "$ENV_FILE" 644 || { log ERROR "寫 env 檔失敗"; exit 1; }
+        printf '%s\n' "# LLMGateway 隧道守護設定。必填三項（值留空）；其餘留空用預設值。"
+        printf '%s\n' "# 預設：REMOTE_API=4710 REMOTE_SSH=4711 LOCAL_API=8480 PROBE_INTERVAL=60 PROBE_FAILS=3"
+        printf 'RENDEZVOUS=\n'
+        printf 'IDENTITY=\n'
+        printf 'KNOWN_HOSTS=\n'
+        printf 'REMOTE_API=\n'
+        printf 'REMOTE_SSH=\n'
+        printf 'LOCAL_API=\n'
+        printf 'PROBE_INTERVAL=\n'
+        printf 'PROBE_FAILS=\n'
+    } | install_text "$TUNNEL_ENV_FILE" 644 || { log ERROR "寫隧道設定範本失敗"; exit 1; }
 fi
 
 if [[ ! -f "$KEYS_FILE" ]]; then
@@ -318,11 +341,38 @@ install_file "${TAG_DIR}/deploy/llmgateway-run" "${BIN_DIR}/llmgateway-run" 755 
 install_file "${TAG_DIR}/deploy/llmgateway.service" "${UNIT_DIR}/${SERVICE_NAME}" 644 || {
     log ERROR "裝 systemd unit 失敗"; exit 1; }
 
-systemctl --user daemon-reload || { log ERROR "daemon-reload 失敗"; exit 1; }
-if systemctl --user is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
-    systemctl --user restart "$SERVICE_NAME" || { log ERROR "restart 失敗"; exit 1; }
+# 隧道執行檔或 unit 有變更嗎（不存在＝有變更）；要在覆蓋前比。
+tunnel_changed=0
+if ! cmp -s "${TAG_DIR}/deploy/${TUNNEL_BIN}" "${BIN_DIR}/${TUNNEL_BIN}" 2>/dev/null; then
+    tunnel_changed=1
+fi
+if ! cmp -s "${TAG_DIR}/deploy/${TUNNEL_SERVICE_NAME}" "${UNIT_DIR}/${TUNNEL_SERVICE_NAME}" 2>/dev/null; then
+    tunnel_changed=1
+fi
+
+install_file "${TAG_DIR}/deploy/${TUNNEL_BIN}" "${BIN_DIR}/${TUNNEL_BIN}" 755 || {
+    log ERROR "裝 ${TUNNEL_BIN} 失敗"; exit 1; }
+install_file "${TAG_DIR}/deploy/${TUNNEL_SERVICE_NAME}" "${UNIT_DIR}/${TUNNEL_SERVICE_NAME}" 644 || {
+    log ERROR "裝隧道 systemd unit 失敗"; exit 1; }
+
+"$SYSTEMCTL" --user daemon-reload || { log ERROR "daemon-reload 失敗"; exit 1; }
+if "$SYSTEMCTL" --user is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
+    "$SYSTEMCTL" --user restart "$SERVICE_NAME" || { log ERROR "restart 失敗"; exit 1; }
 else
-    systemctl --user enable --now "$SERVICE_NAME" || { log ERROR "enable 失敗"; exit 1; }
+    "$SYSTEMCTL" --user enable --now "$SERVICE_NAME" || { log ERROR "enable 失敗"; exit 1; }
+fi
+
+# 隧道守護承載部署連線本身：只 enable；沒在跑就 start；有變更才排
+# 約 60 秒後的重啟，絕不當場 restart／stop（會切斷正在跑的部署）。
+"$SYSTEMCTL" --user enable "$TUNNEL_SERVICE_NAME" || {
+    log ERROR "enable 隧道 unit 失敗"; exit 1; }
+if ! "$SYSTEMCTL" --user is-active --quiet "$TUNNEL_SERVICE_NAME" >/dev/null 2>&1; then
+    "$SYSTEMCTL" --user start "$TUNNEL_SERVICE_NAME" || \
+        log INFO "llmgateway-tunnel: start 未成功（設定未填或未就緒時為預期）"
+elif [[ "$tunnel_changed" -eq 1 ]]; then
+    "$SYSTEMD_RUN" --user --on-active=60 --unit=llmgateway-tunnel-restart \
+        "$SYSTEMCTL" --user restart "$TUNNEL_SERVICE_NAME" || {
+        log ERROR "排程隧道重啟失敗"; exit 1; }
 fi
 
 log INFO "installed llmgateway ${LGW_TAG}"

@@ -18,29 +18,21 @@ def _write_json(tmpdir, obj, name="policy.json"):
     return str(path)
 
 
+def _sub(priority=10, agents=("opencode",), allow=("*",), default=None):
+    return {
+        "priority": priority,
+        "agents": list(agents),
+        "models": {"allow": list(allow), "default": default},
+    }
+
+
 def _good_policy(**over):
     base = {
         "subscriptions": {
-            "claude-personal": {
-                "agents": ["claude-code"],
-                "models": {"allow": ["*"], "default": None},
-                "cap": 2,
-                "default_cooldown_seconds": 18000,
-            },
-            "openrouter": {
-                "agents": ["opencode"],
-                "models": {"allow": ["*:free"], "default": None},
-                "cap": None,
-                "default_cooldown_seconds": 3600,
-            },
-        },
-        "order": {
-            "claude-code": ["claude-personal"],
-            "opencode": ["openrouter"],
+            "claude-personal": _sub(10, ("claude-code",)),
+            "openrouter": _sub(20, ("claude-code", "opencode"), ("*:free",)),
         },
         "cooldown_buffer_seconds": 120,
-        "lease_ttl_seconds": 43200,
-        "confirm_within_seconds": 600,
         "resets_at_max_ahead_seconds": 691200,
     }
     base.update(over)
@@ -50,36 +42,26 @@ def _good_policy(**over):
 class LoadDefaultPolicyTests(unittest.TestCase):
     def test_default_policy_loads(self):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
-        self.assertEqual(policy.candidates("claude-code"), ("claude-personal", "claude-company"))
-        self.assertEqual(policy.candidates("opencode"), ("opencode-zen", "openrouter", "ollama-cloud"))
-        self.assertEqual(policy.subscriptions["claude-personal"].cap, 2)
-        self.assertIsNone(policy.subscriptions["openrouter"].cap)
-        self.assertTrue(policy.allows("openrouter", "opencode", "anything:free"))
-        self.assertFalse(policy.allows("openrouter", "opencode", "anything"))
-        self.assertFalse(policy.allows("openrouter", "claude-code", None))
-        self.assertFalse(policy.allows("nope", "opencode", None))
-        self.assertEqual(policy.candidates("nope"), ())
+        order = [s.name for s in policy.in_priority_order()]
+        self.assertEqual(order, ["claude-personal", "opencode-zen",
+                                 "claude-company", "openrouter", "ollama-cloud"])
+        self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
+        self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
+        self.assertEqual(policy.subscriptions["openrouter"].models_allow, ("*:free",))
+        self.assertIn("claude-code", policy.subscriptions["openrouter"].agents)
+        self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
+        self.assertEqual(policy.cooldown_buffer_seconds, 120)
+        self.assertEqual(policy.resets_at_max_ahead_seconds, 691200)
 
-    def test_claude_code_order_with_openrouter_rejected(self):
+    def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             obj = _good_policy()
-            obj["order"]["claude-code"] = ["claude-personal", "openrouter"]
-            obj["subscriptions"]["openrouter"]["agents"] = ["claude-code", "opencode"]
-            with self.assertRaises(PolicyError):
-                load_policy(_write_json(tmpdir, obj))
-
-    def test_claude_code_order_with_ollama_cloud_rejected(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            obj = _good_policy()
-            obj["subscriptions"]["ollama-cloud"] = {
-                "agents": ["claude-code"],
-                "models": {"allow": ["*"], "default": None},
-                "cap": None,
-                "default_cooldown_seconds": 18000,
-            }
-            obj["order"]["claude-code"] = ["ollama-cloud"]
-            with self.assertRaises(PolicyError):
-                load_policy(_write_json(tmpdir, obj))
+            obj["subscriptions"]["ollama-cloud"] = _sub(10, ("opencode",))
+            policy = load_policy(_write_json(tmpdir, obj))
+            self.assertEqual(
+                [s.name for s in policy.in_priority_order()],
+                ["claude-personal", "ollama-cloud", "openrouter"],
+            )
 
 
 class PolicyValidationTests(unittest.TestCase):
@@ -98,45 +80,49 @@ class PolicyValidationTests(unittest.TestCase):
             obj["subscriptions"]["something-else"] = obj["subscriptions"].pop("openrouter")
             self._reload(obj)
 
-    def test_order_unknown_agent_rejected(self):
-        with self.assertRaises(PolicyError):
-            obj = _good_policy()
-            obj["order"]["something-else"] = ["openrouter"]
-            self._reload(obj)
-
-    def test_order_unknown_subscription_rejected(self):
-        with self.assertRaises(PolicyError):
-            obj = _good_policy()
-            obj["order"]["opencode"] = ["openrouter", "ghost"]
-            self._reload(obj)
-
     def test_claude_agents_restricted(self):
+        for agents in (["claude-code", "opencode"], ["opencode"], []):
+            with self.subTest(agents=agents):
+                with self.assertRaises(PolicyError):
+                    obj = _good_policy()
+                    obj["subscriptions"]["claude-personal"]["agents"] = agents
+                    self._reload(obj)
+
+    def test_zen_must_only_allow_opencode(self):
         with self.assertRaises(PolicyError):
             obj = _good_policy()
-            obj["subscriptions"]["claude-personal"]["agents"] = ["claude-code", "opencode"]
+            obj["subscriptions"]["opencode-zen"] = _sub(10, ("opencode", "claude-code"))
             self._reload(obj)
 
-    def test_zen_must_not_allow_claude_code(self):
+    def test_openrouter_only_free_models(self):
         with self.assertRaises(PolicyError):
             obj = _good_policy()
-            obj["subscriptions"]["opencode-zen"] = {
-                "agents": ["opencode", "claude-code"],
-                "models": {"allow": ["*"], "default": None},
-                "cap": None,
-                "default_cooldown_seconds": 3600,
-            }
+            obj["subscriptions"]["openrouter"]["models"]["allow"] = ["*"]
             self._reload(obj)
 
     def test_bad_numbers_rejected(self):
         for mutate in (
-            lambda o: o["subscriptions"]["openrouter"].update(cap=0),
-            lambda o: o["subscriptions"]["openrouter"].update(cap=-1),
-            lambda o: o["subscriptions"]["openrouter"].update(cap=True),
-            lambda o: o["subscriptions"]["openrouter"].update(cap="2"),
-            lambda o: o["subscriptions"]["openrouter"].update(default_cooldown_seconds=0),
+            lambda o: o["subscriptions"]["openrouter"].update(priority=-1),
+            lambda o: o["subscriptions"]["openrouter"].update(priority="20"),
+            lambda o: o["subscriptions"]["openrouter"].update(priority=True),
+            lambda o: o["subscriptions"]["openrouter"].pop("priority"),
             lambda o: o.update(cooldown_buffer_seconds=0),
-            lambda o: o.update(lease_ttl_seconds=None),
-            lambda o: o.pop("order"),
+            lambda o: o.update(resets_at_max_ahead_seconds=None),
+            lambda o: o.pop("subscriptions"),
+        ):
+            with self.subTest(mutate=getattr(mutate, "__name__", "?")):
+                with self.assertRaises(PolicyError):
+                    obj = _good_policy()
+                    mutate(obj)
+                    self._reload(obj)
+
+    def test_bad_models_rejected(self):
+        for mutate in (
+            lambda o: o["subscriptions"]["openrouter"].update(models=[]),
+            lambda o: o["subscriptions"]["openrouter"]["models"].update(allow=[]),
+            lambda o: o["subscriptions"]["openrouter"]["models"].update(allow=[1]),
+            lambda o: o["subscriptions"]["openrouter"]["models"].update(default=7),
+            lambda o: o["subscriptions"]["openrouter"].pop("models"),
         ):
             with self.subTest(mutate=getattr(mutate, "__name__", "?")):
                 with self.assertRaises(PolicyError):
@@ -160,41 +146,21 @@ class PolicyValidationTests(unittest.TestCase):
         obj["subscriptions"]["openrouter"]["agents"] = [CANARY]
         cases.append(obj)
         obj = _good_policy()
-        obj["order"]["opencode"] = [CANARY]
+        obj["subscriptions"]["openrouter"]["models"]["allow"] = [CANARY]
         cases.append(obj)
         obj = _good_policy()
-        obj["subscriptions"]["openrouter"]["models"]["allow"] = [CANARY]
-        cases.append(obj)  # 合法字串，不該報錯但順便確認可載入
-        for obj in cases[:3]:
+        obj["subscriptions"]["openrouter"]["models"]["default"] = 5
+        cases.append(obj)
+        for obj in cases:
             with tempfile.TemporaryDirectory() as tmpdir:
                 try:
-                    load_policy(_write_json(tmpdir, obj))
+                    policy = load_policy(_write_json(tmpdir, obj))
                 except PolicyError as exc:
                     self.assertNotIn(CANARY, str(exc))
                 else:
-                    self.fail("expected PolicyError")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            policy = load_policy(_write_json(tmpdir, cases[3]))
-            self.assertTrue(policy.allows("openrouter", "opencode", CANARY))
-            # 註：policy 檔本來就在 repo（公開），不含 key 值；repr 不在不含值保證範圍
+                    # 合法值（models.allow）可載入也確認一次
+                    self.assertIn(CANARY, policy.subscriptions["openrouter"].models_allow)
 
 
-class AllowsCandidatesTests(unittest.TestCase):
-    def test_model_none_uses_default(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            obj = _good_policy()
-            obj["subscriptions"]["openrouter"]["models"]["default"] = "picked:free"
-            policy = load_policy(_write_json(tmpdir, obj))
-            self.assertTrue(policy.allows("openrouter", "opencode", None))
-            self.assertFalse(policy.allows("openrouter", "opencode", "other"))
-
-    def test_model_none_without_default_allows(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            policy = load_policy(_write_json(tmpdir, _good_policy()))
-            self.assertTrue(policy.allows("openrouter", "opencode", None))
-            self.assertFalse(policy.allows("openrouter", "opencode", 123))
-
-    def test_candidates_unknown_agent_empty(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            policy = load_policy(_write_json(tmpdir, _good_policy()))
-            self.assertEqual(policy.candidates("ghost"), ())
+if __name__ == "__main__":
+    unittest.main()

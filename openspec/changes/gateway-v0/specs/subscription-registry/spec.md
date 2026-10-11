@@ -37,7 +37,7 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 - **THEN** 15:00 之前 list 裡它的 `available` 為 false、`cooldown.5h.until` 為 15:00；15:00 之後 `available` 回到 true
 
 ### Requirement: get
-`GET /v1/subscriptions/{id}?agent=<種類>` SHALL 回該 subscription 的共通 JSON，含 `key`。`agent` 是必填參數，不在該筆的 `agents` 裡 MUST 回 403 `agent_not_allowed`，不回 key。不存在的 id 回 404；key 沒部署時回 409 `not_deployed`。
+`GET /v1/subscriptions/{id}?agent=<種類>` SHALL 回該 subscription 的共通 JSON，含 `key`。`agent` 是必填參數，缺少時回 400 `bad_request`（帶 `missing: ["agent"]`）；不在該筆的 `agents` 裡 MUST 回 403 `agent_not_allowed`，不回 key。不存在的 id 回 404 `not_found`；key 沒部署時回 409 `not_deployed`。
 
 #### Scenario: Claude Code 拿 Claude 訂閱
 - **WHEN** 以 `agent=claude-code` get `claude-personal`
@@ -53,9 +53,9 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 
 ### Requirement: 登錄冷卻
 `POST /v1/subscriptions/{id}/cooldown {window, resets_at?}` SHALL 登錄某個窗口的冷卻：
-- `window` 為 `5h` 或 `1w`；
+- `window` 為 `5h` 或 `1w`，缺少回 400 `bad_request`，其他值回 400 `invalid_window`；
 - 有 `resets_at` 時冷卻到 `resets_at` 加 2 分鐘；沒有時用該窗口的預設長度（5 小時、7 天）；
-- `resets_at` 在過去或超過 8 天以後，MUST 回 400，不登錄；
+- `resets_at` 不是 RFC 3339 字串時回 400 `invalid_resets_at`；在過去或超過 8 天以後 MUST 回 400 `resets_at_out_of_range`，不登錄；
 - 同一窗口重複登錄時取較晚的結束時刻；
 - 過了結束時刻自動解除，不需要另一個動作。
 
@@ -65,7 +65,7 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 
 #### Scenario: 不合理的時刻
 - **WHEN** `resets_at` 是過去的時刻
-- **THEN** 回 400，冷卻不變
+- **THEN** 回 400 `resets_at_out_of_range`，冷卻不變
 
 #### Scenario: 沒有重置時刻
 - **WHEN** 以 `window=1w` 登錄而沒有 `resets_at`
@@ -77,3 +77,26 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 #### Scenario: get 留下紀錄
 - **WHEN** 有客戶端以 `agent=claude-code` get `claude-personal`
 - **THEN** 稽核紀錄有一筆，內容沒有 key 的值
+
+### Requirement: 錯誤回覆
+所有錯誤 SHALL 以 `{"error": "<碼>"}` 的 JSON 回覆，碼固定如下，訊息不得回顯請求裡的值：
+- 400：`bad_request`（JSON 解析失敗、body 不是物件、缺必填；缺的欄位名放在 `missing`）、`invalid_window`、`invalid_resets_at`、`resets_at_out_of_range`；
+- 403：`agent_not_allowed`；
+- 404：`not_found`（不存在的 id 或未知路徑）；
+- 409：`not_deployed`；
+- 413：`body_too_large`（body 超過 1 MB）；
+- 500：`internal`。
+
+客戶端 SHALL 另外以 `unreachable`（連不上或逾時）與 `bad_response`（回覆不是 JSON 物件）表示自己判讀的失敗，不丟例外。
+
+#### Scenario: 缺必填
+- **WHEN** 登錄冷卻的 body 沒有 `window`
+- **THEN** 回 400 `bad_request`，`missing` 含 `window`
+
+#### Scenario: 窗口不對
+- **WHEN** `window` 是 `"2h"`
+- **THEN** 回 400 `invalid_window`，冷卻不變
+
+#### Scenario: 連不上
+- **WHEN** 客戶端連不上服務
+- **THEN** 結果的 `error` 為 `unreachable`，呼叫方沒有拿到例外

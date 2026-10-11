@@ -11,7 +11,7 @@ v4 定案（2026-10-11 深夜）。
 
 ## 2. `lgw` 客戶端
 
-- [ ] 2.1 list／get／登錄冷卻的客戶端（標準函式庫；連不上回「無法確認」，不丟例外）
+- [x] 2.1 list／get／登錄冷卻的客戶端（標準函式庫；連不上回「無法確認」，不丟例外）
 - [x] 2.2 訊號規則（只有帶額度標記的 402／429 才算用完），給 sidecar 的 AgentDriver 當函式庫用
 - [ ] 2.3 以 git tag `lgw-vX.Y.Z` 發版
 
@@ -20,7 +20,7 @@ v4 定案（2026-10-11 深夜）。
 - [x] 3.1 本人選定放服務的那台；LLMGateway 是獨立服務
 - [x] 3.1a `deploy/`：安裝程式與 `remote-deploy.sh`（`keys`、`upgrade <tag>`）；已用假資料測試
 - [ ] 3.1b 隧道守護 `llmgateway-tunnel.service`：自己的金鑰與連線 `ssh -N -R 127.0.0.1:4710:… -R 127.0.0.1:4711:127.0.0.1:22 sshproxy@<跳板機>`，`ExitOnForwardFailure`／`ServerAlive*`；端對端探針（每 60 秒，連續 3 次失敗就重建）；設定檔 `tunnel.env`；`--check` 加上隧道
-- [ ] 3.1c `lgw connect`（函式庫＋指令）：`ssh -N -L … [-J …] sshproxy@<跳板機>`，回 base URL；連不上回「無法確認」；設定檔 `connect.env`
+- [x] 3.1c `lgw connect`（函式庫＋指令）：`ssh -F … -N -L … [-J …] <帳號>@<會合點>`，回 base URL；連不上回「無法確認」；設定檔是 JSON（`connect.json`，schema 1：`rendezvous`、`jumps`、`identity`、`known_hosts` 或 `host_keys`、`remote_api`；`load_config` 每次重讀），`rendezvous` 要明確的 `user@host:port`、不讀 `~/.ssh/config`；worker 的設定檔由 MyLinuxPool 的 unit 依 gateway.json 產生，Mac 手寫
 - [x] 3.1d workflow 改走會合點（`ssh -J sshproxy@<跳板機> -p 4711 llmgw@127.0.0.1`）
 - [ ] 3.1e lgwd 只綁 127.0.0.1（拿掉 docker bridge 綁定）
 - [ ] 3.2 MyLinuxPool#77（mylinuxpool-pm，進行中）：`TUNNEL_EXTRA_PUBKEYS`（裸公鑰，refresh／rotate 都會收）與 `NODE_GATEWAY.ports.llmgateway: [4710, 4711]`；本人或 PMO 設 var 並 dispatch refresh-authorized-keys。worker 的 id_tunnel 已確認讀得到（#67～#70 已作廢）

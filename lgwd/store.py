@@ -1,68 +1,35 @@
-"""SQLite 細節（LeaseService 的下層；由 impl 實作）。只用標準函式庫。
+"""SQLite 細節（design 決定 5b、8、10；spec subscription-registry、key-vault）。只用標準函式庫。
 
-- 單一連線＋RLock；會改變狀態的動作一律經 txn()（BEGIN IMMEDIATE）。
-- events 只追加、seq 單調；leases／cooldowns／clients 由事件重建（rebuild）。
-- leases 列、events payload 絕不存 env（key 的值只活在回覆裡）。
-- dedup 存第一次的完整回覆（保留 7 天，跨重啟有效）。
+只剩兩張表：
+- cooldowns：subscription × 窗口（5h／1w）→ 結束時刻；同一窗口取較晚的；
+- audit：只追加。get 記（時刻、subscription id、agent）；登錄冷卻記（時刻、subscription id、窗口、結束時刻）。
+絕不存 key 的值，也不記客戶端（沒有應用層認證）。
+
+單一連線＋RLock；會改變狀態的動作一律經 txn()（BEGIN IMMEDIATE）。
 """
 
 from __future__ import annotations
 
 import contextlib
-import json
 import sqlite3
 import threading
 from collections.abc import Iterator
 
-from .errors import ApiError
-
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
+CREATE TABLE IF NOT EXISTS cooldowns (
+    subscription TEXT NOT NULL,
+    window TEXT NOT NULL,
+    until TEXT NOT NULL,
+    PRIMARY KEY (subscription, window)
+);
+CREATE TABLE IF NOT EXISTS audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
-    type TEXT NOT NULL,
-    client TEXT,
-    lease_id TEXT,
-    subscription TEXT,
-    payload TEXT NOT NULL DEFAULT '{}'
-);
-CREATE TABLE IF NOT EXISTS leases (
-    lease_id TEXT PRIMARY KEY,
-    client TEXT NOT NULL,
-    worker TEXT NOT NULL,
-    role TEXT NOT NULL,
-    agent TEXT NOT NULL,
-    instance TEXT NOT NULL,
     subscription TEXT NOT NULL,
-    model TEXT,
-    purpose TEXT,
-    preferences TEXT,
-    status TEXT NOT NULL,
-    granted_at TEXT NOT NULL,
-    confirm_by TEXT NOT NULL,
-    started_at TEXT,
-    expires_at TEXT
-);
-CREATE TABLE IF NOT EXISTS cooldowns (
-    subscription TEXT PRIMARY KEY,
-    until TEXT NOT NULL,
-    signal TEXT,
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS clients (
-    name TEXT PRIMARY KEY,
-    cred_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    revoked_at TEXT,
-    role TEXT NOT NULL DEFAULT 'client'
-);
-CREATE TABLE IF NOT EXISTS dedup (
-    client TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    status INTEGER NOT NULL,
-    body TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (client, request_id)
+    action TEXT NOT NULL,
+    agent TEXT,
+    window TEXT,
+    until TEXT
 );
 """
 
@@ -73,12 +40,7 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(SCHEMA)
-        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(clients)")}
-        if "role" not in cols:  # 舊資料庫補欄位
-            self._conn.execute("ALTER TABLE clients ADD COLUMN role TEXT NOT NULL DEFAULT 'client'")
-            self._conn.commit()
         self._lock = threading.RLock()
-        self.rebuild()
 
     def close(self) -> None:
         with self._lock:
@@ -87,232 +49,63 @@ class Store:
     @contextlib.contextmanager
     def txn(self) -> Iterator[sqlite3.Cursor]:
         """一筆 BEGIN IMMEDIATE 交易；成功或預期的拒絕（ApiError）都 commit，
-        非預期錯誤才 rollback（denied 事件與延後結算要留下來）。"""
+        非預期錯誤才 rollback。"""
         with self._lock:
             cur = self._conn.cursor()
             try:
                 cur.execute("BEGIN IMMEDIATE")
                 yield cur
                 self._conn.commit()
-            except ApiError:
-                self._conn.commit()
-                raise
             except Exception:
                 self._conn.rollback()
                 raise
             finally:
                 cur.close()
 
-    # --- 事件 ---
-    def log(
-        self,
-        cur: sqlite3.Cursor,
-        type: str,
-        ts: str,
-        client: str | None = None,
-        lease_id: str | None = None,
-        subscription: str | None = None,
-        payload: dict | None = None,
-    ) -> int:
-        cur.execute(
-            "INSERT INTO events (ts, type, client, lease_id, subscription, payload)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, type, client, lease_id, subscription, json.dumps(payload or {})),
-        )
-        return cur.lastrowid
-
-    def all_events(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, ts, type, client, lease_id, subscription, payload"
-                " FROM events ORDER BY seq"
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    # --- 客戶端 ---
-    def client_add(self, cur: sqlite3.Cursor, name: str, cred_hash: str, created_at: str,
-                   role: str = "client") -> None:
-        cur.execute(
-            "INSERT INTO clients (name, cred_hash, created_at, role) VALUES (?, ?, ?, ?)",
-            (name, cred_hash, created_at, role),
-        )
-
-    def client_get(self, cur: sqlite3.Cursor, name: str) -> sqlite3.Row | None:
-        return cur.execute("SELECT * FROM clients WHERE name = ?", (name,)).fetchone()
-
-    def client_all(self, cur: sqlite3.Cursor) -> list[sqlite3.Row]:
-        return cur.execute("SELECT * FROM clients ORDER BY name").fetchall()
-
-    def client_revoke(self, cur: sqlite3.Cursor, name: str, revoked_at: str) -> None:
-        cur.execute("UPDATE clients SET revoked_at = ? WHERE name = ?", (revoked_at, name))
-
-    # --- 租約 ---
-    def lease_add(self, cur: sqlite3.Cursor, **fields) -> None:
-        cols = ", ".join(fields)
-        marks = ", ".join("?" for _ in fields)
-        cur.execute(f"INSERT INTO leases ({cols}) VALUES ({marks})", tuple(fields.values()))
-
-    def lease_get(self, cur: sqlite3.Cursor, lease_id: str) -> sqlite3.Row | None:
-        return cur.execute("SELECT * FROM leases WHERE lease_id = ?", (lease_id,)).fetchone()
-
-    def lease_update(self, cur: sqlite3.Cursor, lease_id: str, **fields) -> None:
-        sets = ", ".join(f"{k} = ?" for k in fields)
-        cur.execute(f"UPDATE leases SET {sets} WHERE lease_id = ?", (*fields.values(), lease_id))
-
-    def leases_unfinished(self, cur: sqlite3.Cursor) -> list[sqlite3.Row]:
-        return cur.execute(
-            "SELECT * FROM leases WHERE status IN ('granted', 'active') ORDER BY granted_at"
-        ).fetchall()
-
-    def count_unfinished_for_sub(self, cur: sqlite3.Cursor, subscription: str) -> int:
-        row = cur.execute(
-            "SELECT COUNT(*) AS n FROM leases"
-            " WHERE subscription = ? AND status IN ('granted', 'active')",
-            (subscription,),
-        ).fetchone()
-        return int(row["n"])
-
-    def has_unfinished_instance(self, cur: sqlite3.Cursor, client: str, instance: str) -> bool:
-        row = cur.execute(
-            "SELECT COUNT(*) AS n FROM leases"
-            " WHERE client = ? AND instance = ? AND status IN ('granted', 'active')",
-            (client, instance),
-        ).fetchone()
-        return int(row["n"]) > 0
-
-    def actives_for_sub(self, cur: sqlite3.Cursor, subscription: str) -> list[sqlite3.Row]:
-        return cur.execute(
-            "SELECT * FROM leases WHERE subscription = ? AND status = 'active'"
-            " ORDER BY started_at",
-            (subscription,),
-        ).fetchall()
-
-    def count_granted_for_sub(self, cur: sqlite3.Cursor, subscription: str) -> int:
-        row = cur.execute(
-            "SELECT COUNT(*) AS n FROM leases"
-            " WHERE subscription = ? AND status = 'granted'",
-            (subscription,),
-        ).fetchone()
-        return int(row["n"])
-
     # --- 冷卻 ---
-    def cool_get(self, cur: sqlite3.Cursor, subscription: str) -> sqlite3.Row | None:
+    def cooldown_get(self, cur: sqlite3.Cursor, subscription: str, window: str) -> sqlite3.Row | None:
+        return cur.execute(
+            "SELECT * FROM cooldowns WHERE subscription = ? AND window = ?",
+            (subscription, window),
+        ).fetchone()
+
+    def cooldown_for(self, cur: sqlite3.Cursor, subscription: str) -> list[sqlite3.Row]:
         return cur.execute(
             "SELECT * FROM cooldowns WHERE subscription = ?", (subscription,)
-        ).fetchone()
+        ).fetchall()
 
-    def cool_set(
-        self, cur: sqlite3.Cursor, subscription: str, until: str, signal: str | None,
-        updated_at: str,
+    def cooldown_set(
+        self, cur: sqlite3.Cursor, subscription: str, window: str, until: str
     ) -> None:
+        """寫入；同一窗口取較晚的結束時刻（UPSERT 只在新的較晚時更新）。"""
         cur.execute(
-            "INSERT INTO cooldowns (subscription, until, signal, updated_at)"
-            " VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(subscription) DO UPDATE SET"
-            " until = excluded.until, signal = excluded.signal, updated_at = excluded.updated_at",
-            (subscription, until, signal, updated_at),
+            "INSERT INTO cooldowns (subscription, window, until) VALUES (?, ?, ?)"
+            " ON CONFLICT(subscription, window) DO UPDATE SET until = excluded.until"
+            " WHERE excluded.until > cooldowns.until",
+            (subscription, window, until),
         )
 
-    def cool_all(self, cur: sqlite3.Cursor) -> list[sqlite3.Row]:
-        return cur.execute("SELECT * FROM cooldowns").fetchall()
-
-    # --- 去重 ---
-    def dedup_get(self, cur: sqlite3.Cursor, client: str, request_id: str) -> sqlite3.Row | None:
-        return cur.execute(
-            "SELECT * FROM dedup WHERE client = ? AND request_id = ?", (client, request_id)
-        ).fetchone()
-
-    def dedup_put(
-        self, cur: sqlite3.Cursor, client: str, request_id: str,
-        status: int, body: dict, created_at: str,
+    # --- 稽核（只追加） ---
+    def audit_add(
+        self,
+        cur: sqlite3.Cursor,
+        ts: str,
+        subscription: str,
+        action: str,
+        agent: str | None = None,
+        window: str | None = None,
+        until: str | None = None,
     ) -> None:
         cur.execute(
-            "INSERT INTO dedup (client, request_id, status, body, created_at)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(client, request_id) DO NOTHING",
-            (client, request_id, status, json.dumps(body), created_at),
+            "INSERT INTO audit (ts, subscription, action, agent, window, until)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (ts, subscription, action, agent, window, until),
         )
 
-    def dedup_prune(self, cur: sqlite3.Cursor, cutoff: str) -> None:
-        cur.execute("DELETE FROM dedup WHERE created_at < ?", (cutoff,))
-
-    # --- 重建 ---
-    def rebuild(self) -> None:
-        """從 events 重建現況（leases／cooldowns／clients；dedup 沿用原表）。"""
-        with self.txn() as cur:
-            rows = cur.execute(
-                "SELECT ts, type, client, lease_id, subscription, payload"
-                " FROM events ORDER BY seq"
+    def audit_all(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, ts, subscription, action, agent, window, until"
+                " FROM audit ORDER BY seq"
             ).fetchall()
-            cur.execute("DELETE FROM leases")
-            cur.execute("DELETE FROM cooldowns")
-            cur.execute("DELETE FROM clients")
-            for row in rows:
-                self._apply(cur, row)
-
-    def _apply(self, cur: sqlite3.Cursor, row: sqlite3.Row) -> None:
-        p = json.loads(row["payload"] or "{}")
-        t = row["type"]
-        if t == "client_added":
-            # 雜湊不可逆，記進事件不洩漏憑證；重建時還原身分。
-            cur.execute(
-                "INSERT INTO clients (name, cred_hash, created_at, revoked_at, role)"
-                " VALUES (?, ?, ?, NULL, ?)"
-                " ON CONFLICT(name) DO UPDATE SET"
-                " cred_hash = excluded.cred_hash, created_at = excluded.created_at,"
-                " revoked_at = NULL, role = excluded.role",
-                (p["name"], p.get("cred_hash", ""), p["created_at"], p.get("role", "client")),
-            )
-        elif t == "client_revoked":
-            cur.execute(
-                "UPDATE clients SET revoked_at = ? WHERE name = ?", (p["revoked_at"], p["name"])
-            )
-        elif t == "granted":
-            cur.execute(
-                "INSERT OR IGNORE INTO leases (lease_id, client, worker, role, agent,"
-                " instance, subscription, model, purpose, preferences,"
-                " status, granted_at, confirm_by, started_at, expires_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'granted', ?, ?, NULL, NULL)",
-                (
-                    p["lease_id"], p["client"], p["worker"], p["role"], p["agent"],
-                    p["instance"], p["subscription"], p.get("model"), p.get("purpose"),
-                    json.dumps(p["preferences"]) if p.get("preferences") is not None else None,
-                    p["granted_at"], p["confirm_by"],
-                ),
-            )
-        elif t == "started":
-            cur.execute(
-                "UPDATE leases SET status = 'active', started_at = ?, expires_at = ?"
-                " WHERE lease_id = ?",
-                (p["started_at"], p["expires_at"], p["lease_id"]),
-            )
-        elif t == "renewed":
-            cur.execute(
-                "UPDATE leases SET expires_at = ? WHERE lease_id = ?", (p["expires_at"], p["lease_id"])
-            )
-        elif t == "released":
-            cur.execute(
-                "UPDATE leases SET status = 'released' WHERE lease_id = ?", (p["lease_id"],)
-            )
-        elif t == "expired":
-            cur.execute(
-                "UPDATE leases SET status = 'expired' WHERE lease_id = ?", (p["lease_id"],)
-            )
-        elif t == "superseded":
-            cur.execute(
-                "UPDATE leases SET status = 'superseded' WHERE lease_id = ?", (p["lease_id"],)
-            )
-        elif t == "lease_revoked":
-            cur.execute(
-                "UPDATE leases SET status = 'revoked' WHERE lease_id = ?", (p["lease_id"],)
-            )
-        elif t == "cooling":
-            cur.execute(
-                "INSERT INTO cooldowns (subscription, until, signal, updated_at)"
-                " VALUES (?, ?, ?, ?)"
-                " ON CONFLICT(subscription) DO UPDATE SET"
-                " until = excluded.until, signal = excluded.signal,"
-                " updated_at = excluded.updated_at",
-                (p["subscription"], p["until"], p.get("signal"), p.get("updated_at", "")),
-            )
-        # requested／denied／usage 不影響現況表，只留事件。
+            return [dict(r) for r in rows]

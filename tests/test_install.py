@@ -2,6 +2,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -9,6 +10,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 INSTALL_SH = os.path.join(REPO_ROOT, "deploy", "install.sh")
 RUN_WRAPPER = os.path.join(REPO_ROOT, "deploy", "llmgateway-run")
 SERVICE_UNIT = os.path.join(REPO_ROOT, "deploy", "llmgateway.service")
+TUNNEL_DAEMON = os.path.join(REPO_ROOT, "deploy", "llmgateway-tunnel")
+TUNNEL_UNIT = os.path.join(REPO_ROOT, "deploy", "llmgateway-tunnel.service")
 
 TOOLS_LIST = [
     "mkdir", "mktemp", "chmod", "mv", "ln", "rm", "cat", "date",
@@ -69,6 +72,17 @@ if [[ -n "${SERVICE_MARKER:-}" ]]; then
 else
     cat "${REAL_SERVICE:?}" > "$dest/deploy/llmgateway.service"
 fi
+if [[ -n "${TUNNEL_MARKER:-}" ]]; then
+    printf '#!/bin/sh\\n# %s\\nexit 0\\n' "$TUNNEL_MARKER" > "$dest/deploy/llmgateway-tunnel"
+else
+    cat "${REAL_TUNNEL:?}" > "$dest/deploy/llmgateway-tunnel"
+fi
+chmod +x "$dest/deploy/llmgateway-tunnel"
+if [[ -n "${TUNNEL_UNIT_MARKER:-}" ]]; then
+    printf '[Unit]\\n# %s\\n' "$TUNNEL_UNIT_MARKER" > "$dest/deploy/llmgateway-tunnel.service"
+else
+    cat "${REAL_TUNNEL_UNIT:?}" > "$dest/deploy/llmgateway-tunnel.service"
+fi
 exit 0
 """
         py_script = """#!/usr/bin/env bash
@@ -86,7 +100,11 @@ if [[ "$*" == *"is-active"* ]]; then
         echo "fake systemctl: no bus" >&2
         exit 1
     fi
-    if [[ "${SYS_STATE:-inactive}" == "active" ]]; then
+    state="${SYS_STATE:-inactive}"
+    if [[ "$*" == *"llmgateway-tunnel.service"* ]]; then
+        state="${SYS_TUNNEL_STATE:-$state}"
+    fi
+    if [[ "$state" == "active" ]]; then
         exit 0
     else
         exit 3
@@ -94,15 +112,20 @@ if [[ "$*" == *"is-active"* ]]; then
 fi
 exit 0
 """
+        systemd_run_script = """#!/usr/bin/env bash
+echo "systemd-run $*" >> "${SANDBOX:?}/systemd-run-argv.log"
+exit 0
+"""
         curl_script = """#!/usr/bin/env bash
 echo "curl $*" >> "${SANDBOX:?}/curl-argv.log"
-printf '%s' "${CURL_CODE:-401}"
+printf '%s' "${CURL_CODE:-200}"
 exit "${CURL_RC:-0}"
 """
         for name, content in [
             ("git", git_script),
             ("python3", py_script),
             ("systemctl", sys_script),
+            ("systemd-run", systemd_run_script),
             ("curl", curl_script),
         ]:
             target = os.path.join(self.fakebin, name)
@@ -110,11 +133,11 @@ exit "${CURL_RC:-0}"
                 f.write(content)
             os.chmod(target, 0o755)
 
-        # nopy: symlink git, systemctl, curl
-        for name in ["git", "systemctl", "curl"]:
+        # nopy: symlink git, systemctl, systemd-run, curl
+        for name in ["git", "systemctl", "systemd-run", "curl"]:
             os.symlink(os.path.join(self.fakebin, name), os.path.join(self.fakebin_nopy, name))
 
-        # nosys: symlink git, python3, curl
+        # nosys: symlink git, python3, curl（沒有 systemctl）
         for name in ["git", "python3", "curl"]:
             os.symlink(os.path.join(self.fakebin, name), os.path.join(self.fakebin_nosys, name))
 
@@ -126,11 +149,17 @@ exit "${CURL_RC:-0}"
             "HOME": home,
             "REAL_WRAPPER": RUN_WRAPPER,
             "REAL_SERVICE": SERVICE_UNIT,
+            "REAL_TUNNEL": TUNNEL_DAEMON,
+            "REAL_TUNNEL_UNIT": TUNNEL_UNIT,
         }
         if path_mode == "full":
             env["PATH"] = f"{self.fakebin}:{self.tools}"
+            env["LGW_SYSTEMCTL"] = os.path.join(self.fakebin, "systemctl")
+            env["LGW_SYSTEMD_RUN"] = os.path.join(self.fakebin, "systemd-run")
         elif path_mode == "nopy":
             env["PATH"] = f"{self.fakebin_nopy}:{self.tools}"
+            env["LGW_SYSTEMCTL"] = os.path.join(self.fakebin_nopy, "systemctl")
+            env["LGW_SYSTEMD_RUN"] = os.path.join(self.fakebin_nopy, "systemd-run")
         elif path_mode == "nosys":
             env["PATH"] = f"{self.fakebin_nosys}:{self.tools}"
         if env_overrides:
@@ -159,10 +188,31 @@ exit "${CURL_RC:-0}"
         self.assertIn("ExecReload=/bin/kill -HUP $MAINPID", svc_content)
         self.assertNotIn(".mylinuxpool", svc_content)
 
+        self.assertTrue(os.path.isfile(TUNNEL_DAEMON))
+        self.assertTrue(os.access(TUNNEL_DAEMON, os.X_OK))
+        with open(TUNNEL_DAEMON, "r", encoding="utf-8") as f:
+            self.assertEqual(f.readline().strip(), "#!/usr/bin/env python3")
+
+        self.assertTrue(os.path.isfile(TUNNEL_UNIT))
+        with open(TUNNEL_UNIT, "r", encoding="utf-8") as f:
+            tunnel_content = f.read()
+        self.assertIn("ExecStart=%h/.local/bin/llmgateway-tunnel", tunnel_content)
+        self.assertIn("After=llmgateway.service", tunnel_content)
+        self.assertIn("Restart=always", tunnel_content)
+        self.assertIn("RestartSec=10", tunnel_content)
+        self.assertIn("RestartPreventExitStatus=78", tunnel_content)
+
         # bash -n syntax checks
         res = subprocess.run(["bash", "-n", INSTALL_SH], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         res = subprocess.run(["bash", "-n", RUN_WRAPPER], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        res = subprocess.run(
+            [sys.executable, "-m", "py_compile", TUNNEL_DAEMON],
+            capture_output=True,
+            text=True,
+        )
         self.assertEqual(res.returncode, 0, res.stderr)
 
     def test_first_install(self):
@@ -173,10 +223,18 @@ exit "${CURL_RC:-0}"
         self.assertTrue(os.path.isfile(env_file))
         with open(env_file, "r", encoding="utf-8") as f:
             env_content = f.read()
-        self.assertIn('LGW_API_HOSTS="127.0.0.1"', env_content)
         self.assertIn('LGW_API_PORT="8480"', env_content)
-        self.assertIn('LGW_BOARD_PORT="8481"', env_content)
-        self.assertIn('LGW_USAGE="1"', env_content)
+        self.assertNotIn("LGW_API_HOSTS", env_content)
+        self.assertNotIn("LGW_BOARD_PORT", env_content)
+        self.assertNotIn("LGW_USAGE", env_content)
+
+        tunnel_env_file = os.path.join(self.home, ".config", "llmgateway", "tunnel.env")
+        self.assertTrue(os.path.isfile(tunnel_env_file))
+        with open(tunnel_env_file, "r", encoding="utf-8") as f:
+            tunnel_env_content = f.read()
+        for key in ["RENDEZVOUS", "IDENTITY", "KNOWN_HOSTS", "REMOTE_API", "REMOTE_SSH", "LOCAL_API", "PROBE_INTERVAL", "PROBE_FAILS"]:
+            self.assertIn(f"{key}=\n", tunnel_env_content)
+        self.assertNotIn("sshproxy@", tunnel_env_content)
 
         state_dir = os.path.join(self.home, ".local", "state", "llmgateway")
         self.assertTrue(os.path.isdir(state_dir))
@@ -204,12 +262,25 @@ exit "${CURL_RC:-0}"
         installed_svc = os.path.join(self.home, ".config", "systemd", "user", "llmgateway.service")
         self.assertTrue(os.path.isfile(installed_svc))
 
+        installed_tunnel = os.path.join(self.home, ".local", "bin", "llmgateway-tunnel")
+        self.assertTrue(os.path.isfile(installed_tunnel))
+        self.assertTrue(os.access(installed_tunnel, os.X_OK))
+
+        installed_tunnel_unit = os.path.join(
+            self.home, ".config", "systemd", "user", "llmgateway-tunnel.service"
+        )
+        self.assertTrue(os.path.isfile(installed_tunnel_unit))
+
         git_log = self.read_log("git")
         self.assertIn("clone --depth 1 --branch lgw-v0.1.0 https://github.com/FATESAIKOU/LLMGateway", git_log)
 
         sys_log = self.read_log("systemctl")
         self.assertIn("daemon-reload", sys_log)
         self.assertIn("enable --now llmgateway.service", sys_log)
+        self.assertIn("enable llmgateway-tunnel.service", sys_log)
+        self.assertIn("start llmgateway-tunnel.service", sys_log)
+        self.assertNotIn("stop llmgateway-tunnel.service", sys_log)
+        self.assertNotIn("restart llmgateway-tunnel.service", sys_log)
 
         leftovers = [f for f in os.listdir(share_dir) if f.startswith(".")]
         self.assertEqual(leftovers, [])
@@ -219,9 +290,14 @@ exit "${CURL_RC:-0}"
         self.assertEqual(res.returncode, 0, res.stderr)
 
         env_file = os.path.join(self.home, ".config", "llmgateway", "llmgateway.env")
-        custom_env = 'LGW_API_HOSTS="127.0.0.1 10.9.9.9"\nLGW_API_PORT="9999"\nLGW_BOARD_PORT="9998"\nLGW_USAGE="0"\n'
+        custom_env = 'LGW_API_PORT="9999"\n'
         with open(env_file, "w", encoding="utf-8") as f:
             f.write(custom_env)
+
+        tunnel_env_file = os.path.join(self.home, ".config", "llmgateway", "tunnel.env")
+        custom_tunnel_env = "RENDEZVOUS=sshproxy@example.invalid:22\nIDENTITY=/tmp/id\nKNOWN_HOSTS=/tmp/kh\n"
+        with open(tunnel_env_file, "w", encoding="utf-8") as f:
+            f.write(custom_tunnel_env)
 
         keys_file = os.path.join(self.home, ".local", "state", "llmgateway", "keys.env")
         custom_keys = "SOME_KEY=fake-not-real\n"
@@ -233,11 +309,15 @@ exit "${CURL_RC:-0}"
 
         with open(env_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), custom_env)
+        with open(tunnel_env_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), custom_tunnel_env)
         with open(keys_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), custom_keys)
 
         sys_log = self.read_log("systemctl")
         self.assertIn("restart llmgateway.service", sys_log)
+        self.assertNotIn("restart llmgateway-tunnel.service", sys_log)
+        self.assertNotIn("stop llmgateway-tunnel.service", sys_log)
 
     def test_reinstall_same_tag_reuses_without_git_clone(self):
         res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
@@ -295,15 +375,16 @@ exit "${CURL_RC:-0}"
         res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
         self.assertEqual(res.returncode, 0, res.stderr)
 
-        # 0: Active, tag matches, probe 401
+        # 0: 兩個 unit 都 active、tag 相符、list 探針回 200
         res_ok = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "CURL_CODE": "401", "CURL_RC": "0"}
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
         )
         self.assertEqual(res_ok.returncode, 0, res_ok.stdout + res_ok.stderr)
 
         curl_log = self.read_log("curl")
-        self.assertIn("/v1/board", curl_log)
+        self.assertIn("/v1/subscriptions", curl_log)
+        self.assertNotIn("/v1/board", curl_log)
         self.assertNotIn("Authorization", curl_log)
 
         # 1: Service inactive
@@ -313,24 +394,34 @@ exit "${CURL_RC:-0}"
         )
         self.assertEqual(res_inact.returncode, 1)
 
+        # 1: Tunnel inactive（例如 tunnel.env 還沒填、以 78 結束）
+        res_tunnel_inact = self.run_install(
+            ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+            env_overrides={
+                "SYS_STATE": "active", "SYS_TUNNEL_STATE": "inactive",
+                "CURL_CODE": "200", "CURL_RC": "0",
+            }
+        )
+        self.assertEqual(res_tunnel_inact.returncode, 1)
+
         # 1: Tag mismatch
         tag_file = os.path.join(self.home, ".local", "share", "llmgateway", "lgw-v0.1.0", ".lgw-tag")
         with open(tag_file, "w", encoding="utf-8") as f:
             f.write("other-tag\n")
         res_mismatch = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "CURL_CODE": "401", "CURL_RC": "0"}
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
         )
         self.assertEqual(res_mismatch.returncode, 1)
         with open(tag_file, "w", encoding="utf-8") as f:
             f.write("lgw-v0.1.0\n")
 
-        # 1: Board returns non-401 (e.g. 200 or 500)
-        res_non401 = self.run_install(
+        # 1: list 回非 200（例如 401 或 500）
+        res_401 = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "401", "CURL_RC": "0"}
         )
-        self.assertEqual(res_non401.returncode, 1)
+        self.assertEqual(res_401.returncode, 1)
 
         res_500 = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
@@ -355,7 +446,7 @@ exit "${CURL_RC:-0}"
         # 2: systemctl fails / no bus
         res_sys_nobus = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "SYS_NOBUS": "1", "CURL_CODE": "401"}
+            env_overrides={"SYS_STATE": "active", "SYS_NOBUS": "1", "CURL_CODE": "200"}
         )
         self.assertEqual(res_sys_nobus.returncode, 2)
 
@@ -370,10 +461,10 @@ exit "${CURL_RC:-0}"
         res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
         self.assertEqual(res.returncode, 0, res.stderr)
 
-        # Active + 401 -> 0 even without --tag
+        # 兩個 unit active + 200 -> 0 even without --tag
         res_ok = self.run_install(
             ["--check", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "CURL_CODE": "401", "CURL_RC": "0"}
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
         )
         self.assertEqual(res_ok.returncode, 0)
 
@@ -383,7 +474,7 @@ exit "${CURL_RC:-0}"
             f.write("different-version-not-checked\n")
         res_ok_diff = self.run_install(
             ["--check", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "CURL_CODE": "401", "CURL_RC": "0"}
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
         )
         self.assertEqual(res_ok_diff.returncode, 0)
 
@@ -393,6 +484,13 @@ exit "${CURL_RC:-0}"
             env_overrides={"SYS_STATE": "inactive"}
         )
         self.assertEqual(res_inact.returncode, 1)
+
+        # Tunnel inactive -> 1
+        res_tunnel_inact = self.run_install(
+            ["--check", "--home", self.home],
+            env_overrides={"SYS_STATE": "active", "SYS_TUNNEL_STATE": "inactive", "CURL_CODE": "200"}
+        )
+        self.assertEqual(res_tunnel_inact.returncode, 1)
 
         # Probe returns 500 -> 1
         res_500 = self.run_install(
@@ -442,15 +540,20 @@ exit "${CURL_RC:-0}"
         self.assertEqual(res_notag.returncode, 2)
 
     def test_files_installed_from_new_version_deploy(self):
-        # Wrapper and unit must come from the checked out tag's deploy/, not from the running script's dir
+        # Wrapper, units and tunnel daemon must come from the checked out tag's
+        # deploy/, not from the running script's dir
         wrapper_marker = "TEST_WRAPPER_V2_MARKER_99"
         service_marker = "TEST_SERVICE_V2_MARKER_88"
+        tunnel_marker = "TEST_TUNNEL_V2_MARKER_77"
+        tunnel_unit_marker = "TEST_TUNNEL_UNIT_V2_MARKER_66"
 
         res = self.run_install(
             ["--tag", "lgw-v0.2.0", "--home", self.home],
             env_overrides={
                 "WRAPPER_MARKER": wrapper_marker,
                 "SERVICE_MARKER": service_marker,
+                "TUNNEL_MARKER": tunnel_marker,
+                "TUNNEL_UNIT_MARKER": tunnel_unit_marker,
             }
         )
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -464,6 +567,63 @@ exit "${CURL_RC:-0}"
         with open(installed_svc, "r", encoding="utf-8") as f:
             svc_content = f.read()
         self.assertIn(service_marker, svc_content)
+
+        installed_tunnel = os.path.join(self.home, ".local", "bin", "llmgateway-tunnel")
+        with open(installed_tunnel, "r", encoding="utf-8") as f:
+            tunnel_content = f.read()
+        self.assertIn(tunnel_marker, tunnel_content)
+
+        installed_tunnel_unit = os.path.join(
+            self.home, ".config", "systemd", "user", "llmgateway-tunnel.service"
+        )
+        with open(installed_tunnel_unit, "r", encoding="utf-8") as f:
+            tunnel_unit_content = f.read()
+        self.assertIn(tunnel_unit_marker, tunnel_unit_content)
+
+    def test_tunnel_files_changed_schedules_delayed_restart(self):
+        first = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        # v0.2.0 changes the tunnel daemon and unit; tunnel is active.
+        second = self.run_install(
+            ["--tag", "lgw-v0.2.0", "--home", self.home],
+            env_overrides={
+                "SYS_STATE": "active",
+                "TUNNEL_MARKER": "TEST_TUNNEL_V2_CHANGED",
+                "TUNNEL_UNIT_MARKER": "TEST_TUNNEL_UNIT_V2_CHANGED",
+            },
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+        run_log = self.read_log("systemd-run")
+        self.assertIn("--user --on-active=60 --unit=llmgateway-tunnel-restart", run_log)
+        self.assertIn("--user restart llmgateway-tunnel.service", run_log)
+
+        sys_log = self.read_log("systemctl")
+        self.assertIn("restart llmgateway.service", sys_log)
+        self.assertNotIn("restart llmgateway-tunnel.service", sys_log)
+        self.assertNotIn("stop llmgateway-tunnel.service", sys_log)
+
+    def test_unchanged_tunnel_files_no_delayed_restart(self):
+        first = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = self.run_install(
+            ["--tag", "lgw-v0.1.0", "--home", self.home],
+            env_overrides={"SYS_STATE": "active"},
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.read_log("systemd-run"), "")
+
+    def test_tunnel_inactive_is_started_but_install_still_succeeds(self):
+        # 第一次安裝時 tunnel.env 還是空範本，守護程式以 78 結束是預期；
+        # install.sh 只負責 start，不能因此失敗。
+        res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        sys_log = self.read_log("systemctl")
+        self.assertIn("enable llmgateway-tunnel.service", sys_log)
+        self.assertIn("start llmgateway-tunnel.service", sys_log)
+        self.assertEqual(self.read_log("systemd-run"), "")
 
     def test_version_retention_only_two_versions_and_current_never_deleted(self):
         share_dir = os.path.join(self.home, ".local", "share", "llmgateway")
