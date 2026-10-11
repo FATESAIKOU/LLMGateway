@@ -287,6 +287,22 @@ while :; do sleep 0.05; done
         )
         self.assertTrue(wait_until(lambda: not is_pid_alive(child_pid), timeout=5))
 
+    def test_switch_rendezvous_target_updates_argv(self):
+        other_user = "otheruser"
+        other_host = "other-target.invalid"
+        other_port = "2222"
+        self.write_config(
+            RENDEZVOUS="%s@%s:%s" % (other_user, other_host, other_port)
+        )
+        self.start_daemon()
+        self.assertTrue(wait_until(lambda: "tunnel_up" in self.read_stderr()))
+        self.assertTrue(wait_until(lambda: "argv:" in self.read_ssh_log()))
+        ssh_log = self.read_ssh_log()
+        self.assertIn("-p " + other_port, ssh_log)
+        self.assertIn(other_user + "@" + other_host, ssh_log)
+        self.assertNotIn(FAKE_HOST, ssh_log)
+        self.assertEqual(self.stop_daemon(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
