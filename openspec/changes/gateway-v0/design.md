@@ -189,7 +189,7 @@
   - 判讀：用 `herdr agent read` 讀畫面，交給 `lgw` 的規則判讀。
   - 安全結束：`herdr agent send-keys <name> ctrl+c` 讓 agent 收尾，由 agora continue 做最後寫回；5 秒後還在就對 process group 送 SIGTERM，再 5 秒送 SIGKILL，最後才 `pane close`。
   - 打斷一輪而不結束 agent 時用 Esc（Claude Code 1 次、opencode 2 次）。
-  - 開起來之後呼叫 `start` 確認租約。
+  - 開起來之後呼叫 `start` 確認租約：時機在 agent 的 prompt 出現之後、送 harness 之前；agent 開不起來就不呼叫 `start`，直接 `release`。
   - 接回：`agora continue session <Session> --agent <agent> --sync-period <分鐘>`，不用 `--fork`；session id 的寫法照 sidecar 既有的慣例。
   - 這些都是 sidecar 已有、已審過的生命週期程式（MyAiStorage#31 的 D4 與 10-11 的 spike）。
 - **誰呼叫**：
