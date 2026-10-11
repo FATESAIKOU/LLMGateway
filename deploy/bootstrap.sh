@@ -328,7 +328,7 @@ step_sshd() {
 
     local ss_out=""
     ss_out="$(ss -ltn 2>/dev/null || true)"
-    if ! grep -E '(:22[[:space:]]|127\.0\.0\.1:22|0\.0\.0\.0:22|\*:22|\[::\]:22)' <<< "$ss_out" >/dev/null 2>&1; then
+    if ! grep -E '(127\.0\.0\.1:22|0\.0\.0\.0:22|\*:22|\[::\]:22|:::22)([[:space:]]|$)' <<< "$ss_out" >/dev/null 2>&1; then
         reasons+=("sshd 未在 127.0.0.1:22 監聽 (需於 sshd_config 加入 ListenAddress 127.0.0.1:22 並重啟 sshd)")
     fi
 
