@@ -1,67 +1,45 @@
 ## Purpose
 
-把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管，讓 worker、Mac 與之後的手機都只在租約期間透過租用拿到其中一把，其他地方不再放 key。
+把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；只有持有讀取 token 的客戶端能經 get 拿到，其他地方不再放 key。
 
 ## ADDED Requirements
 
 ### Requirement: key 只保管在一處
-五把 key 的來源 SHALL 是 LLMGateway repo 的 GitHub secret，值由本人設定。LLMGateway SHALL 經由一個只能手動觸發的部署流程，把 key 寫到池內常駐 provider 上、只有服務帳號讀得到的檔案（權限 0600）。部署流程 MUST NOT 把值放在命令列或寫進 log。
+五把 key 的來源 SHALL 是 LLMGateway repo 的 GitHub secret，值由本人設定。LLMGateway SHALL 經由一個只能手動觸發的部署流程，把 key 寫到放服務那台、只有服務帳號讀得到的檔案（權限 0600）。部署流程 MUST NOT 把值放在命令列或寫進 log。
 
 #### Scenario: 部署
 - **WHEN** 本人改了某把 key 的 secret 並手動觸發部署
-- **THEN** provider 上的 key 檔更新，服務重讀後新出租的租約帶新值，部署的 log 裡只出現 secret 名稱
+- **THEN** 那台的 key 檔更新，服務重讀後 get 回新值，部署的 log 裡只出現 secret 名稱
 
 #### Scenario: 權限
-- **WHEN** 檢查 provider 上的 key 檔
+- **WHEN** 檢查那台的 key 檔
 - **THEN** 檔案權限是 0600，擁有者是服務帳號
 
 ### Requirement: 值不外洩
-key 的值 MUST NOT 出現在 repo、服務的資料庫（包含事件紀錄與去重用的回覆）、服務的 log、狀態板、錯誤訊息或任何客戶端的檔案與 log。值只出現在核准租約時給客戶端的那一次回覆，以及 agent 的環境。
+key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務的 log、list 的回覆、錯誤訊息。值只出現在 get 的回覆，以及由 sidecar 開的 agent 的環境。
 
 #### Scenario: 掃描
-- **WHEN** 以憑證樣式掃描 repo、服務資料庫的每一張表、服務 log 與狀態板的輸出
+- **WHEN** 以憑證樣式掃描 repo、服務資料庫、服務 log 與 list 的回覆
 - **THEN** 沒有任何命中
 
-#### Scenario: 錯誤時
-- **WHEN** 某個上游的狀態查詢失敗
-- **THEN** 服務記下錯誤類型與 HTTP 狀態碼，不記下請求標頭或含 key 的內容
+### Requirement: 一類機器一把讀取 token
+服務 SHALL 以「一類機器一把」的讀取 token 認證客戶端：
+- 池的 worker 共用一把（`pool-worker`）；
+- Mac 一把；
+- 之後的手機一把。
 
-### Requirement: 客戶端憑證
-每個客戶端（每台 worker 的 sidecar、Mac、之後的手機）SHALL 持有自己的客戶端憑證，用來向服務證明身分。服務 MUST 只保存客戶端憑證的雜湊，並能單獨撤銷任一客戶端。客戶端憑證不是上游 key，不能直接打任何上游。
+這些 token 與 key 一起由部署流程放到那台，服務只保存雜湊。換掉某一類的 token（改 secret、重新部署）SHALL 讓舊的立即失效。沒有發證或撤證的 API。
 
-#### Scenario: 撤銷
-- **WHEN** 某台 worker 的客戶端憑證被撤銷
-- **THEN** 該客戶端所有未結束的租約記為 revoked，之後的申請、續期、回報都被拒，其他客戶端不受影響
+#### Scenario: 沒有 token
+- **WHEN** 請求沒有帶 token 或帶錯
+- **THEN** 服務回 401，不回任何 subscription 資料
 
-#### Scenario: 核對憑證
-- **WHEN** 持有有效客戶端憑證的客戶端呼叫 whoami
-- **THEN** 服務回 200 與該客戶端的名稱，不產生租約事件，也不打任何上游
-
-#### Scenario: 沒有憑證
-- **WHEN** 請求沒有帶客戶端憑證或帶錯
-- **THEN** 服務回 401，不留下租約事件
-
-### Requirement: 發證用的管理憑證
-服務 SHALL 支援 issuer 角色的客戶端憑證，只能用管理 API 發撤客戶端，不能租用；一般客戶端 MUST NOT 能用管理 API。管理 API MUST 只接受從 loopback 來的請求，issuer 只能發撤名字符合 `worker-*` 的客戶端。同名重複發證時，服務 MUST 先撤掉舊的憑證（連同它未結束的租約）再回新的。
-
-#### Scenario: 發證
-- **WHEN** issuer 從 loopback 以名字 `worker-a1` 發證
-- **THEN** 服務回新的憑證，`worker-a1` 之後可以租用
-
-#### Scenario: 同名重發
-- **WHEN** `worker-a1` 已有憑證與一張 active 租約，issuer 再以同名發證
-- **THEN** 舊憑證失效、舊租約記為 revoked，只有新憑證有效
-
-#### Scenario: 角色與來源
-- **WHEN** 一般客戶端呼叫管理 API，或 issuer 呼叫租用 API，或管理請求不是從 loopback 來的
-- **THEN** 服務回 403
-
-#### Scenario: 名字不在範圍
-- **WHEN** issuer 發撤名字為 `mac-x` 的客戶端
-- **THEN** 服務回 403，不發也不撤
+#### Scenario: 換掉 worker 的 token
+- **WHEN** 本人換掉 `pool-worker` 的 token 並重新部署
+- **THEN** 舊 token 之後一律 401，新 token 可以用
 
 ### Requirement: 服務不對外
-租用服務 SHALL 只綁在 provider 的 loopback，以及池內客戶端連得到的內部介面；MUST NOT 對網際網路開放。Mac 與手機 SHALL 經池的 SSH 跳板以埠轉送連入。
+服務 SHALL 只綁在那台的 loopback，以及同一台容器看得到的 docker bridge 位址；MUST NOT 對網際網路開放。Mac 與手機 SHALL 經池的 SSH 跳板以埠轉送連入；別台的 worker 經 MyLinuxPool 的隧道連入。
 
 #### Scenario: 從外部連
 - **WHEN** 從池外直接連服務的埠

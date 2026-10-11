@@ -1,242 +1,106 @@
-# LLMGateway v0：實體圖、控制時序圖、介面圖
+# LLMGateway v3：實體、控制時序、介面（條列，供 PMO 畫圖）
 
-> 依本人 2026-10-11 晚的回饋整理：介面簡潔、需要抽象時介面與實作分離、不要脆弱的相依、不基於 herdr、LLMGateway 跟 MyLinuxPool 無關。
-> sidecar 那一側的完整設計在 MyAiStorage 的 `docs/proposals/aicompany-design-v2.md`（aistorage-pm），本檔只畫 LLMGateway 與它的接點，兩份用同一套名詞。
-> 機器名不寫：「放服務的那台」是本人選定的常駐 provider。
+> 依本人 2026-10-11 夜的方向：LLMGateway 只有 list、get、登錄冷卻三個介面；相依只有 sidecar→agora、sidecar→LLMGateway。sidecar 那一側見 MyAiStorage 的 `docs/proposals/aicompany-design-v3.md`，名詞一致。機器名不寫，「放服務的那台」是本人選定的常駐 provider。
 
-## 1. 實體圖：有哪些東西、誰碰誰
+## 1. 實體圖
 
-```mermaid
-flowchart LR
-  subgraph GH["GitHub（LLMGateway repo）"]
-    SEC["secret：五把 key＋部署用連線資訊"]
-    WF["workflow：deploy-keys、deploy-service<br/>（手動觸發、本人核准）"]
-  end
-  subgraph JUMP["池的跳板機（MyLinuxPool）"]
-    FWD["部署金鑰：只能轉發到那台的隧道埠<br/>（MyLinuxPool#68）"]
-  end
-  subgraph HOST["放服務的那台（跑兩個服務）"]
-    subgraph LG["帳號 llmgw（LLMGateway）"]
-      DEP["remote-deploy.sh<br/>（keys／upgrade）"]
-      SVC["lgwd：保管＋租用＋冷卻＋狀態板"]
-      KF["keys.env（0600）"]
-      DB["SQLite：事件與租約"]
-    end
-    POOL["池的管理帳號（MyLinuxPool 的服務）"]
-  end
-  subgraph WK["worker 容器（MyLinuxPool 建立）"]
-    SCW["sidecar daemon<br/>＋ LgwCredentialSource"]
-    AW["agent（Claude Code／opencode）"]
-  end
-  subgraph MAC["Mac"]
-    SCM["sidecar daemon<br/>＋ LgwCredentialSource"]
-    AM["agent"]
-  end
-  UP["上游：Anthropic、OpenRouter、Ollama Cloud、OpenCode Zen"]
-  MLPWF["MyLinuxPool 的 create-／delete-worker"]
+**實體**
+- GitHub（LLMGateway repo）：
+  - secret：五把 key、各類機器的讀取 token、部署連線資訊；
+  - workflow：`deploy-keys`、`deploy-service`（手動觸發、本人核准）。
+- 池的跳板機（MyLinuxPool）：一行部署金鑰，只能轉發到那台的隧道埠。
+- 放服務的那台：跑兩個服務。
+  - 帳號 `llmgw`（LLMGateway）：
+    - `remote-deploy.sh`（動詞 `keys`、`upgrade`）；
+    - `lgwd`（list／get／登錄冷卻）；
+    - `keys.env`（0600，key 與 token）；
+    - SQLite（冷卻、稽核）。
+  - 池的管理帳號（MyLinuxPool 的服務）：和 LLMGateway 無關。
+- worker 容器（MyLinuxPool 建立）：
+  - sidecar daemon；
+  - agent（Claude Code／opencode）；
+  - `pool-worker` 的讀取 token（MyLinuxPool 掛進來）。
+- Mac：sidecar daemon、agent、Mac 的讀取 token。
+- 上游：Anthropic、OpenRouter、Ollama Cloud、OpenCode Zen。
+- agora：Session 的保存與接續。
 
-  SEC --> WF
-  WF -- "SSH 經跳板，以 llmgw 登入" --> FWD --> DEP
-  DEP -- "寫入" --> KF
-  DEP -- "升級＋重啟" --> SVC
-  SVC -- "讀" --> KF
-  SVC --- DB
-  SCW -- "租用 API（經 MyLinuxPool#69 的路）" --> SVC
-  SCM -- "租用 API（經 SSH 埠轉送）" --> SVC
-  MLPWF -- "管理 API（發撤 worker 憑證，MyLinuxPool#70）" --> SVC
-  SCW -- "子行程＋env" --> AW
-  SCM -- "子行程＋env" --> AM
-  AW -- "直接連（用租到的 key）" --> UP
-  AM -- "直接連" --> UP
-```
-
-| 誰 | 碰誰 | 怎麼碰 | 不做什麼 |
-|---|---|---|---|
-| deploy workflow | 那台的 `llmgw` | SSH 經跳板；`command=` 只能跑部署腳本的兩個動詞 | 不開 shell、不讀 key 以外的東西 |
-| lgwd | key 檔、SQLite | 讀 key；記事件 | **不轉送模型請求**、不碰 sidecar、不碰 agent |
-| sidecar | lgwd | 透過 `CredentialSource`（實作 `LgwCredentialSource`）呼叫租用 API | 不保存 key；sidecar 本體不知道 LLMGateway |
-| agent | 上游 | 用 sidecar 給的 env 直接連 | 不經 LLMGateway；Claude 訂閱 token 只給原版 Claude Code |
-| MyLinuxPool | lgwd | 管理 API（只綁 loopback、只限 `worker-*`） | 不碰 LLMGateway 的資料庫與 key |
+**連線（誰 → 誰：做什麼）**
+- workflow → 跳板 → `llmgw`：SSH，只能跑部署腳本；寫 key 與 token、升級。
+- 部署腳本 → `lgwd`：重讀或重啟。
+- sidecar（worker 與 Mac） → `lgwd`：list、get、登錄冷卻（帶讀取 token）。
+  - worker 經 MyLinuxPool#69 的路，一律連本機固定埠；
+  - Mac 經 SSH 埠轉送。
+- sidecar → agent：開子行程，env 由 AgentDriver 從 get 的結果推出，不上命令列。
+- sidecar → agora：開啟時繼承 Session，停掉時寫回。
+- agent → 上游：直接連。
+- **沒有的連線**：
+  - `lgwd` 不連 sidecar、不連 agent、不連 agora、不連上游；
+  - MyLinuxPool 不呼叫 `lgwd` 的任何 API（只掛 token）；
+  - Angareion 獨立。
 
 ## 2. 控制時序圖
 
-### 2.1 開一個 agent（拿到一把 key）
+### 2.1 開一個 agent
+1. 控制者 → sidecar：`open {id 或 agent 種類}`。
+2. sidecar → `lgwd`：list（看 `available`、`agents`、`priority`）。
+3. sidecar 挑出一把（`available` 而且 `agents` 含要開的種類、`priority` 最前）。
+4. sidecar → `lgwd`：get(id, agent)。`lgwd` 回共通 JSON（含 key），記一筆稽核。
+5. sidecar → AgentDriver：由 JSON 推出 env，launch 子行程。
+6. sidecar → agora：繼承指定的 Session。
 
-```mermaid
-sequenceDiagram
-  participant C as 控制者（PMO／人／排程）
-  participant SC as sidecar
-  participant CS as LgwCredentialSource
-  participant L as lgwd
-  participant D as AgentDriver
-  C->>SC: open（agent 種類、Session、模型偏好）
-  SC->>CS: acquire（agent 種類、模型偏好）
-  CS->>L: POST /v1/leases（worker、角色、agent、instance、preferences）
-  L-->>CS: lease（env、unset、效期）或拒絕
-  CS-->>SC: env／unset
-  SC->>D: launch（子行程，env 不上命令列）
-  SC->>CS: started
-  CS->>L: POST /v1/leases/{id}/start
-  loop 每小時
-    CS->>L: POST /v1/leases/{id}/renew
-  end
-```
+### 2.2 額度用完、換一把（全部在 sidecar 內部，LLMGateway 只被呼叫）
+1. AgentDriver → sidecar：狀態＝額度用完（窗口 5h 或 1w，有重置時刻就帶）。
+2. sidecar → `lgwd`：登錄冷卻 `{window, resets_at}`。`lgwd` 記到重置＋2 分鐘，記一筆稽核。
+3. sidecar → `lgwd`：list，挑下一把（同 2.1 第 3 步）。
+4. 有能用的：
+   - sidecar → `lgwd`：get；
+   - sidecar → AgentDriver：stop（溫和）；
+   - sidecar → agora：寫回；
+   - sidecar → AgentDriver：用新 env launch，continue 同一個 Session。
+5. 沒有能用的：sidecar 停掉 agent、寫回，狀態記成「等額度」（附最早的冷卻結束時刻，從 list 看得到）。
+6. 冷卻時刻一過，list 自動回到 `available`。不需要任何人通知。
 
-### 2.2 額度用完、換一把（全部在 sidecar 內部；不是新的對外介面）
+### 2.3 部署 key 與 token
+1. 本人 → GitHub：手動觸發 `deploy-keys`，在 environment 核准。
+2. workflow → 跳板 → `llmgw`：SSH，動詞 `keys`；stdin 帶五把 key 與各類 token。
+3. 部署腳本：驗證 → 暫存檔 0600 → rename `keys.env` → 通知 `lgwd` 重讀。
+4. `lgwd`：重讀 key，token 只存雜湊；舊 token 立即失效。
 
-```mermaid
-sequenceDiagram
-  participant D as AgentDriver
-  participant SC as sidecar
-  participant CS as LgwCredentialSource
-  participant L as lgwd
-  participant AG as agora
-  D-->>SC: state = 額度用完（重置時刻）
-  SC->>CS: exhausted（訊號、重置時刻）
-  CS->>L: POST /v1/leases/{id}/exhausted
-  Note over L: 同一筆交易：那把冷卻到重置＋2 分鐘、原租約 superseded、依順序選下一把
-  alt 有下一把
-    L-->>CS: next（env、unset）
-    CS-->>SC: 新的 env
-    SC->>D: stop（溫和）→ 寫回 agora
-    SC->>AG: prepare（continue 同一個 Session）
-    SC->>D: launch（新的 env）
-    SC->>CS: started → POST start
-  else 全部冷卻
-    L-->>CS: 拒絕（最早重置時刻）
-    SC->>D: stop → 寫回；狀態記成「等額度」
-  end
-```
+### 2.4 升級服務
+1. 本人 → GitHub：手動觸發 `deploy-service`（輸入 tag），在 environment 核准。
+2. workflow → 跳板 → `llmgw`：動詞 `upgrade <tag>`。
+3. 安裝程式：固定 tag 取碼（已有就重用）、current 原子切換、裝 unit、重啟 `lgwd`；舊版本只留前一個。
 
-### 2.3 建 worker 時發憑證（MyLinuxPool#70）
+### 2.5 建 worker（MyLinuxPool）
+1. create-worker：照常建容器，並把 `pool-worker` 的讀取 token 像其他 `POOL_WORKER__*` 一樣掛進 worker。
+2. worker 裡的 sidecar 啟動後就能 list／get。LLMGateway 不參與，也不需要知道有新 worker。
 
-```mermaid
-sequenceDiagram
-  participant WF as MyLinuxPool create-worker
-  participant H as 放服務的那台（pool-ssh）
-  participant L as lgwd（loopback）
-  participant W as worker 容器
-  WF->>H: pool-ssh，stdin 帶 issuer 憑證
-  H->>L: POST /v1/admin/clients {name: worker-NAME}
-  L-->>H: token（同名就撤舊發新）
-  H->>W: stdin 寫入 /run/mlp-secrets/llmgateway-client-token
-  Note over W: sidecar 啟動時 GET /v1/whoami，用回來的 client 當租約的 worker
-```
+## 3. 介面圖
 
-### 2.4 部署 key 與升級
+**LLMGateway 對外（只有這三個）**
+- `list`：`GET /v1/subscriptions` → 所有 subscription 的共通 JSON，不含 key。
+- `get`：`GET /v1/subscriptions/{id}?agent=<種類>` → 一筆的共通 JSON，含 key。`agent` 不在 `agents` 裡就回 403，這是 Claude 條款的守門。
+- `登錄冷卻`：`POST /v1/subscriptions/{id}/cooldown {window: 5h|1w, resets_at?}`。
+- 認證：`Authorization: Bearer <一類機器一把的讀取 token>`。
 
-```mermaid
-sequenceDiagram
-  participant P as 本人
-  participant WF as deploy-keys／deploy-service
-  participant J as 跳板機
-  participant R as remote-deploy.sh（llmgw）
-  participant L as lgwd
-  P->>WF: 手動觸發＋在 environment 核准
-  WF->>J: ssh -J（只能轉發）
-  J->>R: 強制命令；動詞 keys 或 upgrade TAG
-  alt keys
-    R->>R: 驗證 stdin → 暫存檔 0600 → rename keys.env
-    R->>L: SIGHUP 重讀
-  else upgrade TAG
-    R->>R: install.sh --tag：固定 tag 取碼、current 原子切換、裝 unit
-    R->>L: 重啟
-  end
-```
+**共通 JSON schema（LLMGateway 與 sidecar 一致）**
+- `schema`、`id`、`provider`、`kind`（`claude-subscription`／`api-key`）；
+- `agents`（`claude-code`／`opencode`）、`priority`、`models{allow, default}`、`endpoint`；
+- `key`（只在 get）；
+- `cooldown{5h, 1w}`（各為 `{until}` 或 null）、`available`。
+- **不含**環境變數名：由 sidecar 的 AgentDriver 推出。
 
-## 3. 介面圖（必要而且只有這些）
+**LLMGateway 內部（介面與實作分開）**
+- `CredentialProvider`：一種 provider 一個實作（anthropic、openrouter、ollama-cloud、opencode-zen），負責 schema 中與 provider 有關的欄位。
+- 政策檔：priority、models、agents。是資料，不是介面。
+- 冷卻表、稽核紀錄：SQLite。
 
-（類別圖裡的參數與回傳只寫主要的；完整欄位見 design 決定 6、表格見下。）
+**sidecar 那一側用到 LLMGateway 的地方（MyAiStorage v3）**
+- sidecar 內部有一層包住 list／get／登錄冷卻（aistorage-pm 稱 `SubscriptionSource`）。挑把邏輯在這一層。
+- AgentDriver：把共通 JSON 變成 agent 的環境變數；判讀額度用完。可以用 `lgw.signals` 的規則表。
 
-```mermaid
-classDiagram
-  class LeaseAPI {
-    <<external lease>>
-    request_lease(worker, role, agent, instance, preferences) lease
-    start(lease_id)
-    renew(lease_id)
-    exhausted(lease_id, signal, resets_at) next
-    release(lease_id)
-  }
-  class AdminAPI {
-    <<external admin loopback>>
-    issue(name) token
-    revoke(name)
-  }
-  class ReadAPI {
-    <<external read>>
-    board()
-    whoami()
-  }
-  class CredentialProvider {
-    <<internal upstream kind>>
-    env_for(agent, key, model) env
-    usage(key) usage
-  }
-  class ClaudeSubscription
-  class OpenRouter
-  class OllamaCloud
-  class OpencodeZen
-  CredentialProvider <|.. ClaudeSubscription
-  CredentialProvider <|.. OpenRouter
-  CredentialProvider <|.. OllamaCloud
-  CredentialProvider <|.. OpencodeZen
-  class SelectionPolicy {
-    <<internal selection>>
-    choose(agent, candidates, preferences) subscription
-  }
-  class CredentialSource {
-    <<sidecar internal interface>>
-    acquire(agent, instance, preferences) LeaseOrRefusal
-    started(lease)
-    renew(lease) Lease
-    exhausted(lease, signal, resets_at) LeaseOrRefusal
-    release(lease)
-  }
-  class Lease {
-    lease_id
-    subscription
-    env
-    unset
-    expires_at
-  }
-  class Refusal {
-    reason
-    earliest_reset
-  }
-  CredentialSource ..> Lease
-  CredentialSource ..> Refusal
-  class LgwCredentialSource {
-    <<implementation in lgw>>
-  }
-  CredentialSource <|.. LgwCredentialSource
-  LgwCredentialSource ..> LeaseAPI : calls
-  LeaseAPI ..> SelectionPolicy : uses
-  LeaseAPI ..> CredentialProvider : uses
-  ReadAPI ..> CredentialProvider : usage
-```
-
-| 抽象 | 介面 | 這次的實作 | 換實作時不受影響的部分 |
-|---|---|---|---|
-| 租用（對外） | `LeaseAPI` 五個動作 | lgwd（HTTP＋SQLite） | sidecar、`LgwCredentialSource` 以外的所有人 |
-| 發證（對外） | `AdminAPI` 兩個動作 | lgwd | MyLinuxPool 的 create-／delete-worker |
-| 上游的種類 | `CredentialProvider` | Claude 訂閱、OpenRouter、Ollama Cloud、OpenCode Zen | 租用 API、選把規則、sidecar |
-| 選把規則 | `SelectionPolicy` | 固定順序＋冷卻＋上限（之後：優先模型＋底線） | 租用 API、上游實作 |
-| 拿 key 的方式（sidecar 側） | `CredentialSource` | `LgwCredentialSource`（本機開發可換成讀環境變數） | sidecar 本體、agent driver |
-
-`CredentialSource` 的暫定形狀（aistorage-pm 提，**還沒定案**，等本人整理好 v2 的疑問再確認）：
-
-- 同步呼叫。一台 sidecar 同時開好幾個 agent，所以 `acquire` 回一個租約 handle（`Lease`），之後的 `started`、`renew`、`exhausted`、`release` 都帶它。
-- `acquire` 與 `exhausted` 回 `Lease` 或 `Refusal{reason, earliest_reset}`。拒絕是正常回傳，不是例外。
-- 只有「無法確認」（連不上、5xx）才拋 `CredentialUnavailable`，sidecar 照「等一下再試」處理。
-- `Preferences{models（有順序）, floor}`。
-- 角色、base URL、token 路徑在建構 `LgwCredentialSource` 時由設定給；worker 名由它自己呼叫 `whoami` 取得。
-| 額度用完的判讀 | sidecar 的 `AgentDriver` 回報正規化狀態 | Claude Code、opencode 的 driver | sidecar 本體、LLMGateway |
-
-**和前一版相比拿掉的**：
-- `usage` 回報端點：v0 沒有人用；
-- `lgw` 裡的換把程序：改在 sidecar 內部；
-- 一切經 herdr 的做法：改成子行程。
-
-**加上的**：
-- `CredentialProvider`、`SelectionPolicy` 兩個內部介面：上游與選把規則都是實作。
+**和前一版相比拿掉的**
+- 租約（request／start／renew／exhausted／release）、同時租用上限、10 分鐘確認；
+- 狀態板、用量查詢；
+- 管理 API（發撤 worker 憑證）、whoami；
+- `launch`（agent 專用的環境變數對應）。
