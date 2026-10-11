@@ -1,0 +1,673 @@
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+import unittest
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+BOOTSTRAP_SH = os.path.join(REPO_ROOT, "deploy", "bootstrap.sh")
+INSTALL_SH = os.path.join(REPO_ROOT, "deploy", "install.sh")
+REMOTE_DEPLOY_SH = os.path.join(REPO_ROOT, "deploy", "remote-deploy.sh")
+RUN_WRAPPER = os.path.join(REPO_ROOT, "deploy", "llmgateway-run")
+SERVICE_UNIT = os.path.join(REPO_ROOT, "deploy", "llmgateway.service")
+
+TOOLS_LIST = [
+    "mkdir", "mktemp", "chmod", "mv", "ln", "rm", "cat", "date",
+    "whoami", "cp", "bash", "head", "grep", "ls", "readlink",
+    "cmp", "stat", "dirname", "sort", "tail", "awk", "sed", "tr", "cut", "sleep",
+    "python3", "ssh", "env"
+]
+
+
+class BootstrapScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.sandbox = self.tmpdir.name
+
+        self.home = os.path.join(self.sandbox, "home")
+        self.rundir = os.path.join(self.sandbox, "rundir")
+        self.logdir = os.path.join(self.sandbox, "log")
+        self.state = os.path.join(self.sandbox, "state")
+        self.fakebin = os.path.join(self.sandbox, "fakebin")
+        self.tools = os.path.join(self.sandbox, "tools")
+
+        os.makedirs(self.home, exist_ok=True)
+        os.makedirs(self.rundir, exist_ok=True)
+        os.makedirs(self.logdir, exist_ok=True)
+        os.makedirs(self.state, exist_ok=True)
+        os.makedirs(self.fakebin, exist_ok=True)
+        os.makedirs(self.tools, exist_ok=True)
+
+        for t in TOOLS_LIST:
+            p = shutil.which(t)
+            if p:
+                os.symlink(p, os.path.join(self.tools, t))
+
+        # Host key file
+        self.hostkey_file = os.path.join(self.sandbox, "ssh_host_ed25519_key.pub")
+        with open(self.hostkey_file, "w", encoding="utf-8") as f:
+            f.write("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForBootstrapTest999 root@mockhost\n")
+
+        # Deploy pubkey file
+        self.deploy_pubkey_file = os.path.join(self.sandbox, "deploy_key.pub")
+        self.deploy_pubkey_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIDeployPublicKeyForTestingOnly12345"
+        with open(self.deploy_pubkey_file, "w", encoding="utf-8") as f:
+            f.write(f"ssh-ed25519 {self.deploy_pubkey_b64} deploy-test\n")
+
+        # Known hosts file for rendezvous
+        self.known_hosts_file = os.path.join(self.sandbox, "rendezvous_known_hosts")
+        with open(self.known_hosts_file, "w", encoding="utf-8") as f:
+            f.write("[jump.example.com]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJumpHostKey123\n")
+
+        # Initial state flags
+        self._set_state("user_exists", "0")
+        self._set_state("user_in_docker", "0")
+        self._set_state("user_linger", "0")
+        self._set_state("sshd_pubkey", "yes")
+        self._set_state("sshd_deny", "")
+        self._set_state("sshd_allow", "")
+        self._set_state("sshd_listen", "1")
+        self._set_state("curl_code", "401")
+        self._set_state("curl_rc", "0")
+
+        self._create_fake_tools()
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _set_state(self, key, val):
+        with open(os.path.join(self.state, key), "w", encoding="utf-8") as f:
+            f.write(str(val))
+
+    def _get_state(self, key, default=""):
+        p = os.path.join(self.state, key)
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        return default
+
+    def _create_fake_tools(self):
+        # 1. sudo
+        # 假 sudo: 去掉選項後以目前使用者執行，-S 只允許和 -v 一起出現，否則測試失敗
+        sudo_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "sudo $*" >> "${LOG_DIR}/sudo-argv.log"
+
+has_S=0
+has_v=0
+has_n=0
+
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -S) has_S=1; shift ;;
+        -v) has_v=1; shift ;;
+        -n) has_n=1; shift ;;
+        -p) shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+        -u) shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+        --) shift; args+=("$@"); break ;;
+        -*) shift ;;
+        *) args+=("$@"); break ;;
+    esac
+done
+
+if [[ $has_S -eq 1 && $has_v -eq 0 ]]; then
+    echo "fake sudo error: -S is only allowed with -v" >&2
+    exit 99
+fi
+
+if [[ $has_v -eq 1 ]]; then
+    if [[ $has_S -eq 1 ]]; then
+        cat >/dev/null || true
+    fi
+    exit 0
+fi
+
+if [[ ${#args[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+exec "${args[@]}"
+"""
+        # 2. useradd
+        useradd_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "useradd $*" >> "${LOG_DIR}/useradd-argv.log"
+echo "1" > "${STATE_DIR}/user_exists"
+user="${@: -1}"
+home="${LGW_BOOT_HOME:-/home/$user}"
+mkdir -p "$home"
+exit 0
+"""
+        # 3. gpasswd
+        gpasswd_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "gpasswd $*" >> "${LOG_DIR}/gpasswd-argv.log"
+if [[ "${1:-}" == "-d" ]]; then
+    echo "0" > "${STATE_DIR}/user_in_docker"
+fi
+exit 0
+"""
+        # 4. id
+        id_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "id $*" >> "${LOG_DIR}/id-argv.log"
+exists="$(cat "${STATE_DIR}/user_exists" 2>/dev/null || echo "0")"
+if [[ "$exists" != "1" ]]; then
+    exit 1
+fi
+
+if [[ "${1:-}" == "-u" ]]; then
+    echo "1001"
+    exit 0
+elif [[ "${1:-}" == "-Gn" ]]; then
+    in_docker="$(cat "${STATE_DIR}/user_in_docker" 2>/dev/null || echo "0")"
+    if [[ "$in_docker" == "1" ]]; then
+        echo "llmgw docker"
+    else
+        echo "llmgw"
+    fi
+    exit 0
+else
+    echo "uid=1001(llmgw) gid=1001(llmgw) groups=1001(llmgw)"
+    exit 0
+fi
+"""
+        # 5. getent
+        getent_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "getent $*" >> "${LOG_DIR}/getent-argv.log"
+exists="$(cat "${STATE_DIR}/user_exists" 2>/dev/null || echo "0")"
+if [[ "${1:-}" == "passwd" ]]; then
+    if [[ "$exists" == "1" ]]; then
+        echo "llmgw:x:1001:1001::${LGW_BOOT_HOME:-/home/llmgw}:/bin/bash"
+        exit 0
+    else
+        exit 2
+    fi
+elif [[ "${1:-}" == "group" ]]; then
+    echo "docker:x:999:llmgw"
+    exit 0
+fi
+exit 2
+"""
+        # 6. loginctl
+        loginctl_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "loginctl $*" >> "${LOG_DIR}/loginctl-argv.log"
+if [[ "${1:-}" == "show-user" ]]; then
+    linger="$(cat "${STATE_DIR}/user_linger" 2>/dev/null || echo "0")"
+    if [[ "$linger" == "1" ]]; then
+        echo "Linger=yes"
+    else
+        echo "Linger=no"
+    fi
+    exit 0
+elif [[ "${1:-}" == "enable-linger" ]]; then
+    echo "1" > "${STATE_DIR}/user_linger"
+    uid="1001"
+    rundir="${LGW_BOOT_RUNDIR:-/run/user}/${uid}"
+    mkdir -p "$rundir"
+    exit 0
+fi
+exit 0
+"""
+        # 7. sshd
+        sshd_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "sshd $*" >> "${LOG_DIR}/sshd-argv.log"
+pubkey="$(cat "${STATE_DIR}/sshd_pubkey" 2>/dev/null || echo "yes")"
+deny="$(cat "${STATE_DIR}/sshd_deny" 2>/dev/null || true)"
+allow="$(cat "${STATE_DIR}/sshd_allow" 2>/dev/null || true)"
+
+echo "pubkeyauthentication ${pubkey}"
+if [[ -n "$deny" ]]; then
+    echo "denyusers ${deny}"
+fi
+if [[ -n "$allow" ]]; then
+    echo "allowusers ${allow}"
+fi
+exit 0
+"""
+        # 8. ss
+        ss_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "ss $*" >> "${LOG_DIR}/ss-argv.log"
+listen="$(cat "${STATE_DIR}/sshd_listen" 2>/dev/null || echo "1")"
+if [[ "$listen" == "1" ]]; then
+    echo "LISTEN 0 128 127.0.0.1:22 0.0.0.0:*"
+else
+    echo "LISTEN 0 128 192.168.1.1:22 0.0.0.0:*"
+fi
+exit 0
+"""
+        # 9. ssh-keygen
+        ssh_keygen_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "ssh-keygen $*" >> "${LOG_DIR}/ssh-keygen-argv.log"
+if [[ "${1:-}" == "-l" ]]; then
+    file=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-f" ]]; then
+            file="$2"; shift 2
+        else
+            shift
+        fi
+    done
+    if [[ -f "$file" ]]; then
+        echo "256 SHA256:MockFingerprintKeyString comment (ED25519)"
+        exit 0
+    else
+        exit 1
+    fi
+elif [[ "${1:-}" == "-t" ]]; then
+    file=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-f" ]]; then
+            file="$2"; shift 2
+        else
+            shift
+        fi
+    done
+    dir="$(dirname "$file")"
+    mkdir -p "$dir"
+    echo "-----BEGIN OPENSSH PRIVATE KEY-----" > "$file"
+    echo "FakePrivateKey" >> "$file"
+    echo "-----END OPENSSH PRIVATE KEY-----" >> "$file"
+    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeTunnelPubKeyGenerated123 llmgateway-tunnel" > "${file}.pub"
+    exit 0
+fi
+exit 0
+"""
+        # 10. systemctl
+        systemctl_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "systemctl $*" >> "${LOG_DIR}/systemctl-argv.log"
+if [[ "$*" == *"is-active"* ]]; then
+    exit 0
+fi
+exit 0
+"""
+        # 11. git
+        git_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "git $*" >> "${LOG_DIR}/git-argv.log"
+if [[ "${1:-}" == "clone" ]]; then
+    dest="${@: -1}"
+    mkdir -p "$dest/policy" "$dest/deploy"
+    echo "{}" > "$dest/policy/default.json"
+    cat "${REAL_INSTALL_SH}" > "$dest/deploy/install.sh"
+    chmod +x "$dest/deploy/install.sh"
+    cat "${REAL_RUN_WRAPPER}" > "$dest/deploy/llmgateway-run"
+    chmod +x "$dest/deploy/llmgateway-run"
+    cat "${REAL_SERVICE_UNIT}" > "$dest/deploy/llmgateway.service"
+    chmod 644 "$dest/deploy/llmgateway.service"
+    cat "${REAL_REMOTE_DEPLOY_SH}" > "$dest/deploy/remote-deploy.sh"
+    chmod +x "$dest/deploy/remote-deploy.sh"
+fi
+exit 0
+"""
+        # 12. install
+        # 假 install: 記錄 argv，並將 -o 剝除以避免 macOS / 非 root 環境 chown 失敗
+        install_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "install $*" >> "${LOG_DIR}/install-argv.log"
+
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+        *)
+            args+=("$1"); shift ;;
+    esac
+done
+
+exec "${REAL_INSTALL_BIN}" "${args[@]}"
+"""
+        # 13. curl (for install.sh --check)
+        curl_script = """#!/usr/bin/env bash
+set -euo pipefail
+echo "curl $*" >> "${LOG_DIR}/curl-argv.log"
+code="$(cat "${STATE_DIR}/curl_code" 2>/dev/null || echo "401")"
+rc="$(cat "${STATE_DIR}/curl_rc" 2>/dev/null || echo "0")"
+printf '%s' "$code"
+exit "$rc"
+"""
+        real_install_bin = shutil.which("install") or "/usr/bin/install"
+
+        scripts = [
+            ("sudo", sudo_script),
+            ("useradd", useradd_script),
+            ("gpasswd", gpasswd_script),
+            ("id", id_script),
+            ("getent", getent_script),
+            ("loginctl", loginctl_script),
+            ("sshd", sshd_script),
+            ("ss", ss_script),
+            ("ssh-keygen", ssh_keygen_script),
+            ("systemctl", systemctl_script),
+            ("git", git_script),
+            ("install", install_script),
+            ("curl", curl_script),
+        ]
+
+        for name, content in scripts:
+            target = os.path.join(self.fakebin, name)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(target, 0o755)
+
+        self.real_install_bin = real_install_bin
+
+    def run_bootstrap(self, args, env_overrides=None):
+        env = {
+            "PATH": f"{self.fakebin}:{self.tools}",
+            "LOG_DIR": self.logdir,
+            "STATE_DIR": self.state,
+            "LGW_BOOT_USER": "llmgw",
+            "LGW_BOOT_HOME": self.home,
+            "LGW_BOOT_RUNDIR": self.rundir,
+            "LGW_BOOT_HOSTKEY": self.hostkey_file,
+            "LGW_BOOT_OS": "Linux",
+            "REAL_INSTALL_SH": INSTALL_SH,
+            "REAL_REMOTE_DEPLOY_SH": REMOTE_DEPLOY_SH,
+            "REAL_RUN_WRAPPER": RUN_WRAPPER,
+            "REAL_SERVICE_UNIT": SERVICE_UNIT,
+            "REAL_INSTALL_BIN": self.real_install_bin,
+        }
+        if env_overrides:
+            env.update(env_overrides)
+        cmd = ["bash", BOOTSTRAP_SH] + list(args)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+    def read_log(self, name):
+        p = os.path.join(self.logdir, f"{name}-argv.log")
+        if not os.path.exists(p):
+            return ""
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # -------------------------------------------------------------------------
+    # 測試項目
+    # -------------------------------------------------------------------------
+    def test_syntax_and_executable(self):
+        self.assertTrue(os.path.isfile(BOOTSTRAP_SH))
+        self.assertTrue(os.access(BOOTSTRAP_SH, os.X_OK))
+        res = subprocess.run(["bash", "-n", BOOTSTRAP_SH], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_fresh_machine_run_and_idempotence(self):
+        """全新機器跑一次全部 changed/todo 正確，第二次跑 changed 為 0"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        # 第一次執行 (全新機器)
+        res1 = self.run_bootstrap(args)
+        self.assertEqual(res1.returncode, 0, f"stdout:\n{res1.stdout}\nstderr:\n{res1.stderr}")
+
+        # 檢查輸出包含各步驟狀態
+        self.assertIn("[prereq] ok", res1.stdout)
+        self.assertIn("[user] changed", res1.stdout)
+        self.assertIn("[linger] changed", res1.stdout)
+        self.assertIn("[sshd] ok", res1.stdout)
+        self.assertIn("[install] changed", res1.stdout)
+        self.assertIn("[tunnel-key] changed", res1.stdout)
+        self.assertIn("[deploy-key] changed", res1.stdout)
+        self.assertIn("[rendezvous] changed", res1.stdout)
+        self.assertIn("[check] ok", res1.stdout)
+        self.assertIn("無 (全部完成)", res1.stdout)
+
+        # 清除日誌準備第二次執行
+        for f in os.listdir(self.logdir):
+            os.remove(os.path.join(self.logdir, f))
+
+        # 第二次執行 (冪等性驗證)
+        res2 = self.run_bootstrap(args)
+        self.assertEqual(res2.returncode, 0, f"stdout:\n{res2.stdout}\nstderr:\n{res2.stderr}")
+
+        # 驗證第二次執行無任何 changed
+        self.assertNotIn("changed", res2.stdout)
+        self.assertIn("[user] ok", res2.stdout)
+        self.assertIn("[linger] ok", res2.stdout)
+        self.assertIn("[install] ok", res2.stdout)
+        self.assertIn("[tunnel-key] ok", res2.stdout)
+        self.assertIn("[deploy-key] ok", res2.stdout)
+        self.assertIn("[rendezvous] ok", res2.stdout)
+        self.assertIn("[check] ok", res2.stdout)
+
+    def test_password_never_leaks(self):
+        """密碼檔的內容 (用假字串) 不出現在任何 stdout、stderr、argv 紀錄、產生的檔案裡"""
+        secret_canary = "MOCK_CANARY_SUDO_PASSWORD_SECRET_987654"
+        passfile = os.path.join(self.sandbox, "sudo_pass.txt")
+        with open(passfile, "w", encoding="utf-8") as f:
+            f.write(secret_canary + "\n")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--sudo-pass-file", passfile,
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        # 1. 不在 stdout / stderr
+        self.assertNotIn(secret_canary, res.stdout)
+        self.assertNotIn(secret_canary, res.stderr)
+
+        # 2. 不在任何 log 檔案中
+        for log_name in os.listdir(self.logdir):
+            content = self.read_log(log_name.replace("-argv.log", ""))
+            self.assertNotIn(secret_canary, content, f"Leaked in {log_name}")
+
+        # 3. 不在 home 目錄的任何生成檔案中
+        for root, _, files in os.walk(self.home):
+            for file in files:
+                filepath = os.path.join(root, file)
+                try:
+                    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                        fc = f.read()
+                        self.assertNotIn(secret_canary, fc, f"Leaked in {filepath}")
+                except Exception:
+                    pass
+
+    def test_docker_group_removal(self):
+        """帳號已在 docker 群組時會被移出"""
+        self._set_state("user_exists", "1")
+        self._set_state("user_in_docker", "1")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        gpasswd_log = self.read_log("gpasswd")
+        self.assertIn("gpasswd -d llmgw docker", gpasswd_log)
+        self.assertIn("[user] changed 將帳號 llmgw 自 docker 群組移出", res.stdout)
+        self.assertEqual(self._get_state("user_in_docker"), "0")
+
+    def test_tunnel_key_not_regenerated_if_exists(self):
+        """隧道金鑰已存在時不重產"""
+        ssh_dir = os.path.join(self.home, ".ssh")
+        os.makedirs(ssh_dir, exist_ok=True)
+        key_path = os.path.join(ssh_dir, "id_llmgw_tunnel")
+        key_pub_path = os.path.join(ssh_dir, "id_llmgw_tunnel.pub")
+        original_priv = "CANARY_EXISTING_PRIVATE_KEY_CONTENT\n"
+        original_pub = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExistingTunnelPub CanaryComment\n"
+
+        with open(key_path, "w", encoding="utf-8") as f:
+            f.write(original_priv)
+        with open(key_pub_path, "w", encoding="utf-8") as f:
+            f.write(original_pub)
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        keygen_log = self.read_log("ssh-keygen")
+        self.assertNotIn("id_llmgw_tunnel", keygen_log)
+        self.assertIn("[tunnel-key] ok 隧道金鑰已存在", res.stdout)
+
+        with open(key_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), original_priv)
+        with open(key_pub_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), original_pub)
+
+    def test_authorized_keys_management_and_permissions(self):
+        """authorized_keys: 重跑不會多出重複行; 換新公鑰時舊的同一把被換掉、其他行保留; 權限 0600"""
+        ssh_dir = os.path.join(self.home, ".ssh")
+        os.makedirs(ssh_dir, exist_ok=True)
+        auth_keys = os.path.join(ssh_dir, "authorized_keys")
+
+        other_key_line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKeyForAdminBackup admin@backup"
+        with open(auth_keys, "w", encoding="utf-8") as f:
+            f.write(other_key_line + "\n")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        # 1. 第一次寫入部署公鑰
+        res1 = self.run_bootstrap(args)
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+
+        with open(auth_keys, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        self.assertEqual(len(lines), 2)
+        self.assertIn(other_key_line, lines)
+        deploy_line = [l for l in lines if l != other_key_line][0]
+        self.assertIn(self.deploy_pubkey_b64, deploy_line)
+        self.assertTrue(deploy_line.startswith('command="'))
+        self.assertIn('",restrict ', deploy_line)
+        self.assertEqual(stat.S_IMODE(os.stat(auth_keys).st_mode), 0o600)
+
+        # 2. 第二次執行: 不重複添加行
+        res2 = self.run_bootstrap(args)
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+
+        with open(auth_keys, "r", encoding="utf-8") as f:
+            lines2 = [line.strip() for line in f if line.strip()]
+        self.assertEqual(len(lines2), 2)
+
+        # 3. 換新公鑰 (同 base64 但不同 comment): 舊行替換、其他行保留
+        new_comment_key = os.path.join(self.sandbox, "new_comment.pub")
+        with open(new_comment_key, "w", encoding="utf-8") as f:
+            f.write(f"ssh-ed25519 {self.deploy_pubkey_b64} updated-comment-999\n")
+
+        args_update = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", new_comment_key,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+        res3 = self.run_bootstrap(args_update)
+        self.assertEqual(res3.returncode, 0, res3.stderr)
+
+        with open(auth_keys, "r", encoding="utf-8") as f:
+            lines3 = [line.strip() for line in f if line.strip()]
+        self.assertEqual(len(lines3), 2)
+        self.assertIn(other_key_line, lines3)
+        self.assertIn("updated-comment-999", lines3[1])
+
+    def test_check_mode_changes_nothing(self):
+        """--check 不改任何東西 (argv 紀錄裡沒有 useradd、loginctl enable-linger、install 等)"""
+        args = [
+            "--check",
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        # 由於 user 不存在且服務尚未安裝，--check 會回傳 3 (有待辦/todo)
+        self.assertEqual(res.returncode, 3)
+
+        # 驗證 argv 紀錄中絕無修改動作
+        self.assertEqual(self.read_log("useradd"), "")
+        self.assertEqual(self.read_log("gpasswd"), "")
+        self.assertNotIn("enable-linger", self.read_log("loginctl"))
+        self.assertEqual(self.read_log("git"), "")
+
+        # install 紀錄中不應有寫入/複製
+        install_log = self.read_log("install")
+        self.assertEqual(install_log, "")
+
+    def test_argument_errors_exit_2(self):
+        """參數錯回 2"""
+        cases = [
+            ["--tag", "invalid_tag"],
+            ["--tag", "lgw-v1.0"],
+            [],  # 沒有 --tag 且不是 --check
+            ["--rendezvous", "sshproxy@jump:2222"],  # 缺少 --rendezvous-known-hosts
+            ["--rendezvous-known-hosts", self.known_hosts_file],  # 缺少 --rendezvous
+            ["--sudo-pass-file", "/nonexistent/pass.txt"],
+            ["--deploy-pubkey-file", "/nonexistent/pub.key"],
+            ["--rendezvous-known-hosts", "/nonexistent/kh.txt"],
+            ["--tag"],  # 缺少值
+            ["--unknown-arg"],
+        ]
+        for c in cases:
+            res = self.run_bootstrap(c)
+            self.assertEqual(res.returncode, 2, f"Failed for args: {c}")
+
+    def test_todos_exit_3(self):
+        """有 todo 時回 3"""
+        # 未提供 --deploy-pubkey-file 與 --rendezvous
+        args = [
+            "--tag", "lgw-v0.1.0",
+        ]
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 3, f"stdout:\n{res.stdout}")
+        self.assertIn("[deploy-key] todo 未提供部署公鑰", res.stdout)
+        self.assertIn("[rendezvous] todo 未提供會合點設定", res.stdout)
+        self.assertIn("3. 待辦事項 (Pending Todos):", res.stdout)
+        self.assertIn("未提供部署公鑰", res.stdout)
+        self.assertIn("未提供會合點設定", res.stdout)
+
+    def test_sshd_todo_reporting(self):
+        """sshd 不符時回 todo 且說明要改什麼"""
+        self._set_state("sshd_pubkey", "no")
+        self._set_state("sshd_deny", "llmgw")
+        self._set_state("sshd_listen", "0")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("[sshd] todo", res.stdout)
+        self.assertIn("PubkeyAuthentication", res.stdout)
+        self.assertIn("DenyUsers", res.stdout)
+        self.assertIn("ListenAddress 127.0.0.1:22", res.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
