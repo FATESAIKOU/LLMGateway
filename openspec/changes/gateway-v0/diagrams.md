@@ -117,7 +117,7 @@ sequenceDiagram
   participant L as lgwd（loopback）
   participant W as worker 容器
   WF->>H: pool-ssh，stdin 帶 issuer 憑證
-  H->>L: POST /v1/admin/clients {name: worker-<名>}
+  H->>L: POST /v1/admin/clients {name: worker-NAME}
   L-->>H: token（同名就撤舊發新）
   H->>W: stdin 寫入 /run/mlp-secrets/llmgateway-client-token
   Note over W: sidecar 啟動時 GET /v1/whoami，用回來的 client 當租約的 worker
@@ -134,11 +134,11 @@ sequenceDiagram
   participant L as lgwd
   P->>WF: 手動觸發＋在 environment 核准
   WF->>J: ssh -J（只能轉發）
-  J->>R: 強制命令；動詞 keys 或 upgrade <tag>
+  J->>R: 強制命令；動詞 keys 或 upgrade TAG
   alt keys
     R->>R: 驗證 stdin → 暫存檔 0600 → rename keys.env
     R->>L: SIGHUP 重讀
-  else upgrade <tag>
+  else upgrade TAG
     R->>R: install.sh --tag：固定 tag 取碼、current 原子切換、裝 unit
     R->>L: 重啟
   end
