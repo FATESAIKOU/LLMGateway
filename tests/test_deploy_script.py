@@ -117,6 +117,11 @@ class DeployScriptTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(read(log), b"--tag\nlgw-v0.1.0\n")
 
+    def test_upgrade_missing_installer_rejected(self):
+        proc = run(b"", self.dir, command="upgrade lgw-v0.1.0", installer=os.path.join(self.dir, "nope.sh"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(b"installer not found", proc.stderr)
+
     def test_upgrade_invalid_tags_rejected(self):
         installer, log = self._fake_installer()
         bad = ["lgw-v0.1", "lgw-v0.1.0;rm -rf /", "lgw-v0.1.0 x", "../lgw-v0.1.0", "v0.1.0",

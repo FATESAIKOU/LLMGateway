@@ -97,6 +97,8 @@ git clone --depth 1 --branch <tag> https://github.com/FATESAIKOU/LLMGateway.git 
 
 ---
 
+> **綁定位址**：`~/.config/llmgateway/llmgateway.env` 的 `LGW_API_HOSTS` 要分別列出 `127.0.0.1` 與 docker bridge 的位址，**不要用 `0.0.0.0`**。管理 API 只接受綁在 loopback 上收到的請求，綁 `0.0.0.0` 時一律拒絕；v0 只支援 IPv4。
+
 ### 步驟 1.6：配置部署專用公鑰至 `authorized_keys`
 
 在放服務的那台，切換為 `llmgw` 身分：

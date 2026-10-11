@@ -54,6 +54,7 @@ jobs:
           K_OLLAMA: ${{ secrets.POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM }}
         run: |
           set -eu -o pipefail
+          test -n "$JUMP" && test -n "$TARGET" || { echo "deploy connection secrets are not set" >&2; exit 2; }
           target_user_host="${TARGET%:*}"
           target_port="${TARGET##*:}"
           jump_host="${JUMP#*@}"; jump_host="${jump_host%:*}"

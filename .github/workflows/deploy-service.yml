@@ -55,6 +55,7 @@ jobs:
         run: |
           set -eu -o pipefail
           printf '%s' "$TAG" | grep -Eqx 'lgw-v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}' || { echo "invalid tag" >&2; exit 2; }
+          test -n "$JUMP" && test -n "$TARGET" || { echo "deploy connection secrets are not set" >&2; exit 2; }
           target_user_host="${TARGET%:*}"
           target_port="${TARGET##*:}"
           jump_host="${JUMP#*@}"; jump_host="${jump_host%:*}"

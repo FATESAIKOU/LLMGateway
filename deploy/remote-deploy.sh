@@ -22,6 +22,10 @@ case "$verb" in
       exit 2
     fi
     installer="${LGW_INSTALLER:-$(dirname "$0")/install.sh}"
+    if [ ! -x "$installer" ]; then
+      echo "deploy: installer not found or not executable" >&2
+      exit 2
+    fi
     exec "$installer" --tag "$tag" </dev/null
     ;;
   *)

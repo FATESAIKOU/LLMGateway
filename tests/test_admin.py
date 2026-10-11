@@ -86,6 +86,12 @@ class AdminCase(unittest.TestCase):
         for line in out.strip().split("\n"):
             self.assertEqual(len(line.split("\t")), 4)  # name、role、created_at、revoked_at
 
+    def test_add_拒絕worker前綴(self):
+        rc, out, err = self._run("client", "add", "worker-mac")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out, "")
+        self.assertIn("admin API", err)
+
     # --- rm 與 whoami ---
     def test_rm之後whoami回401(self):
         rc, out, _ = self._run("client", "add", "w1")

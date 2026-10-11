@@ -31,6 +31,10 @@ def open_service(db: str, policy_path: str, keys_path: str) -> LeaseService:
 
 
 def _cmd_add(service: LeaseService, name: str, role: str = "client") -> int:
+    if name.startswith("worker-"):
+        # worker-* 是 issuer（MyLinuxPool）經管理 API 發撤的範圍，手動發會被 issuer 撤掉或覆蓋
+        print("lgw.admin: names starting with worker- are issued by the admin API, not by hand", file=sys.stderr)
+        return 1
     try:
         token = service.add_client(name, role=role)
     except ValueError as exc:
