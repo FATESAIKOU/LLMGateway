@@ -108,6 +108,18 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 - 不用 sub2api：它的價值在持有訂閱 token 代轉，對 Claude 不能用。
 - LiteLLM 只在「某個上游接不上 Claude Code、又一定要用 Claude Code」時才加，做格式轉換。要加就固定版本、用雜湊或 image digest 查核，因為 PyPI 上曾有被植入的版本（`docs/research/litellm-supply-chain.md`，查證中）。
 
+## Capabilities
+
+### New Capabilities
+
+- `key-vault`：五把 key 只保管在 LLMGateway；部署、不外洩、客戶端憑證、服務不對外。
+- `status-board`：每把 key 的使用者、數量／上限、冷卻與用量。
+
+### Modified Capabilities
+
+- `agent-lease`：租約欄位加上 `env`／`unset`／客戶端／`preferences`；選定改成固定順序＋冷卻＋同時租用上限；key 改由租用取得；換把由 `exhausted` 回報並直接拿下一張；Mac 與 worker 共用同一段換把程序。
+- `usage-record`：不改。token 回報不在 v0（design 決定 11）。
+
 ## 試做的結果與留到實作的驗證
 
 | 項目 | 結果 |
