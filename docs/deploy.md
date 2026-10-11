@@ -103,6 +103,8 @@ cat ~/.ssh/id_llmgw_tunnel.pub
 [<跳板機>]:<埠> ssh-ed25519 <跳板機的 host key>
 ```
 
+- 埠不是 22 時主機寫成 `[host]:port`；**埠是 22 時只寫 `host`**（OpenSSH 對預設埠不加括號，寫成 `[host]:22` 對不上）。2.2 的 `DEPLOY_KNOWN_HOSTS` 與 3.1 的 `host_keys` 也是同一個規則。
+
 **不要用 `ssh-keyscan` 現掃、不要用 `accept-new`**；隧道守護是 `StrictHostKeyChecking=yes`，對不上就不連。
 
 ### 1.8 填 `tunnel.env`，啟動隧道守護
@@ -173,7 +175,7 @@ Settings → Environments → New environment，名稱 `llmgateway-deploy`，勾
 | Secret | 格式 | 說明 |
 |---|---|---|
 | `GH_LLMGATEWAY__POOL_SSH__DEPLOY` | OpenSSH 私鑰全文 | 部署私鑰，公鑰見 1.9。 |
-| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS` | known_hosts，兩行 | `[<跳板機>]:<埠> <跳板機的 host key>`，與 `[127.0.0.1]:4711 <放服務那台的 host key>`。用 MyLinuxPool 提供的指紋與那台的 `/etc/ssh/ssh_host_ed25519_key.pub` 建，不要現掃。 |
+| `GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS` | known_hosts，兩行 | `[<跳板機>]:<埠> <跳板機的 host key>`（埠是 22 時寫 `<跳板機> <host key>`，見 1.7），與 `[127.0.0.1]:4711 <放服務那台的 host key>`。用 MyLinuxPool 提供的指紋與那台的 `/etc/ssh/ssh_host_ed25519_key.pub` 建，不要現掃。 |
 | `GH_LLMGATEWAY__POOL_SSH__DEPLOY_JUMP` | `sshproxy@<跳板機>:<埠>` | 會合點。 |
 | `GH_LLMGATEWAY__POOL_SSH__DEPLOY_TARGET` | `llmgw@127.0.0.1:4711` | 固定值：經會合點看到的、放服務那台的 sshd。 |
 
@@ -181,7 +183,10 @@ Settings → Environments → New environment，名稱 `llmgateway-deploy`，勾
 
 **五把 key（5 個）**
 
-值不能有空白、換行、引號。**還沒有的那把就不要建 secret**：workflow 會送出空值，服務視為「沒部署」（list 的 `available` 為 false，get 回 409）。
+值不能有空白、換行、引號。**還沒有的那把就不要建 secret**。「沒建 secret ＝ 空值 ＝ 沒部署」整條路是這樣走的：
+1. workflow：沒建的 secret 在 GitHub 展開成空字串，照樣送 `NAME=`（五行一定都在）；
+2. `remote-deploy.sh keys`：只檢查名字（五個都要有、不重複）與值不含空白或引號，空值通過，寫進 `keys.env`；
+3. `lgwd`（`lgwd/keys.py`）：值為空視同沒部署，list 的 `available` 為 false，get 回 409 `not_deployed`。
 
 | Secret | 內容 | 寫進 `keys.env` 的名字 |
 |---|---|---|
@@ -197,26 +202,30 @@ Settings → Environments → New environment，名稱 `llmgateway-deploy`，勾
 
 ### 3.1 Mac
 
-Mac 用自己已經能登入 sshproxy 的金鑰。建 `~/.config/lgw/connect.env`：
+Mac 用自己已經能登入 sshproxy 的金鑰。連線設定是一個 **JSON 檔**（格式由 `lgw/connect.py` 的模組說明定義），手寫 `~/.config/lgw/connect.json`：
 
-```sh
-JUMPS=
-RENDEZVOUS=sshproxy@<跳板機>:<埠>
-IDENTITY=/Users/<你>/.ssh/<能登入 sshproxy 的金鑰>
-KNOWN_HOSTS=/Users/<你>/.ssh/known_hosts_rendezvous
-REMOTE_API=4710
+```json
+{
+  "schema": 1,
+  "rendezvous": "sshproxy@<跳板機>:<埠>",
+  "identity": "/Users/<你>/.ssh/<能登入 sshproxy 的金鑰>",
+  "known_hosts": "/Users/<你>/.ssh/known_hosts_rendezvous",
+  "remote_api": 4710
+}
 ```
 
-- `JUMPS`：要先經過其他跳板時，用逗號分隔的 `user@host:port`；直接連得到會合點就留空。
-- `KNOWN_HOSTS` 和 1.7 一樣，用 MyLinuxPool 提供的 host key。
+- 欄位只有這些，多一個、缺必填、`schema` 不是 1 都會 `ConfigError`。`jumps`（字串陣列，每個 `user@host:port`）要先經過其他跳板時才加，直接連得到會合點就省略；`remote_api` 省略時是 4710。
+- `rendezvous` 一律寫完整的 `user@host:port`：`lgw connect` 用自己的 ssh 設定（`-F`），**不讀 `~/.ssh/config`**，所以別名、`Host` 區塊裡的帳號與埠都沒用；帳號可以改，不固定是 `sshproxy`。
+- host key 二擇一，不能兩個都給或都不給：`known_hosts`（檔案路徑，內容照 1.7 的格式）或 `host_keys`（known_hosts 格式的字串陣列，設定檔自成一體）。埠不是 22 時寫 `[host]:port`，是 22 時只寫 `host`；用跳板時，`host_keys` 要包含每個跳板的 host key（所有跳板與會合點共用同一把 identity 與同一份 known_hosts）。
+- 一律嚴格檢查（`StrictHostKeyChecking yes`），用 MyLinuxPool 提供的 host key，不現掃。
 
 ```bash
-python3 -m lgw.connect --config ~/.config/lgw/connect.env
+python3 -m lgw.connect --config ~/.config/lgw/connect.json
 # 印出一行 http://127.0.0.1:<臨時埠>，Ctrl-C 結束
 curl -s http://127.0.0.1:<臨時埠>/v1/subscriptions
 ```
 
-程式裡則是 `with lgw.connect.connect(cfg) as base_url:`，再用 `lgw.client` 的 list／get／cooldown。
+程式裡則是 `with lgw.connect.connect(lgw.connect.load_config(path)) as base_url:`，再用 `lgw.client` 的 list／get／cooldown。`load_config` 每次呼叫都重讀檔案，不快取。
 
 ### 3.2 worker
 
@@ -257,9 +266,17 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`，連
 | 1 | 確定不正常：unit 沒在跑或 failed、版本不對、探針不是 200 |
 | 2 | 無法確認：連不上 user bus、curl 逾時等 |
 
+注意：`--check` 的探針打的是**本機** `127.0.0.1:<LGW_API_PORT>`，不經會合點；隧道斷了而 `llmgateway.service` 活著時仍會回 0。隧道通不通要看 `journalctl --user -u llmgateway-tunnel`（有沒有 `tunnel_up`、`probe_fail`），或從客戶端照 3.1 連一次。
+
 ### 4.5 外洩時
 
 - **key 外洩**（或懷疑）：在上游作廢並換新 → 更新 secret → `deploy-keys`。本人已接受「能登入 sshproxy 的金鑰都讀得到全部 key」（design 決定 5a），換 key 是這種情況的標準處理。
+- **客戶端裝置遺失**（例如手機）：服務沒有應用層認證，任何能登入會合點並開得了轉發的金鑰都能讀全部 key，所以裝置上有 sshproxy 的金鑰就要當成 key 已外洩。依序：
+  1. 請 MyLinuxPool（mylinuxpool-pm，經 PMO）把那把金鑰從 sshproxy 撤掉；
+  2. 在上游作廢並換新五把 key，更新五個 secret；
+  3. 跑 `deploy-keys` 重新部署。
+
+  客戶端不持有 key，不用改任何客戶端設定。步驟 1 做完之前，那把金鑰仍然讀得到。
 - **隧道私鑰外洩**：請 mylinuxpool-pm 從 `TUNNEL_EXTRA_PUBKEYS` 拿掉舊公鑰，照 1.6 重產並登記新的，改 `tunnel.env` 後 `systemctl --user restart llmgateway-tunnel`。
 - **部署私鑰外洩**：從 `TUNNEL_EXTRA_PUBKEYS` 與 `~llmgw/.ssh/authorized_keys` 拿掉，重產一對，更新 secret。
 
@@ -272,13 +289,15 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`，連
 ~/.local/share/llmgateway/current/deploy/install.sh --check; echo $?
 ```
 
-前一版還在 `~/.local/share/llmgateway/<tag>/`，`install.sh` 會直接重用，不用連網；執行檔與 unit 也會換回那一版的。也可以從 GitHub 用 `deploy-service` 輸入前一個 tag。
+前一版還在 `~/.local/share/llmgateway/<tag>/`，`install.sh` 會直接重用，不用連網；執行檔與 unit 也會換回那一版的。隧道守護有變更時一樣排約 60 秒後重啟（見 4.2 第 4 點）。`keys.env` 與 `tunnel.env` 不隨版本，退回不會動它們。也可以從 GitHub 用 `deploy-service` 輸入前一個 tag。
 
 ## 5. 排錯
 
-### 5.1 `deploy-keys` 結束碼 4（格式錯誤）
+### 5.1 `deploy-keys` 結束碼 2、3、4（輸入不合）
 
-`remote-deploy.sh` 拒收：行不是 `NAME=value`、名字不在五個裡、重複、缺名字、值有空白／換行／引號。檢查五個 `POOL_LLMGATEWAY__*` secret 有沒有夾到前後空白或換行。沒有的那把不要建 secret（見 2.2）。
+- 2：`SSH_ORIGINAL_COMMAND` 不是 `keys` 或 `upgrade lgw-vX.Y.Z`（多行、tag 格式不對、沒有動詞）。多半是那台 `authorized_keys` 的 `command=` 沒設好（1.9）。
+- 3：stdin 是空的，或超過 64 KiB。
+- 4：`remote-deploy.sh` 拒收：行不是 `NAME=value`、名字不在五個裡、重複、缺名字、值有空白／換行／引號。檢查五個 `POOL_LLMGATEWAY__*` secret 有沒有夾到前後空白或換行。沒有的那把不要建 secret（見 2.2）。
 
 ### 5.2 `deploy-keys` 結束碼 5（寫好了但重讀失敗）
 
@@ -304,7 +323,12 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`，連
 
 ### 5.5 `lgw connect` 回「無法確認」（`Unavailable`）
 
-訊息只有錯誤種類，不含位址。依序檢查：`connect.env` 的 `RENDEZVOUS`／`IDENTITY`／`KNOWN_HOSTS`；手動 `ssh -i <金鑰> -p <埠> sshproxy@<跳板機>` 能不能過；伺服器端隧道（5.4）。
+訊息只有錯誤種類（`ssh_missing`、`bad_config`、`temp_failed`、`ssh_exited`、`timeout`），不含位址。依序檢查：
+
+- 設定檔是 JSON、不是 KEY=VALUE（3.1）：不是 JSON 或欄位不對會是 `ConfigError`，檔案不存在或沒權限是 `OSError`，都在連線之前就停；
+- `rendezvous` 有沒有寫成完整的 `user@host:port`（不會讀 `~/.ssh/config` 的別名）、`identity` 路徑與權限、`known_hosts`／`host_keys` 的格式（非 22 埠要 `[host]:port`）；
+- 手動 `ssh -i <金鑰> -p <埠> <帳號>@<跳板機>` 能不能過；
+- 伺服器端隧道（5.4）。
 
 ### 5.6 get 回 403 `agent_not_allowed`
 
