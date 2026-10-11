@@ -7,7 +7,8 @@
 #   LGW_DEPLOY_SSH_KEY        部署專用私鑰
 #   LGW_DEPLOY_KNOWN_HOSTS    跳板機與 provider 的 host key（known_hosts 格式）
 #   LGW_DEPLOY_JUMP           跳板機，格式 user@host:port
-#   LGW_DEPLOY_TARGET         provider（經跳板看到的位址），格式 user@host:port
+#   LGW_DEPLOY_TARGET         provider（經跳板看到的位址），格式 user@127.0.0.1:<埠>，
+#                             字面要和跳板機 permitopen 的 "127.0.0.1:<埠>" 一模一樣（MyLinuxPool#68）
 #   LGW_KEY_CLAUDE_PERSONAL、LGW_KEY_CLAUDE_COMPANY、LGW_KEY_OPENROUTER、LGW_KEY_OPENCODE_ZEN、LGW_KEY_OLLAMA
 # 連線資訊也放 secret，是因為本 repo 是 public，不把池的位址放在公開的 vars；
 # ssh 的錯誤輸出也會把位址換成 [jump]／[target] 再印。
