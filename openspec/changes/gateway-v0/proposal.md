@@ -95,11 +95,10 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 
 ### 5. Mac 和 worker 走同一套，沒有 Mac 專用的分支
 
-- 換把的邏輯只有一份：本 repo 提供一個只用 Python 標準函式庫的客戶端模組（暫名 `lgw`）。內容：
-  - 租用 API 的呼叫；
-  - 額度訊號的判讀；
-  - 換把的程序：安全結束 agent → 拿下一張 → 帶新 env 開 agent → `agora continue` 接回。agent 一律跑在 herdr 裡，開關與讀畫面都經 herdr。
-- worker 上由 sidecar 呼叫這個模組。Mac 上的 `lgw run claude`、`lgw run opencode` 是同一個模組的命令列入口，在 herdr 裡開 agent 並在旁邊監看。兩邊只差「誰呼叫」，換把流程完全一樣，Mac 一樣會自動重開。
+- 換把的程序只有一份，放在 sidecar 的 agent 宿主（MyAiStorage）：安全結束 agent → 拿下一張 → 帶新 env 開 agent → `agora continue` 接回。
+  - 本 repo 的 `lgw` 只提供租用 API 客戶端與額度訊號的判讀規則，只用 Python 標準函式庫，sidecar 依賴它。
+  - 這是和 aistorage-pm 談定的：開關 agent 與接回的程式 sidecar 已經有、也審過，不再寫第二份。
+- worker 上由常駐的 sidecar 執行。Mac 上用 `sidecar agent run claude|opencode` 在前景執行同一段程序（sidecar 和 agora 同一個套件，Mac 已經裝了 agora）。兩邊只差常駐或前景，換把流程完全一樣，Mac 一樣會自動重開。
 - 原本的 `claude`、`opencode` 不動，隨時可以退回。
 
 ### 6. 程式
@@ -117,7 +116,7 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 
 ### Modified Capabilities
 
-- `agent-lease`：租約欄位加上 `env`／`unset`／客戶端／`preferences`；選定改成固定順序＋冷卻＋同時租用上限；key 改由租用取得；換把由 `exhausted` 回報並直接拿下一張；Mac 與 worker 共用同一段換把程序。
+- `agent-lease`：租約欄位加上 `env`／`unset`／客戶端／`preferences`；選定改成固定順序＋冷卻＋同時租用上限；key 改由租用取得；換把由 `exhausted` 回報並直接拿下一張；Mac 與 worker 共用同一段換把程序（sidecar 的 agent 宿主）。
 - `usage-record`：不改。token 回報不在 v0（design 決定 11）。
 
 ## 試做的結果與留到實作的驗證
@@ -140,9 +139,9 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 | 可沿用的 | 要重做 SSH、池的解析、私鑰保管 | 既有 App 已有 SSH（jsch，本身支援本機埠轉送）、池的解析、私鑰保管、機器池控制畫面 |
 | 連線 | AI App 連另一個 App 開的本機埠；兩個 App 都要活著，Android 背景限制要處理兩次 | 同一個 App 內：開轉送、租用、打上游都在一起 |
 | 職責 | 機器池控制和 AI 對話分開，比較乾淨；之後其他 App 也能用這條轉送 | AI App 變得更大；但機器池控制本來就在裡面 |
-| 成本 | 新 App 的建置、簽章、發佈、測試全套 | 加一個轉送功能（含前景服務與斷線重連） |
+| 成本 | 新 App 的建置、簽章、發佈、測試全套 | 長時間開著的轉送、前景服務、斷線重連都要新做。既有的 jsch 轉送只在每次執行指令時串接跳板，用完就拆（MyAiEntry PM 核對原始碼） |
 
-**本人選 (2)**：成本最低，而且需要轉送的只有這個 App。等出現第二個需要池內服務的手機 App，再把轉送拆成 (1)。實作在 MyAiEntry 開單（接 MyAiEntry#31、#33）；本 repo 只提供租用介面與手機用的客戶端憑證。
+**本人選 (2)**：成本最低，而且需要轉送的只有這個 App。等出現第二個需要池內服務的手機 App，再把轉送拆成 (1)。實作已在 MyAiEntry#147 開單（blocked by #8）；本 repo 只提供租用介面與手機用的客戶端憑證。
 
 ## v0 不做
 
@@ -152,7 +151,7 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 | #3 免費模型依效能自動切換 | 不進 | blocked by #4 |
 | #4 隱私界線 | 不進 | v0 只照固定順序換把，不依內容改送別的模型。opencode 那條鏈本來就以免費模型為主，等 #4 定案再收斂 |
 | #6 和 sidecar 對齊 | **進** | 本提案的租用介面就是 `ModelBroker` 要對齊的形狀；草擬好後直接和 aistorage-pm 對齊 |
-| #7 手機 App 的入口 | 只定方向 | 走 (2)，實作在 MyAiEntry 開單 |
+| #7 手機 App 的入口 | 只定方向 | 走 (2)，實作在 MyAiEntry#147 |
 | Antigravity（agy） | 不進 | 不在這五把裡（用 Google 帳號登入） |
 | 資料面代轉、格式轉換 | 不進 | 只在試做 c 證明「非加不可」時才另外提 |
 
@@ -166,10 +165,10 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 
 ## 驗收
 
-1. **租用**：Mac 上 `lgw run claude` 開出的 Claude Code 回得了一則最短的訊息。紀錄有租約（客戶端＝Mac、訂閱＝`claude-personal`）與 release；agent 環境裡只有那一把。
-2. **切換**：用假的額度用完訊號（不真的燒額度）→ `claude-personal` 進冷卻 → 下一張是 `claude-company` → agent 自動重開並接回 session → 狀態板顯示冷卻與重置時間 → 冷卻到期後新開的租約回到 `claude-personal`。Mac 的 `lgw run` 與 sidecar 各跑一次，走的是同一段程式。
+1. **租用**：Mac 上 `sidecar agent run claude` 開出的 Claude Code 回得了一則最短的訊息。紀錄有租約（客戶端＝Mac、訂閱＝`claude-personal`）與 release；agent 環境裡只有那一把。
+2. **切換**：用假的額度用完訊號（不真的燒額度）→ `claude-personal` 進冷卻 → 下一張是 `claude-company` → agent 自動重開並接回 session → 狀態板顯示冷卻與重置時間 → 冷卻到期後新開的租約回到 `claude-personal`。Mac 的 `sidecar agent run` 與 worker 上的 sidecar 各跑一次，走的是同一段程式。
 3. **sidecar**：sidecar 的假 broker 換成真的租用服務後，跑一次「額度用完 → 換把 → `agora continue` 接回」。可以在一台 worker 上做，或用測試替身做。
-4. **opencode**：`lgw run opencode` 對三家 key 型上游各跑通一次。
+4. **opencode**：`sidecar agent run opencode` 對三家 key 型上游各跑通一次。
 5. **狀態板**：顯示五把的使用者、數量／上限、冷卻、用量 %（拿不到的顯示「未知」）。
 6. **秘密**：repo、log、紀錄、狀態板掃描不到任何 key 的值。
 7. **退回**：停用服務、Mac 改回用原本的指令，一切照舊。
@@ -184,7 +183,7 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
   - worker 容器要連得到服務。
   - 這三件另開 MyLinuxPool 的工單。
 - **MyAiStorage#31**：照上面的租用介面和 aistorage-pm 對齊 `ModelBroker` 的形狀（`request_lease` 回傳環境變數、`report_exhausted`、`release`）。
-- **MyAiEntry#31／#33**：手機用的轉送照 (2) 在那邊開單。
+- **MyAiEntry#147**：手機用的轉送（照 (2)），接 MyAiEntry#31、#33；租約欄位定案與 agent 種類要加給 App 的值時，通知 MyAiEntry PM。
 - **MyAiStorage#32（Atelier）**：harness 的能力需求要能寫「優先模型」與「底線模型」（PMO 會轉告 aistorage-pm）；LLMGateway 這邊見「之後」。
 
 ## 之後（v0 不做，但介面留了擴充點）

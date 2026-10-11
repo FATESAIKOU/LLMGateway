@@ -55,7 +55,7 @@
 - **THEN** LLMGateway 選出 `claude-personal`
 
 ### Requirement: 憑證由 launcher 注入
-五把上游 key 的值 SHALL 只保管在 LLMGateway。launcher（worker 上的 sidecar、Mac 上的 `lgw run`）SHALL 只透過租約的 `env` 取得那一把 key，並在啟動 agent 前：
+五把上游 key 的值 SHALL 只保管在 LLMGateway。launcher（worker 上常駐的 sidecar、Mac 上前景執行的 `sidecar agent run`）SHALL 只透過租約的 `env` 取得那一把 key，並在啟動 agent 前：
 - 套用 `env`；
 - 從 agent 的環境中去掉 `unset` 列出的變數；
 - 不把值寫進任何檔案、log 或命令列；
@@ -130,14 +130,14 @@
 - **THEN** 該 agent 繼續使用 `claude-company`；下一個新開的 Claude Code 才拿到 `claude-personal`
 
 ### Requirement: Mac 與 worker 走同一套
-在 Mac 上開 agent SHALL 使用與 worker 相同的租用介面與相同的換把程序（同一個客戶端模組的 `start`、`watch`、`switch`）；worker 欄位以 `mac:<主機名>` 區分。實作中 MUST NOT 有只在 Mac 才走的換把分支；額度用完時，Mac 上的 agent 也會自動重開並接回 session。
+在 Mac 上開 agent SHALL 使用與 worker 相同的租用介面與相同的換把程序（同一份 sidecar agent 宿主的程式，判讀規則來自 `lgw`）；worker 欄位以 `mac:<主機名>` 區分。實作中 MUST NOT 有只在 Mac 才走的換把分支；額度用完時，Mac 上的 agent 也會自動重開並接回 session。
 
 #### Scenario: Mac 上開 agent
-- **WHEN** 本人或 PM 在 Mac 上用 `lgw run claude` 開一個 Claude Code
+- **WHEN** 本人或 PM 在 Mac 上用 `sidecar agent run claude` 開一個 Claude Code
 - **THEN** LLMGateway 有一張 worker 為 `mac:<主機名>` 的租約，事件與 worker 上的相同
 
 #### Scenario: Mac 上額度用完
-- **WHEN** Mac 上由 `lgw run` 開的 agent 額度用完
+- **WHEN** Mac 上由 `sidecar agent run` 開的 agent 額度用完
 - **THEN** 和 worker 上一樣：回報、冷卻、拿下一張、自動重開並接回 session
 
 ## ADDED Requirements

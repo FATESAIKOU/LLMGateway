@@ -13,8 +13,8 @@
 
 **Goals**
 - 五把 key 只放一處，客戶端只在租約期間拿到其中一把。
-- 換把的判斷只有一份（服務端），換把的程序也只有一份（客戶端模組），worker 與 Mac 共用。
-- 第三方依賴越少越好：服務與客戶端模組都只用 Python 標準函式庫。
+- 換把的判斷只有一份（服務端），換把的程序也只有一份（sidecar 的 agent 宿主），worker 與 Mac 共用。
+- 第三方依賴越少越好：服務與 `lgw` 都只用 Python 標準函式庫。
 
 **Non-Goals**
 - 不轉送任何模型請求（沒有資料面）。
@@ -110,7 +110,7 @@ JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑�
 | `opencode-zen` | 拒絕 `not_allowed`（沒有官方接法） | `env: {OPENCODE_API_KEY}` |
 
 - opencode 用的 provider 設定（模型清單、base URL）放在 repo 的 `client/opencode.json`，由模組帶 `OPENCODE_CONFIG` 指給 opencode；key 用 `{env:...}` 讀，設定檔不含值。各變數名以實作時的實打結果定案。
-- 回傳的值只在記憶體裡交給 agent，客戶端模組不寫檔、不寫 log。
+- 回傳的值只在記憶體裡交給 agent，`lgw` 與 sidecar 都不寫檔、不寫 log。
 
 ### 決定 8：選把、冷卻、同時租用上限
 
@@ -127,35 +127,40 @@ JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑�
 - **同一個 agent 不同時拿兩把**：`exhausted` 會先結束原租約，再發新的。
 - **擴充點**：`preferences: {preferred_models, floor_model}` 存進 granted 事件，v0 的選把邏輯不看它。之後選把改成「在底線之上照優先順序選」，介面不變。
 
-### 決定 9：換把程序只有一份：客戶端模組 `lgw`
+### 決定 9：換把程序只有一份，放在 sidecar 的 agent 宿主；`lgw` 只給 API 客戶端與訊號規則
 
-- `lgw` 是本 repo 的 Python 套件，只用標準函式庫，含三塊：
-  1. **API 客戶端**：連不上時回報「無法確認」，不丟例外讓呼叫方當掉。
-  2. **訊號判讀**：輸入 agent 的畫面文字（由 `herdr agent read` 取得），輸出「額度用完（重置時間或無）」「暫時錯誤」或「正常」。規則照 `quota-signals.md`：Claude Code 的 `You've hit your … limit · resets …`、opencode 的 `Free usage exceeded`、`usage limit reached` 與 402／429。規則放資料表，可以單獨更新與測試。
-  3. **換把程序**：
-     - `start(agent, session=None)`：申請租約 → `herdr tab create --env` 帶 env 開 agent。unset 用 `env -u NAME`。Claude Code 加上 `--settings` 關掉 `autoContinueAtUsageLimit`。有 session 時用 `agora continue` 接回，沒有就開新的。
-     - `watch()`：定期讀畫面，判讀到「額度用完」就呼叫 `switch()`。
-     - `switch()`：
-       1. 從 herdr 的 `agent_session` 取得目前的 session id；
-       2. 安全結束 agent（SIGINT，等 agora 寫回）；
-       3. 呼叫 `exhausted` 取得下一張；
-       4. 用新 env 呼叫 `start(session=…)`；
-       5. 拿到拒絕就停下並通知。
+- **本 repo 的 `lgw`**：Python 套件，只用標準函式庫，不綁 herdr、agora。內容：
+  1. **API 客戶端**：base URL 與客戶端憑證路徑可設定；連不上時回報「無法確認」，不丟例外讓呼叫方當掉。
+  2. **訊號規則**：輸入 agent 的畫面文字，輸出「額度用完（含重置時刻或無）」「暫時錯誤」或「正常」。規則照 `quota-signals.md`：
+     - Claude Code 的 `You've hit your … limit · resets …`；
+     - opencode 的 `Free usage exceeded`、`usage limit reached` 與 402／429。
+
+     規則放資料表，可以單獨更新與測試。
+  3. **管理命令**：`lgw admin client add|revoke|list`，在 provider 上用。
+- **換把程序在 MyAiStorage 的 sidecar 裡（agent 宿主）**：
+  - 開 agent：`herdr tab create --env` 帶 env；unset 用 `env -u NAME`；Claude Code 加 `--settings` 關掉 `autoContinueAtUsageLimit`。
+  - 判讀：用 `herdr agent read` 讀畫面，交給 `lgw` 的規則判讀。
+  - 安全結束：`herdr agent send-keys <name> ctrl+c` 讓 agent 收尾，由 agora continue 做最後寫回；5 秒後還在就對 process group 送 SIGTERM，再 5 秒送 SIGKILL，最後才 `pane close`。
+  - 打斷一輪而不結束 agent 時用 Esc（Claude Code 1 次、opencode 2 次）。
+  - 接回：`agora continue session <Session> --agent <agent> --sync-period <分鐘>`，不用 `--fork`。
+  - 這些都是 sidecar 已有、已審過的生命週期程式（MyAiStorage#31 的 D4 與 10-11 的 spike）。
 - **誰呼叫**：
-  - worker：sidecar 把 `lgw` 當作它的 `ModelBroker` 與換把實作，sidecar 管佇列與通訊；
-  - Mac：`lgw run claude|opencode` 在目前的 herdr session 開 agent，自己留在原本的 pane 監看。
-  - 兩邊走同一段 `start`、`watch`、`switch`，沒有 Mac 專用的分支（本人要求）。
-- **為什麼**：判斷集中在服務、程序集中在模組，規則改一次兩邊都生效。
+  - worker：sidecar 常駐，依賴 `lgw`（從本 repo 的固定 ref 裝進 sidecar 的 venv）。
+  - Mac：`sidecar agent run claude|opencode`（sidecar 與 agora 是同一個 Python distribution，Mac 已經裝了 agora），在前景跑同一段程序。
+  - 兩邊只差「常駐或前景」，換把程序完全同一份，沒有 Mac 專用的分支（本人要求）。
+- **為什麼**（和 aistorage-pm 2026-10-11 談定）：
+  - 開關 agent、三段終止、重啟後找回、agora continue 這段 sidecar 已經有了；LLMGateway 再寫一份就會變成兩份。
+  - `lgw` 不綁 agent 工具，agent 工具換了，服務與 `lgw` 都不必改。
 - **放棄的選項**：
-  - Mac 也跑整個 sidecar：sidecar 還帶著 Angareion 與 team 管理，v0 在 Mac 上用不到；之後要的話，sidecar 也是呼叫同一個模組。
-  - 各自實作：會有兩份判讀規則，遲早不一致。
-- **需要和 aistorage-pm 確認**：sidecar 直接依賴 `lgw`（標準函式庫、固定版本）。對方先前說 sidecar 只用標準函式庫的 HTTP 客戶端，`lgw` 符合這一點。
+  - 換把程序放在 `lgw`（PR #9 先前的寫法）：sidecar 要把已審過的那段改成呼叫 `lgw`，等於重寫一份。
+  - 各自實作：會有兩份程序與兩份判讀規則。
+- **依賴**：v0 在 Mac 上的驗收要等 sidecar 提供 `sidecar agent run`。
 
 ### 決定 10：通知
 
 - 每次冷卻、換把、兩把都冷卻而停下，都寫進事件與狀態板。
 - Angareion 可用之後，由 sidecar 以 team 的身分通知 PMO（sidecar 本來就有 Angareion）。
-- Mac 上由 `lgw run` 在 pane 裡印出。
+- Mac 上由 `sidecar agent run` 在終端機印出（Mac 沒有常駐的 sidecar，也沒有 A2A token）。
 - 服務端不直接連 Angareion，所以服務不需要 A2A token。
 
 ### 決定 11：狀態板
@@ -181,7 +186,7 @@ JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑�
 
 ## Migration Plan
 
-1. 服務、政策檔、`lgw` 模組在本 repo 寫好，含測試（假 key、假上游、假 herdr）。
+1. 服務、政策檔、`lgw`（API 客戶端、訊號規則、管理命令）在本 repo 寫好，含測試（假 key、假上游、假時鐘）。
 2. MyLinuxPool：
    - 服務的單元；
    - Actions 的 client 身分；
@@ -189,8 +194,8 @@ JSON over HTTP，路徑前綴 `/v1`，用 `Authorization: Bearer <客戶端憑�
    - 客戶端憑證放進 `/run/mlp-secrets/`。
    這四件另開 MyLinuxPool 的單。
 3. 本人設五把 secret，跑 `deploy-keys`。
-4. Mac：`lgw run claude`、`lgw run opencode` 驗收，包含用假訊號換把。
-5. sidecar：aistorage-pm 把假 broker 換成 `lgw`，在一台 worker 驗收。
+4. Mac：`sidecar agent run claude`、`sidecar agent run opencode` 驗收，包含用假訊號換把（等 sidecar 提供這個命令）。
+5. sidecar：aistorage-pm 把假 broker 換成 `lgw` 的 API 客戶端，在一台 worker 驗收。
 6. 另開單把 MyLinuxPool#50 的 key 來源換成租用，收掉 MyLinuxPool 裡的 key。
 - **退回**：停服務、Mac 改回原本的指令；worker 在第 6 步之前仍有 MyLinuxPool#50 的 key，可以照舊。
 
