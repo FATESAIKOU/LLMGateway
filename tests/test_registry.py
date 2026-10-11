@@ -184,6 +184,7 @@ class GetTest(RegistryCase):
             with self.subTest(agent=agent):
                 err = self.assert_api_error(400, "bad_request", self.get, "claude-personal", agent)
                 self.assertEqual(err.body()["missing"], ["agent"])
+                self.assertNotIn("detail", err.body())
 
     def test_不存在的id回404(self):
         self.assert_api_error(404, "not_found", self.get, "ghost", "opencode")
@@ -212,18 +213,43 @@ class CooldownTest(RegistryCase):
         self.assertFalse(item["available"])
         self.assertEqual(self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z"), None)
 
-    def test_不合理的時刻(self):
-        for resets in ("2026-10-10T23:59:59Z", "2026-10-19T00:00:01Z", "not-a-time", 123):
+    def test_resets_at型別或格式不對回invalid_resets_at(self):
+        for resets in ("not-a-time", "2026-99-99", 123, True, ["2026-10-11T15:00:00Z"]):
             with self.subTest(resets=resets):
-                self.assert_api_error(
-                    400, "bad_request", self.cooldown, "claude-personal", "5h", resets)
+                err = self.assert_api_error(
+                    400, "invalid_resets_at", self.cooldown, "claude-personal", "5h", resets)
+                self.assertNotIn("detail", err.body())
                 item = _by_id(self.list_items())["claude-personal"]
                 self.assertIsNone(item["cooldown"]["5h"])  # 冷卻不變
+
+    def test_resets_at在過去或超過八天回resets_at_out_of_range(self):
+        # 邊界：過去 1 秒、超過 8 天 1 秒，以及遠過去與遠未來
+        cases = [
+            ("2026-10-10T23:59:59Z", "過去1秒"),
+            ("2026-10-19T00:00:01Z", "超過8天1秒"),
+            ("2020-01-01T00:00:00Z", "遠過去"),
+            ("2099-01-01T00:00:00Z", "遠未來"),
+        ]
+        for resets, label in cases:
+            with self.subTest(label=label, resets=resets):
+                err = self.assert_api_error(
+                    400, "resets_at_out_of_range", self.cooldown, "claude-personal", "5h", resets)
+                self.assertNotIn("detail", err.body())
+                item = _by_id(self.list_items())["claude-personal"]
+                self.assertIsNone(item["cooldown"]["5h"])
 
     def test_八天整可以剛好超過不行(self):
         self.cooldown("claude-personal", "5h", "2026-10-19T00:00:00Z")  # 剛好 8 天
         self.assertIsNotNone(
             _by_id(self.list_items())["claude-personal"]["cooldown"]["5h"])
+        err = self.assert_api_error(
+            400, "resets_at_out_of_range", self.cooldown, "claude-personal", "5h", "2026-10-19T00:00:01Z")
+        self.assertNotIn("detail", err.body())
+
+    def test_剛好現在的時刻可以(self):
+        self.cooldown("claude-personal", "5h", "2026-10-11T00:00:00Z")  # 剛好現在（00:00:00）
+        item = _by_id(self.list_items())["claude-personal"]
+        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T00:02:00Z"})
 
     def test_沒有重置時刻(self):
         self.cooldown("claude-personal", "1w")
@@ -260,10 +286,17 @@ class CooldownTest(RegistryCase):
         self.assertTrue(item["available"])
         self.assertIsNone(item["cooldown"]["1w"])
 
-    def test_窗口不對回400(self):
-        for window in (None, "", "24h", "1d", 5):
+    def test_窗口不是5h或1w回invalid_window(self):
+        for window in (None, "", "24h", "1d", 5, True):
             with self.subTest(window=window):
-                self.assert_api_error(400, "bad_request", self.cooldown, "claude-personal", window)
+                err = self.assert_api_error(400, "invalid_window", self.cooldown, "claude-personal", window)
+                self.assertNotIn("detail", err.body())
+
+    def test_缺window欄位回bad_request(self):
+        err = self.assert_api_error(
+            400, "bad_request", self.service.register_cooldown, "claude-personal", {})
+        self.assertEqual(err.body()["missing"], ["window"])
+        self.assertNotIn("detail", err.body())
 
     def test_不存在的id回404(self):
         self.assert_api_error(
