@@ -206,7 +206,7 @@ def main():
         state["shutdown"] = True
         stop.set()
         if tunnel.poll() is None:
-            tunnel.kill()
+            tunnel.terminate()
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
@@ -224,7 +224,7 @@ def main():
                 log("restart")
                 stop.set()
                 if tunnel.poll() is None:
-                    tunnel.kill()
+                    tunnel.terminate()
                 return
 
     watcher = threading.Thread(target=watch, daemon=True)
