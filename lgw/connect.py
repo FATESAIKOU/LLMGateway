@@ -50,13 +50,17 @@ v0 沒有應用層認證，開著不放只增加暴露面。
       "remote_api": 4710
     }
 
-自成一體的版本（`host_keys` 取代 `known_hosts`）：
+自成一體的版本（`host_keys` 取代 `known_hosts`；22 埠寫裸主機名，非 22 埠寫 `[host]:port`）：
 
     {
       "schema": 1,
       "rendezvous": "sshproxy@rendezvous.example:22",
+      "jumps": ["jump1@jump.example:2222"],
       "identity": "/home/sidecar/.ssh/id_tunnel",
-      "host_keys": ["[rendezvous.example]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAFAKEfakeFAKEfakeFAKEfakeFAKEfake"]
+      "host_keys": [
+        "rendezvous.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAFAKEfakeFAKEfakeFAKEfakeFAKEfake",
+        "[jump.example]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAFAKEfakeFAKEfakeFAKEfakeFAKEfake"
+      ]
     }
 
 指令：`python3 -m lgw.connect --config <connect.json>`，前景維持轉發、印出一行
