@@ -337,9 +337,25 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`（`id
 - 手動 `ssh -i <金鑰> -p <埠> <帳號>@<跳板機>` 能不能過；
 - 伺服器端隧道（5.4）。
 
-### 5.6 get 回 403 `agent_not_allowed`
+### 5.6 API 回的錯誤碼
 
-`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403，這是預期的。其他組合要改 `policy/default.json` 並發新版。
+回覆是 `{"error": "<碼>"}`，完整表在 design 決定 6。
+
+| 狀態 | 碼 | 怎麼辦 |
+|---|---|---|
+| 400 | `bad_request` | JSON 壞掉、body 不是物件或缺必填（看回覆的 `missing`；get 少了 `?agent=` 也是這個）。檢查呼叫方送的內容。 |
+| 400 | `invalid_window` | `window` 只能是 `5h` 或 `1w`。 |
+| 400 | `invalid_resets_at` | `resets_at` 要是 RFC 3339 字串（例如 `2026-10-18T00:00:00Z`）。 |
+| 400 | `resets_at_out_of_range` | `resets_at` 在過去或超過 8 天以後。多半是客戶端判讀錯或時鐘不準；查呼叫方，不是服務的問題。 |
+| 403 | `agent_not_allowed` | 見下。 |
+| 404 | `not_found` | id 不存在或路徑錯（路徑對但方法錯也是 404）。id 見 `policy/default.json`。 |
+| 409 | `not_deployed` | 見 5.7。 |
+| 413 | `body_too_large` | body 超過 1 MB。 |
+| 500 | `internal` | 服務內部錯誤，只有例外種類在 log，看 `journalctl --user -u llmgateway`。 |
+
+客戶端側（`lgw.client` 的 `Result.error`）另有兩個自己判讀的值：`unreachable`（連不上或逾時，先看 5.5 與 5.4）與 `bad_response`（回覆不是 JSON 物件，通常是連到不是 `lgwd` 的東西，查會合點上 4710 是誰在聽）。
+
+**403 `agent_not_allowed`**：`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403，這是預期的。其他組合要改 `policy/default.json` 並發新版。
 
 ### 5.7 `available` 為 false，或 get 回 409 `not_deployed`
 

@@ -124,12 +124,28 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 | 方法 | 路徑 | 成功 | 錯誤 |
 |---|---|---|---|
 | GET | `/v1/subscriptions` | `200 {schema, subscriptions: [ … ]}`，依 `priority` 排序，不含 `key` | — |
-| GET | `/v1/subscriptions/{id}?agent=claude-code\|opencode` | `200 { … , key}` | 400（缺 `agent`）、403 `agent_not_allowed`、404、409 `not_deployed` |
-| POST | `/v1/subscriptions/{id}/cooldown` | `204`；body `{window: "5h"\|"1w", resets_at?}` | 400（窗口不對、時刻不合理）、404 |
+| GET | `/v1/subscriptions/{id}?agent=claude-code\|opencode` | `200 { … , key}` | 400 `bad_request`（缺 `agent`，帶 `missing`）、403 `agent_not_allowed`、404 `not_found`、409 `not_deployed` |
+| POST | `/v1/subscriptions/{id}/cooldown` | `204`；body `{window: "5h"\|"1w", resets_at?}` | 400（`bad_request`、`invalid_window`、`invalid_resets_at`、`resets_at_out_of_range`）、404 `not_found`、413 `body_too_large` |
 
 - 時刻一律是 RFC 3339 UTC。
 - 請求 body 上限 1 MB。
 - 冷卻中的 subscription 仍可 get，`available` 為 false，由呼叫方決定。
+
+**錯誤碼表**（實作在 `lgwd/errors.py`）：回覆一律是 `{"error": "<碼>", …}`，訊息是固定字串，不回顯請求裡的值。
+
+| 狀態 | 碼 | 什麼時候 |
+|---|---|---|
+| 400 | `bad_request` | JSON 解析失敗、body 不是物件、缺必填（缺的欄位名放在 `"missing": [...]`，get 缺 `agent` 也是這個） |
+| 400 | `invalid_window` | `window` 不是 `"5h"` 或 `"1w"` |
+| 400 | `invalid_resets_at` | `resets_at` 不是 RFC 3339 字串（或型別不對） |
+| 400 | `resets_at_out_of_range` | `resets_at` 在過去，或超過 8 天以後 |
+| 403 | `agent_not_allowed` | `agent` 不在該筆的 `agents` 裡 |
+| 404 | `not_found` | 不存在的 id 或未知路徑（路徑對、方法不對也是 404） |
+| 409 | `not_deployed` | 該筆的 key 尚未部署 |
+| 413 | `body_too_large` | body 超過 1 MB |
+| 500 | `internal` | 伺服器內部非預期錯誤（只記例外種類到 log） |
+
+客戶端（`lgw.client` 的 `Result.error`）照實回上面的碼，另外有兩個**客戶端自己判讀**的值：`unreachable`（連不上或逾時，`Result.unreachable` 為 true，不丟例外）與 `bad_response`（回覆不是 JSON 物件）。呼叫方遇到 `unreachable` 要當成「無法確認」。
 
 ### 決定 7：共通 JSON schema（和 aistorage-pm 一致）
 
