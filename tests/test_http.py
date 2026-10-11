@@ -6,13 +6,19 @@
 
 import http.client
 import json
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from lgwd import errors
+from lgwd.clock import FakeClock
 from lgwd.http import make_api_server
+from lgwd.keys import KeyStore
+from lgwd.policy import load_policy
+from lgwd.registry import RegistryService
 
 HOST = "127.0.0.1"
 
@@ -125,12 +131,14 @@ class ApiTest(ServerCase):
         data = self.json_of(payload)
         self.assertEqual(data["error"], "bad_request")
         self.assertEqual(data["missing"], ["agent"])
+        self.assertNotIn("detail", data)
         self.assertIsNone(self.fake.calls[-1][2])
 
     def test_get_空agent回400(self):
         self.fake.raise_for["get_subscription"] = errors.bad_request(missing=["agent"])
-        status, _ = self.call("GET", "/v1/subscriptions/claude-personal?agent=")
+        status, payload = self.call("GET", "/v1/subscriptions/claude-personal?agent=")
         self.assertEqual(status, 400)
+        self.assertNotIn("detail", self.json_of(payload))
 
     def test_get_id解碼(self):
         status, _ = self.call("GET", "/v1/subscriptions/ghost%2Did?agent=opencode")
@@ -151,6 +159,7 @@ class ApiTest(ServerCase):
                 self.assertEqual(status, code)
                 self.assertEqual(self.json_of(payload)["error"], err)
                 self.assertNotIn("key", self.json_of(payload))
+                self.assertNotIn("detail", self.json_of(payload))
 
     # --- cooldown ---
     def test_cooldown_204(self):
@@ -169,27 +178,38 @@ class ApiTest(ServerCase):
         self.assertEqual(self.fake.calls[-1][2], {})
 
     def test_cooldown錯誤對應(self):
-        for exc, code, err in (
-            (errors.bad_request(detail="window must be 5h or 1w"), 400, "bad_request"),
+        cases = [
+            (errors.invalid_window(), 400, "invalid_window"),
+            (errors.invalid_resets_at(), 400, "invalid_resets_at"),
+            (errors.resets_at_out_of_range(), 400, "resets_at_out_of_range"),
+            (errors.bad_request(missing=["window"]), 400, "bad_request"),
             (errors.not_found(), 404, "not_found"),
-        ):
+        ]
+        for exc, code, err in cases:
             with self.subTest(code=err):
                 self.fake.raise_for["register_cooldown"] = exc
                 status, payload = self.call(
                     "POST", "/v1/subscriptions/ghost/cooldown", {"window": "24h"})
                 self.assertEqual(status, code)
-                self.assertEqual(self.json_of(payload)["error"], err)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], err)
+                self.assertNotIn("detail", data)
+                if exc.extra.get("missing"):
+                    self.assertEqual(data["missing"], exc.extra["missing"])
 
     def test_cooldown_bad_json回400(self):
         status, payload = self.call(
             "POST", "/v1/subscriptions/claude-personal/cooldown", raw=b"{nope")
         self.assertEqual(status, 400)
         self.assertEqual(self.json_of(payload)["error"], "bad_request")
+        self.assertNotIn("detail", self.json_of(payload))
 
     def test_json_list_body回400(self):
-        status, _ = self.call(
+        status, payload = self.call(
             "POST", "/v1/subscriptions/claude-personal/cooldown", raw=b"[1]")
         self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(payload)["error"], "bad_request")
+        self.assertNotIn("detail", self.json_of(payload))
 
     # --- 其他路徑一律 404 ---
     def test_其他路徑404(self):
@@ -268,6 +288,113 @@ class ApiTest(ServerCase):
             "POST", "/v1/subscriptions/claude-personal/cooldown", raw=raw)
         self.assertEqual(status, 204)  # 邊界：超過才擋
         self.assertEqual(self.fake.calls[-1][2]["window"], "5h")
+
+
+class RealServiceHttpTest(ServerCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        keys_path = root / "keys.env"
+        canary = (
+            "# 測試用假 key\n"
+            "CLAUDE_PERSONAL_OAUTH_TOKEN=fake-personal\n"
+            "CLAUDE_COMPANY_OAUTH_TOKEN=fake-company\n"
+            "OPENROUTER_API_KEY=fake-openrouter\n"
+            "OPENCODE_ZEN_API_KEY=fake-zen\n"
+            "OLLAMA_API_KEY=fake-ollama\n"
+        )
+        keys_path.write_text(canary, encoding="utf-8")
+        policy_path = str(Path(__file__).resolve().parent.parent / "policy" / "default.json")
+        self.clock = FakeClock()  # 預設 2026-10-11T00:00:00Z
+        self.policy = load_policy(policy_path)
+        self.keys = KeyStore(str(keys_path))
+        self.service = RegistryService(str(root / "llm.db"), self.policy, self.keys, self.clock)
+        self.base = self.serve(self.service)
+
+    def tearDown(self):
+        super().tearDown()
+        self.service.close()
+        self.tmp.cleanup()
+
+    def json_of(self, payload):
+        return json.loads(payload.decode())
+
+    def test_http端到端_400碼表案例(self):
+        # 1. bad_request: JSON 解析失敗
+        status, payload = self.call("POST", "/v1/subscriptions/claude-personal/cooldown", raw=b"{broken")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(payload)["error"], "bad_request")
+        self.assertNotIn("detail", self.json_of(payload))
+
+        # 2. bad_request: body 不是物件
+        status, payload = self.call("POST", "/v1/subscriptions/claude-personal/cooldown", raw=b"[\"not-dict\"]")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(payload)["error"], "bad_request")
+        self.assertNotIn("detail", self.json_of(payload))
+
+        # 3. bad_request: get 缺 agent
+        status, payload = self.call("GET", "/v1/subscriptions/claude-personal")
+        self.assertEqual(status, 400)
+        data = self.json_of(payload)
+        self.assertEqual(data["error"], "bad_request")
+        self.assertEqual(data["missing"], ["agent"])
+        self.assertNotIn("detail", data)
+
+        # 4. bad_request: cooldown 缺 window
+        status, payload = self.call("POST", "/v1/subscriptions/claude-personal/cooldown", {})
+        self.assertEqual(status, 400)
+        data = self.json_of(payload)
+        self.assertEqual(data["error"], "bad_request")
+        self.assertEqual(data["missing"], ["window"])
+        self.assertNotIn("detail", data)
+
+        # 5. invalid_window: window 不是 5h 或 1w
+        for w in ("24h", "1d", "", "invalid"):
+            with self.subTest(window=w):
+                status, payload = self.call("POST", "/v1/subscriptions/claude-personal/cooldown", {"window": w})
+                self.assertEqual(status, 400)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], "invalid_window")
+                self.assertNotIn("detail", data)
+
+        # 6. invalid_resets_at: 型別或格式不是 RFC 3339
+        for resets in ("not-a-time", "2026-99-99", 123, True):
+            with self.subTest(resets=resets):
+                status, payload = self.call(
+                    "POST", "/v1/subscriptions/claude-personal/cooldown",
+                    {"window": "5h", "resets_at": resets}
+                )
+                self.assertEqual(status, 400)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], "invalid_resets_at")
+                self.assertNotIn("detail", data)
+
+        # 7. resets_at_out_of_range: 過去 1 秒（2026-10-10T23:59:59Z）
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/claude-personal/cooldown",
+            {"window": "5h", "resets_at": "2026-10-10T23:59:59Z"}
+        )
+        self.assertEqual(status, 400)
+        data = self.json_of(payload)
+        self.assertEqual(data["error"], "resets_at_out_of_range")
+        self.assertNotIn("detail", data)
+
+        # 8. resets_at_out_of_range: 超過 8 天 1 秒（2026-10-19T00:00:01Z）
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/claude-personal/cooldown",
+            {"window": "5h", "resets_at": "2026-10-19T00:00:01Z"}
+        )
+        self.assertEqual(status, 400)
+        data = self.json_of(payload)
+        self.assertEqual(data["error"], "resets_at_out_of_range")
+        self.assertNotIn("detail", data)
+
+        # 9. 邊界成功：剛好 8 天（2026-10-19T00:00:00Z）
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/claude-personal/cooldown",
+            {"window": "5h", "resets_at": "2026-10-19T00:00:00Z"}
+        )
+        self.assertEqual(status, 204)
 
 
 if __name__ == "__main__":
