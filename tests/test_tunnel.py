@@ -1,4 +1,6 @@
 import os
+import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,14 @@ FAKE_HOST = "rendezvous.invalid"
 FAKE_PORT = "2200"
 FAKE_IDENTITY = "/tmp/does-not-exist/id_fake_tunnel"
 FAKE_KNOWN_HOSTS = "/tmp/does-not-exist/known_hosts_fake"
+
+
+def is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def wait_until(predicate, timeout=10.0):
@@ -50,6 +60,9 @@ for arg in "$@"; do
         -W) mode=probe ;;
     esac
 done
+if [[ "$mode" == "tunnel" ]]; then
+    printf 'tunnel_pid: %s\\n' "$$" >> "${FAKE_SSH_LOG}"
+fi
 if [[ "$mode" == "probe" ]]; then
     request="$(cat)"
     printf 'request: %s\\n' "$request" >> "${FAKE_SSH_LOG}"
@@ -193,6 +206,8 @@ while :; do sleep 0.05; done
         self.assertIn("-o ExitOnForwardFailure=yes", ssh_log)
         self.assertIn("-o StrictHostKeyChecking=yes", ssh_log)
         self.assertIn("-o BatchMode=yes", ssh_log)
+        self.assertIn("-o GlobalKnownHostsFile=/dev/null", ssh_log)
+        self.assertIn("-o IdentitiesOnly=yes", ssh_log)
         self.assertIn("-o ServerAliveInterval=30", ssh_log)
         self.assertIn("-o ServerAliveCountMax=3", ssh_log)
         self.assertIn("UserKnownHostsFile=" + FAKE_KNOWN_HOSTS, ssh_log)
@@ -252,6 +267,41 @@ while :; do sleep 0.05; done
         stderr = self.read_stderr()
         self.assertIn("tunnel_up", stderr)
         self.assertNotIn("restart", stderr)
+
+    def test_sigterm_stops_daemon_and_ssh_child(self):
+        self.write_config()
+        self.start_daemon()
+        self.assertTrue(wait_until(lambda: "tunnel_up" in self.read_stderr()))
+        self.assertTrue(wait_until(lambda: "tunnel_pid:" in self.read_ssh_log()))
+        m = re.search(r"tunnel_pid: (\d+)", self.read_ssh_log())
+        self.assertIsNotNone(m)
+        child_pid = int(m.group(1))
+        self.assertTrue(is_pid_alive(child_pid))
+
+        self.proc.send_signal(signal.SIGTERM)
+        rc = self.wait_exit(timeout=5)
+        self.assertEqual(rc, 0)
+
+        self.assertTrue(
+            wait_until(lambda: "tunnel_terminated" in self.read_ssh_log(), timeout=5)
+        )
+        self.assertTrue(wait_until(lambda: not is_pid_alive(child_pid), timeout=5))
+
+    def test_switch_rendezvous_target_updates_argv(self):
+        other_user = "otheruser"
+        other_host = "other-target.invalid"
+        other_port = "2222"
+        self.write_config(
+            RENDEZVOUS="%s@%s:%s" % (other_user, other_host, other_port)
+        )
+        self.start_daemon()
+        self.assertTrue(wait_until(lambda: "tunnel_up" in self.read_stderr()))
+        self.assertTrue(wait_until(lambda: "argv:" in self.read_ssh_log()))
+        ssh_log = self.read_ssh_log()
+        self.assertIn("-p " + other_port, ssh_log)
+        self.assertIn(other_user + "@" + other_host, ssh_log)
+        self.assertNotIn(FAKE_HOST, ssh_log)
+        self.assertEqual(self.stop_daemon(), 0)
 
 
 if __name__ == "__main__":
