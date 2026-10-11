@@ -5,7 +5,7 @@
 - **Claude 條款**：訂閱的 OAuth 是給原版 Claude Code 這類 Anthropic 原生 app 的一般使用；第三方不得代為路由、收集、存放、中轉 Claude.ai 的 token（`docs/research/claude-failover.md` §7）。所以 LLMGateway 不能代轉 Claude 的請求，只能把 `CLAUDE_CODE_OAUTH_TOKEN` 交給本人自己的原版 Claude Code。
 - **期 1 設計**（已封存為 `openspec/specs/agent-lease`、`openspec/specs/usage-record`）：控制面、租約、只追加事件、launcher 注入、切換留紀錄。v0 延伸它；差別見決定 1、2、3。
 - **池**：池內有常駐的 provider，Mac 已經有經 SSH 跳板連入池內的身分。worker 是跑在 provider 上的容器。對外只有跳板機的 SSH 埠，其餘服務都不對外。
-- **sidecar**（MyAiStorage#31，範圍 B，已開工）：用 herdr 開關 agent，用 `agora continue` 接回 session，用假的 `ModelBroker` 頂著。介面形狀已和 aistorage-pm 對齊（proposal 第 2 節）。
+- **sidecar**（MyAiStorage#31；本人 2026-10-11 晚的要求，設計見 MyAiStorage 的 `docs/proposals/aicompany-design-v2.md`）：一台機器一個 daemon（Mac 也能跑），對外只有開啟、暫停、關閉、搜集狀態、戳五個操作加上 HTTP 控制；不基於 herdr，agent 是它開的子行程；內部用 `AgentDriver`、`SessionStore`、`CredentialSource` 三個介面，換把在內部完成。
 - **各上游**：OpenRouter、Ollama Cloud 有官方的 Claude Code 接法；Zen 只有 opencode（`upstream-claude-code-compat.md`）。額度訊號見 `quota-signals.md`。
 - **Claude Code**：`--settings <file-or-json>` 可以在啟動時給設定；互動模式有 `autoContinueAtUsageLimit`，會在額度重置後自己續跑。
 
@@ -124,7 +124,6 @@
 | POST | `/v1/leases/{id}/start` | `request_id` | `200 {expires_at}`：確認 agent 已經開起來，granted → active；對已 active 的租約重送也回 200 |
 | POST | `/v1/leases/{id}/exhausted` | `signal, resets_at?, request_id` | `200 {next: lease}`，或 `200 {next: null, refusal}` |
 | POST | `/v1/leases/{id}/renew` | `request_id` | `200 {expires_at}` |
-| POST | `/v1/leases/{id}/usage` | `snapshot` | `204` |
 | POST | `/v1/leases/{id}/release` | `reason?, request_id` | `204`（重複 release 也回 204） |
 | GET | `/v1/board` | — | `200 {subscriptions: [...]}` |
 | GET | `/v1/whoami` | — | `200 {client, role}`（核對憑證用，不花額度） |
@@ -194,46 +193,43 @@
 - **同一個 agent 不同時拿兩把**：靠 `instance`（決定 6）擋住直接申請兩次；`exhausted` 先結束原租約，再發新的。
 - **擴充點**：`preferences: {preferred_models, floor_model}` 存進 granted 事件，v0 的選把邏輯不看它。之後選把改成「在底線之上照優先順序選，沒有就拒絕 `below_floor`」，介面不變。「平均分攤」留在政策檔的選項裡（期 1 的設計），v0 的初始政策不用它。
 
-### 決定 9：換把程序只有一份，放在 sidecar 的 agent 宿主；`lgw` 只給 API 客戶端與訊號規則
+### 決定 9：換把在 sidecar 內部，經 sidecar 定義的 `CredentialSource` 介面；`lgw` 提供實作 `LgwCredentialSource`
 
-- **本 repo 的 `lgw`**：Python 套件，只用標準函式庫，不綁 herdr、agora。內容：
-  1. **API 客戶端**：base URL 與客戶端憑證路徑可設定；連不上時回報「無法確認」，不丟例外讓呼叫方當掉。
-  2. **訊號規則**：輸入 agent 的畫面文字，輸出「額度用完（含 `signal` 與重置時刻或無）」「暫時錯誤」或「正常」。規則照 `quota-signals.md`：
-     - Claude Code：`You've hit your (session|weekly|Opus|Sonnet) limit · resets …` → `claude_limit`；
-     - opencode 對 Zen：`FreeUsageLimitError`／`Free usage exceeded` → `zen_free_limit`；`GoUsageLimitError`／`usage limit reached. It will reset in …` → `zen_go_limit`；`CreditLimitExceeded` → `credit_limit`。訊息內容的標記優先於狀態碼。
-     - OpenRouter：402 且 `limit_source` 不是 in-flight 預算 → `openrouter_limit`。in-flight 預算的 402 是暫時錯誤。
-     - Ollama Cloud：429 且訊息含 `session usage limit` 或 `weekly usage limit` → `ollama_limit`。
-     - Claude Code 的 spend limit 類訊息（月額度、額外用量上限，不會隨 5 小時窗口重置）→ `claude_limit`、不帶重置時刻，於是用政策檔的預設冷卻；寧可冷卻久一點也不空轉重試。
-     - **沒有額度標記的 402／429 一律判為「暫時錯誤」**，不換把。
+（和 aistorage-pm 2026-10-11 晚談定，對應他提案的 Q5；圖見 `diagrams.md`。）
 
-     規則放資料表，正反兩面都用 `quota-signals.md` 的樣本測試。
-  3. **opencode 設定**：`client/opencode.json`（模型清單、base URL，key 用 `{env:...}` 讀）隨 `lgw` 一起打包，sidecar 用 `lgw` 提供的路徑把它指給 opencode（`OPENCODE_CONFIG`）。
-  4. **管理命令**：`lgw admin client add|revoke|list`，在 provider 上用。
-- **換把程序在 MyAiStorage 的 sidecar 裡（agent 宿主）**。以下是轉述，規格以 MyAiStorage#31 為準，那邊改了以那邊為準：
-  - 開 agent：`herdr tab create --env` 帶 env；unset 用 `env -u NAME`；Claude Code 加 `--settings` 關掉 `autoContinueAtUsageLimit`。
-  - 判讀：用 `herdr agent read` 讀畫面，交給 `lgw` 的規則判讀。
-  - 安全結束：`herdr agent send-keys <name> ctrl+c` 讓 agent 收尾，由 agora continue 做最後寫回；5 秒後還在就對 process group 送 SIGTERM，再 5 秒送 SIGKILL，最後才 `pane close`。
-  - 打斷一輪而不結束 agent 時用 Esc（Claude Code 1 次、opencode 2 次）。
-  - 開起來之後呼叫 `start` 確認租約：時機在 agent 的 prompt 出現之後、送 harness 之前；agent 開不起來就不呼叫 `start`，直接 `release`。
-  - 接回：`agora continue session <Session> --agent <agent> --sync-period <分鐘>`，不用 `--fork`；session id 的寫法照 sidecar 既有的慣例。
-  - 這些都是 sidecar 已有、已審過的生命週期程式（MyAiStorage#31 的 D4 與 10-11 的 spike）。
-- **誰呼叫**：
-  - worker：sidecar 常駐，依賴 `lgw`（從本 repo 的固定 ref 裝進 sidecar 的 venv）。
-  - Mac：`sidecar agent run claude|opencode`（sidecar 與 agora 是同一個 Python distribution，Mac 已經裝了 agora），在前景跑同一段程序。
-  - 兩邊只差「常駐或前景」，換把程序完全同一份，沒有 Mac 專用的分支（本人要求）。
-- **為什麼**（和 aistorage-pm 2026-10-11 談定）：
-  - 開關 agent、三段終止、重啟後找回、agora continue 這段 sidecar 已經有了；LLMGateway 再寫一份就會變成兩份。
-  - `lgw` 不綁 agent 工具，agent 工具換了，服務與 `lgw` 都不必改。
+- **sidecar**（MyAiStorage）內部定義 `CredentialSource`：
+  - `acquire(agent 種類, 模型偏好) → env／unset`
+  - `started()`
+  - `renew()`
+  - `exhausted(訊號, 重置時刻) → 下一組 env 或拒絕`
+  - `release()`
+
+  sidecar 本體只認這個介面，**不知道 LLMGateway**。
+- **`lgw` 提供 `LgwCredentialSource`**，把這五個動作對到租用 API：
+  - `acquire` → `POST /v1/leases`
+  - `started` → `start`
+  - `renew` → `renew`
+  - `exhausted` → `exhausted`
+  - `release` → `release`
+
+  `lgw` 只用標準函式庫，不綁 herdr、agora、任何 agent 工具。
+- **額度用完由 agent driver 判讀**（sidecar 的 `AgentDriver`：Claude Code、opencode 各一個實作），在狀態裡回正規化的「額度用完＋重置時刻」。driver 建議用 agent 的程式化模式（Claude Code stream-json、opencode server），錯誤是結構化的。`lgw.signals` 的規則表（只有帶額度標記的 402／429 才算用完）可以給 driver 當函式庫用，判讀的責任在 driver。
+- **換把的步驟**（sidecar 內部，不是新的對外介面）：driver 回報額度用完 → `CredentialSource.exhausted` 拿下一組 → `stop`（溫和，寫回 agora）→ `SessionStore.prepare`（continue 同一個 Session）→ `launch`（新的 env）→ `started`。拿到拒絕時停下，狀態記成「等額度」，`status` 看得到。
+- **env 的交付**：sidecar 直接開子行程，env 用子行程的環境給，不上命令列；`unset` 列出的變數從子行程環境去掉。由 sidecar 開的 Claude Code 關掉 `autoContinueAtUsageLimit`（以設定或旗標）。
+- **Mac 與 worker 走同一套**：Mac 也跑同一個 sidecar daemon，用它的 `open` 開 agent。沒有 Mac 專用的分支，也沒有另一個換把程式。
+- **為什麼**：
+  - sidecar 對外仍是五個操作，LLMGateway 仍是租用介面；「怎麼拿 key、怎麼換」只在 `LgwCredentialSource` 這個實作裡。
+  - 不多一個常駐行程。
+  - 定時開啟的 job 執行時也拿得到憑證。
 - **放棄的選項**：
-  - 換把程序放在 `lgw`（PR #9 先前的寫法）：sidecar 要把已審過的那段改成呼叫 `lgw`，等於重寫一份。
-  - 各自實作：會有兩份程序與兩份判讀規則。
-- **依賴**：v0 在 Mac 上的驗收要等 sidecar 提供 `sidecar agent run`。
+  - 換把器做成 sidecar 外面的第三個行程（我先前的提案）：多一個常駐行程，而且 sidecar 的定時 job 拿不到憑證。
+  - 換把程序放在 `lgw` 並綁 herdr（PR #9 更早的寫法）：本人要求不基於 herdr。
 
 ### 決定 10：通知
 
 - 每次冷卻、換把、兩把都冷卻而停下，都寫進事件與狀態板。
 - Angareion 可用之後，由 sidecar 以 team 的身分通知 PMO（sidecar 本來就有 Angareion）。
-- Mac 上由 `sidecar agent run` 在終端機印出（Mac 沒有常駐的 sidecar，也沒有 A2A token）。
+- Mac 上同樣由 sidecar 記錄並在 `status` 顯示。
 - 服務端不直接連 Angareion，所以服務不需要 A2A token。
 
 ### 決定 11：狀態板
@@ -250,7 +246,7 @@
     - Claude 與 Zen 顯示「未知」。
 - **HTML 版**（`/board`）只綁在 provider 的 **loopback**（不開在 worker 看得到的介面），不要客戶端憑證、唯讀。Mac 經 SSH 埠轉送後用瀏覽器開。客戶端憑證永遠不放進 URL。
 - 從不顯示 key 的值。狀態板含 worker 名稱（Mac 是主機名），只在池內、經 SSH 通道看得到。
-- 期 1 `usage-record` 的 token 回報（OTel、opencode export）不在 v0，`report_usage` 介面先留著。
+- 期 1 `usage-record` 的 token 回報（OTel、opencode export）不在 v0；回報用量的端點也拿掉（沒有人用，本人要求「必要而且只有這些」），之後真的需要再加。
 
 ### 決定 12：一致性、邊界與錯誤處理
 
@@ -276,7 +272,7 @@
 - [公司帳號用完換另一帳號是灰色地帶] → 本人已接受。設計上做到：冷卻中不出租不試探；Claude 兩把各最多 2 個同時；只有額度用完才換；事件全留。
 - [key 集中在一台 provider] → 只綁內部介面、只經 SSH 進入；檔案 0600；事件、log、狀態板都不含值；輪替只要改 secret 並重跑 workflow。
 - [訊號判讀靠畫面文字，agent 改版會失效] → 規則是資料表，有單元測試，用 `quota-signals.md` 的樣本與實際碰到的輸出當測試資料；判讀不出時就不換，只記錄。
-- [`herdr tab create --env` 的行為在 worker 的 herdr 0.9.3 上還沒驗] → sidecar 驗收時再驗，不過就改用 0600 暫存 env 檔、讀完即刪。
+- [sidecar 改成直接開子行程，agent 的程式化模式還沒 spike] → 由 aistorage-pm 先 spike（他提案的 Q3）；env 一律走子行程環境、不上命令列。
 - [換把會中斷正在跑的那一輪] → 本人已知；靠 `agora continue` 接回。
 - [服務掛掉] → systemd 拉起並從 events 重建。客戶端拿不到租約時不開新 agent；已經在跑的 agent 不受影響，因為 env 已經給了。
 - [GitHub Actions 能登入放服務的那台] → 部署金鑰在跳板機上只能轉發、在那台只能跑部署腳本的兩個動詞；workflow 只能手動觸發，而且要本人在 environment 核准；跳板那一行可在 MyLinuxPool 單獨撤銷，那台那一行由 llmgw 帳號撤銷。
@@ -291,8 +287,8 @@
    - MyLinuxPool#69：worker 怎麼連到服務；
    - MyLinuxPool#70：create-／delete-worker 透過管理 API 發撤 worker 的客戶端憑證。
 4. 本人設 environment 與 secret，跑 `deploy-service`（`upgrade <tag>`）與 `deploy-keys`。
-5. Mac：`sidecar agent run claude`、`sidecar agent run opencode` 驗收，包含用假訊號換把（等 sidecar 提供這個命令）。
-6. sidecar：aistorage-pm 把假 broker 換成 `lgw` 的 API 客戶端，在一台 worker 驗收。
+5. Mac：用 sidecar 的 `open` 開 Claude Code 與 opencode 驗收，包含用假訊號換把（等 sidecar v2 與 `LgwCredentialSource`）。
+6. worker：sidecar 用 `LgwCredentialSource`，在一台 worker 驗收。
 7. 另開單把 MyLinuxPool#50 的 key 來源換成租用，收掉 MyLinuxPool 裡的 key。
 - **退回**：停服務、Mac 改回原本的指令；worker 在第 7 步之前仍有 MyLinuxPool#50 的 key，可以照舊。
 

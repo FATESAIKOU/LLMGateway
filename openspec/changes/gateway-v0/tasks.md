@@ -1,5 +1,7 @@
 ## 1. 租用服務（本 repo；假 key、假上游、假時鐘）
 
+- [ ] 1.0 內部介面：上游的種類抽成 `CredentialProvider`（env 對照、用量查詢；四個實作），選把規則抽成 `SelectionPolicy`（diagrams.md 的介面圖）
+
 - [ ] 1.1 專案骨架：`server/`（服務）、`lgw/`（API 客戶端、訊號規則、管理命令）、`policy/default.json`（內容照設計決定 8）、`client/opencode.json`；只用 Python 標準函式庫；測試用 `unittest`；「現在」經可替換的 clock 介面
 - [ ] 1.2 SQLite：`events`（只追加、單調序號）、`leases`、`cooldowns`、`clients`、去重表；每個改變狀態的動作一筆 `BEGIN IMMEDIATE` 交易；重啟時從 `events` 重建
 - [ ] 1.3 客戶端憑證：`lgw admin client add|rm|list`（rm 等同 revoke）、`GET /v1/whoami`；32 bytes 隨機值，只存 SHA-256；撤銷時一併 revoke 該客戶端未結束的租約；worker 名稱與客戶端相符的檢查
@@ -10,7 +12,7 @@
   - 回租約物件；`preferences` 只記錄。
 - [ ] 1.5 `POST /v1/leases/{id}/start`：granted → active（效期從此起算；已 active 重送回 200）；10 分鐘未確認的記為 expired；未確認的租約只接受 start、release（其他回 `lease_not_confirmed`）
 - [ ] 1.6 `POST /v1/leases/{id}/exhausted`：同一筆交易內設冷卻（重置時刻＋2 分鐘；不合理或沒有時用預設）、原租約 superseded、給下一張或拒絕
-- [ ] 1.7 `renew`、`release`（重複也回 204）、`usage`；延後結算的逾期（任何經認證的請求都先結算）；（客戶端，`request_id`）去重存 7 天、跨重啟有效；錯誤碼照設計決定 6
+- [ ] 1.7 `renew`、`release`（重複也回 204）；（`usage` 端點拿掉）延後結算的逾期（任何經認證的請求都先結算）；（客戶端，`request_id`）去重存 7 天、跨重啟有效；錯誤碼照設計決定 6
 - [ ] 1.8 key 檔：讀取、SIGHUP 重讀（失敗沿用舊的、空字串視同沒部署）；值不進事件、log、錯誤訊息
 - [ ] 1.9 env 對照表（設計決定 7）：Claude 兩把只給 `claude-code`；Zen 只給 `opencode`；`unset` 清單；`claude-code` 的順序不含 `openrouter`、`ollama-cloud`（測試鎖住）
 - [ ] 1.10 狀態板：
@@ -27,7 +29,7 @@
 ## 2. `lgw`（API 客戶端＋訊號規則；換把程序在 sidecar）
 
 - [ ] 2.1 API 客戶端：base URL 與客戶端憑證路徑可設定；連不上時回「無法確認」，不丟例外；不認得的拒絕理由當一般拒絕
-- [ ] 2.2 訊號規則（設計決定 9），用資料表、帶 `signal`：
+- [ ] 2.2（已做）訊號規則（設計決定 9），用資料表、帶 `signal`；定位改成給 agent driver 用的函式庫：
   - Claude：`You've hit your … limit · resets …`；
   - Zen：`FreeUsageLimitError`／`GoUsageLimitError`／`CreditLimitExceeded`（訊息標記優先於狀態碼）；
   - OpenRouter：402 且 `limit_source` 不是 in-flight；
@@ -36,13 +38,7 @@
   - **沒有額度標記的 402／429 判為暫時錯誤**；
   - 正反兩面都用 `quota-signals.md` 的樣本測試。
 - [ ] 2.3 打包與版本：以 git tag `lgw-vX.Y.Z` 發版，可從 tag 安裝，標準函式庫以外沒有依賴；`client/opencode.json` 隨套件提供路徑；測試鎖住 `lgw` 不引用 `subprocess`、herdr、agora，也沒有依平台分支（`sys.platform`、`darwin`）
-- [ ] 2.4 和 aistorage-pm 交接（MyAiStorage 那邊實作）：
-  - sidecar 的換把程序改用 `lgw`：開 agent 帶 env、`--settings` 關掉 autoContinue、開起後呼叫 `start`、判讀、安全結束、`exhausted`、接回；
-  - session id 寫法照 sidecar 慣例；
-  - 通知失敗留在本機重試、補送恰一則；
-  - 冷卻結束不主動重開；
-  - `sidecar agent run claude|opencode` 作為 Mac 的入口，沒有 Mac 專用分支，同一套測試參數化兩種模式。
-  - **Mac 的驗收（4.1～4.3）blocked by 這一項。**
+- [ ] 2.4 `LgwCredentialSource`：實作 sidecar 定義的 `CredentialSource`（acquire／started／renew／exhausted／release 對到租用 API），只用標準函式庫；介面的確切簽名和 aistorage-pm 對齊（MyAiStorage v2 提案 2.2）。sidecar 本體、agent driver、換把步驟由 MyAiStorage 實作；**Mac 與 worker 的驗收（4.1～4.3、4.5）blocked by sidecar v2**
 - [ ] 2.5 測試：`lgw` 的 API 客戶端對假服務的每種回覆（核准、各種拒絕、各種錯誤、連不上）
 
 ## 3. 部署（LLMGateway 自己的服務帳號；MyLinuxPool 只管連線與 worker 的掛載）
@@ -64,11 +60,11 @@
 
 ## 4. 驗收
 
-- [ ] 4.1 Mac：`sidecar agent run claude` 開出的 Claude Code 回得了一則最短的訊息；事件（含 start、release）齊全；agent 環境只有那一把
+- [ ] 4.1 Mac：sidecar 的 `open` 開出的 Claude Code 回得了一則最短的訊息；事件（含 start、release）齊全；agent 環境只有那一把
 - [ ] 4.2 Mac：用假的額度用完訊號換把（`claude-personal` → `claude-company`），自動重開並接回；冷卻到期後新開的回到 `claude-personal`；短暫 429 不換把
-- [ ] 4.3 Mac：`sidecar agent run opencode` 對 Zen、OpenRouter（免費模型）、Ollama Cloud 各跑通一次
+- [ ] 4.3 Mac：sidecar 開 opencode，對 Zen、OpenRouter（免費模型）、Ollama Cloud 各跑通一次
 - [ ] 4.4 要用 key 的驗證（PM 或本人）：OpenRouter、Ollama Cloud 讓 Claude Code 跑一則最短的訊息；Ollama `GET /api/balance` 回哪一種欄位；opencode 讀 key 的變數名
-- [ ] 4.5 sidecar：aistorage-pm 把假 broker 換成 `lgw`；在一台 worker 驗收換把；在 worker 的 herdr 0.9.3 驗 `tab create --env` 不留值（不過就改用 0600 暫存 env 檔、讀完即刪）
+- [ ] 4.5 worker：sidecar 用 `LgwCredentialSource`，在一台 worker 驗收換把；確認 env 不出現在任何命令列
 - [ ] 4.6 狀態板：五把的使用者、數量／上限、冷卻、部署狀態、用量（拿不到的顯示「未知」）；URL 與 log 裡沒有客戶端憑證
 - [ ] 4.7 秘密掃描：repo、事件、log、狀態板、匯出檔沒有任何 key 的值
 - [ ] 4.8 退回演練：停服務、Mac 改回原本的指令

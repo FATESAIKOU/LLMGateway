@@ -36,7 +36,6 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 | `request_lease` | worker、角色、coding agent、模型（可空）、訂閱（可空，空的就照順序選）、來由；**擴充點**：`preferences`（優先模型清單＋底線模型），v0 收下並記錄、不影響選把 | `{lease_id, subscription, env, unset, expires_at}`；或拒絕 `{reason: all_cooling\|cap_reached\|not_allowed, earliest_reset}` |
 | `report_exhausted` | 租約 id、偵測到的訊號、重置時間（有就給） | 那一把進冷卻，原租約結束；**順便回傳下一張租約**（或拒絕） |
 | `renew` | 租約 id | 新效期 |
-| `report_usage` | 租約 id、用量快照（例如 Claude status line 的 `rate_limits`） | — |
 | `release` | 租約 id | — |
 | `board` | — | 狀態板（JSON；另有一頁唯讀 HTML） |
 
@@ -49,15 +48,11 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 | `opencode-zen` | 不提供：官方沒有 Claude Code 接法，只有社群做法 | 連線位址與 key（opencode 官方支援） |
 
 - sidecar 和包裝指令只把環境變數交給 agent，**不保存**，租約結束或換把時就丟掉。
-  - 回傳裡有一份 `unset` 清單，啟動前從 agent 的環境裡明確去掉。例如 `ANTHROPIC_API_KEY` 會蓋過訂閱 token，一律去掉；herdr server 繼承來的環境裡也可能有。
-  - **值不能出現在命令列上**，否則會出現在 `ps` 和 herdr 的 pane 資訊裡。
-    - sidecar 的做法：用 `herdr tab create --env` 交值；unset 在啟動命令裡用 `env -u NAME`，命令列上只有變數名。
-    - aistorage-pm 在 Mac 的 herdr 0.8.0 上用假值實測：值不出現在 herdr 的輸出、pane／tab 資訊、狀態目錄與任何命令列，關掉 tab 就沒了。
-    - worker 上是 herdr 0.9.3，要在 worker 上再驗一次；驗不過就退回「0600 暫存 env 檔，讀完即刪」。
+  - 回傳裡有一份 `unset` 清單，啟動前從 agent 的環境裡明確去掉。例如 `ANTHROPIC_API_KEY` 會蓋過訂閱 token，一律去掉；從父行程繼承來的環境裡也可能有。
+  - **值不能出現在命令列上**，否則會出現在 `ps` 裡。sidecar 直接開子行程，env 用子行程的環境給。
 - 和 sidecar 已對齊的部分（aistorage-pm，2026-10-11）：
   - 用上表的命名；
   - renew 由 sidecar 的常駐迴圈每小時做；
-  - report_usage 之後再接；
   - 拒絕時把 `earliest_reset` 記進 sidecar 的 registry，到時間再申請；
   - 客戶端憑證放 `/run/mlp-secrets/llmgateway-client-token`（0400），比照 A2A token；
   - 服務的 base URL 可以設定，連不上時 sidecar 回報「無法確認」，不會掛掉；
@@ -88,17 +83,17 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 
 - 每把 key 一定有：誰在用（worker、角色、agent、從何時開始）、幾個在用／上限、是否冷卻、冷卻何時結束。這些都來自 LLMGateway 自己的紀錄。
 - 用量 %，有更好、沒有也行：
-  - Claude：顯示「未知」。本人的印象是 setup-token 拿不到用量 %，v0 以此為前提，不做 status line 回報。`report_usage` 介面留著，之後拿得到時再接。
+  - Claude：顯示「未知」。本人的印象是 setup-token 拿不到用量 %，v0 以此為前提，不做 status line 回報。之後拿得到時再加回報的介面。
   - OpenRouter：服務定期查 `GET /api/v1/key`。
   - Ollama Cloud：官方文件有 `GET /api/balance`，每分鐘最多 10 次。剩餘 % 與重置時間只出現在 legacy 方案的欄位，現行方案回的是美元額度。我們的方案回哪一種，實作時用 key 確認（reviewer 已查證文件，見 `review-notes-v0.md`）；拿不到 % 就顯示美元額度或「未知」。
   - OpenCode Zen：截至 2026-10-11 查無公開的用量 API，顯示「未知」。
 
 ### 5. Mac 和 worker 走同一套，沒有 Mac 專用的分支
 
-- 換把的程序只有一份，放在 sidecar 的 agent 宿主（MyAiStorage）：安全結束 agent → 拿下一張 → 帶新 env 開 agent → `agora continue` 接回。
-  - 本 repo 的 `lgw` 只提供租用 API 客戶端與額度訊號的判讀規則，只用 Python 標準函式庫，sidecar 依賴它。
-  - 這是和 aistorage-pm 談定的：開關 agent 與接回的程式 sidecar 已經有、也審過，不再寫第二份。
-- worker 上由常駐的 sidecar 執行。Mac 上用 `sidecar agent run claude|opencode` 在前景執行同一段程序（sidecar 和 agora 同一個套件，Mac 已經裝了 agora）。兩邊只差常駐或前景，換把流程完全一樣，Mac 一樣會自動重開。
+- 本人 2026-10-11 晚的要求：sidecar 是一台機器一個的 daemon，Mac 也能跑；不基於 herdr。
+- 換把在 sidecar 內部，經 sidecar 定義的 `CredentialSource` 介面完成；本 repo 的 `lgw` 提供它的實作 `LgwCredentialSource`（design 決定 9、`diagrams.md`）。
+- 額度用完由 sidecar 的 agent driver 判讀；`lgw.signals` 的規則表可以當函式庫用。
+- Mac 上也用同一個 sidecar 開 agent，額度用完一樣自動換把並接回 session。
 - 原本的 `claude`、`opencode` 不動，隨時可以退回。
 
 ### 6. 程式
@@ -165,10 +160,10 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 
 ## 驗收
 
-1. **租用**：Mac 上 `sidecar agent run claude` 開出的 Claude Code 回得了一則最短的訊息。紀錄有租約（客戶端＝Mac、訂閱＝`claude-personal`）與 release；agent 環境裡只有那一把。
-2. **切換**：用假的額度用完訊號（不真的燒額度）→ `claude-personal` 進冷卻 → 下一張是 `claude-company` → agent 自動重開並接回 session → 狀態板顯示冷卻與重置時間 → 冷卻到期後新開的租約回到 `claude-personal`。Mac 的 `sidecar agent run` 與 worker 上的 sidecar 各跑一次，走的是同一段程式。
+1. **租用**：Mac 上用 sidecar 的 `open` 開出的 Claude Code 回得了一則最短的訊息。紀錄有租約（客戶端＝Mac、訂閱＝`claude-personal`）與 release；agent 環境裡只有那一把。
+2. **切換**：用假的額度用完訊號（不真的燒額度）→ `claude-personal` 進冷卻 → 下一張是 `claude-company` → agent 自動重開並接回 session → 狀態板顯示冷卻與重置時間 → 冷卻到期後新開的租約回到 `claude-personal`。Mac 與 worker 上的 sidecar 各跑一次，走的是同一段程式。
 3. **sidecar**：sidecar 的假 broker 換成真的租用服務後，跑一次「額度用完 → 換把 → `agora continue` 接回」。可以在一台 worker 上做，或用測試替身做。
-4. **opencode**：`sidecar agent run opencode` 對三家 key 型上游各跑通一次。
+4. **opencode**：用 sidecar 開 opencode，對三家 key 型上游各跑通一次。
 5. **狀態板**：顯示五把的使用者、數量／上限、冷卻、用量 %（拿不到的顯示「未知」）。
 6. **秘密**：repo、log、紀錄、狀態板掃描不到任何 key 的值。
 7. **退回**：停用服務、Mac 改回用原本的指令，一切照舊。
@@ -188,7 +183,7 @@ Claude 訂閱的 token 只能交給原版 Claude Code 自己用，不能經第�
 - **依 harness 的模型偏好選把**：Atelier 的 harness 設定「可接受的底線模型」與「優先模型」，sidecar 盡量滿足，滿足不了就停（本人要求）。
   - v0 的 `request_lease` 已接受 `preferences: {preferred_models: [...], floor_model: ...}`，先記錄、不影響選把。
   - 之後選把邏輯換成「在底線之上照優先順序選，沒有就拒絕（`reason: below_floor`）」，客戶端不用改。
-- **Claude 的用量 %**：拿得到時經 `report_usage` 接上狀態板。
+- **Claude 的用量 %**：拿得到時再加回報的介面，接上狀態板。
 - **跨 agent 的接續**：Claude 兩把都冷卻時，改用 opencode 接同一個 session（agora 支援換 agent 接續），要等 #4 隱私界線與本人同意。
 
 ## 本人的回答（第 2 版的確認事項，2026-10-11）
