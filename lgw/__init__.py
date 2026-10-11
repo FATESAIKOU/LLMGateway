@@ -12,6 +12,15 @@
 
 from __future__ import annotations
 
-from . import client, signals
+import importlib
 
-__all__ = ["client", "signals"]
+_SUBMODULES = ("client", "connect", "signals")
+
+__all__ = list(_SUBMODULES)
+
+
+def __getattr__(name: str):
+    """需要時才載入子模組（`lgw.connect` 等）；`python -m lgw.connect` 不先載入它。"""
+    if name in _SUBMODULES:
+        return importlib.import_module("." + name, __name__)
+    raise AttributeError("module 'lgw' has no attribute {0!r}".format(name))
