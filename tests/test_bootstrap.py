@@ -72,6 +72,7 @@ class BootstrapScriptTests(unittest.TestCase):
         self._set_state("sshd_listen", "1")
         self._set_state("curl_code", "200")
         self._set_state("curl_rc", "0")
+        self._set_state("ssh_probe_code", "200")
 
         self._create_fake_tools()
 
@@ -351,6 +352,31 @@ exit "$rc"
 """
         real_install_bin = shutil.which("install") or "/usr/bin/install"
 
+        # 14. ssh
+        # 假 ssh: -W (探針) 讀完 stdin 後回一個可設定的 HTTP 狀態列 (預設 200)；
+        # 其餘參數 (守護程式的 -N) 直接成功。避免測試真的去連會合點位址。
+        ssh_script = """#!/usr/bin/env bash
+set -uo pipefail
+echo "ssh $*" >> "${LOG_DIR}/ssh-argv.log"
+
+mode="plain"
+for a in "$@"; do
+    if [[ "$a" == "-W" ]]; then
+        mode="probe"
+    fi
+done
+
+if [[ "$mode" == "probe" ]]; then
+    # 探針會把 HTTP 請求寫進 stdin，讀完再回狀態列
+    cat >/dev/null 2>&1 || true
+    code="$(cat "${LGW_TEST_STATE_DIR}/ssh_probe_code" 2>/dev/null || echo "200")"
+    printf 'HTTP/1.0 %s\\r\\n\\r\\n' "$code"
+    exit 0
+fi
+
+exit 0
+"""
+
         scripts = [
             ("sudo", sudo_script),
             ("useradd", useradd_script),
@@ -365,6 +391,7 @@ exit "$rc"
             ("git", git_script),
             ("install", install_script),
             ("curl", curl_script),
+            ("ssh", ssh_script),
         ]
 
         for name, content in scripts:
@@ -385,6 +412,7 @@ exit "$rc"
             "LGW_BOOT_RUNDIR": self.rundir,
             "LGW_BOOT_HOSTKEY": self.hostkey_file,
             "LGW_BOOT_OS": "Linux",
+            "LGW_TEST_STATE_DIR": self.state,
             "REAL_INSTALL_SH": INSTALL_SH,
             "REAL_REMOTE_DEPLOY_SH": REMOTE_DEPLOY_SH,
             "REAL_RUN_WRAPPER": RUN_WRAPPER,
@@ -631,6 +659,38 @@ exit "$rc"
         # install 紀錄中不應有寫入/複製
         install_log = self.read_log("install")
         self.assertEqual(install_log, "")
+
+    def test_check_probe_uses_fake_ssh(self):
+        """install.sh --check 的會合點探針走 fake ssh（不連真位址），回 200 時 check 通過"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[check] ok", res.stdout)
+
+        ssh_log = self.read_log("ssh")
+        self.assertIn("-W 127.0.0.1:4710", ssh_log)
+        self.assertIn("sshproxy@jump.example.com", ssh_log)
+
+    def test_check_probe_non_200_is_fail(self):
+        """探針回非 200 時 check 記 fail、結束碼 1（不是 todo）"""
+        self._set_state("ssh_probe_code", "503")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[check] fail install.sh --check 未通過 (rc=1)", res.stdout)
 
     def test_argument_errors_exit_2(self):
         """參數錯回 2"""
