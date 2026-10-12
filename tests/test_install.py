@@ -199,7 +199,15 @@ if [[ "${1:-}" == "api" ]]; then
         echo "gh: Could not resolve to a Repository with the name 'x/y'." >&2
         exit 1
     fi
-    printf '%s\\n' "${2#repos/}"
+    out="${2#repos/}"
+    # 觀察-2：某版 gh 的 --jq 輸出可能包引號或多空白；這裡模擬，install.sh 要先修剪再比對
+    case "${FAKE_GH_DECORATE:-plain}" in
+        quoted) out="\\"${out}\\"" ;;
+        squoted) out="'${out}'" ;;
+        spaced) out="  ${out}  " ;;
+        quoted_spaced) out="  \\"${out}\\"  " ;;
+    esac
+    printf '%s\\n' "$out"
     exit 0
 fi
 echo "fake gh: unsupported: $*" >&2
@@ -921,6 +929,26 @@ exec "$@"
 
         r0 = check(LGW_SUDO=sudo_ok)
         self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+
+    def test_check_keysync_repo_name_trimmed(self):
+        """gh --jq .full_name 包引號或多空白時仍認得是同一個 repo（觀察-2）"""
+        res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.write_probe_config()
+        base_env = {"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0",
+                    "FAKE_PROBE_CODE": "200"}
+
+        def check(**overrides):
+            env = dict(base_env)
+            env.update(overrides)
+            return self.run_install(["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+                                    env_overrides=env)
+
+        for decorate in ("plain", "quoted", "squoted", "spaced", "quoted_spaced"):
+            with self.subTest(decorate=decorate):
+                r = check(FAKE_GH_DECORATE=decorate)
+                self.assertEqual(r.returncode, 0, f"{decorate}: {r.stdout + r.stderr}")
+                self.assertIn("gh 已登入，且讀得到", r.stdout)
 
     def test_missing_or_old_python(self):
         # Missing python3 in PATH

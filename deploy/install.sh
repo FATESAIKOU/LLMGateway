@@ -349,7 +349,21 @@ check_keysync() {
         log INFO "key-sync: 無法確認（讀 ${KEYS_REPO} 逾時 ${gh_timeout}s）"
         return 2
     fi
-    if [[ "$repo_rc" -ne 0 ]] || [[ "$repo_out" != "${KEYS_REPO}" ]]; then
+    # 真 gh 的 --jq .full_name 預期回裸名；某版包引號或多空白時別誤判 1
+    # （觀察-2）。純 bash 修剪（不叫 sed/tr，測試 PATH 未必有）。
+    local repo_name="$repo_out"
+    repo_name="${repo_name#"${repo_name%%[![:space:]]*}"}"
+    repo_name="${repo_name%"${repo_name##*[![:space:]]}"}"
+    if [[ "$repo_name" == '"'*'"' ]]; then
+        repo_name="${repo_name#?}"
+        repo_name="${repo_name%?}"
+    elif [[ "$repo_name" == \'*\' ]]; then
+        repo_name="${repo_name#?}"
+        repo_name="${repo_name%?}"
+    fi
+    repo_name="${repo_name#"${repo_name%%[![:space:]]*}"}"
+    repo_name="${repo_name%"${repo_name##*[![:space:]]}"}"
+    if [[ "$repo_rc" -ne 0 ]] || [[ "$repo_name" != "${KEYS_REPO}" ]]; then
         log INFO "key-sync: 不能用（讀不到 ${KEYS_REPO}：登入的帳號可能沒有讀權限）"
         return 1
     fi
