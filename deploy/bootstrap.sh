@@ -423,7 +423,7 @@ step_sshd() {
     local reasons=()
     # sshd -T 拿不到輸出（指令失敗或空輸出）是「問不出來」，不是「未啟用
     # PubkeyAuthentication」：前者要記 fail 請人修（沒有權限、sshd 設定壞掉、
-    # sudo 驗證失敗都屬於這類），後者才是照設定判断。兩者混為一談會讓
+    # sudo 驗證失敗都屬於這類），後者才是照設定判斷。兩者混為一談會讓
     # 主機明明不安全卻只看到 todo (M-F1)。
     local sshd_out="" sshd_rc=0
     # run_root 讀密碼檔時是 < "$SUDO_PASS_FILE"（指令本身仍是 </dev/null），
