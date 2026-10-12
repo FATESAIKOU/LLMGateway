@@ -99,7 +99,7 @@ bash ~/lgw-boot/deploy/bootstrap.sh \
    - **隧道公鑰**（一行 `ssh-ed25519 … llmgateway-tunnel`）：經 PMO 交給 mylinuxpool-pm，登記到 MyLinuxPool 的 `TUNNEL_EXTRA_PUBKEYS`（MyLinuxPool#77）。v5 不用登記部署公鑰。
    - **那台的 ed25519 host 公鑰**：給本人自己，之後手動 ssh 進去（4.2）時比對指紋用。
 
-   第一次一定會有 `todo`（還沒給會合點），結束碼是 3，這是預期的。
+   第一次一定會有 `todo`（還沒給會合點、還沒登入 `gh`），結束碼是 3，這是預期的；`gh` 登入完照第 3 步重跑一次即可。
 2. **等 MyLinuxPool 登記好隧道公鑰後，第二次：補上會合點。**
 
    ```bash
@@ -109,17 +109,34 @@ bash ~/lgw-boot/deploy/bootstrap.sh \
    ```
 
    這次會複製 known_hosts、填 `tunnel.env`，然後重啟 `llmgateway-tunnel.service`。
-3. **本人：`gh` 登入＋第一次拉取**（bootstrap 不做，見 1.9）：
+3. **`gh` 登入（本人做；bootstrap 只看狀態、不代做）**：
+
+   bootstrap 有一步 `gh-auth`，以 `llmgw` 身分問 `gh auth status`：
+
+   | 狀態 | 意思 |
+   |---|---|
+   | `ok` | `llmgw` 已登入 `gh` |
+   | `todo` | 還沒登入。**結束碼 3**，後面的步驟照跑、摘要照印；照下面登入後重跑本腳本即可 |
+   | `fail` | 找不到 `gh`（該身分要裝 `gh` 才拉得到金鑰）。腳本停在這裡，結束碼 1 |
+
+   本人照這段登入（v5 選 (B)：用瀏覽器登入，不放 token 檔）：
 
    ```bash
    sudo -u llmgw -i
-   gh auth login            # 或 gh auth login --with-token（只讀單一 repo 的 fine-grained token，推薦）
+   gh auth login
+   ```
+
+   登入完重跑第一次那條 `bootstrap.sh`，這次 `gh-auth` 會是 `ok`。
+4. **第一次拉取**（登入完可以立刻拉，不必等 10 分鐘）：
+
+   ```bash
+   sudo -u llmgw -i
    systemctl --user start key-sync.service
    journalctl --user -u key-sync -n 5
    ```
 
-   log 看到 `ok 已換 keys.env` 就是拉下首版；`failed=gh_auth` 表示 `gh` 沒登入或 token 失效。
-4. **`--check` 確認**：帶和第二次一樣的參數再加 `--check`（沒帶的參數，對應的那一步會被當成 `todo`）。
+   log 看到 `ok 已換 keys.env` 就是拉下首版；`failed=gh_auth` 表示 `gh` 沒登入或 token 失效（5.1）。
+5. **`--check` 確認**：帶和第二次一樣的參數再加 `--check`（沒帶的參數，對應的那一步會被當成 `todo`）。
 
    ```bash
    bash ~/lgw-boot/deploy/bootstrap.sh --tag lgw-vX.Y.Z --sudo-pass-file <密碼檔> \
@@ -131,7 +148,7 @@ bash ~/lgw-boot/deploy/bootstrap.sh \
 
 #### 1.A.5 看懂輸出
 
-每一步印一行 `[步驟] 狀態 說明`。步驟依序是 `prereq`（前提）、`user`（帳號）、`linger`、`sshd`、`install`（安裝）、`tunnel-key`（隧道金鑰）、`keysync`（解密密碼）、`rendezvous`（會合點）、`check`（`install.sh --check`）。
+每一步印一行 `[步驟] 狀態 說明`。步驟依序是 `prereq`（前提）、`user`（帳號）、`gh-auth`（`llmgw` 的 `gh` 登入狀態）、`linger`、`sshd`、`install`（安裝）、`tunnel-key`（隧道金鑰）、`keysync`（解密密碼）、`rendezvous`（會合點）、`check`（`install.sh --check`）。
 
 | 狀態 | 意思 |
 |---|---|
@@ -159,6 +176,8 @@ bash ~/lgw-boot/deploy/bootstrap.sh \
 | `user` | `todo`（`--check` 時）：帳號不存在，或在 `docker` 群組 | 不加 `--check` 重跑，腳本會建帳號或把 `llmgw` 移出 `docker` 群組（1.1）。 |
 | `linger` | `fail`：等 `/run/user/<uid>` 逾時 | `loginctl show-user llmgw -p Linger` 看是否 `yes`；等一下再重跑。 |
 | `install` | `fail` | 多半是 clone 不到 tag（tag 沒 push、網路）或 `install.sh` 出錯；看輸出裡 `ERROR` 那行，排除後重跑；已經裝好卻想重裝加 `--reinstall`。 |
+| `gh-auth` | `todo`：`llmgw` 的 `gh` 尚未登入 | 本人 `sudo -u llmgw -i` 後 `gh auth login`（用瀏覽器登入，不放 token 檔），再重跑本腳本。腳本不代做登入、也不碰 token 值。 |
+| `gh-auth` | `fail`：找不到 `gh` | 該身分要裝 `gh` 才拉得到金鑰；裝好再重跑（這一步失敗腳本會停在這裡，後面的步驟不跑）。 |
 | `keysync` | `todo`：未提供解密密碼 | 給 `--decrypt-pass-file`（單行、0600），或接在終端機上重跑讓它問一次。已經有 `keysync.env` 時這一步是 `ok`，不會覆蓋。 |
 | `keysync` | `fail`：解密密碼檔格式無效 | 檔案只能有一行、值不含空白（1.9）。修正後重跑；既有 `keysync.env` 不會被動到。 |
 | `rendezvous` | `todo`：未給會合點 | 等 MyLinuxPool 登記好隧道公鑰，第二次帶上 `--rendezvous` 與 `--rendezvous-known-hosts`。 |
@@ -287,16 +306,21 @@ journalctl --user -u llmgateway-tunnel -n 20
 
 ```bash
 sudo -u llmgw -i
-gh auth login        # 互動登入（預設）
-# 或
-gh auth login --with-token < <只有該 repo 讀權限的 fine-grained token 檔>
+gh auth login        # 選 (B)：用瀏覽器登入，不放 token 檔
 ```
 
-token 二選一（v5-plan §2.1）：
-- （甲，推薦）只讀 `FATESAIKOU/LLMGateway-keys` 單一 repo 的 fine-grained token，`gh auth login --with-token`；權限最小。
-- （乙）接受預設：token 拿到本人帳號的 repo 全權限；拿著這台登入狀態的人能讀寫本人所有 repo。
+v5 的 `gh` 認證**本人已選 (B)**（2026-10-12）：`llmgw` 自己用瀏覽器 `gh auth login` 登入，不用 `--with-token` 的 token 檔。token 存在 `~llmgw/.config/gh/`（0600），由 `gh` 自己管，LLMGateway 不碰、不複製、不轉發它的值。
 
-token 存在 `~llmgw/.config/gh/`（0600）。**不用 deploy key**：免登記公鑰、免管 ssh host key；代價是登入狀態失效時 key 凍在舊版（4.1）。
+- 風險（**本人已知並接受**）：`gh` 的登入狀態拿到的是本人帳號的一般權限，拿著這台 `llmgw` 的登入狀態的人可能讀寫本人其他 repo；也因此這台不能當成完全隔離的機器來放。
+- 因此 `install.sh --check` 除了問「登入了沒」，還會實際問一次**讀不讀得到** `FATESAIKOU/LLMGateway-keys`（只問 repo 本身，不讀檔案內容），讀不到就是不能用（4.4）。
+- **不用 deploy key**：免登記公鑰、免管 ssh host key；代價是登入狀態失效時 key 凍在舊版（4.1）。
+- 確認登入好了：
+
+  ```bash
+  sudo -u llmgw -i
+  gh auth status
+  gh api repos/FATESAIKOU/LLMGateway-keys --jq .full_name
+  ```
 
 **解密密碼**：`bootstrap.sh --decrypt-pass-file` 或互動輸入會寫進 `~/.config/llmgateway/keysync.env`（0600、擁有者 `llmgw`），內容只有一行：
 
@@ -447,17 +471,21 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
 
 ### 4.4 `install.sh --check`（三態）
 
-`--check` 依序檢查：兩個 unit 都 active（有給 `--tag` 時版本要與 `current` 一致）→ 本機 `GET /v1/subscriptions` 回 200 → 經會合點的同一個 list 探針回 200 → key-sync 能不能用（`gh` 在不在、`gh auth status` 過不過、`keysync.env` 有沒有非空的解密密碼、`key-sync.service` 上次有沒有失敗）。每一項分開印。
+`--check` 依序檢查：兩個 unit 都 active（有給 `--tag` 時版本要與 `current` 一致）→ 本機 `GET /v1/subscriptions` 回 200 → 經會合點的同一個 list 探針回 200 → key-sync 能不能用（以服務帳號問 `gh` 有沒有登入、讀不讀得到 `FATESAIKOU/LLMGateway-keys`、`keysync.env` 有沒有非空的解密密碼、`key-sync.service` 上次有沒有失敗）。每一項分開印。
 
 | 結果 | 意思 |
 |---|---|
 | 0 | 兩個 unit 都 active、版本一致（有給 `--tag` 時）、本機與經會合點 list 探針都回 200、key 拉取那條路可用 |
-| 1 | 確定不正常：unit 沒在跑或 failed、版本不對、探針不是 200、`gh` 不能用、解密密碼沒放、上次拉取失敗 |
-| 2 | 無法確認：連不上 user bus、本機 curl 逾時、經會合點探針無法執行（`tunnel.env` 不能用或找不到 ssh 等） |
+| 1 | 確定不正常：unit 沒在跑或 failed、版本不對、探針不是 200、`gh` 沒登入／讀不到金鑰 repo、解密密碼沒放、上次拉取失敗 |
+| 2 | 無法確認：連不上 user bus、本機 curl 逾時、經會合點探針無法執行、**`gh` 不存在或查詢逾時** |
 
 - 經會合點那一步是 `~/.local/bin/llmgateway-tunnel --probe-once`：讀 `tunnel.env`，用與隧道守護同一套 ssh 參數跑一次 `ssh -W 127.0.0.1:<REMOTE_API>`；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。
 - 本機不是 200 時不會跑經會合點那一步；本機 200 但經會合點不是 200 表示隧道斷了或會合點的 4710 探不到，照 5.3 查。兩段探針都只證明 `GET /v1/subscriptions` 回 200。
-- key-sync 那一段（v5.4）：`gh` 沒登入／token 失效、`keysync.env` 沒放或沒有非空的值、`key-sync.service` 上次失敗，任一項就回 1 並印出是哪一項（照 5.1 補）。
+- key-sync 那一段（v5.4）以**服務帳號**（`llmgw`）的身分問 `gh`——`gh` 的登入跟著 Unix 使用者走，用管理帳號問沒意義（`--check` 是服務帳號跑的話直接問，否則 `sudo -n -u llmgw` 過去）：
+  - 沒登入／token 失效、或讀不到 `FATESAIKOU/LLMGateway-keys`（用 `gh api repos/… --jq .full_name` 問 repo 本身，**不讀任何檔案內容**）→ 回 1，印出是哪一項（照 5.1 補）。
+  - 找不到 `gh`，或 `gh` 查詢逾時（`timeout`，可經 `LGW_GH_TIMEOUT` 調，預設 30 秒）→ 回 2（無法確認，不是確定壞掉）。
+  - `keysync.env` 沒放、沒有非空的值、**或讀不到該檔**（權限壞掉）→ 回 1，三種分別印不同的訊息。
+  - `key-sync.service` 上次失敗 → 回 1。
 
 ### 4.5 外洩時
 
@@ -469,7 +497,7 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
   客戶端不持有 key，不用改任何客戶端設定。步驟 1 做完之前，那把金鑰仍然讀得到。
 - **解密密碼外洩**：重設新密碼、整檔重加密後 push（4.1 的流程，密碼換新的），再更新 2.2 的備份 secret；服務那台的 `keysync.env` 也要換成新密碼（本人以 `llmgw` 身分改）。
 - **隧道私鑰外洩**：請 mylinuxpool-pm 從 `TUNNEL_EXTRA_PUBKEYS` 拿掉舊公鑰，照 1.6 重產並登記新的，改 `tunnel.env` 後 `systemctl --user restart llmgateway-tunnel`。
-- **`gh` 登入狀態外洩**：照 4.2 的流程請本人重新 `gh auth login`（換 token）；同時把 2.2 的 token 權限收緊（甲案），必要時在上游撤掉該 token。
+- **`gh` 登入狀態外洩**：請本人以 `llmgw` 身分重新 `gh auth login`（登入狀態在 `~llmgw/.config/gh/`，LLMGateway 不碰它的值）；必要的話在上游撤掉舊的憑證。
 
 ### 4.6 退回前一版
 
@@ -495,7 +523,7 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
 | `failed=gh_auth` | `gh` 沒登入或 token 失效（可能帶 `（HTTP 401）`） | 以 `llmgw` 身分重新 `gh auth login`（1.9）；`install.sh --check` 也看得出來 |
 | `failed=gh_missing` | 找不到 `gh` | 裝 `gh`（1.4） |
 | `failed=gh_failed`／`gh_timeout` | `gh` 執行失敗或逾時（可能是網路） | 手動跑一次 `gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc >/dev/null` 看網路；下一次 timer 再試 |
-| `failed=gh_not_found` | repo 或檔案路徑不對（HTTP 404） | 確認 private repo 名稱與檔名（2.3） |
+| `failed=gh_not_found` | repo 或檔案路徑不對（HTTP 404） | 確認 private repo 名稱與檔名（2.3）。**登入了但讀不到那個 repo**：以 `llmgw` 身分跑 `gh api repos/FATESAIKOU/LLMGateway-keys --jq .full_name`（只問 repo、不讀檔案內容）；404 或沒讀權限就是登入的帳號看不到這個 private repo，請本人確認 repo 名稱與帳號權限 |
 | `failed=password_missing` | `keysync.env` 沒放或沒讀到 | 照 1.9 放解密密碼 |
 | `failed=decrypt_failed` | 解不開（密碼錯或檔壞） | 確認 `keysync.env` 的密碼與加密時一致（1.9）；重加密後再 push（4.1） |
 | `failed=format_failed` | 解密出來不是合法的 key 檔（訊息只有行號與種類） | 檢查 `keys.env.enc` 的明文格式（2.3）；重新加密後再 push |
