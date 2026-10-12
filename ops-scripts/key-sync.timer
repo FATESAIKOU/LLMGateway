@@ -1,0 +1,12 @@
+[Unit]
+Description=LLMGateway key sync timer (about every 10 minutes)
+
+[Timer]
+Unit=key-sync.service
+# 約每 10 分鐘一次（OnActiveSec 是 timer 起來後第一次，OnUnitActiveSec 是之後每次）；
+# 趕時間就手動跑一次：systemctl --user start key-sync.service。
+OnActiveSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

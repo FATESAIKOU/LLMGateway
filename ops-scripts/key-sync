@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""key-sync：把 private repo 的加密 key 檔拉下來，解密驗證後原子換掉本機的 keys.env。
+
+流程（v5-plan §1.2、spec key-vault「拉取與輪替」）：
+
+1. 拉取：``gh api repos/<repo>/contents/<path>`` 取回 base64 內容與 blob ``sha``；
+2. 比對版本：``sha`` 與 ``.keysync.sha`` 相同 → 直接結束（不解碼、不解密、不碰 key 檔）；
+3. 解碼＋解密：base64 解碼 → ``openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a``，
+   密碼只經環境變數傳（``-pass env:``），不上命令列、不寫進 log；
+4. 驗證格式：用 ``lgwd/keys.py`` 的規則（見 ``--code-dir``）；
+5. 原子替換：驗過才寫暫存檔（0600）→ rename 成 keys.env；內容與現行檔相同時不換檔
+   （避免 lgwd 因 mtime 空轉重讀），只更新 ``.keysync.sha``；
+6. 記下新 ``sha``。
+
+任何一步失敗（``gh`` 沒登入／token 失效、斷網、解密失敗、格式不過、寫入失敗）都
+MUST NOT 動 key 檔、MUST NOT 寫 ``sha``，只記一行不含值的 log；服務照用舊 key，
+下次 timer 再試。``gh`` 沒登入或失效記成 ``failed=gh_auth``，與其他 ``gh`` 失敗
+（``gh_failed``、``gh_missing``、``gh_not_found``）分得出來。
+
+只用 Python 標準函式庫（3.10 以上）；外部指令只有 ``gh`` 與 ``openssl``。
+key 的值與解密密碼 MUST NOT 出現在 argv、log、例外訊息裡。
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import hashlib
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+LOG = logging.getLogger("keysync")
+
+DEFAULT_REPO = "FATESAIKOU/LLMGateway-keys"
+DEFAULT_REPO_PATH = "keys.env.enc"
+DEFAULT_PASSWORD_ENV = "LLMGW_KEYS_PASSWORD"
+DEFAULT_KEYS_PATH = os.path.expanduser("~/.local/state/llmgateway/keys.env")
+DEFAULT_SHA_FILENAME = ".keysync.sha"
+DEFAULT_CODE_DIR = os.path.expanduser("~/.local/share/llmgateway/current")
+DEFAULT_TIMEOUT = 60.0
+
+ENV_KEYS = "LGWD_KEYS"
+ENV_CODE_DIR = "LGWD_CODE_DIR"
+ENV_GH = "LGWSYNC_GH"
+ENV_OPENSSL = "LGWSYNC_OPENSSL"
+ENV_TIMEOUT = "LGWSYNC_TIMEOUT"
+
+# 解密用的固定參數（加密端同這些參數，見 v5-plan §1.3）。
+DECRYPT_ARGS = ("-d", "-aes-256-cbc", "-pbkdf2", "-iter", "10000", "-a")
+
+# 結束碼（systemd 只看 0 與非 0；這些碼只是讓手動跑時看得出來卡在哪）。
+EXIT_OK = 0
+EXIT_UNEXPECTED = 1
+EXIT_CONFIG = 3
+EXIT_GH = 5
+EXIT_RESPONSE = 6
+EXIT_DECRYPT = 7
+EXIT_FORMAT = 8
+EXIT_WRITE = 9
+
+_SHA_RE = re.compile(r"[0-9a-fA-F]{7,128}")
+_HTTP_RE = re.compile(r"http (\d{3})")
+
+
+class SyncError(Exception):
+    """一次拉取失敗。``tag`` 是不含值的種類，``message`` 是一行中文說明（不含值）。"""
+
+    def __init__(self, tag: str, message: str, code: int):
+        super().__init__(tag)
+        self.tag = tag
+        self.message = message
+        self.code = code
+
+
+class Outcome:
+    """成功的結果：換了檔沒有、套用的 sha。"""
+
+    def __init__(self, updated: bool, sha: str, action: str):
+        self.updated = updated
+        self.sha = sha
+        self.action = action  # updated｜same_content｜same_sha
+
+
+def _sha_short(sha: str | None) -> str:
+    return (sha or "")[:12] or "-"
+
+
+def _http_status(text: str) -> str | None:
+    found = _HTTP_RE.search(text.lower())
+    return found.group(1) if found else None
+
+
+def _run(cmd: list[str], *, stdin_data: bytes | None = None, env=None,
+         timeout: float = DEFAULT_TIMEOUT) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        input=stdin_data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        timeout=timeout,
+        stdin=None if stdin_data is not None else subprocess.DEVNULL,
+    )
+
+
+def _load_keys_module(code_dir: str):
+    """載入 lgwd/keys.py（驗證規則的唯一來源）。失敗丟 SyncError。"""
+    if code_dir and code_dir not in sys.path:
+        sys.path.insert(0, code_dir)
+    try:
+        from lgwd.keys import KeyFileError, KeyStore  # noqa: PLC0415
+    except Exception as exc:  # ImportError 及其他載入錯誤
+        raise SyncError(
+            "code_missing",
+            f"載不到 {code_dir}/lgwd/keys.py（{type(exc).__name__}）",
+            EXIT_CONFIG,
+        ) from None
+    return KeyFileError, KeyStore
+
+
+def _gh_error(proc: subprocess.CompletedProcess) -> SyncError:
+    """把 gh 的失敗分類；只取 HTTP 狀態碼，不回顯 gh 的輸出（避免夾帶不該記的東西）。"""
+    text = (proc.stderr or b"").decode("utf-8", "replace")
+    low = text.lower()
+    http = _http_status(low)
+    detail = f"（HTTP {http}）" if http else ""
+    if proc.returncode == 4 or http == "401" or any(
+        needle in low
+        for needle in ("gh auth login", "bad credentials", "requires authentication",
+                       "not logged in", "authentication failed")
+    ):
+        return SyncError("gh_auth", f"gh 沒登入或 token 失效{detail}", EXIT_GH)
+    if http == "404":
+        return SyncError("gh_not_found", "gh 找不到 repo 或檔案（HTTP 404）", EXIT_GH)
+    return SyncError("gh_failed", f"gh 失敗 rc={proc.returncode}{detail}", EXIT_GH)
+
+
+def _fetch_blob(gh: str, repo: str, path: str, timeout: float) -> tuple[str, str, int]:
+    """回 (sha, base64 content, size)。"""
+    cmd = [gh, "api", f"repos/{repo}/contents/{path}"]
+    try:
+        proc = _run(cmd, timeout=timeout)
+    except FileNotFoundError:
+        raise SyncError("gh_missing", f"找不到 {gh}", EXIT_GH) from None
+    except subprocess.TimeoutExpired:
+        raise SyncError("gh_timeout", f"{gh} 逾時（{timeout:g}s）", EXIT_GH) from None
+    except OSError as exc:
+        raise SyncError("gh_failed", f"執行 {gh} 失敗（{type(exc).__name__}）", EXIT_GH) from None
+    if proc.returncode != 0:
+        raise _gh_error(proc)
+
+    try:
+        data = json.loads((proc.stdout or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise SyncError("bad_response", "gh api 回的不是 JSON", EXIT_RESPONSE) from None
+    if not isinstance(data, dict):
+        raise SyncError("bad_response", "gh api 回的不是物件", EXIT_RESPONSE)
+    sha = data.get("sha")
+    content = data.get("content")
+    encoding = data.get("encoding") or "base64"
+    if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
+        raise SyncError("bad_response", "gh api 回覆缺 blob sha", EXIT_RESPONSE)
+    if encoding != "base64":
+        raise SyncError("bad_response", f"gh api 回覆的 encoding 不是 base64（{encoding}）",
+                        EXIT_RESPONSE)
+    if not isinstance(content, str) or not content.strip():
+        # GitHub 對大於 1 MB 的檔案不給 content；這個檔不該長那樣。
+        raise SyncError("bad_response", "gh api 回覆缺 content（檔案太大或不是檔案）",
+                        EXIT_RESPONSE)
+    size = data.get("size")
+    if not isinstance(size, int) or size <= 0:
+        size = 0
+    return sha.lower(), content, size
+
+
+def _decode_base64(text: str) -> bytes:
+    try:
+        return base64.b64decode("".join(text.split()), validate=True)
+    except (binascii.Error, ValueError):
+        raise SyncError("decode_failed", "base64 解碼失敗", EXIT_RESPONSE) from None
+
+
+def _decrypt(openssl: str, password_env: str, password: str, ciphertext: bytes,
+             timeout: float) -> str:
+    cmd = [openssl, "enc", *DECRYPT_ARGS, "-pass", f"env:{password_env}"]
+    env = os.environ.copy()
+    env[password_env] = password
+    try:
+        proc = _run(cmd, stdin_data=ciphertext, env=env, timeout=timeout)
+    except FileNotFoundError:
+        raise SyncError("openssl_missing", f"找不到 {openssl}", EXIT_DECRYPT) from None
+    except subprocess.TimeoutExpired:
+        raise SyncError("decrypt_failed", f"{openssl} 逾時（{timeout:g}s）", EXIT_DECRYPT) from None
+    except OSError as exc:
+        raise SyncError("decrypt_failed", f"執行 {openssl} 失敗（{type(exc).__name__}）",
+                        EXIT_DECRYPT) from None
+    if proc.returncode != 0:
+        raise SyncError("decrypt_failed", f"openssl 解密失敗 rc={proc.returncode}（密碼錯或檔壞）",
+                        EXIT_DECRYPT)
+    try:
+        return (proc.stdout or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        raise SyncError("decrypt_failed", "解密結果不是 UTF-8 文字（密碼錯或檔壞）",
+                        EXIT_DECRYPT) from None
+
+
+def _same_content(path: str, new_bytes: bytes) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            old_bytes = fh.read()
+    except OSError:
+        return False
+    return hashlib.sha256(old_bytes).digest() == hashlib.sha256(new_bytes).digest()
+
+
+def _write_sha(sha_file: str, sha: str) -> None:
+    """記下已套用的 blob sha（純文字，本人讀得到）；內容沒變就不動它。"""
+    try:
+        with open(sha_file, "r", encoding="utf-8") as fh:
+            if fh.read().strip() == sha:
+                return
+    except OSError:
+        pass
+    _atomic_write(sha_file, (sha + "\n").encode("utf-8"))
+
+
+def _atomic_write(path: str, data: bytes, mode: int = 0o600) -> None:
+    """同目錄暫存（0600）→ fsync → rename；中途失敗不留暫存、不動原檔。"""
+    directory = os.path.dirname(path) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", dir=directory)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _install_plaintext(KeyFileError, KeyStore, keys_path: str, text: str) -> bool:
+    """驗證並換檔；回 True 表示 keys.env 換了。任何失敗都不動原 key 檔。"""
+    state_dir = os.path.dirname(os.path.abspath(keys_path)) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".keys.env.", dir=state_dir)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        try:
+            KeyStore(tmp)  # 用 lgwd/keys.py 的規則驗證（訊息不含值）
+        except KeyFileError as exc:
+            raise SyncError("format_failed", f"格式不過：{exc}", EXIT_FORMAT) from None
+        if _same_content(keys_path, text.encode("utf-8")):
+            os.unlink(tmp)
+            tmp = None
+            return False
+        os.replace(tmp, keys_path)
+        tmp = None
+        return True
+    except SyncError:
+        raise
+    except OSError as exc:
+        raise SyncError("write_failed", f"寫入 {keys_path} 失敗（{type(exc).__name__}）",
+                        EXIT_WRITE) from None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def sync(args) -> Outcome:
+    """跑一次；成功回 Outcome，失敗丟 SyncError。"""
+    KeyFileError, KeyStore = _load_keys_module(args.code_dir)
+    keys_path = os.path.abspath(args.keys)
+    sha_file = args.sha_file or os.path.join(os.path.dirname(keys_path), DEFAULT_SHA_FILENAME)
+
+    previous_sha = None
+    try:
+        with open(sha_file, "r", encoding="utf-8") as fh:
+            previous_sha = fh.read().strip() or None
+    except OSError:
+        previous_sha = None  # 第一次拉取（或檔案被清掉）
+
+    sha, content_b64, _size = _fetch_blob(args.gh, args.repo, args.path, args.timeout)
+    if previous_sha and previous_sha.lower() == sha:
+        return Outcome(updated=False, sha=sha, action="same_sha")
+
+    password = os.environ.get(args.password_env) or ""
+    if not password:
+        raise SyncError("password_missing",
+                        f"環境變數 {args.password_env} 沒設（解密密碼沒放）", EXIT_CONFIG)
+
+    ciphertext = _decode_base64(content_b64)
+    text = _decrypt(args.openssl, args.password_env, password, ciphertext, args.timeout)
+    updated = _install_plaintext(KeyFileError, KeyStore, keys_path, text)
+    _write_sha(sha_file, sha)
+    return Outcome(updated=updated, sha=sha, action="updated" if updated else "same_content")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="key-sync",
+        description="拉取 private repo 的加密 key 檔，解密驗證後原子換掉本機 keys.env。",
+    )
+    parser.add_argument("--keys", default=os.environ.get(ENV_KEYS) or DEFAULT_KEYS_PATH,
+                        help=f"本機 key 檔路徑（預設 {DEFAULT_KEYS_PATH}；環境變數 {ENV_KEYS}）")
+    parser.add_argument("--sha-file", default=None,
+                        help=f"記上次套用 sha 的檔（預設與 key 檔同目錄的 {DEFAULT_SHA_FILENAME}）")
+    parser.add_argument("--repo", default=DEFAULT_REPO,
+                        help=f"private repo（預設 {DEFAULT_REPO}）")
+    parser.add_argument("--path", default=DEFAULT_REPO_PATH,
+                        help=f"repo 裡加密檔的路徑（預設 {DEFAULT_REPO_PATH}）")
+    parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV,
+                        help=f"解密密碼的環境變數名（預設 {DEFAULT_PASSWORD_ENV}）")
+    parser.add_argument("--gh", default=os.environ.get(ENV_GH) or "gh",
+                        help="gh 執行檔（測試可換假 script；環境變數 LGWSYNC_GH）")
+    parser.add_argument("--openssl", default=os.environ.get(ENV_OPENSSL) or "openssl",
+                        help="openssl 執行檔（測試可換假 script；環境變數 LGWSYNC_OPENSSL）")
+    parser.add_argument("--code-dir", default=os.environ.get(ENV_CODE_DIR) or DEFAULT_CODE_DIR,
+                        help="lgwd 套件所在目錄（預設 current；環境變數 LGWD_CODE_DIR）")
+    parser.add_argument("--timeout", type=float,
+                        default=float(os.environ.get(ENV_TIMEOUT) or DEFAULT_TIMEOUT),
+                        help=f"外部指令逾時秒數（預設 {DEFAULT_TIMEOUT:g}）")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    try:
+        outcome = sync(args)
+    except SyncError as exc:
+        LOG.warning("failed=%s %s（保留舊 key，下次再試）", exc.tag, exc.message)
+        return exc.code
+    except Exception as exc:  # 未預期錯誤：只記種類，不含值
+        LOG.warning("failed=unexpected %s（保留舊 key，下次再試）", type(exc).__name__)
+        return EXIT_UNEXPECTED
+    if outcome.action == "same_sha":
+        LOG.info("ok sha 未變，不動作（sha=%s）", _sha_short(outcome.sha))
+    elif outcome.updated:
+        LOG.info("ok 已換 keys.env（sha=%s）", _sha_short(outcome.sha))
+    else:
+        LOG.info("ok 內容沒變，不換檔（sha=%s）", _sha_short(outcome.sha))
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
