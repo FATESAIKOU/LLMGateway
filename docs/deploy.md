@@ -64,6 +64,8 @@ v5（2026-10-12）跟 v4 的差別，一句話：**key 改由服務自己用 `gh
 git clone --depth 1 --branch lgw-vX.Y.Z https://github.com/FATESAIKOU/LLMGateway.git ~/lgw-boot
 ```
 
+`lgw-vX.Y.Z` 是 annotated tag（指向 tag 物件，不是 commit 本身）。clone 時 git 可能印一行 `warning: refs/tags/lgw-vX.Y.Z … is not a commit!`：**這是正常的警告**，工作目錄拿到的就是那個 tag 標記的 commit，照樣跑 1.A.3 即可。
+
 #### 1.A.3 執行
 
 ```bash
