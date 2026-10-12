@@ -446,10 +446,20 @@ step_sshd() {
     deny_users="$(grep -Ei '^denyusers[[:space:]]+' <<< "$sshd_out" | cut -d' ' -f2- || true)"
     if [[ -n "$deny_users" ]]; then
         for u in $deny_users; do
-            if [[ "$u" == "$USER_NAME" ]]; then
-                reasons+=("sshd DenyUsers 阻擋了 ${USER_NAME} (需自 DenyUsers 移除)")
-                break
-            fi
+            # 萬用字元或 user@host 不自己解析，一律轉 todo 請人工確認 (L-R9；
+            # 同 AllowUsers 與 DenyGroups 的做法)。
+            case "$u" in
+                *\** | *\?* | *@*)
+                    reasons+=("sshd DenyUsers 包含萬用字元或 user@host 格式（${u}），請人工確認是否阻擋 ${USER_NAME}")
+                    break
+                    ;;
+                *)
+                    if [[ "$u" == "$USER_NAME" ]]; then
+                        reasons+=("sshd DenyUsers 阻擋了 ${USER_NAME} (需自 DenyUsers 移除)")
+                        break
+                    fi
+                    ;;
+            esac
         done
     fi
 
