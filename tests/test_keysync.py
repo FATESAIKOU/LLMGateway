@@ -505,6 +505,38 @@ exit 0
         self.assertIn("keys.env", res.stdout)
         self.assertIn("--gh", res.stdout)
 
+    def test_timeout環境變數非法不噴traceback(self):
+        # 審查 #13 低-3：LGWSYNC_TIMEOUT=abc 原本在 build_parser 裸跑 float()，
+        # 連 --help 都炸 traceback。現在要清楚錯誤、非零結束。
+        self.write_keys(key_text("test-keysync-old"), sha=SHA_B)
+        self._set("gh_response", blob_json(b64(b"cipher-a"), SHA_A))
+        for bad in ("abc", "0", "-5", "nan", "inf"):
+            with self.subTest(value=bad):
+                res = self.run_sync(env_overrides={"LGWSYNC_TIMEOUT": bad})
+                self.assertNotEqual(res.returncode, 0)
+                self.assertNotIn("Traceback", res.stderr)
+                self.assertIn("bad_config", res.stderr)
+                self.assertIn("LGWSYNC_TIMEOUT", res.stderr)
+                # 舊 key 保留、舊 sha 不動（連 gh 都不該去叫）
+                self.assertEqual(self.read_keys(), key_text("test-keysync-old"))
+                with open(self.sha_file, "r", encoding="utf-8") as fh:
+                    self.assertEqual(fh.read().strip(), SHA_B)
+                self.assertEqual(self._log("gh"), "")
+                self.assert_no_leak(res)
+
+    def test_timeout環境變數非法時_help仍可用(self):
+        res = self.run_sync(["--help"], env_overrides={"LGWSYNC_TIMEOUT": "abc"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("usage: key-sync", res.stdout)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_timeout環境變數合法照用(self):
+        self._set("gh_mode", "sleep")
+        res = self.run_sync(env_overrides={"LGWSYNC_TIMEOUT": "0.5"})
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("failed=gh_timeout", res.stderr)
+        self.assertNotIn("bad_config", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

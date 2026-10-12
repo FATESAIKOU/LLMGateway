@@ -31,6 +31,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -333,7 +334,25 @@ def sync(args) -> Outcome:
     return Outcome(updated=updated, sha=sha, action="updated" if updated else "same_content")
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _timeout_from_env() -> tuple[float, str | None]:
+    """讀 LGWSYNC_TIMEOUT；回 (秒數, 錯誤訊息或 None)。
+
+    非法值不讓它炸 traceback（低-3）：退回預設並回一條給人看的錯誤，
+    由 main() 在 argparse 之後印出來、回非零結束。
+    """
+    raw = os.environ.get(ENV_TIMEOUT)
+    if not raw:
+        return DEFAULT_TIMEOUT, None
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_TIMEOUT, f"{ENV_TIMEOUT} 要是一個數字（秒），現在是 {raw!r}"
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_TIMEOUT, f"{ENV_TIMEOUT} 要是大於 0 的有限秒數，現在是 {raw!r}"
+    return value, None
+
+
+def build_parser(timeout_default: float = DEFAULT_TIMEOUT) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="key-sync",
         description="拉取 private repo 的加密 key 檔，解密驗證後原子換掉本機 keys.env。",
@@ -354,16 +373,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="openssl 執行檔（測試可換假 script；環境變數 LGWSYNC_OPENSSL）")
     parser.add_argument("--code-dir", default=os.environ.get(ENV_CODE_DIR) or DEFAULT_CODE_DIR,
                         help="lgwd 套件所在目錄（預設 current；環境變數 LGWD_CODE_DIR）")
-    parser.add_argument("--timeout", type=float,
-                        default=float(os.environ.get(ENV_TIMEOUT) or DEFAULT_TIMEOUT),
-                        help=f"外部指令逾時秒數（預設 {DEFAULT_TIMEOUT:g}）")
+    parser.add_argument("--timeout", type=float, default=timeout_default,
+                        help=f"外部指令逾時秒數（預設 {DEFAULT_TIMEOUT:g}；環境變數 {ENV_TIMEOUT}）")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    timeout_default, timeout_error = _timeout_from_env()
+    args = build_parser(timeout_default).parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    if timeout_error:
+        # 不噴 traceback：清楚的錯誤、非零結束（審查 #13 低-3）
+        LOG.error("bad_config %s（用預設 %gs；CLI 可用 --timeout 覆蓋）",
+                  timeout_error, DEFAULT_TIMEOUT)
+        return EXIT_CONFIG
     try:
         outcome = sync(args)
     except SyncError as exc:
