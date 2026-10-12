@@ -499,6 +499,7 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
 | `failed=format_failed` | 解密出來不是合法的 key 檔（訊息只有行號與種類） | 檢查 `keys.env.enc` 的明文格式（2.3）；重新加密後再 push |
 | `failed=bad_response`／`decode_failed` | `gh api` 的回覆不是預期的 JSON／base64 | 手動跑一次同一條 `gh api` 指令看回什麼；檔案太大（> 1 MB）也會這樣 |
 | `failed=write_failed` | 寫 `keys.env` 失敗 | 看 `~/.local/state/llmgateway/` 的權限與磁碟空間 |
+| `failed=openssl_missing`／`code_missing`／`unexpected` | 環境缺東西（找不到 `openssl`、載不到 `lgwd` 套件）或未預期錯誤 | 照訊息補環境（1.4、1.5）；`unexpected` 要看訊息裡的例外種類再判斷 |
 
 key-sync 失敗**不會**動舊 key：服務照用舊版。連續失敗才需要人看（看 log，不看 key）。要立刻套用：`systemctl --user start key-sync.service`。
 
