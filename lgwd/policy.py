@@ -34,8 +34,7 @@ class SubscriptionPolicy:
 @dataclass(frozen=True)
 class Policy:
     subscriptions: dict[str, SubscriptionPolicy]
-    cooldown_buffer_seconds: int
-    resets_at_max_ahead_seconds: int
+    until_max_ahead_seconds: int
 
     def in_priority_order(self) -> tuple[SubscriptionPolicy, ...]:
         """依 priority 排序（數字小的先；同分照 id）。list 用。"""
@@ -90,7 +89,7 @@ def load_policy(path: str) -> Policy:
     - claude-personal／claude-company 的 agents 只能剛好是 ["claude-code"]（條款）；
     - opencode-zen 的 agents 只能剛好是 ["opencode"]（沒有官方的 Claude Code 接法）；
     - openrouter 的 models.allow 只能是 ["*:free"]（只允許免費模型）；
-    - priority 為非負整數；cooldown 的數值為正整數。
+    - priority 為非負整數；cooldown 的 until 上限為正整數。
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -116,14 +115,10 @@ def load_policy(path: str) -> Policy:
             raise PolicyError("opencode-zen must only allow opencode")
     if "openrouter" in parsed_subs and parsed_subs["openrouter"].models_allow != ("*:free",):
         raise PolicyError("openrouter must only allow *:free models")
-    numbers: dict[str, int] = {}
-    for field in ("cooldown_buffer_seconds", "resets_at_max_ahead_seconds"):
-        value = data.get(field)
-        if not _positive_int(value):
-            raise PolicyError(f"policy.{field} must be a positive integer")
-        numbers[field] = value
+    max_ahead = data.get("until_max_ahead_seconds")
+    if not _positive_int(max_ahead):
+        raise PolicyError("policy.until_max_ahead_seconds must be a positive integer")
     return Policy(
         subscriptions=parsed_subs,
-        cooldown_buffer_seconds=numbers["cooldown_buffer_seconds"],
-        resets_at_max_ahead_seconds=numbers["resets_at_max_ahead_seconds"],
+        until_max_ahead_seconds=max_ahead,
     )
