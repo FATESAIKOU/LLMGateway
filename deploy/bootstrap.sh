@@ -317,6 +317,35 @@ step_user() {
 }
 
 # -----------------------------------------------------------------------------
+# 步驟 2b: gh 登入狀態（llmgw 身分）
+# -----------------------------------------------------------------------------
+# v5：key-sync 以 llmgw 跑、用 gh 拉，所以 gh 登入是使用前提。本人選 (B)：llmgw
+# 自己用瀏覽器 gh auth login，不走 token 檔（風險由本人接受）。這一步只看狀態：
+# gh 沒裝 → fail；沒登入 → todo（本人登入後重跑本腳本即可）；已登入 → ok。
+# bootstrap 不代做登入，也不碰任何 token 值。
+step_gh_auth() {
+    # 這一步第一個動作就是 sudo；沒快取時 sudo -n 必敗、會印出假 todo，
+    # 所以跟 step_sshd 一樣先刷新（同 M-F1 的理由）。
+    sudo_refresh || return 1
+
+    local out rc=0
+    # 以 llmgw 身分問；gh auth status 的輸出不含 token 值，仍不印出來
+    out="$(run_as_llmgw gh auth status 2>&1)" || rc=$?
+    if [[ "$rc" -eq 127 ]]; then
+        log_step gh-auth fail "找不到 gh（${USER_NAME} 身分要裝 gh 才能拉金鑰）"
+        step_failed=1
+        return 1
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        # 沒登入／token 失效是「要人做」，不是腳本失敗：記 todo、照常跑完印摘要
+        log_step gh-auth todo "${USER_NAME} 的 gh 尚未登入"
+        record_todo "請本人執行 sudo -u ${USER_NAME} -i 後 gh auth login（選 (B)：用瀏覽器登入，不放 token 檔），再重跑本腳本"
+        return 0
+    fi
+    log_step gh-auth ok "${USER_NAME} 已登入 gh"
+}
+
+# -----------------------------------------------------------------------------
 # 步驟 3: linger
 # -----------------------------------------------------------------------------
 step_linger() {
@@ -1026,6 +1055,7 @@ run_step() {
 
 run_step step_prereq
 run_step step_user
+run_step step_gh_auth
 run_step step_linger
 run_step step_sshd
 run_step step_install

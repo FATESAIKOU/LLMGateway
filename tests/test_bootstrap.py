@@ -410,17 +410,32 @@ fi
 exit 0
 """
 
-        # 15. gh（install.sh --check 看「gh 能不能用」）
+        # 15. gh（bootstrap 的 gh-auth 步驟與 install.sh --check 都用）
+        # 狀態：${LGW_TEST_STATE_DIR}/gh_auth = ok | logged_out | repo_denied
         # 注意：狀態檔要用 LGW_TEST_STATE_DIR——install.sh 自己會覆寫 STATE_DIR，
         # 傳下去的 STATE_DIR 不會是測試的狀態目錄。
         gh_script = """#!/usr/bin/env bash
 set -uo pipefail
 echo "gh $*" >> "${LOG_DIR}/gh-argv.log"
+state="$(cat "${LGW_TEST_STATE_DIR}/gh_auth" 2>/dev/null || echo ok)"
+if [[ "$state" == "missing" ]]; then
+    # 模擬「沒裝 gh」：bash 找不到指令時回的就是 127
+    echo "bash: gh: command not found" >&2
+    exit 127
+fi
 if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
-    if [[ "$(cat "${LGW_TEST_STATE_DIR}/gh_auth" 2>/dev/null || echo ok)" != "ok" ]]; then
+    if [[ "$state" == "logged_out" ]]; then
         echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2
         exit 1
     fi
+    exit 0
+fi
+if [[ "${1:-}" == "api" ]]; then
+    if [[ "$state" == "repo_denied" ]]; then
+        echo "gh: Could not resolve to a Repository with the name 'x/y'." >&2
+        exit 1
+    fi
+    printf 'FATESAIKOU/LLMGateway-keys\\n'
     exit 0
 fi
 echo "fake gh: unsupported: $*" >&2
@@ -1015,7 +1030,7 @@ exit 1
 
     def test_gh沒登入時check會說gh不能用(self):
         """v5：gh 登入是使用前提、bootstrap 不做登入；--check 看得出 gh 不能用"""
-        self._set_state("gh_auth", "fail")
+        self._set_state("gh_auth", "logged_out")
         args = [
             "--tag", "lgw-v0.1.0",
             "--decrypt-pass-file", self.decrypt_pass_file,
@@ -1033,6 +1048,58 @@ exit 1
         self.assertIn("auth status", gh_log)
         self.assertNotIn("auth login", gh_log)
         self.assertNotIn("auth token", gh_log)
+
+    def test_gh已登入時gh_auth步驟ok(self):
+        """已登入 → [gh-auth] ok，而且兩步驟的順序在 user 之後"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("[gh-auth] ok llmgw 已登入 gh", res.stdout)
+
+        lines = [ln for ln in res.stdout.splitlines() if ln.startswith("[")]
+        steps = [ln.split("]")[0].lstrip("[") for ln in lines]
+        self.assertIn("gh-auth", steps)
+        self.assertLess(steps.index("user"), steps.index("gh-auth"))
+        self.assertLess(steps.index("gh-auth"), steps.index("linger"))
+
+    def test_gh沒登入時記todo結束碼3且照常印摘要(self):
+        """沒登入 → todo（不是 fail）、結束碼 3、摘要照印，人照訊息去登入再重跑"""
+        self._set_state("gh_auth", "logged_out")
+        args = ["--tag", "lgw-v0.1.0", "--decrypt-pass-file", self.decrypt_pass_file]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("[gh-auth] todo llmgw 的 gh 尚未登入", res.stdout)
+        self.assertIn("gh auth login", res.stdout)          # 訊息要寫明本人怎麼做
+        self.assertIn("sudo -u llmgw -i", res.stdout)
+        self.assertIn("重跑本腳本", res.stdout)
+        # 後面的步驟照跑、摘要照印
+        self.assertIn("[linger]", res.stdout)
+        self.assert_summary_printed(res.stdout)
+        self.assertNotIn("[gh-auth] fail", res.stdout)
+
+    def test_gh沒裝時gh_auth步驟fail(self):
+        """gh 沒裝 → fail（不是 todo）：拉金鑰的路根本不存在，結束碼 1"""
+        self._set_state("gh_auth", "missing")
+        res = self.run_bootstrap(["--tag", "lgw-v0.1.0"])
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("[gh-auth] fail 找不到 gh", res.stdout)
+        self.assertNotIn("[linger]", res.stdout)  # 停在這裡
+        self.assert_summary_printed(res.stdout)
+
+    def test_gh_auth步驟在check模式也不寫任何東西(self):
+        """--check 時 gh-auth 只報狀態，不碰系統"""
+        self._set_state("gh_auth", "logged_out")
+        res = self.run_bootstrap(["--check", "--tag", "lgw-v0.1.0"])
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("[gh-auth] todo", res.stdout)
+        self.assertEqual(self.read_log("useradd"), "")
+        self.assertEqual(self.read_log("install"), "")
 
     def test_sshd_todo_reporting(self):
         """sshd 不符時回 todo 且說明要改什麼"""
