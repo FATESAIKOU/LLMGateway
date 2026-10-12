@@ -1170,6 +1170,59 @@ exit 1
         self.assertIn("DenyUsers", res.stdout)
         self.assertIn("ListenAddress 127.0.0.1:22", res.stdout)
 
+    def test_sshd_deny_wildcard_and_userhost_are_todo(self):
+        """DenyUsers 萬用字元／user@host 不自己解析，一律轉 todo（L-R9）"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        for deny in ("llmgw*", "llmgw@127.0.0.1"):
+            with self.subTest(deny=deny):
+                self._set_state("sshd_deny", deny)
+                res = self.run_bootstrap(args)
+                self.assertEqual(res.returncode, 3, res.stdout)
+                self.assertIn("[sshd] todo", res.stdout)
+                self.assertIn("人工確認", res.stdout)
+                self.assertNotIn("[sshd] fail", res.stdout)
+
+    def test_rendezvous_tmp_leaves_nothing(self):
+        """rendezvous 暫存成功與早敗兩路都不留檔（L-R11）"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        def leftovers():
+            found = []
+            for root, _, files in os.walk(self.sandbox):
+                for fn in files:
+                    if fn.startswith(".llmgw-env."):
+                        found.append(os.path.join(root, fn))
+            return found
+
+        # 成功路：走完不斷言內容，只斷言暫存清零
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertEqual(leftovers(), [])
+
+        # 早敗路：known_hosts 安裝失敗（rendezvous 段、暫存已建出）。
+        # 換個埠，避開「已是最新」的提前返回，確保真的走到安裝步。
+        self._set_state("sudo_fail_substr", "install -m 644")
+        res = self.run_bootstrap([
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2223",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ])
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("[rendezvous] fail", res.stdout)
+        self.assertEqual(leftovers(), [])
+
     def test_summary_public_keys_strip_comments(self):
         """摘要的兩處公鑰只印前兩欄：註解（含機器名）不得出現在輸出（L-R8＋備查硬化）"""
         args = [

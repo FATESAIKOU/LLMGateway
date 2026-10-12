@@ -950,6 +950,28 @@ exec "$@"
                 self.assertEqual(r.returncode, 0, f"{decorate}: {r.stdout + r.stderr}")
                 self.assertIn("gh 已登入，且讀得到", r.stdout)
 
+    def test_check_restart_pending_reminder(self):
+        """隧道重啟已排程時 --check 多一行提醒，三態不變仍回 0（L-R3）"""
+        res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.write_probe_config()
+        base_env = {"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0",
+                    "FAKE_PROBE_CODE": "200"}
+
+        def check(**overrides):
+            env = dict(base_env)
+            env.update(overrides)
+            return self.run_install(["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+                                    env_overrides=env)
+
+        pending = check(SYS_TIMER_STATE="active")
+        self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
+        self.assertIn("重啟已排程", pending.stdout)
+
+        quiet = check()
+        self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
+        self.assertNotIn("重啟已排程", quiet.stdout)
+
     def test_missing_or_old_python(self):
         # Missing python3 in PATH
         res_nopy = self.run_install(
