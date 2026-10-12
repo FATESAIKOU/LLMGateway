@@ -352,6 +352,10 @@ step_linger() {
 # 步驟 4: sshd
 # -----------------------------------------------------------------------------
 step_sshd() {
+    # 這步第一個動作就是 sudo：sshd 在主程序第 4 步，早於任何會刷新
+    # sudo 的步驟；沒有快取時 sudo -n 必敗，輸出空 → 恆記假 todo (M-F1)
+    sudo_refresh || return 1
+
     local reasons=()
     local sshd_out=""
     sshd_out="$(run_root sshd -T -C "user=${USER_NAME},host=localhost,addr=127.0.0.1" 2>/dev/null || true)"
