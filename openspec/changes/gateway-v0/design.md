@@ -202,6 +202,44 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 
 impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢，照 v4 移除或改寫（tasks 1.x）。部署腳本、安裝程式、維運手冊保留。
 
+## v5 變更（本人，2026-10-12；以 v4 為底，只列改的地方）
+
+### 決定 4 的取代：不提供客戶端連線程式
+
+- 拿掉 `lgw connect`（函式庫＋指令）與 `connect.json` 整套格式。sidecar 直接 curl 本機的 port。
+- LLMGateway 對通道只提一個需求：sidecar 所在機器本機 loopback 上的某個 port，必須是會合點 API 埠的 HTTP 轉發（純 HTTP、無認證）。port 號由建通道的一方與 sidecar 約定，LLMGateway 不規定（待本人決定，見 v5-plan 疑點）。
+- worker：由 MyLinuxPool 的 LLMGateway capability 附建通道小 script（那是 MyLinuxPool 的工作）；Mac／手機：用 mlp 或 ssh -J 自己轉發。
+- `lgw` 剩 `client`（list／get／登錄冷卻，base URL 由呼叫方給）與 `signals`（判讀結果轉 `{until}` 用）。
+
+### 決定 3 的補充：隧道守護搬到 ops-scripts/
+
+- `deploy/llmgateway-tunnel` 與 `deploy/llmgateway-tunnel.service` 搬到 `ops-scripts/`（維運工具定位），內容不變；`install.sh`、`bootstrap.sh` 改從新路徑裝。決定 3 的行為（探針、重啟語意）不變。
+
+### 決定 5／5b 的取代：金鑰自己拉
+
+- 正本：private repo 的加密檔（`openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt`，密碼經 `-pass env:`／`fd:` 傳，不上命令列）；檔名、內容格式、版本判斷見 v5-plan。
+- 服務那台跑 key-sync（小 script＋systemd timer，約每 10 分鐘）：拉→比對→解密→驗證格式→原子替換 `keys.env`；失敗保留舊版。`lgwd` 每次請求前比對 `keys.env` 的 mtime，變了就重讀（失敗沿用舊的、記 log）。
+- 拿掉：`deploy-keys` workflow、`remote-deploy.sh` 的 `keys` 動詞、SIGHUP 重讀（`llmgateway.service` 的 `ExecReload` 一併拿掉）、bootstrap 的部署公鑰／forced command 步驟、部署私鑰整組 secret。
+- 初次啟動引導（GitHub 登入方式的比較與推薦、解密密碼的放置）見 v5-plan；引導完手動跑一次 key-sync 拉下首版，`--check` 才會過。
+- 服務程式本身怎麼升級（`upgrade` 動詞與 deploy-service 去留）待本人決定。
+
+### 決定 7／8 的取代：冷卻 until-only
+
+- 登錄冷卻的 body 改 `{until}`（必填，RFC 3339 UTC）：缺 → 400 `bad_request`（`missing: ["until"]`）；不是 RFC 3339 → 400 `invalid_until`；在過去或超過 8 天以後 → 400 `until_out_of_range`；未知欄位忽略。
+- 同一 subscription 重複登錄取較晚的 `until`；過了自動解除。`cooldown` 欄位改 `{"until": …｜null}`；`available`＝已部署且沒有未來的 `until`。
+- 政策檔：拿掉 `cooldown_buffer_seconds`，`resets_at_max_ahead_seconds` 更名（until 語意，值不變）。DB：`cooldowns` 剩 subscription → until，稽核拿掉 `window`。
+- sidecar 拿不到恢復時間時報「現在＋1 小時」（sidecar 的行為；`lgw.signals` 只把判讀結果轉成 `{until}`）。
+
+### 說法（決定 2 相關）
+
+- sshproxy 是既有設施（MyLinuxPool 維運，LLMGateway 只當會合點用）；sidecar 內部的 SubscriptionSource 是 sidecar 的事，diagrams 只寫「sidecar 內部自理」。
+
+### v5 新增的風險
+
+- [key-sync 拉失敗] → 保留舊版、記 log，服務照常用舊 key；連續失敗才需要人看。
+- [private repo 權限外洩] → 加密檔本身還要解密密碼才打得開；解密密碼只在服務那台（0600），不進 repo。
+- [拿掉 `lgw connect` 後通道各搞各的] → LLMGateway 只認「本機 loopback 某 port 即 HTTP API」；通道斷了客戶端照舊回「無法確認」。
+
 ## Risks / Trade-offs
 
 - [公司帳號用完換另一個是灰色地帶，v0 沒有同時上限] → 本人已接受灰色地帶，也定案 v0 不做上限。冷卻中不硬撞仍成立：sidecar 只挑 `available` 的。
@@ -230,3 +268,4 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
 ## Open Questions
 
 - opencode 讀 key 與 baseURL 的方式（例如 `OPENCODE_CONFIG_CONTENT`）：屬於 sidecar 的 AgentDriver，實作時在 opencode 1.18.35 上驗證。
+- v5 待本人決定（見 `docs/research/v5-plan.md` 疑點）：服務程式本身怎麼升級（`upgrade` 動詞與 deploy-service 去留）；worker 本機 port 的約定；反向隧道與 ops-scripts 的邊界。

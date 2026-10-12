@@ -1,11 +1,11 @@
-v4 定案（2026-10-11 深夜）。
+v4 定案（2026-10-11 深夜）。v5 增補（2026-10-12）見最下面一節；被取代的舊項旁標了「（v5：…）」。
 
 ## 1. 服務改成三個介面（本 repo；假 key、假時鐘）
 
-- [ ] 1.1 `GET /v1/subscriptions`（list，不含 key，依 priority 排序）、`GET /v1/subscriptions/{id}?agent=`（get，含 key；agent 不符 403、未部署 409）、`POST /v1/subscriptions/{id}/cooldown`（5h／1w、resets_at＋2 分鐘、預設長度、不合理時刻 400、取較晚、自動解除）
-- [ ] 1.2 共通 JSON schema（design 決定 7）；內部 `CredentialProvider`（四種 provider）與政策檔（priority、models、agents）
+- [ ] 1.1（v5：改 until-only，見 v5 增補 1.1′） `GET /v1/subscriptions`（list，不含 key，依 priority 排序）、`GET /v1/subscriptions/{id}?agent=`（get，含 key；agent 不符 403、未部署 409）、`POST /v1/subscriptions/{id}/cooldown`（5h／1w、resets_at＋2 分鐘、預設長度、不合理時刻 400、取較晚、自動解除）
+- [ ] 1.2（v5：政策檔拿掉 buffer、max-ahead 更名，見 v5 增補） 共通 JSON schema（design 決定 7）；內部 `CredentialProvider`（四種 provider）與政策檔（priority、models、agents）
 - [ ] 1.3 不做應用層認證（本人選 (a)）；服務只綁 127.0.0.1
-- [ ] 1.4 SQLite 只剩 `cooldowns` 與 `audit`；稽核紀錄不含 key
+- [ ] 1.4（v5：`cooldowns` 拿掉 window 欄，見 v5 增補） SQLite 只剩 `cooldowns` 與 `audit`；稽核紀錄不含 key
 - [ ] 1.5 移除 impl branch 上的租約核心、管理 API、whoami、狀態板、用量查詢與相關測試
 - [ ] 1.6 測試：spec 每個服務端 Scenario；canary key 不出現在 list、資料庫、log
 
@@ -18,14 +18,14 @@ v4 定案（2026-10-11 深夜）。
 ## 3. 連線與部署（會合點＝sshproxy）
 
 - [x] 3.1 本人選定放服務的那台；LLMGateway 是獨立服務
-- [x] 3.1a `deploy/`：安裝程式與 `remote-deploy.sh`（`keys`、`upgrade <tag>`）；已用假資料測試
-- [ ] 3.1b 隧道守護 `llmgateway-tunnel.service`：自己的金鑰與連線 `ssh -N -R 127.0.0.1:4710:… -R 127.0.0.1:4711:127.0.0.1:22 sshproxy@<跳板機>`，`ExitOnForwardFailure`／`ServerAlive*`；端對端探針（每 60 秒，連續 3 次失敗就重建）；設定檔 `tunnel.env`；`--check` 加上隧道
-- [x] 3.1c `lgw connect`（函式庫＋指令）：`ssh -F … -N -L … [-J …] <帳號>@<會合點>`，回 base URL；連不上回「無法確認」；設定檔是 JSON（`connect.json`，schema 1：`rendezvous`、`jumps`、`identity`、`known_hosts` 或 `host_keys`、`remote_api`；`load_config` 每次重讀），`rendezvous` 要明確的 `user@host:port`、不讀 `~/.ssh/config`；worker 的設定檔由 MyLinuxPool 的 unit 依 gateway.json 產生，Mac 手寫
+- [x] 3.1a `deploy/`：安裝程式與 `remote-deploy.sh`（`keys`、`upgrade <tag>`）；已用假資料測試（v5：`keys` 動詞拿掉，`upgrade` 去留待本人決定，見 v5 增補）
+- [ ] 3.1b 隧道守護 `llmgateway-tunnel.service`（v5：搬到 `ops-scripts/`，行為不變，見 v5 增補）：自己的金鑰與連線 `ssh -N -R 127.0.0.1:4710:… -R 127.0.0.1:4711:127.0.0.1:22 sshproxy@<跳板機>`，`ExitOnForwardFailure`／`ServerAlive*`；端對端探針（每 60 秒，連續 3 次失敗就重建）；設定檔 `tunnel.env`；`--check` 加上隧道
+- [x] 3.1c（v5：拿掉，見 v5 增補） `lgw connect`（函式庫＋指令）：`ssh -F … -N -L … [-J …] <帳號>@<會合點>`，回 base URL；連不上回「無法確認」；設定檔是 JSON（`connect.json`，schema 1：`rendezvous`、`jumps`、`identity`、`known_hosts` 或 `host_keys`、`remote_api`；`load_config` 每次重讀），`rendezvous` 要明確的 `user@host:port`、不讀 `~/.ssh/config`；worker 的設定檔由 MyLinuxPool 的 unit 依 gateway.json 產生，Mac 手寫
 - [x] 3.1d workflow 改走會合點（`ssh -J sshproxy@<跳板機> -p 4711 llmgw@127.0.0.1`）
 - [ ] 3.1e lgwd 只綁 127.0.0.1（拿掉 docker bridge 綁定）
 - [ ] 3.2 MyLinuxPool#77（mylinuxpool-pm，進行中）：`TUNNEL_EXTRA_PUBKEYS`（裸公鑰，refresh／rotate 都會收）與 `NODE_GATEWAY.ports.llmgateway: [4710, 4711]`；本人或 PMO 設 var 並 dispatch refresh-authorized-keys。worker 的 id_tunnel 已確認讀得到（#67～#70 已作廢）
 - [ ] 3.3 一次性開機設定（root，本人做或本人授權）：服務那台建 `llmgw`（不加 docker 群組）、linger、產生隧道金鑰（公鑰交給 MyLinuxPool 登記）、放部署公鑰、第一次安裝
-- [ ] 3.4 本人設定（AI 不經手值）：
+- [ ] 3.4（v5：整組換掉，見 v5 增補 3.4′） 本人設定（AI 不經手值）：
   - environment「llmgateway-deploy」（required reviewer＝本人）；
   - key 5 個：`POOL_LLMGATEWAY__CLAUDE_PERSONAL__LLM`、`POOL_LLMGATEWAY__CLAUDE_COMPANY__LLM`、`POOL_LLMGATEWAY__OPENROUTER_API__LLM`、`POOL_LLMGATEWAY__OPENCODE_ZEN__LLM`、`POOL_LLMGATEWAY__OLLAMA_CLOUD__LLM`；
   - 部署 4 個：`GH_LLMGATEWAY__POOL_SSH__DEPLOY`（部署私鑰）、`…_KNOWN_HOSTS`、`…_JUMP`（`sshproxy@<跳板機>:<埠>`）、`…_TARGET`（`llmgw@127.0.0.1:4711`）；
@@ -34,17 +34,35 @@ v4 定案（2026-10-11 深夜）。
 ## 4. 驗收
 
 - [ ] 4.1 Mac：sidecar 以 list／get 開 Claude Code，回得了一則最短的訊息
-- [ ] 4.2 換把：用假的額度用完訊號 → sidecar 登錄冷卻 → list 顯示 `claude-personal` 不能用 → sidecar 挑到 `claude-company` 重開並接回；冷卻到期後 list 恢復
+- [ ] 4.2 換把：用假的額度用完訊號 → sidecar 登錄冷卻（v5：`{until}`） → list 顯示 `claude-personal` 不能用 → sidecar 挑到 `claude-company` 重開並接回；冷卻到期後 list 恢復
 - [ ] 4.3 opencode 拿不到 Claude 訂閱（403）；opencode 對 Zen、OpenRouter（免費模型）、Ollama 各跑通一次
 - [ ] 4.4 要用 key 的驗證（PM 或本人）：OpenRouter、Ollama Cloud 讓 Claude Code 跑一則最短的訊息；opencode 讀 key 的方式
-- [ ] 4.5 worker：在一台 worker 用 id_tunnel 經 `lgw connect` 連線並驗收換把
+- [ ] 4.5 worker：在一台 worker 用自備通道（v5：不再經 `lgw connect`）連線並驗收換把
 - [ ] 4.5a 隧道：殺掉隧道連線後自動恢復；佔住遠端埠時守護程式重試而不假裝健康
 - [ ] 4.6 秘密掃描：repo、資料庫、log、list 的回覆沒有任何 key 的值
 - [ ] 4.7 退回演練
 
 ## 5. 銜接
 
-- [ ] 5.1 把共通 JSON schema 與三個介面的最後版本交給 aistorage-pm（已在 v3 對齊草案）
-- [x] 5.2 手機的轉送：MyAiEntry#147
+- [ ] 5.1 把共通 JSON schema 與三個介面的最後版本交給 aistorage-pm（已在 v3 對齊草案；v5：改為 until-only 版）
+- [x] 5.2 手機的轉送：MyAiEntry#147（v5：手機改走自備通道，不再經 `lgw connect`，MyAiEntry PM 已通知？待確認）
 - [ ] 5.3 另開單：把 MyLinuxPool#50 的 key 來源換成 LLMGateway，收掉 MyLinuxPool 裡的 key
 - [ ] 5.4 通知 MyAiEntry PM：手機改成經會合點 SSH 轉發＋list／get（不再有租約、沒有應用層 token）
+- [ ] 5.5（v5 新增）通知 mylinuxpool-pm：worker 通道改由 MyLinuxPool 的 LLMGateway capability 附小 script 建立（LLMGateway 只提需求：本機 loopback 某 port 即 HTTP API）；本機 port 號約定待本人決定
+
+## v5 增補（2026-10-12；取代或新增上面標了 v5 的項）
+
+- [ ] 1.1′ 登錄冷卻 until-only：`POST …/cooldown {until}`（必填 RFC 3339；缺→400 `bad_request`＋`missing: ["until"]`；格式錯→400 `invalid_until`；過去或 8 天以後→400 `until_out_of_range`；未知欄位忽略）；重複登錄取較晚；過期自動解除；`cooldown` 欄位改單一 `until`／null；`available`＝已部署且無未來 `until`
+- [ ] 1.2′ 政策檔：拿掉 `cooldown_buffer_seconds`，`resets_at_max_ahead_seconds` 更名（until 語意，值不變）
+- [ ] 1.4′ SQLite：`cooldowns` 拿掉 `window` 欄（subscription → until），`audit` 拿掉 `window` 欄
+- [ ] 1.6′ 測試：spec 每個服務端 Scenario 重寫（until-only）；canary key 不出現在 list、資料庫、log
+- [ ] 2.1′ `lgw.client.cooldown(id, until)` 只送 `{until}`；拿掉 window 相關錯誤碼
+- [ ] 2.2′ `lgw.signals`：`Signal` 拿掉 `window`，`to_cooldown_body()` 改產 `{until}`（判讀不出時呼叫方用現在＋1 小時）
+- [ ] 2.4′（新增）拿掉 `lgw/connect.py`、`tests/test_connect.py`；`lgw/__init__.py`、`pyproject.toml`（描述）、`tests/test_package.py` 跟著改
+- [ ] 3.1b′ 隧道守護與其 unit 從 `deploy/` 搬到 `ops-scripts/`（內容不變）；`install.sh`、`bootstrap.sh`、`test_install.py`、`test_bootstrap.py`、`test_tunnel.py` 改引用新路徑
+- [ ] 3.1d′ `remote-deploy.sh` 拿掉 `keys` 動詞；`upgrade` 動詞與 deploy-service 去留待本人決定（v5-plan 疑點）
+- [ ] 3.3′ bootstrap 拿掉部署公鑰／forced command 步驟；新增初次啟動引導步驟（GitHub 登入、解密密碼放置，方案見 v5-plan）
+- [ ] 3.4′ 本人設定（AI 不經手值）：開新的 private repo（名字待本人定，提案見 v5-plan）；放加密檔正本；secret 改為解密密碼（命名照 `<存取方>__<被存取方>__<動作>`，提案見 v5-plan）；舊的 5＋4 個 secret 與部署公鑰登記收掉
+- [ ] 3.5′（新增）key-sync：小 script＋systemd timer（約每 10 分鐘）：拉→比對→解密（`-pass env:`／`fd:`）→驗證格式→原子替換→`lgwd` 依 mtime 重讀；失敗保留舊版；`lgwd` 拿掉 SIGHUP（`llmgateway.service` 拿掉 `ExecReload`）
+- [ ] 4.1′ Mac 驗收改走自備通道（手寫 ssh -L 或 mlp）；換把驗收用 `{until}` 登錄
+- [ ] 4.6′ 秘密掃描：private repo 加密檔、解密密碼不進本 repo；repo、資料庫、log、list 回覆無 key 的值
