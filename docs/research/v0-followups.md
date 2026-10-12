@@ -40,3 +40,14 @@
 `要修` 共 8 條：L-R3、L-R4、L-R5、L-R6（後半）、L-R7、L-R8（補測試）、L-R9、L-R11。
 另順手修備查 (a) 隧道 `.pub` 摘要取前兩欄（與 L-R8 同手法、一行）。
 L-R1、L-R2、L-R10 為 `v5 已不適用`，不動程式。
+
+## 順手（別單低項，branch 實際多修的 4 項）
+
+審查 #17 低-1 指正：以下 4 項不在 11 條內，但同屬「前幾輪審查低項」級別，已在本 branch 修好，一併記帳。
+
+| 項 | 出處 | 修法（commit） |
+|---|---|---|
+| #13 新-低-1：管理帳號直跑 `--check`、sudo 快取缺時 `sudo -n` 失敗被算成「gh 沒登入」 | `docs/research/v5-review-13.md:142` | `deploy/install.sh:318-323`、`342-347`（sudo 自己失敗回 2「無法確認」）＋`tests/test_install.py:847-931` 四案測試（`dc5e2af`） |
+| #13 觀察-2：`repo_out == KEYS_REPO` 字串比對偏嚴（引號／空白誤判 1） | `docs/research/v5-review-13.md:144` | `deploy/install.sh:354-365`（純 bash 修剪）＋假 gh `FAKE_GH_DECORATE`（`:197-210`）＋`tests/test_install.py:933-951` 五態測試（`e55a5c2`） |
+| #19 低-2：假 sudo 單槽快取改每 PPID 一檔 | `docs/research/review-18.md:82-87` | `tests/test_bootstrap.py:143-157`（`sudo-v-ppid-$PPID` 各記一筆）；既有三情境照過（`e631357`） |
+| `docs/deploy.md` 5.1 排錯表加 `bad_config` 列 | #13 低-3（`v5-review-13.md:73-78`）／觀察-1（`:143`） | `docs/deploy.md:519,535`（設定錯、結束碼 3，非 `failed=` 體系）（`eefc994`） |
