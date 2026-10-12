@@ -18,7 +18,7 @@ TOOLS_LIST = [
     "mkdir", "mktemp", "chmod", "mv", "ln", "rm", "cat", "date",
     "whoami", "cp", "bash", "head", "grep", "ls", "readlink",
     "cmp", "stat", "dirname", "sort", "tail", "awk", "sed", "tr", "cut", "sleep",
-    "python3", "ssh", "env"
+    "test", "python3", "ssh", "env"
 ]
 
 
@@ -72,6 +72,7 @@ class BootstrapScriptTests(unittest.TestCase):
         self._set_state("sshd_listen", "1")
         self._set_state("curl_code", "200")
         self._set_state("curl_rc", "0")
+        self._set_state("ssh_probe_code", "200")
 
         self._create_fake_tools()
 
@@ -92,8 +93,11 @@ class BootstrapScriptTests(unittest.TestCase):
     def _create_fake_tools(self):
         # 1. sudo
         # 假 sudo: 去掉選項後以目前使用者執行，-S 只允許和 -v 一起出現，否則測試失敗
+        # 兩種失敗注入（狀態檔在 LGW_TEST_STATE_DIR）：
+        #   sudo_fail_substr=<子字串>：argv 含此字串的指令回非零
+        #   sudo_no_cache=1：-n 的指令必須先有 sudo -v 刷新過，否則回非零
         sudo_script = """#!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 echo "sudo $*" >> "${LOG_DIR}/sudo-argv.log"
 
 has_S=0
@@ -123,11 +127,25 @@ if [[ $has_v -eq 1 ]]; then
     if [[ $has_S -eq 1 ]]; then
         cat >/dev/null || true
     fi
+    echo "1" > "${LGW_TEST_STATE_DIR}/sudo-v-called"
     exit 0
 fi
 
 if [[ ${#args[@]} -eq 0 ]]; then
     exit 0
+fi
+
+fail_substr="$(cat "${LGW_TEST_STATE_DIR}/sudo_fail_substr" 2>/dev/null || true)"
+if [[ -n "$fail_substr" && "$*" == *"${fail_substr}"* ]]; then
+    echo "fake sudo: injected failure for: ${fail_substr}" >&2
+    exit 1
+fi
+
+if [[ $has_n -eq 1 && "$(cat "${LGW_TEST_STATE_DIR}/sudo_no_cache" 2>/dev/null || echo 0)" == "1" ]]; then
+    if [[ ! -f "${LGW_TEST_STATE_DIR}/sudo-v-called" ]]; then
+        echo "fake sudo: no cached credentials (sudo -n without sudo -v)" >&2
+        exit 1
+    fi
 fi
 
 exec "${args[@]}"
@@ -261,8 +279,13 @@ if [[ "${1:-}" == "-l" ]]; then
         fi
     done
     if [[ -f "$file" ]]; then
-        echo "256 SHA256:MockFingerprintKeyString comment (ED25519)"
-        exit 0
+        # 真 ssh-keygen 對空檔（或只有空白／註解）回非零
+        if grep -q '[^[:space:]]' "$file" 2>/dev/null; then
+            echo "256 SHA256:MockFingerprintKeyString comment (ED25519)"
+            exit 0
+        fi
+        echo "fake ssh-keygen: $file has no key" >&2
+        exit 1
     else
         exit 1
     fi
@@ -351,6 +374,31 @@ exit "$rc"
 """
         real_install_bin = shutil.which("install") or "/usr/bin/install"
 
+        # 14. ssh
+        # 假 ssh: -W (探針) 讀完 stdin 後回一個可設定的 HTTP 狀態列 (預設 200)；
+        # 其餘參數 (守護程式的 -N) 直接成功。避免測試真的去連會合點位址。
+        ssh_script = """#!/usr/bin/env bash
+set -uo pipefail
+echo "ssh $*" >> "${LOG_DIR}/ssh-argv.log"
+
+mode="plain"
+for a in "$@"; do
+    if [[ "$a" == "-W" ]]; then
+        mode="probe"
+    fi
+done
+
+if [[ "$mode" == "probe" ]]; then
+    # 探針會把 HTTP 請求寫進 stdin，讀完再回狀態列
+    cat >/dev/null 2>&1 || true
+    code="$(cat "${LGW_TEST_STATE_DIR}/ssh_probe_code" 2>/dev/null || echo "200")"
+    printf 'HTTP/1.0 %s\\r\\n\\r\\n' "$code"
+    exit 0
+fi
+
+exit 0
+"""
+
         scripts = [
             ("sudo", sudo_script),
             ("useradd", useradd_script),
@@ -365,6 +413,7 @@ exit "$rc"
             ("git", git_script),
             ("install", install_script),
             ("curl", curl_script),
+            ("ssh", ssh_script),
         ]
 
         for name, content in scripts:
@@ -385,6 +434,7 @@ exit "$rc"
             "LGW_BOOT_RUNDIR": self.rundir,
             "LGW_BOOT_HOSTKEY": self.hostkey_file,
             "LGW_BOOT_OS": "Linux",
+            "LGW_TEST_STATE_DIR": self.state,
             "REAL_INSTALL_SH": INSTALL_SH,
             "REAL_REMOTE_DEPLOY_SH": REMOTE_DEPLOY_SH,
             "REAL_RUN_WRAPPER": RUN_WRAPPER,
@@ -404,6 +454,13 @@ exit "$rc"
             return ""
         with open(p, "r", encoding="utf-8") as f:
             return f.read()
+
+    def assert_summary_printed(self, stdout):
+        """摘要三段都在：隧道公鑰、host 公鑰、待辦清單"""
+        self.assertIn("開機設定摘要 (Bootstrap Summary)", stdout)
+        self.assertIn("1. 隧道公鑰", stdout)
+        self.assertIn("2. 這台的 ed25519 host 公鑰", stdout)
+        self.assertIn("3. 待辦事項 (Pending Todos):", stdout)
 
     # -------------------------------------------------------------------------
     # 測試項目
@@ -631,6 +688,162 @@ exit "$rc"
         # install 紀錄中不應有寫入/複製
         install_log = self.read_log("install")
         self.assertEqual(install_log, "")
+
+    def test_check_probe_uses_fake_ssh(self):
+        """install.sh --check 的會合點探針走 fake ssh（不連真位址），回 200 時 check 通過"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[check] ok", res.stdout)
+
+        ssh_log = self.read_log("ssh")
+        self.assertIn("-W 127.0.0.1:4710", ssh_log)
+        self.assertIn("sshproxy@jump.example.com", ssh_log)
+
+    def test_check_probe_non_200_is_fail(self):
+        """探針回非 200 時 check 記 fail、結束碼 1（不是 todo）"""
+        self._set_state("ssh_probe_code", "503")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[check] fail install.sh --check 未通過 (rc=1)", res.stdout)
+
+    def test_sudo_command_failure_fails_the_step(self):
+        """某個 sudo -n 指令失敗 → 該步記 fail、不印 changed、結束碼 1（H1 失敗傳播）"""
+        self._set_state("sudo_fail_substr", "git clone")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[install] fail git clone", res.stdout)
+        self.assertNotIn("[install] changed", res.stdout)
+        # 失敗之後不再往下走
+        self.assertNotIn("[check]", res.stdout)
+        # 失敗也要跑摘要
+        self.assert_summary_printed(res.stdout)
+
+    def test_failed_step_still_prints_summary(self):
+        """前面某步就 fail 時也要有摘要：公鑰與待辦清單兩段都印出來"""
+        self._set_state("sudo_fail_substr", "useradd")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[user] fail useradd", res.stdout)
+        self.assertNotIn("[linger]", res.stdout)
+        self.assert_summary_printed(res.stdout)
+
+    def test_sudo_no_cache_check_refreshes_before_sshd(self):
+        """沒有 sudo 快取時，--check 也要先 sudo -v；sshd 檢查不因 sudo -n 失敗而記假 todo"""
+        self._set_state("user_exists", "1")
+        self._set_state("user_linger", "1")
+        self._set_state("sudo_no_cache", "1")
+
+        args = [
+            "--check",
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 3, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[sshd] ok", res.stdout)
+
+        sudo_lines = [line for line in self.read_log("sudo").splitlines() if line.strip()]
+        first_n = next((i for i, line in enumerate(sudo_lines) if " -n " in line), None)
+        self.assertIsNotNone(first_n, f"no sudo -n call: {sudo_lines}")
+        self.assertIn("sudo -v", sudo_lines[:first_n],
+                      f"sudo -v must come before the first sudo -n: {sudo_lines[:first_n + 1]}")
+
+    def test_home_reads_go_through_sudo(self):
+        """讀 ~llmgw 的動作都經 sudo：家目錄 0700/0750 時管理帳號自己讀不到"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res1 = self.run_bootstrap(args)
+        self.assertEqual(res1.returncode, 0, f"stdout:\n{res1.stdout}\nstderr:\n{res1.stderr}")
+
+        # 第二次執行要讀：已安裝版本、隧道金鑰是否存在、authorized_keys、
+        # 會合點 known_hosts、tunnel.env、install.sh 是否存在
+        for f in os.listdir(self.logdir):
+            os.remove(os.path.join(self.logdir, f))
+
+        res2 = self.run_bootstrap(args)
+        self.assertEqual(res2.returncode, 0, f"stdout:\n{res2.stdout}\nstderr:\n{res2.stderr}")
+
+        sudo_log = self.read_log("sudo")
+        expected = [
+            f"test -e {os.path.join(self.home, '.ssh', 'id_llmgw_tunnel')}",
+            f"test -e {os.path.join(self.home, '.ssh', 'known_hosts_rendezvous')}",
+            f"test -e {os.path.join(self.home, '.ssh', 'authorized_keys')}",
+            f"test -e {os.path.join(self.home, '.config', 'llmgateway', 'tunnel.env')}",
+            f"cat {os.path.join(self.home, '.ssh', 'known_hosts_rendezvous')}",
+            f"cat {os.path.join(self.home, '.config', 'llmgateway', 'tunnel.env')}",
+            f"cat {os.path.join(self.home, '.ssh', 'authorized_keys')}",
+            f"cat {os.path.join(self.home, '.local', 'share', 'llmgateway', 'current', '.lgw-tag')}",
+            f"test -e {os.path.join(self.home, '.local', 'share', 'llmgateway', 'current', 'deploy', 'install.sh')}",
+        ]
+        for needle in expected:
+            self.assertIn(needle, sudo_log, f"not read through sudo: {needle}")
+
+    def test_rendezvous_argument_validation_exit_2(self):
+        """--rendezvous 格式錯與無效的 known_hosts 都回 2"""
+        bad_rendezvous = [
+            "sshproxy@jump.example.com",        # 缺埠
+            "sshproxy@jump.example.com:0",      # 埠 0
+            "sshproxy@jump.example.com:70000",  # 埠超出範圍
+            "sshproxy@jump.example.com:abc",    # 埠不是數字
+            "jump.example.com:2222",            # 沒有 user
+            "sshproxy@:2222",                   # 沒有 host
+        ]
+        for rv in bad_rendezvous:
+            res = self.run_bootstrap([
+                "--tag", "lgw-v0.1.0",
+                "--rendezvous", rv,
+                "--rendezvous-known-hosts", self.known_hosts_file,
+            ])
+            self.assertEqual(res.returncode, 2, f"Failed for rendezvous: {rv}")
+
+        empty_kh = os.path.join(self.sandbox, "empty_known_hosts")
+        with open(empty_kh, "w", encoding="utf-8"):
+            pass
+        res = self.run_bootstrap([
+            "--tag", "lgw-v0.1.0",
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", empty_kh,
+        ])
+        self.assertEqual(res.returncode, 2, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
 
     def test_argument_errors_exit_2(self):
         """參數錯回 2"""
