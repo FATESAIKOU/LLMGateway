@@ -313,10 +313,11 @@ check_keysync() {
 
     local auth_out="" rc=0
     auth_out="$("${gh_cmd[@]}" auth status 2>&1)" || rc=$?
-    # 管理帳號直跑 --check 且 sudo 快取缺時，sudo -n 自己失敗（rc=1＋sudo:…），
-    # 不能算成「gh 沒登入」；sudo 本體缺席的 127 同理（#13 新-低-1）。三態用 2。
+    # 管理帳號直跑 --check 且 sudo 快取缺時，sudo -n 自己失敗（rc=1＋sudo:…）、
+    # 不在 sudoers（該版訊息無 sudo: 前綴）或sudo 轉交的指令不存在，
+    # 都不能算成「gh 沒登入」；sudo 本體缺席的 127 同理（#13 新-低-1）。三態用 2。
     if [[ "$use_sudo" -eq 1 ]]; then
-        if [[ "$rc" -eq 127 || "$auth_out" == *"sudo:"* ]]; then
+        if [[ "$rc" -eq 127 || "$auth_out" == *"sudo:"* || "$auth_out" == *"not in the sudoers file"* || "$auth_out" == *"command not found"* ]]; then
             log INFO "key-sync: 無法確認（sudo 需要密碼或失敗，無法以 ${service_user} 身分問 gh）"
             return 2
         fi
@@ -340,7 +341,7 @@ check_keysync() {
     repo_out="$("${gh_cmd[@]}" api "repos/${KEYS_REPO}" --jq .full_name 2>&1)" || repo_rc=$?
     # 同上：經 sudo 問而 sudo 自己失敗時回 2，不是「讀不到 repo」。
     if [[ "$use_sudo" -eq 1 ]]; then
-        if [[ "$repo_rc" -eq 127 || "$repo_out" == *"sudo:"* ]]; then
+        if [[ "$repo_rc" -eq 127 || "$repo_out" == *"sudo:"* || "$repo_out" == *"not in the sudoers file"* || "$repo_out" == *"command not found"* ]]; then
             log INFO "key-sync: 無法確認（sudo 需要密碼或失敗，無法以 ${service_user} 身分問 gh）"
             return 2
         fi

@@ -883,6 +883,21 @@ exec "$@"
         self.assertIn("sudo", r1.stdout)
         self.assertNotIn("gh 沒登入", r1.stdout)
 
+        # 不在 sudoers（該版 sudo 訊息無 sudo: 前綴）：同樣回 2（#17 低-5）
+        sudoers_fail = os.path.join(self.sandbox, "fake-sudo-not-in-sudoers")
+        with open(sudoers_fail, "w", encoding="utf-8") as f:
+            f.write('#!/usr/bin/env bash\n'
+                    'echo "sudo $*" >> "${SANDBOX:?}/sudo-argv.log"\n'
+                    'echo "manager is not in the sudoers file. This incident will be reported." >&2\n'
+                    'exit 1\n')
+        os.chmod(sudoers_fail, 0o755)
+
+        r4 = check(LGW_SUDO=sudoers_fail)
+        self.assertEqual(r4.returncode, 2, r4.stdout)
+        self.assertIn("無法確認", r4.stdout)
+        self.assertIn("sudo", r4.stdout)
+        self.assertNotIn("gh 沒登入", r4.stdout)
+
         # sudo 本體缺席：同樣回 2（不是「找不到 gh」）
         r2 = check(LGW_SUDO="/nonexistent/no-such-sudo")
         self.assertEqual(r2.returncode, 2, r2.stdout)
