@@ -69,35 +69,50 @@
 5. 等一次拉取（≤約 10 分鐘；趕時間就上服務那台手動觸發 key-sync 跑一次）。
 6. 驗證：`curl` 經本機通道打 list（`available` 回來了）或等 sidecar 換把成功。log 只看 key-sync 的成敗行。
 
-## 4. 受影響的程式與測試（對照 A：`v5-inventory.md`）
+## 4. 本人要做的事（照順序）
+
+1. **建 repo**：開 private repo `FATESAIKOU/LLMGateway-keys`（只有本人用）。
+2. **加密上傳 `keys.env.enc`**（本人在自己電腦；AI 不經手值）：
+   ```bash
+   export LLMGW_KEYS_PASSWORD='...'  # 32 字元隨機英數，本人自己產生；用完就 unset
+   openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt -pass env:LLMGW_KEYS_PASSWORD -in keys.env -out keys.env.enc
+   unset LLMGW_KEYS_PASSWORD
+   shred -u keys.env  # 刪明文
+   git add keys.env.enc && git commit -m 'update keys' && git push
+   ```
+3. **`gh` 登入（以 `llmgw` 身分）**：`sudo -u llmgw -i` 後 `gh auth login`（預設）或 `gh auth login --with-token`（只讀單一 repo 的 fine-grained token，推薦）；二選一見 §2.1。
+4. **加 secret**：本 repo `llmgateway-deploy` environment 加 `GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`（解密密碼備份；AI 不經手值）；收掉五把 key secret、部署連線 4 個；請 mylinuxpool-pm 拿掉部署公鑰登記（隧道公鑰保留）。
+5. **之後換 key**：照 §3.3（改明文→重加密→刪明文→push→等一次拉取；趕時間手動觸發 key-sync→驗證）。
+
+## 5. 受影響的程式與測試（對照 A：`v5-inventory.md`）
 
 - **服務 until-only**：修改 `lgwd/registry.py`、`store.py`、`errors.py`、`http.py`、`policy.py`、`main.py`（mtime 重讀、拿掉 SIGHUP）；`keys.py`、`clock.py`、`providers.py` 保留。測試改 `test_registry.py`、`test_http.py`、`test_policy.py`、`test_main.py`；`test_keys.py` 保留。
 - **客戶端**：修改 `lgw/client.py`、`signals.py`、`__init__.py`、`pyproject.toml`；拿掉 `lgw/connect.py`、`tests/test_connect.py`；測試改 `test_client.py`、`test_signals.py`、`test_package.py`。
-- **金鑰管線**：拿掉 `.github/workflows/deploy-keys.yml`；`remote-deploy.sh` 拿掉 `keys` 動詞（`upgrade` 待定）；新增 key-sync＋timer＋`test_keysync.py`（實作階段新檔）；`test_deploy_script.py`、`test_workflows.py` 跟著改。
-- **搬移與安裝**：`llmgateway-tunnel`＋unit 搬 `ops-scripts/`；改 `install.sh`、`bootstrap.sh`（＋初次引導步驟、拿掉部署公鑰步驟——但疑點 1 選甲則保留 deploy-key 步驟只為 upgrade）、`llmgateway.service`（拿掉 `ExecReload`）；測試改 `test_install.py`、`test_bootstrap.py`、`test_tunnel.py`。
+- **金鑰管線**：拿掉 `.github/workflows/deploy-keys.yml`、`deploy-service.yml`、`deploy/remote-deploy.sh`、`tests/test_deploy_script.py`、`tests/test_workflows.py`；新增 key-sync（`ops-scripts/`）＋timer＋`test_keysync.py`（實作階段新檔）。
+- **搬移與安裝**：`llmgateway-tunnel`＋unit 搬 `ops-scripts/`；改 `install.sh`、`bootstrap.sh`（拿掉部署公鑰步驟、改放解密密碼；`gh` 登入由本人手動做）、`llmgateway.service`（拿掉 `ExecReload`）；測試改 `test_install.py`、`test_bootstrap.py`、`test_tunnel.py`。
 - **文件**：`docs/deploy.md` 全文重寫（大綱已在本 repo `deploy.md` 頂端）；`policy/default.json` 改政策欄位。
 
-## 5. 估工（一個實作隊員，單位：工作段）
+## 6. 估工（一個實作隊員，單位：工作段）
 
 | 塊 | 內容 | 段 |
 |---|---|---|
 | 服務 until-only | registry／store／errors／http／policy／main＋測試 | 2 |
 | 客戶端 | client／signals／拿掉 connect／packaging＋測試 | 1 |
-| key-sync 管線 | key-sync＋timer＋mtime 重讀＋測試（含失敗保留舊版演練） | 2 |
-| 部署與安裝 | remote-deploy／install／bootstrap（含初次引導）／deploy-service 去留實作＋測試 | 1.5 |
-| 搬移 | ops-scripts 搬移＋引用更新＋測試 | 0.5 |
+| key-sync 管線 | `gh api` 拉取＋timer＋mtime 重讀＋測試（含 `gh` 失效演練） | 2 |
+| 移除部署入口 | remote-deploy、兩 workflow、bootstrap deploy-key、測試刪除 | 1 |
+| ops-scripts 搬移＋install／bootstrap | 隧道搬移引用更新＋install／bootstrap 調整＋測試 | 1 |
 | 文件 | deploy.md 全文重寫 | 1 |
-| 驗收 | Mac 換把、worker 換把、拉取失敗演練、秘密掃描、退回演練 | 1.5 |
+| 驗收 | Mac／worker 換把、手動升級、拉取失敗演練、秘密掃描、退回演練 | 1.5 |
 | **合計** | | **約 9.5（抓 10）** |
 
-建議切兩單：單一「until-only＋拿掉 connect」（約 3.5 段）先行，單二「key-sync＋部署＋文件」（約 6 段）；兩單都只碰文件與程式，不 merge（照本次規矩由本人合）。
+建議切兩單：單一「until-only＋拿掉 connect」（約 3 段）先行，單二「key-sync、移除部署入口、ops-scripts 搬移、install／bootstrap、文件」（約 5 段＋驗收 1.5）；兩單都只碰文件與程式，不 merge（照本次規矩由本人合）。
 
-## 6. 疑點與需要本人決定的地方
+## 7. 原疑點（本人 2026-10-12 第二輪已全部裁定，無未決）
 
-1. **服務程式本身怎麼升級（`upgrade` 動詞與 deploy-service 去留）**：甲＝精簡保留（只剩 upgrade；部署公鑰、forced command、bootstrap deploy-key 步驟、部署連線 4 secret 全留）；乙＝整組拿掉（升級改本人手動經會合點 ssh 跑 `install.sh`）。提案甲（改動最小、已有測試）。連帶：A 盤點的 bootstrap／deploy-service 條目以此決定為準（選甲則 bootstrap 保留 deploy-key 步驟）。
-2. **worker 本機 port 的約定**：提案 LLMGateway 不規定（只認「本機 loopback 某 port 即 HTTP API」），由 MyLinuxPool capability 與 sidecar 約定；要不要給預設值（如 8480）請本人定。
-3. **反向隧道與 ops-scripts 的邊界**：提案 key-sync 也放 `ops-scripts/`（跟隧道作伴，都是維運工具），`install.sh` 從 `deploy/` 裝服務、`ops-scripts/` 裝維運工具；或 key-sync 留 `deploy/`。請本人定。
-4. **拉取頻率**：提案約 10 分鐘（換 key 最長等 10 分鐘，趕時間手動觸發）；要更短／更長請本人定。
-5. **初次引導的 deploy keypair**：提案由 bootstrap 在服務那台產生（私鑰不離開，印公鑰給本人登記），同隧道金鑰模式；請本人確認。
-6. **private repo 名與 secret 名**：提案 `LLMGateway-keys` 與 `GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`；請本人定（定了才開得了 repo 與 secret）。
-7. **手機通道**：v5.2 後手機用 mlp 或 ssh -J 自備通道（MyAiEntry#147 原定的 App 內轉發是否照走），請本人確認 MyAiEntry PM 已知。
+1. 升級選**乙**：拿掉部署入口整組，改手動 `install.sh --tag`。
+2. worker 本機 port 預設 **4710**，可改。
+3. key-sync 放 **`ops-scripts/`**。
+4. 拉取頻率約 **10 分鐘**＋可手動觸發。
+5. 不用 deploy key：`gh` 拉，登入是使用前提（`llmgw` 身分，token 二選一）。
+6. 名稱：`FATESAIKOU/LLMGateway-keys`、`keys.env.enc`、`GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`。
+7. MyAiEntry#147 **關掉**，手機自行轉發。
