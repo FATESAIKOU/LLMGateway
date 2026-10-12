@@ -4,7 +4,9 @@
 流程（v5-plan §1.2、spec key-vault「拉取與輪替」）：
 
 1. 拉取：``gh api repos/<repo>/contents/<path>`` 取回 base64 內容與 blob ``sha``；
-2. 比對版本：``sha`` 與 ``.keysync.sha`` 相同 → 直接結束（不解碼、不解密、不碰 key 檔）；
+2. 比對版本：``sha`` 與 ``.keysync.sha`` 相同 **而且本機 ``keys.env`` 還在、還驗得過**
+   → 直接結束（不解碼、不解密、不碰 key 檔）。sha 相同但本機檔被刪或寫壞（帶外
+   損毀）→ 照常往下解密重寫，自我修復；
 3. 解碼＋解密：base64 解碼 → ``openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a``，
    密碼只經環境變數傳（``-pass env:``），不上命令列、不寫進 log；
 4. 驗證格式：用 ``lgwd/keys.py`` 的規則（見 ``--code-dir``）；
@@ -286,6 +288,18 @@ def _install_plaintext(KeyFileError, KeyStore, keys_path: str, text: str) -> boo
                 pass
 
 
+def _local_keys_intact(KeyFileError, KeyStore, keys_path: str) -> bool:
+    """唯讀驗證本機 keys.env 還好著：檔在，而且用 lgwd/keys.py 的規則驗得過。
+
+    帶外被刪或寫壞時回 False（呼叫者才會重拉重寫 → 自我修復）。這裡不寫任何東西。
+    """
+    try:
+        KeyStore(keys_path)
+    except (KeyFileError, OSError):
+        return False
+    return True
+
+
 def sync(args) -> Outcome:
     """跑一次；成功回 Outcome，失敗丟 SyncError。"""
     KeyFileError, KeyStore = _load_keys_module(args.code_dir)
@@ -301,7 +315,11 @@ def sync(args) -> Outcome:
 
     sha, content_b64, _size = _fetch_blob(args.gh, args.repo, args.path, args.timeout)
     if previous_sha and previous_sha.lower() == sha:
-        return Outcome(updated=False, sha=sha, action="same_sha")
+        # blob 沒變就不解密、不碰 key 檔——但先唯讀確認本機檔還好著：
+        # sha 相同而 keys.env 單獨被刪／被寫壞時，要照常拉下去解密重寫（自我修復），
+        # 否則 key 會永遠回不來（v5-plan §1.2 第 2 步的「不碰」是不修改）。
+        if _local_keys_intact(KeyFileError, KeyStore, keys_path):
+            return Outcome(updated=False, sha=sha, action="same_sha")
 
     password = os.environ.get(args.password_env) or ""
     if not password:

@@ -226,6 +226,48 @@ exit 0
                     parts.append(fh.read())
         return "\n".join(parts)
 
+    # --- sha 相同時的自我修復（審查 中-1） ---------------------------------
+    def test_sha相同但本機key檔不見時重拉修復(self):
+        # keys.env 被帶外刪掉（.keysync.sha 還在）：不能因為 blob 沒變就擺著不管，
+        # 否則 key 永遠不回來（審查 中-1）
+        self.write_keys(key_text("test-keysync-old"), sha=SHA_A)
+        self._set("gh_response", blob_json(b64(b"cipher-a"), SHA_A))
+        os.remove(self.keys_path)
+
+        res = self.run_sync()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.read_keys(), key_text("test-keysync-new"))
+        self.assertEqual(stat.S_IMODE(os.stat(self.keys_path).st_mode), 0o600)
+        self.assertIn("已換 keys.env", res.stderr)
+        self.assertIn("-pass env:LLMGW_KEYS_PASSWORD", self._log("openssl"))
+        with open(self.sha_file, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read().strip(), SHA_A)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_sha相同但本機key檔寫壞時重拉修復(self):
+        self.write_keys("NOT A KEY FILE\n", sha=SHA_A)
+        self._set("gh_response", blob_json(b64(b"cipher-a"), SHA_A))
+
+        res = self.run_sync()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.read_keys(), key_text("test-keysync-new"))
+        self.assertEqual(stat.S_IMODE(os.stat(self.keys_path).st_mode), 0o600)
+        self.assertEqual(self.leftovers(), [])
+        self.assert_no_leak(res)
+
+    def test_本機key檔只是空的仍算完好(self):
+        # 空檔（install.sh 會先建）是合法狀態＝什麼都沒部署，不算損毀：
+        # sha 相同就短路，不要每 10 分鐘重寫一次空檔。
+        self.write_keys("", sha=SHA_A)
+        self._set("gh_response", blob_json(b64(b"cipher-a"), SHA_A))
+        before = os.stat(self.keys_path).st_mtime_ns
+
+        res = self.run_sync()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("sha 未變", res.stderr)
+        self.assertEqual(self.read_keys(), "")
+        self.assertEqual(os.stat(self.keys_path).st_mtime_ns, before)
+
     # --- 正常路徑 -------------------------------------------------------------
     def test_正常替換且sha與權限正確(self):
         self._set("gh_response", blob_json(b64(b"cipher-a"), SHA_A))
