@@ -3,15 +3,16 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BOOTSTRAP_SH = os.path.join(REPO_ROOT, "deploy", "bootstrap.sh")
 INSTALL_SH = os.path.join(REPO_ROOT, "deploy", "install.sh")
-REMOTE_DEPLOY_SH = os.path.join(REPO_ROOT, "deploy", "remote-deploy.sh")
 RUN_WRAPPER = os.path.join(REPO_ROOT, "deploy", "llmgateway-run")
 SERVICE_UNIT = os.path.join(REPO_ROOT, "deploy", "llmgateway.service")
 REPO_DEPLOY = os.path.join(REPO_ROOT, "deploy")
+REPO_OPS = os.path.join(REPO_ROOT, "ops-scripts")
 REPO_POLICY = os.path.join(REPO_ROOT, "policy")
 
 TOOLS_LIST = [
@@ -51,11 +52,11 @@ class BootstrapScriptTests(unittest.TestCase):
         with open(self.hostkey_file, "w", encoding="utf-8") as f:
             f.write("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForBootstrapTest999 root@mockhost\n")
 
-        # Deploy pubkey file
-        self.deploy_pubkey_file = os.path.join(self.sandbox, "deploy_key.pub")
-        self.deploy_pubkey_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIDeployPublicKeyForTestingOnly12345"
-        with open(self.deploy_pubkey_file, "w", encoding="utf-8") as f:
-            f.write(f"ssh-ed25519 {self.deploy_pubkey_b64} deploy-test\n")
+        # 解密密碼檔（假值；單行、不含空白）
+        self.decrypt_pass_file = os.path.join(self.sandbox, "decrypt_pass.txt")
+        self.decrypt_password = "FakeBootstrapDecryptPassword_01"
+        with open(self.decrypt_pass_file, "w", encoding="utf-8") as f:
+            f.write(self.decrypt_password + "\n")
 
         # Known hosts file for rendezvous
         self.known_hosts_file = os.path.join(self.sandbox, "rendezvous_known_hosts")
@@ -331,7 +332,7 @@ set -euo pipefail
 echo "git $*" >> "${LOG_DIR}/git-argv.log"
 if [[ "${1:-}" == "clone" ]]; then
     dest="${@: -1}"
-    mkdir -p "$dest/policy" "$dest/deploy"
+    mkdir -p "$dest/policy" "$dest/deploy" "$dest/ops-scripts"
     if [[ -d "${REPO_POLICY:-}" ]]; then
         cp -R "${REPO_POLICY}/." "$dest/policy/"
     else
@@ -339,6 +340,9 @@ if [[ "${1:-}" == "clone" ]]; then
     fi
     if [[ -d "${REPO_DEPLOY:-}" ]]; then
         cp -R "${REPO_DEPLOY}/." "$dest/deploy/"
+    fi
+    if [[ -d "${REPO_OPS:-}" ]]; then
+        cp -R "${REPO_OPS}/." "$dest/ops-scripts/"
     fi
 fi
 exit 0
@@ -424,7 +428,7 @@ exit 0
 
         self.real_install_bin = real_install_bin
 
-    def run_bootstrap(self, args, env_overrides=None):
+    def bootstrap_env(self, env_overrides=None):
         env = {
             "PATH": f"{self.fakebin}:{self.tools}",
             "LOG_DIR": self.logdir,
@@ -435,18 +439,23 @@ exit 0
             "LGW_BOOT_HOSTKEY": self.hostkey_file,
             "LGW_BOOT_OS": "Linux",
             "LGW_TEST_STATE_DIR": self.state,
+            "LGW_BOOT_DECRYPT_PROMPT": "0",
             "REAL_INSTALL_SH": INSTALL_SH,
-            "REAL_REMOTE_DEPLOY_SH": REMOTE_DEPLOY_SH,
             "REAL_RUN_WRAPPER": RUN_WRAPPER,
             "REAL_SERVICE_UNIT": SERVICE_UNIT,
             "REPO_DEPLOY": REPO_DEPLOY,
+            "REPO_OPS": REPO_OPS,
             "REPO_POLICY": REPO_POLICY,
             "REAL_INSTALL_BIN": self.real_install_bin,
         }
         if env_overrides:
             env.update(env_overrides)
+        return env
+
+    def run_bootstrap(self, args, env_overrides=None):
         cmd = ["bash", BOOTSTRAP_SH] + list(args)
-        return subprocess.run(cmd, env=env, capture_output=True, text=True)
+        return subprocess.run(cmd, env=self.bootstrap_env(env_overrides),
+                              capture_output=True, text=True)
 
     def read_log(self, name):
         p = os.path.join(self.logdir, f"{name}-argv.log")
@@ -475,7 +484,7 @@ exit 0
         """全新機器跑一次全部 changed/todo 正確，第二次跑 changed 為 0"""
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -491,7 +500,7 @@ exit 0
         self.assertIn("[sshd] ok", res1.stdout)
         self.assertIn("[install] changed", res1.stdout)
         self.assertIn("[tunnel-key] changed", res1.stdout)
-        self.assertIn("[deploy-key] changed", res1.stdout)
+        self.assertIn("[keysync] changed", res1.stdout)
         self.assertIn("[rendezvous] changed", res1.stdout)
         self.assertIn("[check] ok", res1.stdout)
         self.assertIn("無 (全部完成)", res1.stdout)
@@ -510,21 +519,29 @@ exit 0
         self.assertIn("[linger] ok", res2.stdout)
         self.assertIn("[install] ok", res2.stdout)
         self.assertIn("[tunnel-key] ok", res2.stdout)
-        self.assertIn("[deploy-key] ok", res2.stdout)
+        self.assertIn("[keysync] ok", res2.stdout)
         self.assertIn("[rendezvous] ok", res2.stdout)
         self.assertIn("[check] ok", res2.stdout)
 
     def test_password_never_leaks(self):
-        """密碼檔的內容 (用假字串) 不出現在任何 stdout、stderr、argv 紀錄、產生的檔案裡"""
-        secret_canary = "MOCK_CANARY_SUDO_PASSWORD_SECRET_987654"
+        """密碼檔的內容（用假字串）不出現在 stdout、stderr、argv 紀錄、其他生成檔案裡。
+
+        解密密碼是例外：它必須寫進 ~/.config/llmgateway/keysync.env（0600），
+        這是它的去處；除此之外任何地方都不該出現。
+        """
+        sudo_canary = "MOCK_CANARY_SUDO_PASSWORD_SECRET_987654"
+        decrypt_canary = "MOCK_CANARY_DECRYPT_PASSWORD_SECRET_123456"
         passfile = os.path.join(self.sandbox, "sudo_pass.txt")
         with open(passfile, "w", encoding="utf-8") as f:
-            f.write(secret_canary + "\n")
+            f.write(sudo_canary + "\n")
+        decrypt_passfile = os.path.join(self.sandbox, "decrypt_pass.txt")
+        with open(decrypt_passfile, "w", encoding="utf-8") as f:
+            f.write(decrypt_canary + "\n")
 
         args = [
             "--tag", "lgw-v0.1.0",
             "--sudo-pass-file", passfile,
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", decrypt_passfile,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -532,25 +549,35 @@ exit 0
         res = self.run_bootstrap(args)
         self.assertEqual(res.returncode, 0, res.stderr)
 
-        # 1. 不在 stdout / stderr
-        self.assertNotIn(secret_canary, res.stdout)
-        self.assertNotIn(secret_canary, res.stderr)
+        keysync_env = os.path.join(self.home, ".config", "llmgateway", "keysync.env")
+        # 1. 兩個值都不在 stdout / stderr
+        for canary in (sudo_canary, decrypt_canary):
+            self.assertNotIn(canary, res.stdout)
+            self.assertNotIn(canary, res.stderr)
 
-        # 2. 不在任何 log 檔案中
+        # 2. 兩個值都不在任何 argv 紀錄中
         for log_name in os.listdir(self.logdir):
             content = self.read_log(log_name.replace("-argv.log", ""))
-            self.assertNotIn(secret_canary, content, f"Leaked in {log_name}")
+            for canary in (sudo_canary, decrypt_canary):
+                self.assertNotIn(canary, content, f"Leaked in {log_name}")
 
-        # 3. 不在 home 目錄的任何生成檔案中
+        # 3. 解密密碼只出現在 keysync.env（0600）裡，其他生成檔案都沒有
+        self.assertTrue(os.path.isfile(keysync_env))
+        self.assertEqual(stat.S_IMODE(os.stat(keysync_env).st_mode), 0o600)
+        with open(keysync_env, "r", encoding="utf-8") as f:
+            keysync_content = f.read()
+        self.assertIn(f"LLMGW_KEYS_PASSWORD={decrypt_canary}\n", keysync_content)
         for root, _, files in os.walk(self.home):
             for file in files:
                 filepath = os.path.join(root, file)
                 try:
                     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                         fc = f.read()
-                        self.assertNotIn(secret_canary, fc, f"Leaked in {filepath}")
                 except Exception:
-                    pass
+                    continue
+                self.assertNotIn(sudo_canary, fc, f"Leaked in {filepath}")
+                if filepath != keysync_env:
+                    self.assertNotIn(decrypt_canary, fc, f"Leaked in {filepath}")
 
     def test_docker_group_removal(self):
         """帳號已在 docker 群組時會被移出"""
@@ -559,7 +586,7 @@ exit 0
 
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -588,7 +615,7 @@ exit 0
 
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -605,72 +632,124 @@ exit 0
         with open(key_pub_path, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), original_pub)
 
-    def test_authorized_keys_management_and_permissions(self):
-        """authorized_keys: 重跑不會多出重複行; 換新公鑰時舊的同一把被換掉、其他行保留; 權限 0600"""
-        ssh_dir = os.path.join(self.home, ".ssh")
-        os.makedirs(ssh_dir, exist_ok=True)
-        auth_keys = os.path.join(ssh_dir, "authorized_keys")
-
-        other_key_line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKeyForAdminBackup admin@backup"
-        with open(auth_keys, "w", encoding="utf-8") as f:
-            f.write(other_key_line + "\n")
+    def test_keysync_env_management_and_permissions(self):
+        """keysync.env：第一次寫入（0600）、重跑不動、既有內容絕不覆蓋"""
+        conf_dir = os.path.join(self.home, ".config", "llmgateway")
+        keysync_env = os.path.join(conf_dir, "keysync.env")
 
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
 
-        # 1. 第一次寫入部署公鑰
+        # 1. 第一次寫入解密密碼
         res1 = self.run_bootstrap(args)
-        self.assertEqual(res1.returncode, 0, res1.stderr)
+        self.assertEqual(res1.returncode, 0, res1.stdout + res1.stderr)
+        self.assertIn("[keysync] changed", res1.stdout)
 
-        with open(auth_keys, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
+        with open(keysync_env, "r", encoding="utf-8") as f:
+            written = f.read()
+        self.assertIn(f"LLMGW_KEYS_PASSWORD={self.decrypt_password}\n", written)
+        self.assertEqual(stat.S_IMODE(os.stat(keysync_env).st_mode), 0o600)
 
-        self.assertEqual(len(lines), 2)
-        self.assertIn(other_key_line, lines)
-        deploy_line = [l for l in lines if l != other_key_line][0]
-        self.assertIn(self.deploy_pubkey_b64, deploy_line)
-        self.assertTrue(deploy_line.startswith('command="'))
-        self.assertIn('",restrict ', deploy_line)
-        self.assertEqual(stat.S_IMODE(os.stat(auth_keys).st_mode), 0o600)
+        # 2. 既有檔案存在時：就算給不同的密碼檔也不覆蓋
+        other_pass = os.path.join(self.sandbox, "other_pass.txt")
+        with open(other_pass, "w", encoding="utf-8") as f:
+            f.write("FakeOtherPassword_ShouldNotWin_02\n")
+        args_other = list(args)
+        args_other[args_other.index(self.decrypt_pass_file)] = other_pass
 
-        # 2. 第二次執行: 不重複添加行
-        res2 = self.run_bootstrap(args)
-        self.assertEqual(res2.returncode, 0, res2.stderr)
+        res2 = self.run_bootstrap(args_other)
+        self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
+        self.assertIn("[keysync] ok 解密密碼已就位", res2.stdout)
 
-        with open(auth_keys, "r", encoding="utf-8") as f:
-            lines2 = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(lines2), 2)
+        with open(keysync_env, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), written)
+        self.assertNotIn("FakeOtherPassword_ShouldNotWin_02", res2.stdout + res2.stderr)
 
-        # 3. 換新公鑰 (同 base64 但不同 comment): 舊行替換、其他行保留
-        new_comment_key = os.path.join(self.sandbox, "new_comment.pub")
-        with open(new_comment_key, "w", encoding="utf-8") as f:
-            f.write(f"ssh-ed25519 {self.deploy_pubkey_b64} updated-comment-999\n")
+        # 3. 密碼檔格式錯（多行）→ 這一步 fail，不動既有的檔
+        two_lines = os.path.join(self.sandbox, "two_lines_pass.txt")
+        with open(two_lines, "w", encoding="utf-8") as f:
+            f.write("first\nsecond\n")
+        os.remove(keysync_env)
+        args_bad = list(args)
+        args_bad[args_bad.index(self.decrypt_pass_file)] = two_lines
+        res3 = self.run_bootstrap(args_bad)
+        self.assertEqual(res3.returncode, 1, res3.stdout + res3.stderr)
+        self.assertIn("[keysync] fail", res3.stdout)
+        self.assertFalse(os.path.exists(keysync_env))
 
-        args_update = [
+    def test_互動輸入解密密碼不回顯也不外洩(self):
+        """接在終端機時（stdin 是 tty）可以互動輸入；密碼寫進 keysync.env，不進 argv／輸出"""
+        import pty
+
+        master, slave = pty.openpty()
+        args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", new_comment_key,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
-        res3 = self.run_bootstrap(args_update)
-        self.assertEqual(res3.returncode, 0, res3.stderr)
+        env = self.bootstrap_env({"LGW_BOOT_DECRYPT_PROMPT": "1"})
+        proc = subprocess.Popen(
+            ["bash", BOOTSTRAP_SH] + args, stdin=slave,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        os.close(slave)
+        try:
+            # 等提示出現（等同本人看到提示才輸入）：read -s 之前先送進去的會被丟掉，
+            # 所以要等提示出來、read 開始之後才寫入。
+            seen = ""
+            prompt_seen = False
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                chunk = proc.stderr.read(1)
+                if not chunk:
+                    break
+                seen += chunk
+                if "解密密碼" in seen:
+                    prompt_seen = True
+                    break
+            self.assertTrue(prompt_seen, f"沒看到互動提示；stderr={seen!r}")
+            time.sleep(0.3)
+            os.write(master, (self.decrypt_password + "\n").encode())
+            out, err = proc.communicate(timeout=60)
+        finally:
+            os.close(master)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        err = seen + err
 
-        with open(auth_keys, "r", encoding="utf-8") as f:
-            lines3 = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(lines3), 2)
-        self.assertIn(other_key_line, lines3)
-        self.assertIn("updated-comment-999", lines3[1])
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertIn("[keysync] changed", out)
+        keysync_env = os.path.join(self.home, ".config", "llmgateway", "keysync.env")
+        with open(keysync_env, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn(f"LLMGW_KEYS_PASSWORD={self.decrypt_password}\n", content)
+        self.assertNotIn(self.decrypt_password, out)
+        self.assertNotIn(self.decrypt_password, err)
+        for log_name in os.listdir(self.logdir):
+            self.assertNotIn(self.decrypt_password,
+                             self.read_log(log_name.replace("-argv.log", "")))
+
+    def test_沒有終端機又不給密碼檔時記todo(self):
+        """非互動（stdin 不是終端機）且沒給 --decrypt-pass-file 時要 todo、不要等人輸入"""
+        proc = subprocess.run(
+            ["bash", BOOTSTRAP_SH, "--tag", "lgw-v0.1.0"],
+            env=self.bootstrap_env({"LGW_BOOT_DECRYPT_PROMPT": "1"}),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("[keysync] todo 未提供解密密碼", proc.stdout)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.home, ".config", "llmgateway", "keysync.env")))
 
     def test_check_mode_changes_nothing(self):
         """--check 不改任何東西 (argv 紀錄裡沒有 useradd、loginctl enable-linger、install 等)"""
         args = [
             "--check",
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -693,7 +772,7 @@ exit 0
         """install.sh --check 的會合點探針走 fake ssh（不連真位址），回 200 時 check 通過"""
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -712,7 +791,7 @@ exit 0
 
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -727,7 +806,7 @@ exit 0
 
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -747,7 +826,7 @@ exit 0
 
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -767,7 +846,7 @@ exit 0
         args = [
             "--check",
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -786,7 +865,7 @@ exit 0
         """讀 ~llmgw 的動作都經 sudo：家目錄 0700/0750 時管理帳號自己讀不到"""
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
@@ -794,7 +873,7 @@ exit 0
         res1 = self.run_bootstrap(args)
         self.assertEqual(res1.returncode, 0, f"stdout:\n{res1.stdout}\nstderr:\n{res1.stderr}")
 
-        # 第二次執行要讀：已安裝版本、隧道金鑰是否存在、authorized_keys、
+        # 第二次執行要讀：已安裝版本、隧道金鑰是否存在、keysync.env、
         # 會合點 known_hosts、tunnel.env、install.sh 是否存在
         for f in os.listdir(self.logdir):
             os.remove(os.path.join(self.logdir, f))
@@ -806,11 +885,11 @@ exit 0
         expected = [
             f"test -e {os.path.join(self.home, '.ssh', 'id_llmgw_tunnel')}",
             f"test -e {os.path.join(self.home, '.ssh', 'known_hosts_rendezvous')}",
-            f"test -e {os.path.join(self.home, '.ssh', 'authorized_keys')}",
+            f"test -e {os.path.join(self.home, '.config', 'llmgateway', 'keysync.env')}",
             f"test -e {os.path.join(self.home, '.config', 'llmgateway', 'tunnel.env')}",
             f"cat {os.path.join(self.home, '.ssh', 'known_hosts_rendezvous')}",
             f"cat {os.path.join(self.home, '.config', 'llmgateway', 'tunnel.env')}",
-            f"cat {os.path.join(self.home, '.ssh', 'authorized_keys')}",
+            f"cat {os.path.join(self.home, '.config', 'llmgateway', 'keysync.env')}",
             f"cat {os.path.join(self.home, '.local', 'share', 'llmgateway', 'current', '.lgw-tag')}",
             f"test -e {os.path.join(self.home, '.local', 'share', 'llmgateway', 'current', 'deploy', 'install.sh')}",
         ]
@@ -854,7 +933,7 @@ exit 0
             ["--rendezvous", "sshproxy@jump:2222"],  # 缺少 --rendezvous-known-hosts
             ["--rendezvous-known-hosts", self.known_hosts_file],  # 缺少 --rendezvous
             ["--sudo-pass-file", "/nonexistent/pass.txt"],
-            ["--deploy-pubkey-file", "/nonexistent/pub.key"],
+            ["--decrypt-pass-file", "/nonexistent/pass.txt"],
             ["--rendezvous-known-hosts", "/nonexistent/kh.txt"],
             ["--tag"],  # 缺少值
             ["--unknown-arg"],
@@ -865,16 +944,16 @@ exit 0
 
     def test_todos_exit_3(self):
         """有 todo 時回 3"""
-        # 未提供 --deploy-pubkey-file 與 --rendezvous
+        # 未提供 --decrypt-pass-file 與 --rendezvous
         args = [
             "--tag", "lgw-v0.1.0",
         ]
         res = self.run_bootstrap(args)
         self.assertEqual(res.returncode, 3, f"stdout:\n{res.stdout}")
-        self.assertIn("[deploy-key] todo 未提供部署公鑰", res.stdout)
+        self.assertIn("[keysync] todo 未提供解密密碼", res.stdout)
         self.assertIn("[rendezvous] todo 未提供會合點設定", res.stdout)
         self.assertIn("3. 待辦事項 (Pending Todos):", res.stdout)
-        self.assertIn("未提供部署公鑰", res.stdout)
+        self.assertIn("未提供解密密碼", res.stdout)
         self.assertIn("未提供會合點設定", res.stdout)
 
     def test_sshd_todo_reporting(self):
@@ -885,7 +964,7 @@ exit 0
 
         args = [
             "--tag", "lgw-v0.1.0",
-            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
             "--rendezvous", "sshproxy@jump.example.com:2222",
             "--rendezvous-known-hosts", self.known_hosts_file,
         ]
