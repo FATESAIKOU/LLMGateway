@@ -32,8 +32,7 @@ def _good_policy(**over):
             "claude-personal": _sub(10, ("claude-code",)),
             "openrouter": _sub(20, ("claude-code", "opencode"), ("*:free",)),
         },
-        "cooldown_buffer_seconds": 120,
-        "resets_at_max_ahead_seconds": 691200,
+        "until_max_ahead_seconds": 691200,
     }
     base.update(over)
     return base
@@ -50,8 +49,9 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(policy.subscriptions["openrouter"].models_allow, ("*:free",))
         self.assertIn("claude-code", policy.subscriptions["openrouter"].agents)
         self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
-        self.assertEqual(policy.cooldown_buffer_seconds, 120)
-        self.assertEqual(policy.resets_at_max_ahead_seconds, 691200)
+        self.assertEqual(policy.until_max_ahead_seconds, 691200)
+        self.assertFalse(hasattr(policy, "cooldown_buffer_seconds"))  # 窗口欄位拿掉
+        self.assertFalse(hasattr(policy, "resets_at_max_ahead_seconds"))
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -106,8 +106,10 @@ class PolicyValidationTests(unittest.TestCase):
             lambda o: o["subscriptions"]["openrouter"].update(priority="20"),
             lambda o: o["subscriptions"]["openrouter"].update(priority=True),
             lambda o: o["subscriptions"]["openrouter"].pop("priority"),
-            lambda o: o.update(cooldown_buffer_seconds=0),
-            lambda o: o.update(resets_at_max_ahead_seconds=None),
+            lambda o: o.update(until_max_ahead_seconds=0),
+            lambda o: o.update(until_max_ahead_seconds=None),
+            lambda o: o.update(until_max_ahead_seconds=True),
+            lambda o: o.pop("until_max_ahead_seconds"),
             lambda o: o.pop("subscriptions"),
         ):
             with self.subTest(mutate=getattr(mutate, "__name__", "?")):
@@ -115,6 +117,14 @@ class PolicyValidationTests(unittest.TestCase):
                     obj = _good_policy()
                     mutate(obj)
                     self._reload(obj)
+
+    def test_舊窗口欄位被忽略(self):
+        # 舊政策檔留著 cooldown_buffer_seconds／resets_at_max_ahead_seconds 也能載入
+        obj = _good_policy()
+        obj["cooldown_buffer_seconds"] = 120
+        obj["resets_at_max_ahead_seconds"] = 691200
+        policy = self._reload(obj)
+        self.assertEqual(policy.until_max_ahead_seconds, 691200)
 
     def test_bad_models_rejected(self):
         for mutate in (
