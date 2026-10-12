@@ -1,4 +1,4 @@
-"""key 檔（design 決定 2、12；spec key-vault）。由 review 實作。
+"""key 檔（design 決定 5b；spec key-vault）。由 review 實作。
 
 key 檔是 `KEY=VALUE` 一行一把：空行略過，# 開頭為註解，鍵名固定見 KEY_NAMES，
 重複鍵亦視為格式錯誤。值為空字串視同沒部署。

@@ -2,7 +2,7 @@
 # deploy/install.sh
 #
 # 在常駐機器上安裝 LLMGateway：固定 tag 取碼、current symlink 原子切換、
-# systemd user unit（租用服務 lgwd 與隧道守護 llmgateway-tunnel）。放哪一台
+# systemd user unit（subscription registry lgwd 與隧道守護 llmgateway-tunnel）。放哪一台
 # 由安裝的人決定，這裡不寫機器名或 IP。
 #
 # 隧道守護承載部署連線本身，所以這裡絕不當場 restart／stop 它：沒在跑就
