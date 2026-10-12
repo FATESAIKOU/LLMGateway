@@ -1,4 +1,5 @@
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -172,14 +173,33 @@ exit 0
             f.write(probe_ssh_script)
         os.chmod(self.probe_ssh, 0o755)
 
-        # 假 gh：只支援 `gh auth status`（install.sh --check 用）
+        # 假 gh：支援 `gh auth status` 與 `gh api repos/<repo> --jq .full_name`
+        # （install.sh --check 用）。FAKE_GH_MODE：ok／logged_out／repo_denied／
+        # missing（rc=127，模擬沒裝）／slow（rc=124，模擬逾時）
         gh_script = """#!/usr/bin/env bash
 echo "gh $*" >> "${SANDBOX:?}/gh-argv.log"
+mode="${FAKE_GH_MODE:-ok}"
+if [[ "$mode" == "missing" ]]; then
+    echo "bash: gh: command not found" >&2
+    exit 127
+fi
+if [[ "$mode" == "slow" ]]; then
+    # 逾時路徑由假 timeout 擋（exit 124），這裡直接回同樣的碼避免真的睡
+    exit 124
+fi
 if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
-    if [[ "${FAKE_GH_MODE:-ok}" == "fail" ]]; then
+    if [[ "$mode" == "logged_out" ]]; then
         echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2
         exit 1
     fi
+    exit 0
+fi
+if [[ "${1:-}" == "api" ]]; then
+    if [[ "$mode" == "repo_denied" ]]; then
+        echo "gh: Could not resolve to a Repository with the name 'x/y'." >&2
+        exit 1
+    fi
+    printf '%s\\n' "${2#repos/}"
     exit 0
 fi
 echo "fake gh: unsupported: $*" >&2
@@ -189,6 +209,20 @@ exit 1
         with open(gh_target, "w", encoding="utf-8") as f:
             f.write(gh_script)
         os.chmod(gh_target, 0o755)
+
+        # 假 timeout：讓 --check 的逾時路徑可在測試裡觸發（真 sleep 由呼叫端決定）
+        timeout_script = """#!/usr/bin/env bash
+echo "timeout $*" >> "${SANDBOX:?}/gh-argv.log"
+limit="$1"; shift
+if [[ "${FAKE_GH_MODE:-ok}" == "slow" ]]; then
+    exit 124
+fi
+exec "$@"
+"""
+        timeout_target = os.path.join(self.fakebin, "timeout")
+        with open(timeout_target, "w", encoding="utf-8") as f:
+            f.write(timeout_script)
+        os.chmod(timeout_target, 0o755)
 
         for name, content in [
             ("git", git_script),
@@ -226,6 +260,9 @@ exit 1
             "REAL_PYTHON": sys.executable,
             "PROBE_SSH_LOG": self.probe_ssh_log,
             "FAKE_PROBE_CODE": "200",
+            # --check 問「服務帳號」的 gh 狀態；測試沒有真的 llmgw，
+            # 讓它以執行測試的這個使用者身分直接跑假 gh。
+            "LGW_SERVICE_USER": pwd.getpwuid(os.geteuid()).pw_name,
         }
         if path_mode == "full":
             env["PATH"] = f"{self.fakebin}:{self.tools}"
@@ -726,23 +763,39 @@ exit 1
             return self.run_install(["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
                                     env_overrides=env)
 
-        # 0：gh 已登入、解密密碼放了、上次沒失敗
+        # 0：gh 已登入且讀得到金鑰 repo、解密密碼放了、上次沒失敗
         ok = check()
         self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
-        self.assertIn("key-sync: gh 已登入", ok.stdout)
+        self.assertIn("gh 已登入，且讀得到 FATESAIKOU/LLMGateway-keys", ok.stdout)
         self.assertIn("key-sync: 解密密碼已放", ok.stdout)
-        self.assertIn("gh auth status", self.read_log("gh"))
+        gh_log = self.read_log("gh")
+        self.assertIn("auth status", gh_log)
+        # 只問 repo 本身，不讀任何檔案內容
+        self.assertIn("api repos/FATESAIKOU/LLMGateway-keys --jq .full_name", gh_log)
 
         # 1：gh 沒登入／token 失效
-        gh_fail = check(FAKE_GH_MODE="fail")
+        gh_fail = check(FAKE_GH_MODE="logged_out")
         self.assertEqual(gh_fail.returncode, 1, gh_fail.stdout)
-        self.assertIn("key-sync: 不能用（gh 沒登入或 token 失效）", gh_fail.stdout)
+        self.assertIn("key-sync: 不能用", gh_fail.stdout)
+        self.assertIn("gh 沒登入或 token 失效", gh_fail.stdout)
         self.assertNotIn("解密密碼已放", gh_fail.stdout)
 
-        # 1：找不到 gh
-        no_gh = check(LGW_GH="/nonexistent/gh-not-here")
-        self.assertEqual(no_gh.returncode, 1, no_gh.stdout)
-        self.assertIn("找不到", no_gh.stdout)
+        # 1：登入了但讀不到金鑰 repo（權限被改／repo 改名）
+        repo_denied = check(FAKE_GH_MODE="repo_denied")
+        self.assertEqual(repo_denied.returncode, 1, repo_denied.stdout)
+        self.assertIn("讀不到 FATESAIKOU/LLMGateway-keys", repo_denied.stdout)
+
+        # 2：gh 不存在 → 無法確認（不是「確定壞掉」）
+        no_gh = check(FAKE_GH_MODE="missing")
+        self.assertEqual(no_gh.returncode, 2, no_gh.stdout)
+        self.assertIn("無法確認", no_gh.stdout)
+        self.assertIn("找不到 gh", no_gh.stdout)
+
+        # 2：查詢逾時 → 無法確認
+        gh_slow = check(FAKE_GH_MODE="slow")
+        self.assertEqual(gh_slow.returncode, 2, gh_slow.stdout)
+        self.assertIn("無法確認", gh_slow.stdout)
+        self.assertIn("逾時", gh_slow.stdout)
 
         # 1：解密密碼沒放（keysync.env 不存在）
         keysync_env = os.path.join(self.home, ".config", "llmgateway", "keysync.env")

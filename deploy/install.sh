@@ -77,6 +77,8 @@ KEY_SYNC_BIN="key-sync"
 KEY_SYNC_SERVICE="key-sync.service"
 KEY_SYNC_TIMER="key-sync.timer"
 KEY_SYNC_PASSWORD_VAR="LLMGW_KEYS_PASSWORD"
+# 金鑰正本所在的 private repo（key-sync 從這裡拉，--check 也問讀不讀得到）
+KEYS_REPO="FATESAIKOU/LLMGateway-keys"
 OPS_DIR="ops-scripts"
 
 # 測試可換成假指令。
@@ -272,22 +274,62 @@ check_unit() {
     check_keysync
 }
 
-# check_keysync：key-sync 能不能用（v5.4）。0 成立、1 確定不成立。
-#   1. gh 在不在、有沒有登入（沒登入／token 失效時 key 會凍在舊版）；
+# check_keysync：key-sync 能不能用（v5.4）。0 成立、1 確定不成立、2 無法確認。
+#   1. 以服務帳號身分問 gh：有沒有登入、讀不讀得到金鑰 repo
+#      （沒登入／token 失效／讀不到 repo → 1：key 會凍在舊版；
+#        gh 不存在或查詢逾時 → 2：沒法確認）；
 #   2. 解密密碼放了沒（keysync.env 有非空的一行；只看有沒有，不讀值出來）；
 #   3. 上次拉取有沒有失敗（systemd 把最後一次非零結束的 oneshot 記成 failed）。
 # 排到最後才跑：前面（unit、本機、經會合點）先確定服務是活的。
 check_keysync() {
+    # 2：服務帳號名（預設由 HOME_DIR 推；測試可覆寫）。
+    local service_user="${LGW_SERVICE_USER:-$(basename "$HOME_DIR")}"
     local gh_bin="${LGW_GH:-gh}"
-    if ! command -v "$gh_bin" >/dev/null 2>&1; then
-        log INFO "key-sync: 不能用（找不到 ${gh_bin}）"
+    local gh_timeout="${LGW_GH_TIMEOUT:-30}"
+
+    # gh 的登入跟著 Unix 使用者走，所以一定要問服務帳號的狀態；目前就是服務帳號
+    # 就直接跑，否則 sudo -u 過去（升級時用管理帳號跑 --check 的情況）。
+    local current_user=""
+    current_user="$(id -un 2>/dev/null || true)"
+    local -a gh_cmd=()
+    if [[ -z "$current_user" || "$current_user" == "$service_user" ]]; then
+        gh_cmd=("$gh_bin")
+    else
+        gh_cmd=("${LGW_SUDO:-sudo}" -n -u "$service_user" "$gh_bin")
+    fi
+    # 有 timeout 就加（沒有的系統就直接跑，不擋）
+    if command -v timeout >/dev/null 2>&1; then
+        gh_cmd=(timeout "$gh_timeout" "${gh_cmd[@]}")
+    fi
+
+    local auth_out="" rc=0
+    auth_out="$("${gh_cmd[@]}" auth status 2>&1)" || rc=$?
+    if [[ "$rc" -eq 127 ]]; then
+        log INFO "key-sync: 無法確認（${service_user} 身分找不到 ${gh_bin}）"
+        return 2
+    fi
+    if [[ "$rc" -eq 124 ]]; then
+        log INFO "key-sync: 無法確認（${gh_bin} auth status 逾時 ${gh_timeout}s）"
+        return 2
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log INFO "key-sync: 不能用（${service_user} 的 gh 沒登入或 token 失效）"
         return 1
     fi
-    if ! "$gh_bin" auth status >/dev/null 2>&1; then
-        log INFO "key-sync: 不能用（gh 沒登入或 token 失效）"
+
+    # 登入不代表讀得到那個 repo（權限被改、repo 改名、網路擋）；只問 repo 本身，
+    # 不讀任何檔案內容。
+    local repo_out="" repo_rc=0
+    repo_out="$("${gh_cmd[@]}" api "repos/${KEYS_REPO}" --jq .full_name 2>&1)" || repo_rc=$?
+    if [[ "$repo_rc" -eq 124 ]]; then
+        log INFO "key-sync: 無法確認（讀 ${KEYS_REPO} 逾時 ${gh_timeout}s）"
+        return 2
+    fi
+    if [[ "$repo_rc" -ne 0 ]] || [[ "$repo_out" != "${KEYS_REPO}" ]]; then
+        log INFO "key-sync: 不能用（讀不到 ${KEYS_REPO}：登入的帳號可能沒有讀權限）"
         return 1
     fi
-    log INFO "key-sync: gh 已登入"
+    log INFO "key-sync: gh 已登入，且讀得到 ${KEYS_REPO}"
 
     if [[ ! -f "$KEYSYNC_ENV_FILE" ]]; then
         log INFO "key-sync: 還沒放解密密碼（${KEYSYNC_ENV_FILE}）"
@@ -305,7 +347,6 @@ check_keysync() {
     fi
     log INFO "key-sync: 解密密碼已放"
 
-    local rc=0
     "$SYSTEMCTL" --user is-failed --quiet "$KEY_SYNC_SERVICE" >/dev/null 2>&1
     rc=$?
     if [[ "$rc" -eq 0 ]]; then
