@@ -58,6 +58,12 @@ class BootstrapScriptTests(unittest.TestCase):
         with open(self.decrypt_pass_file, "w", encoding="utf-8") as f:
             f.write(self.decrypt_password + "\n")
 
+        # sudo 密碼檔（假值；單行）
+        self.sudo_pass_file = os.path.join(self.sandbox, "sudo_pass.txt")
+        self.sudo_password = "FakeBootstrapSudoPassword_03"
+        with open(self.sudo_pass_file, "w", encoding="utf-8") as f:
+            f.write(self.sudo_password + "\n")
+
         # Known hosts file for rendezvous
         self.known_hosts_file = os.path.join(self.sandbox, "rendezvous_known_hosts")
         with open(self.known_hosts_file, "w", encoding="utf-8") as f:
@@ -71,6 +77,7 @@ class BootstrapScriptTests(unittest.TestCase):
         self._set_state("sshd_deny", "")
         self._set_state("sshd_allow", "")
         self._set_state("sshd_listen", "1")
+        self._set_state("sshd_T_fail", "0")
         self._set_state("curl_code", "200")
         self._set_state("curl_rc", "0")
         self._set_state("ssh_probe_code", "200")
@@ -97,9 +104,18 @@ class BootstrapScriptTests(unittest.TestCase):
         # 兩種失敗注入（狀態檔在 LGW_TEST_STATE_DIR）：
         #   sudo_fail_substr=<子字串>：argv 含此字串的指令回非零
         #   sudo_no_cache=1：-n 的指令必須先有 sudo -v 刷新過，否則回非零
+        # 一種真的 sudo 行為模擬（環境變數）：
+        #   LGW_SUDO_CACHE_PPID=1：快取跟著 parent pid 走（沒有 tty 時的真機
+        #     行為）。-v 記下呼叫者的 PPID；-n 時 PPID 不同就沒有快取，回
+        #     「sudo: interactive authentication is required」。
+        #     腳本要在同一個 shell 層級先 -v 再 -n 才過得了：$(...) 子 shell
+        #     的 PPID 跟主腳本不同，只在步驟開頭刷新的快取拿不到。
         sudo_script = """#!/usr/bin/env bash
 set -uo pipefail
 echo "sudo $*" >> "${LOG_DIR}/sudo-argv.log"
+# 另記一條帶呼叫者 PPID 的紀錄，測試用來驗證「每個 sudo -n 之前，
+# 同一個 parent pid 都有 sudo -v 過」
+echo "$PPID|$*" >> "${LOG_DIR}/sudo-ppid.log"
 
 has_S=0
 has_v=0
@@ -122,6 +138,18 @@ done
 if [[ $has_S -eq 1 && $has_v -eq 0 ]]; then
     echo "fake sudo error: -S is only allowed with -v" >&2
     exit 99
+fi
+
+if [[ "${LGW_SUDO_CACHE_PPID:-0}" == "1" ]]; then
+    if [[ $has_v -eq 1 ]]; then
+        echo "$PPID" > "${LGW_TEST_STATE_DIR}/sudo-v-ppid"
+    elif [[ $has_n -eq 1 ]]; then
+        cached_ppid="$(cat "${LGW_TEST_STATE_DIR}/sudo-v-ppid" 2>/dev/null || true)"
+        if [[ -z "$cached_ppid" || "$cached_ppid" != "$PPID" ]]; then
+            echo "sudo: interactive authentication is required" >&2
+            exit 1
+        fi
+    fi
 fi
 
 if [[ $has_v -eq 1 ]]; then
@@ -182,6 +210,9 @@ fi
 if [[ "${1:-}" == "-u" ]]; then
     echo "1001"
     exit 0
+elif [[ "${1:-}" == "-un" || "${1:-}" == "--user-name" ]]; then
+    echo "llmgw"
+    exit 0
 elif [[ "${1:-}" == "-Gn" ]]; then
     in_docker="$(cat "${STATE_DIR}/user_in_docker" 2>/dev/null || echo "0")"
     if [[ "$in_docker" == "1" ]]; then
@@ -241,6 +272,17 @@ exit 0
         sshd_script = """#!/usr/bin/env bash
 set -euo pipefail
 echo "sshd $*" >> "${LOG_DIR}/sshd-argv.log"
+# sshd_T_fail=1：模擬 sudo sshd -T 失敗（沒權限、設定檔壞掉）。
+# bootstrap 要記 fail「無法執行 sshd -T」，不能當成「未啟用 PubkeyAuthentication」
+for a in "$@"; do
+    if [[ "$a" == "-T" ]]; then
+        if [[ "$(cat "${STATE_DIR}/sshd_T_fail" 2>/dev/null || echo 0)" == "1" ]]; then
+            echo "fake sshd: /etc/ssh/sshd_config: Permission denied" >&2
+            exit 1
+        fi
+        break
+    fi
+done
 pubkey="$(cat "${STATE_DIR}/sshd_pubkey" 2>/dev/null || echo "yes")"
 deny="$(cat "${STATE_DIR}/sshd_deny" 2>/dev/null || true)"
 allow="$(cat "${STATE_DIR}/sshd_allow" 2>/dev/null || true)"
@@ -480,6 +522,11 @@ exit 1
             "LGW_BOOT_OS": "Linux",
             "LGW_TEST_STATE_DIR": self.state,
             "LGW_BOOT_DECRYPT_PROMPT": "0",
+            # 真機上 install.sh 是 bootstrap 以 llmgw 身分跑的，服務帳號與目前
+            # 使用者相同、install.sh 不會自己 sudo。測試的家目錄 basename 不是
+            # llmgw，所以明確指定，讓 install.sh 的行為跟真機一致（也才測得到
+            # bootstrap 自己的 sudo 包裝）。
+            "LGW_SERVICE_USER": "llmgw",
             "REAL_INSTALL_SH": INSTALL_SH,
             "REAL_RUN_WRAPPER": RUN_WRAPPER,
             "REAL_SERVICE_UNIT": SERVICE_UNIT,
@@ -1120,6 +1167,120 @@ exit 1
         self.assertIn("PubkeyAuthentication", res.stdout)
         self.assertIn("DenyUsers", res.stdout)
         self.assertIn("ListenAddress 127.0.0.1:22", res.stdout)
+
+    # -------------------------------------------------------------------------
+    # #18 sudo 驗證快取跟著 parent pid
+    # -------------------------------------------------------------------------
+    def _sudo_calls(self):
+        """讀 sudo-ppid.log，回 [(ppid, argv)]。log 清空就回空 list。"""
+        p = os.path.join(self.logdir, "sudo-ppid.log")
+        if not os.path.exists(p):
+            return []
+        out = []
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                if not line.strip():
+                    continue
+                ppid, _, argv = line.partition("|")
+                out.append((ppid, argv))
+        return out
+
+    def assert_every_sudo_n_was_validated(self):
+        """每個 sudo -n 之前，同一個 parent pid 都已經 sudo -v 過
+
+        這正是真機的行為：沒有 tty 時 sudo 的快取跟著 parent pid 走，
+        $(...) 子 shell 的 PPID 跟主腳本不同，所以每個 -n 都必須在
+        同一層級先 -v。
+        """
+        validated = set()
+        bare = []
+        for ppid, argv in self._sudo_calls():
+            if " -v " in f" {argv} " or argv.rstrip().endswith(" -v"):
+                validated.add(ppid)
+            elif " -n " in f" {argv} ":
+                if ppid not in validated:
+                    bare.append((ppid, argv))
+        self.assertEqual(bare, [], f"這些 sudo -n 沒有先在同一個 parent pid 上 -v: {bare}")
+
+    def _ppid_env(self):
+        """開啟假 sudo 的「快取跟著 parent pid」模式（真機沒有 tty 時的行為）"""
+        return {"LGW_SUDO_CACHE_PPID": "1"}
+
+    def _ppid_args(self, extra=None):
+        """帶密碼檔的 args；--rendezvous 由 extra 決定"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--sudo-pass-file", self.sudo_pass_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
+        ]
+        return args + list(extra or [])
+
+    def test_sudo_cache_ppid_first_run_no_rendezvous(self):
+        """第一次跑（沒有 --rendezvous、gh 沒登入）在快取跟著 parent pid 的
+        真機上也要結束碼是 3：$(...) 子 shell 裡的 sudo -n 必須自己驗證過"""
+        self._set_state("gh_auth", "logged_out")
+
+        res = self.run_bootstrap(self._ppid_args(), self._ppid_env())
+        self.assertEqual(res.returncode, 3, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+
+        # 偽 todo 不見了：gh 是真的沒登入，不是 sudo 拿不到快取
+        self.assertIn("[gh-auth] todo llmgw 的 gh 尚未登入", res.stdout)
+        self.assertNotIn("[gh-auth] fail", res.stdout)
+        # 摘要讀得到隧道公鑰（經 run_as_llmgw cat）
+        self.assertIn("FakeTunnelPubKeyGenerated123", res.stdout)
+        self.assertIn("1. 隧道公鑰", res.stdout)
+        self.assertNotIn("(無法讀取", res.stdout)
+        # sshd 結果正確：不是被 sudo 失敗拖成假 todo
+        self.assertIn("[sshd] ok", res.stdout)
+        # check 問 tunnel.env 也不會被 sudo 卡住：不存在是「還沒填」，不是讀不到
+        self.assertIn("[check] todo", res.stdout)
+        self.assertNotIn("[check] fail", res.stdout)
+        # 沒有半個 sudo -n 是裸跑的：每一個 -n 之前，同一個 parent pid 都有 -v
+        self.assert_every_sudo_n_was_validated()
+
+    def test_sudo_cache_ppid_rerun_reads_version_file(self):
+        """已安裝、第二次跑（帶 --rendezvous）讀得到已安裝版本檔，走到
+        rendezvous 並寫好 tunnel.env（真機曾在此 fail）"""
+        first = self.run_bootstrap(self._ppid_args(), self._ppid_env())
+        self.assertEqual(first.returncode, 3, first.stdout + first.stderr)
+
+        second = self.run_bootstrap(
+            self._ppid_args([
+                "--rendezvous", "sshproxy@jump.example.com:2222",
+                "--rendezvous-known-hosts", self.known_hosts_file,
+            ]),
+            self._ppid_env())
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+
+        # 讀得到已安裝版本檔（真機曾經 fail 在這裡）
+        self.assertNotIn("無法讀取已安裝版本檔", second.stdout)
+        self.assertIn("[install] ok 程式版本已是 lgw-v0.1.0", second.stdout)
+        # 走到 rendezvous 並寫好 tunnel.env
+        self.assertIn("[rendezvous] changed", second.stdout)
+        tunnel_env = os.path.join(self.home, ".config", "llmgateway", "tunnel.env")
+        with open(tunnel_env, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("RENDEZVOUS=sshproxy@jump.example.com:2222", content)
+        self.assertIn("IDENTITY=", content)
+        self.assertIn("KNOWN_HOSTS=", content)
+
+    def test_sshd_T_failure_is_fail_not_todo(self):
+        """sshd -T 執行失敗 → fail，不當成「未啟用 PubkeyAuthentication」"""
+        self._set_state("sshd_T_fail", "1")
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--sudo-pass-file", self.sudo_pass_file,
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args, self._ppid_env())
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("[sshd] fail 無法執行 sshd -T", res.stdout)
+        self.assertNotIn("[sshd] todo", res.stdout)
+        self.assertNotIn("PubkeyAuthentication", res.stdout)
+        self.assert_summary_printed(res.stdout)
 
 
 if __name__ == "__main__":
