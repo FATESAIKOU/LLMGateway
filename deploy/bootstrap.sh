@@ -525,7 +525,9 @@ step_sshd() {
     fi
 
     local ss_out=""
-    ss_out="$(ss -ltn 2>/dev/null || true)"
+    # ss 可能在 /usr/sbin（PATH 未含時直接跑會找不到而誤記 todo）；先經 sudo 試，
+    # 失敗退回直接跑 (L-R6 後半；分類不變，只判監聽)。
+    ss_out="$(PATH="/usr/sbin:/sbin:$PATH" run_root ss -ltn 2>/dev/null || PATH="/usr/sbin:/sbin:$PATH" ss -ltn 2>/dev/null || true)"
     if ! grep -E '(127\.0\.0\.1:22|0\.0\.0\.0:22|\*:22|\[::\]:22|:::22)([[:space:]]|$)' <<< "$ss_out" >/dev/null 2>&1; then
         reasons+=("sshd 未在 127.0.0.1:22 監聽 (需於 sshd_config 加入 ListenAddress 127.0.0.1:22 並重啟 sshd)")
     fi
