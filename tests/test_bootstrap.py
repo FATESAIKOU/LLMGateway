@@ -171,6 +171,9 @@ elif [[ "${1:-}" == "-Gn" ]]; then
         echo "llmgw"
     fi
     exit 0
+elif [[ "${1:-}" == "-gn" ]]; then
+    echo "llmgw"
+    exit 0
 else
     echo "uid=1001(llmgw) gid=1001(llmgw) groups=1001(llmgw)"
     exit 0
@@ -323,15 +326,17 @@ exit 0
 set -euo pipefail
 echo "install $*" >> "${LOG_DIR}/install-argv.log"
 
-args=()
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -o)
-            shift; if [[ $# -gt 0 ]]; then shift; fi ;;
-        *)
-            args+=("$1"); shift ;;
-    esac
-done
+        args=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -o)
+                    shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+                -g)
+                    shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+                *)
+                    args+=("$1"); shift ;;
+            esac
+        done
 
 exec "${REAL_INSTALL_BIN}" "${args[@]}"
 """
