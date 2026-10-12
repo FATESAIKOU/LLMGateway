@@ -22,6 +22,9 @@ _CLAUDE_ONLY = ("claude-personal", "claude-company")
 _ZEN_ONLY = ("opencode-zen",)
 
 
+_OPENROUTER_ALLOW = ("*:free", "openrouter/free")
+
+
 class PolicyError(ValueError):
     pass
 
@@ -92,7 +95,7 @@ def load_policy(path: str) -> Policy:
     - subscriptions 的鍵只能是 SUBSCRIPTIONS；
     - claude-personal／claude-company 的 agents 只能剛好是 ["claude-code"]（條款）；
     - opencode-zen 的 agents 只能剛好是 ["opencode"]（沒有官方的 Claude Code 接法）；
-    - openrouter 的 models.allow 只能是 ["*:free"]（只允許免費模型）；
+    - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
     - priority 為非負整數；cooldown 的 until 上限為正整數。
     """
     try:
@@ -117,7 +120,7 @@ def load_policy(path: str) -> Policy:
     for name in _ZEN_ONLY:
         if name in parsed_subs and parsed_subs[name].agents != ("opencode",):
             raise PolicyError("opencode-zen must only allow opencode")
-    if "openrouter" in parsed_subs and parsed_subs["openrouter"].models_allow != ("*:free",):
+    if "openrouter" in parsed_subs and parsed_subs["openrouter"].models_allow != _OPENROUTER_ALLOW:
         raise PolicyError("openrouter must only allow *:free models")
     max_ahead = data.get("until_max_ahead_seconds")
     if not _positive_int(max_ahead):

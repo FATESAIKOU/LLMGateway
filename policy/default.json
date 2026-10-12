@@ -19,7 +19,7 @@
     "openrouter": {
       "priority": 20,
       "agents": ["claude-code", "opencode"],
-      "models": {"allow": ["*:free"], "default": null}
+      "models": {"allow": ["*:free", "openrouter/free"], "default": "openrouter/free"}
     },
     "ollama-cloud": {
       "priority": 30,
