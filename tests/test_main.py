@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 
 from lgwd.clock import FakeClock
-from lgwd.keys import KEY_NAMES
+from lgwd.keys import KEY_NAMES, KeyFileError
 from lgwd.main import Config, Gateway, load_config
 
 REPO = Path(__file__).resolve().parent.parent
@@ -280,6 +280,32 @@ class ReloadTest(MainCase):
         rotate(self.root / "keys.env", key_text(rotated))
         self.assertEqual(self._get_key()[1], "test-main-second-222")
         self.assertIsNone(self.gw.keys.last_reload_error)
+
+    def test_壞key檔會一直重試到修好(self):
+        """審查 #13 低-5：失敗時不推進戳，下一個請求就再試（不是等檔案再變一次）。"""
+        rotate(self.root / "keys.env", "NOT A LINE\n")
+        calls = []
+        real = self.gw.keys.reload
+        self.gw.keys.reload = lambda: (calls.append(1), real())[1]
+        try:
+            for _ in range(3):
+                self.assertEqual(self._get_key()[1], FAKE_KEYS["claude-personal"])
+            self.assertEqual(len(calls), 3)  # 三個請求、三次重試
+            # 壞檔期間一直是舊 key，服務不下線
+            self.assertEqual(http_get(self.base + "/v1/subscriptions")[0], 200)
+            # 不會無限重試到 hot loop：檔案沒再變、成功重讀過就不再試
+            with self.assertRaises(KeyFileError):
+                real()  # 直接重讀：還是壞的（證明戳沒被推進成「已處理」）
+            # 修好（原地寫回同樣內容以外的新檔）→ 下個請求讀到新值，且不再重讀
+            rotated = dict(FAKE_KEYS, **{"claude-personal": "test-main-fixed-444"})
+            rotate(self.root / "keys.env", key_text(rotated))
+            self.assertEqual(self._get_key()[1], "test-main-fixed-444")
+            self.assertIsNone(self.gw.keys.last_reload_error)
+            before = len(calls)
+            self.assertEqual(self._get_key()[1], "test-main-fixed-444")
+            self.assertEqual(len(calls), before)  # 戳推進了 → 不再重讀
+        finally:
+            self.gw.keys.reload = real
 
     def test_policy不再熱重載(self):
         # v5：拿掉 SIGHUP 之後 policy 只在啟動時讀，改政策要重啟服務

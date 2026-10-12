@@ -190,7 +190,9 @@ class Gateway:
     def reload_keys_if_changed(self) -> bool:
         """keys.env 的 (mtime_ns, size, ino) 變了才重讀；回 True 表示這次有重讀。
 
-        檢查在每個請求處理前跑；失敗時沿用舊 key，等下次檔案再變才重試。
+        檢查在每個請求處理前跑。重讀失敗時**不推進戳**，所以下一個請求會再試
+        （不會因為「戳已是新的」就擺著不管）；舊 key 全程沿用。key-sync 只寫驗過
+        的檔，實務上失敗多來自人工手改壞，修好後下一個請求就會讀到。
         """
         stamp = _stat_stamp(self._config.keys_path)
         if stamp == self._keys_stamp:
@@ -198,8 +200,10 @@ class Gateway:
         with self._keys_lock:
             if stamp == self._keys_stamp:  # 別的執行緒已經處理過
                 return False
-            self._keys_stamp = stamp
-            return self.reload_keys()
+            ok = self.reload_keys()
+            if ok:
+                self._keys_stamp = stamp
+            return ok
 
 
 def main(argv: list[str] | None = None) -> int:
