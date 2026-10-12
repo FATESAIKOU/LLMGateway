@@ -26,6 +26,7 @@
   - agent（Claude Code／opencode）；
   - pool-tunnel 既有的 sshproxy 金鑰（id_tunnel），sidecar 用它連會合點。
 - Mac：sidecar daemon、agent、自己能登入 sshproxy 的金鑰。
+- 手機：不跑 sidecar；自行用 ssh -J 等方式把會合點 API 轉到本機再打 list／get（MyAiEntry#147 已關掉，不做 App 內轉發；LLMGateway 不提供程式）。
 - 上游：Anthropic、OpenRouter、Ollama Cloud、OpenCode Zen。
 - agora：Session 的保存與接續。
 
@@ -96,7 +97,7 @@
 
 **連線（v5：LLMGateway 不再提供連線程式）**
 - 伺服器端：隧道守護 `llmgateway-tunnel`（v5：程式搬到 `ops-scripts/`）。設定檔 `tunnel.env` 有會合點 `user@host:port`、金鑰、known_hosts、會合點上的 API 埠與 SSH 埠、探針間隔。
-- 客戶端：自備通道。sidecar 把會合點 API 轉到本機 loopback 某 port 後直接 curl（本機 port 預設 4710，可改；worker 由 MyLinuxPool capability 建通道，Mac／手機用 mlp 或 ssh -J）。
+- 客戶端：自備通道。sidecar 把會合點 API 轉到本機 loopback 某 port 後直接 curl（本機 port 預設 4710，可改；worker 由 MyLinuxPool capability 建通道，Mac 用 mlp 或 ssh -J 自己轉發；手機自行用 ssh -J 等方式轉發，LLMGateway 不提供程式）。
 - 會合點（sshproxy）是既有設施：隧道金鑰（服務那台產生）照舊登記；部署金鑰整組不用了（v5：`keys` 動詞與 deploy-keys 拿掉）。
 
 **共通 JSON schema（LLMGateway 與 sidecar 一致）**
@@ -126,7 +127,7 @@
 ## v5 變更（2026-10-12，本人；以 v4 為底，只列改的地方）
 
 1. **冷卻只收 `until`**：`POST …/cooldown` 的 body 改 `{until}`；`cooldown` 欄位改單一 `{until}` 或 null；`available`＝已部署且無未來 `until`；sidecar 判讀不出恢復時間時報現在＋1 小時。
-2. **拿掉 `lgw connect`**：上文 §2.0a 整節作廢；sidecar 直接 curl 本機 port（本機 port 預設 4710，可改；worker 由 MyLinuxPool capability 建通道，Mac／手機用 mlp 或 ssh -J）。
+2. **拿掉 `lgw connect`**：上文 §2.0a 整節作廢；sidecar 直接 curl 本機 port（本機 port 預設 4710，可改；worker 由 MyLinuxPool capability 建通道，Mac 用 mlp 或 ssh -J 自己轉發；手機自行轉發，LLMGateway 不提供程式，MyAiEntry#147 已關掉）。
 3. **反向隧道搬到 `ops-scripts/`**：`llmgateway-tunnel` 與其 unit 內容不變、只搬目錄；`install.sh`、`bootstrap.sh` 改從新路徑裝。
 4. **金鑰自己拉（v5 第二輪選乙）**：正本是 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`；key-sync 約每 10 分鐘用 `gh` 拉（`gh api …/contents/keys.env.enc`，blob `sha` 即版本）→解碼→解密→驗證→原子替換；`lgwd` 依 mtime 重讀；`gh` 登入是使用前提（`llmgw` 身分，token 二選一）。拿掉：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 4 secret、MyLinuxPool 部署公鑰登記（隧道公鑰保留）。升級改手動（上文 §2.4）。
 5. **說法**：sshproxy 是既有設施；sidecar 內部層次不寫名。
