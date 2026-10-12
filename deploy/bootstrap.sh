@@ -273,7 +273,7 @@ step_user() {
             record_todo "帳號 ${USER_NAME} 不存在，需執行 useradd -m -s /bin/bash ${USER_NAME}"
             return 0
         fi
-        sudo_refresh
+        sudo_refresh || return 1
         if ! run_root useradd -m -s /bin/bash "$USER_NAME"; then
             log_step user fail "useradd -m -s /bin/bash ${USER_NAME} 失敗"
             step_failed=1
@@ -301,7 +301,7 @@ step_user() {
             record_todo "帳號 ${USER_NAME} 在 docker 群組中，需執行 gpasswd -d ${USER_NAME} docker"
             return 0
         fi
-        sudo_refresh
+        sudo_refresh || return 1
         if ! run_root gpasswd -d "$USER_NAME" docker; then
             log_step user fail "gpasswd -d ${USER_NAME} docker 失敗"
             step_failed=1
@@ -331,7 +331,7 @@ step_linger() {
         return 0
     fi
 
-    sudo_refresh
+    sudo_refresh || return 1
     if ! run_root loginctl enable-linger "$USER_NAME"; then
         log_step linger fail "loginctl enable-linger ${USER_NAME} 失敗"
         step_failed=1
@@ -511,7 +511,7 @@ step_install() {
         return 0
     fi
 
-    sudo_refresh
+    sudo_refresh || return 1
     if ! ensure_llmgw_dir "$share_dir" 755; then
         log_step install fail "建立 ${share_dir} 失敗"
         step_failed=1
@@ -568,7 +568,7 @@ step_tunnel_key() {
         return 0
     fi
 
-    sudo_refresh
+    sudo_refresh || return 1
     if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
         log_step tunnel-key fail "建立 ${BOOT_HOME}/.ssh 失敗"
         step_failed=1
@@ -657,7 +657,7 @@ step_deploy_key() {
         return 0
     fi
 
-    sudo_refresh
+    sudo_refresh || return 1
     if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
         log_step deploy-key fail "建立 ${BOOT_HOME}/.ssh 失敗"
         step_failed=1
@@ -824,7 +824,7 @@ step_rendezvous() {
         return 0
     fi
 
-    sudo_refresh
+    sudo_refresh || return 1
     local grp=""
     grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
@@ -891,7 +891,7 @@ step_check() {
         return 1
     fi
 
-    sudo_refresh
+    sudo_refresh || return 1
     local chk_cmd=(bash "$install_script" --check --home "$BOOT_HOME")
     if [[ -n "$TAG" ]]; then
         chk_cmd+=(--tag "$TAG")
@@ -1004,32 +1004,29 @@ print_summary() {
 # -----------------------------------------------------------------------------
 # 主程序
 # -----------------------------------------------------------------------------
-step_prereq
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
+# run_step：在條件脈絡裡呼叫步驟。直接寫 `step_x` 時，步驟回 1 會被 set -e
+# 當成致命錯誤，腳本當場結束、印不到摘要（H3）；步驟自己已記 step_failed，
+# 這裡只是接手收尾。
+run_step() {
+    local fn="$1"
+    if ! "$fn"; then
+        step_failed=1
+    fi
+    if [[ $step_failed -ne 0 ]]; then
+        print_summary
+        exit 1
+    fi
+}
 
-step_user
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
-
-step_linger
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
-
-step_sshd
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
-
-step_install
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
-
-step_tunnel_key
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
-
-step_deploy_key
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
-
-step_rendezvous
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
-
-step_check
-if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
+run_step step_prereq
+run_step step_user
+run_step step_linger
+run_step step_sshd
+run_step step_install
+run_step step_tunnel_key
+run_step step_deploy_key
+run_step step_rendezvous
+run_step step_check
 
 print_summary
 

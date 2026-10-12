@@ -455,6 +455,13 @@ exit 0
         with open(p, "r", encoding="utf-8") as f:
             return f.read()
 
+    def assert_summary_printed(self, stdout):
+        """摘要三段都在：隧道公鑰、host 公鑰、待辦清單"""
+        self.assertIn("開機設定摘要 (Bootstrap Summary)", stdout)
+        self.assertIn("1. 隧道公鑰", stdout)
+        self.assertIn("2. 這台的 ed25519 host 公鑰", stdout)
+        self.assertIn("3. 待辦事項 (Pending Todos):", stdout)
+
     # -------------------------------------------------------------------------
     # 測試項目
     # -------------------------------------------------------------------------
@@ -731,6 +738,25 @@ exit 0
         self.assertNotIn("[install] changed", res.stdout)
         # 失敗之後不再往下走
         self.assertNotIn("[check]", res.stdout)
+        # 失敗也要跑摘要
+        self.assert_summary_printed(res.stdout)
+
+    def test_failed_step_still_prints_summary(self):
+        """前面某步就 fail 時也要有摘要：公鑰與待辦清單兩段都印出來"""
+        self._set_state("sudo_fail_substr", "useradd")
+
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--deploy-pubkey-file", self.deploy_pubkey_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 1, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertIn("[user] fail useradd", res.stdout)
+        self.assertNotIn("[linger]", res.stdout)
+        self.assert_summary_printed(res.stdout)
 
     def test_sudo_no_cache_check_refreshes_before_sshd(self):
         """沒有 sudo 快取時，--check 也要先 sudo -v；sshd 檢查不因 sudo -n 失敗而記假 todo"""
