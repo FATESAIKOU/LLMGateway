@@ -11,6 +11,8 @@ INSTALL_SH = os.path.join(REPO_ROOT, "deploy", "install.sh")
 REMOTE_DEPLOY_SH = os.path.join(REPO_ROOT, "deploy", "remote-deploy.sh")
 RUN_WRAPPER = os.path.join(REPO_ROOT, "deploy", "llmgateway-run")
 SERVICE_UNIT = os.path.join(REPO_ROOT, "deploy", "llmgateway.service")
+REPO_DEPLOY = os.path.join(REPO_ROOT, "deploy")
+REPO_POLICY = os.path.join(REPO_ROOT, "policy")
 
 TOOLS_LIST = [
     "mkdir", "mktemp", "chmod", "mv", "ln", "rm", "cat", "date",
@@ -68,7 +70,7 @@ class BootstrapScriptTests(unittest.TestCase):
         self._set_state("sshd_deny", "")
         self._set_state("sshd_allow", "")
         self._set_state("sshd_listen", "1")
-        self._set_state("curl_code", "401")
+        self._set_state("curl_code", "200")
         self._set_state("curl_rc", "0")
 
         self._create_fake_tools()
@@ -168,6 +170,9 @@ elif [[ "${1:-}" == "-Gn" ]]; then
     else
         echo "llmgw"
     fi
+    exit 0
+elif [[ "${1:-}" == "-gn" ]]; then
+    echo "llmgw"
     exit 0
 else
     echo "uid=1001(llmgw) gid=1001(llmgw) groups=1001(llmgw)"
@@ -285,6 +290,14 @@ exit 0
 set -euo pipefail
 echo "systemctl $*" >> "${LOG_DIR}/systemctl-argv.log"
 if [[ "$*" == *"is-active"* ]]; then
+    if [[ "$*" == *"llmgateway-tunnel.service"* ]]; then
+        tunnel_env="${LGW_BOOT_HOME:-}/.config/llmgateway/tunnel.env"
+        if [[ -f "$tunnel_env" ]] && grep -Eq '^RENDEZVOUS=[^[:space:]]+' "$tunnel_env" 2>/dev/null; then
+            exit 0
+        else
+            exit 3
+        fi
+    fi
     exit 0
 fi
 exit 0
@@ -296,15 +309,14 @@ echo "git $*" >> "${LOG_DIR}/git-argv.log"
 if [[ "${1:-}" == "clone" ]]; then
     dest="${@: -1}"
     mkdir -p "$dest/policy" "$dest/deploy"
-    echo "{}" > "$dest/policy/default.json"
-    cat "${REAL_INSTALL_SH}" > "$dest/deploy/install.sh"
-    chmod +x "$dest/deploy/install.sh"
-    cat "${REAL_RUN_WRAPPER}" > "$dest/deploy/llmgateway-run"
-    chmod +x "$dest/deploy/llmgateway-run"
-    cat "${REAL_SERVICE_UNIT}" > "$dest/deploy/llmgateway.service"
-    chmod 644 "$dest/deploy/llmgateway.service"
-    cat "${REAL_REMOTE_DEPLOY_SH}" > "$dest/deploy/remote-deploy.sh"
-    chmod +x "$dest/deploy/remote-deploy.sh"
+    if [[ -d "${REPO_POLICY:-}" ]]; then
+        cp -R "${REPO_POLICY}/." "$dest/policy/"
+    else
+        echo "{}" > "$dest/policy/default.json"
+    fi
+    if [[ -d "${REPO_DEPLOY:-}" ]]; then
+        cp -R "${REPO_DEPLOY}/." "$dest/deploy/"
+    fi
 fi
 exit 0
 """
@@ -314,15 +326,17 @@ exit 0
 set -euo pipefail
 echo "install $*" >> "${LOG_DIR}/install-argv.log"
 
-args=()
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -o)
-            shift; if [[ $# -gt 0 ]]; then shift; fi ;;
-        *)
-            args+=("$1"); shift ;;
-    esac
-done
+        args=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -o)
+                    shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+                -g)
+                    shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+                *)
+                    args+=("$1"); shift ;;
+            esac
+        done
 
 exec "${REAL_INSTALL_BIN}" "${args[@]}"
 """
@@ -330,7 +344,7 @@ exec "${REAL_INSTALL_BIN}" "${args[@]}"
         curl_script = """#!/usr/bin/env bash
 set -euo pipefail
 echo "curl $*" >> "${LOG_DIR}/curl-argv.log"
-code="$(cat "${STATE_DIR}/curl_code" 2>/dev/null || echo "401")"
+code="$(cat "${STATE_DIR}/curl_code" 2>/dev/null || echo "200")"
 rc="$(cat "${STATE_DIR}/curl_rc" 2>/dev/null || echo "0")"
 printf '%s' "$code"
 exit "$rc"
@@ -375,6 +389,8 @@ exit "$rc"
             "REAL_REMOTE_DEPLOY_SH": REMOTE_DEPLOY_SH,
             "REAL_RUN_WRAPPER": RUN_WRAPPER,
             "REAL_SERVICE_UNIT": SERVICE_UNIT,
+            "REPO_DEPLOY": REPO_DEPLOY,
+            "REPO_POLICY": REPO_POLICY,
             "REAL_INSTALL_BIN": self.real_install_bin,
         }
         if env_overrides:

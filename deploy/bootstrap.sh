@@ -94,6 +94,27 @@ if [[ -n "$RENDEZVOUS_KNOWN_HOSTS" && ! -f "$RENDEZVOUS_KNOWN_HOSTS" ]]; then
     exit 2
 fi
 
+# --rendezvous 驗證 user@host:port 格式（中 M4）
+if [[ -n "$RENDEZVOUS" ]]; then
+    if ! [[ "$RENDEZVOUS" =~ ^[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:[1-9][0-9]*$ ]]; then
+        echo "錯誤: --rendezvous 格式無效，需為 user@host:port（埠 1-65535）: ${RENDEZVOUS}" >&2
+        exit 2
+    fi
+    rendezvous_port="${RENDEZVOUS##*:}"
+    if [[ -z "$rendezvous_port" ]] || [[ "$rendezvous_port" -lt 1 ]] || [[ "$rendezvous_port" -gt 65535 ]] 2>/dev/null; then
+        echo "錯誤: --rendezvous 埠號無效（需 1-65535）: ${RENDEZVOUS}" >&2
+        exit 2
+    fi
+fi
+
+# --rendezvous-known-hosts 用 ssh-keygen -l -f 驗證（中 M4）
+if [[ -n "$RENDEZVOUS_KNOWN_HOSTS" ]]; then
+    if ! ssh-keygen -l -f "$RENDEZVOUS_KNOWN_HOSTS" >/dev/null 2>&1; then
+        echo "錯誤: --rendezvous-known-hosts 檔案無效（無法被 ssh-keygen -l -f 讀取）: ${RENDEZVOUS_KNOWN_HOSTS}" >&2
+        exit 2
+    fi
+fi
+
 # -----------------------------------------------------------------------------
 # 環境配置 (支援測試覆寫)
 # -----------------------------------------------------------------------------
@@ -122,13 +143,18 @@ BOOT_HOME="$(resolve_home)"
 # sudo 封裝
 # -----------------------------------------------------------------------------
 sudo_refresh() {
-    if [[ $CHECK_ONLY -eq 1 ]]; then
-        return 0
-    fi
     if [[ -n "$SUDO_PASS_FILE" ]]; then
-        sudo -S -p '' -v < "$SUDO_PASS_FILE"
+        sudo -S -p '' -v < "$SUDO_PASS_FILE" || {
+            log_step prereq fail "sudo 密碼驗證失敗"
+            step_failed=1
+            return 1
+        }
     else
-        sudo -v
+        sudo -v || {
+            log_step prereq fail "sudo -v 失敗"
+            step_failed=1
+            return 1
+        }
     fi
 }
 
@@ -139,7 +165,8 @@ run_root() {
 run_as_llmgw() {
     local uid
     uid="$(id -u "$USER_NAME" 2>/dev/null || echo "1000")"
-    sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" "$@" </dev/null
+    # 先切到 llmgw 可讀的目錄，避免繼承管理帳號 cwd 導致 git clone 失敗 (H6)
+    sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" bash -c 'cd "${BOOT_HOME:-/home/llmgw}" || cd /; exec "$@"' bash "$@" </dev/null
 }
 
 # -----------------------------------------------------------------------------
@@ -212,7 +239,11 @@ step_user() {
             return 0
         fi
         sudo_refresh
-        run_root useradd -m -s /bin/bash "$USER_NAME"
+        if ! run_root useradd -m -s /bin/bash "$USER_NAME"; then
+            log_step user fail "useradd -m -s /bin/bash ${USER_NAME} 失敗"
+            step_failed=1
+            return 1
+        fi
         BOOT_HOME="$(resolve_home)"
         log_step user changed "建立帳號 ${USER_NAME}"
         changed_count=$((changed_count + 1))
@@ -236,7 +267,11 @@ step_user() {
             return 0
         fi
         sudo_refresh
-        run_root gpasswd -d "$USER_NAME" docker
+        if ! run_root gpasswd -d "$USER_NAME" docker; then
+            log_step user fail "gpasswd -d ${USER_NAME} docker 失敗"
+            step_failed=1
+            return 1
+        fi
         log_step user changed "將帳號 ${USER_NAME} 自 docker 群組移出"
         changed_count=$((changed_count + 1))
     else
@@ -262,7 +297,11 @@ step_linger() {
     fi
 
     sudo_refresh
-    run_root loginctl enable-linger "$USER_NAME"
+    if ! run_root loginctl enable-linger "$USER_NAME"; then
+        log_step linger fail "loginctl enable-linger ${USER_NAME} 失敗"
+        step_failed=1
+        return 1
+    fi
 
     local uid
     uid="$(id -u "$USER_NAME" 2>/dev/null || echo "1000")"
@@ -292,7 +331,7 @@ step_linger() {
 step_sshd() {
     local reasons=()
     local sshd_out=""
-    sshd_out="$(sshd -T -C "user=${USER_NAME},host=localhost,addr=127.0.0.1" 2>/dev/null || true)"
+    sshd_out="$(run_root sshd -T -C "user=${USER_NAME},host=localhost,addr=127.0.0.1" 2>/dev/null || true)"
 
     local pubkey_auth=""
     pubkey_auth="$(grep -Ei '^pubkeyauthentication[[:space:]]+' <<< "$sshd_out" | awk '{print tolower($2)}' || true)"
@@ -311,18 +350,74 @@ step_sshd() {
         done
     fi
 
+    # AllowGroups / DenyGroups 檢查（中等 M3）
+    local allow_groups deny_groups
+    allow_groups="$(grep -Ei '^allowgroups[[:space:]]+' <<< "$sshd_out" | cut -d' ' -f2- || true)"
+    deny_groups="$(grep -Ei '^denygroups[[:space:]]+' <<< "$sshd_out" | cut -d' ' -f2- || true)"
+    if [[ -n "$deny_groups" ]]; then
+        for g in $deny_groups; do
+            # 簡單明確比對；若含萬用字元或複雜格式，印 todo 請人工確認
+            case "$g" in
+                *\** | *\?* | *@*)
+                    reasons+=("sshd DenyGroups 設定複雜（${g}），請人工確認是否封鎖 ${USER_NAME}")
+                    ;;
+                *)
+                    local user_groups
+                    user_groups="$(id -Gn "$USER_NAME" 2>/dev/null || true)"
+                    if printf '%s\n' "$user_groups" | grep -qwF "$g"; then
+                        reasons+=("sshd DenyGroups 包含 ${g}，可能封鎖 ${USER_NAME}（需人工確認）")
+                    fi
+                    ;;
+            esac
+        done
+    fi
+    if [[ -n "$allow_groups" ]]; then
+        local allowed_group=0
+        for g in $allow_groups; do
+            # 簡單明確比對；若含萬用字元或複雜格式，印 todo
+            case "$g" in
+                *\** | *\?* | *@*)
+                    reasons+=("sshd AllowGroups 設定複雜（${g}），請人工確認是否允許 ${USER_NAME}")
+                    allowed_group=1
+                    ;;
+                *)
+                    local user_groups
+                    user_groups="$(id -Gn "$USER_NAME" 2>/dev/null || true)"
+                    if printf '%s\n' "$user_groups" | grep -qwF "$g"; then
+                        allowed_group=1
+                    fi
+                    ;;
+            esac
+        done
+        # 只要 AllowGroups 有設但沒明確允許 llmgw，就印 todo（不自己解析萬用字元與 user@host）
+        if [[ $allowed_group -eq 0 ]]; then
+            reasons+=("sshd AllowGroups 未明確允許 ${USER_NAME}（請人工確認 AllowGroups 設定）")
+        fi
+    fi
+
     local allow_users=""
     allow_users="$(grep -Ei '^allowusers[[:space:]]+' <<< "$sshd_out" | cut -d' ' -f2- || true)"
     if [[ -n "$allow_users" ]]; then
         local allowed=0
         for u in $allow_users; do
-            if [[ "$u" == "$USER_NAME" ]]; then
-                allowed=1
-                break
-            fi
+            # 處理 user@host 形式（取 @ 前面的 user 部分）
+            local u_simple="${u%%@*}"
+            case "$u_simple" in
+                *\** | *\?*)
+                    # 萬用字元：不自己解析，印 todo 請人工確認
+                    reasons+=("sshd AllowUsers 包含萬用字元或 user@host 格式（${u}），請人工確認是否允許 ${USER_NAME}")
+                    allowed=1
+                    break
+                    ;;
+                *)
+                    if [[ "$u_simple" == "$USER_NAME" ]]; then
+                        allowed=1
+                    fi
+                    ;;
+            esac
         done
         if [[ $allowed -eq 0 ]]; then
-            reasons+=("sshd AllowUsers 未包含 ${USER_NAME} (需將 ${USER_NAME} 加入 AllowUsers)")
+            reasons+=("sshd AllowUsers 未包含 ${USER_NAME}（需將 ${USER_NAME} 加入 AllowUsers，或人工確認萬用字元設定）")
         fi
     fi
 
@@ -367,14 +462,44 @@ step_install() {
         return 0
     fi
 
+    local grp=""
+    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     sudo_refresh
-    run_root install -d -m 755 -o "$USER_NAME" "$share_dir"
+    if [[ -n "$grp" ]]; then
+        if ! run_root install -d -m 755 -o "$USER_NAME" -g "$grp" "$share_dir"; then
+            log_step install fail "install -d ... ${share_dir} 失敗"
+            step_failed=1
+            return 1
+        fi
+    else
+        if ! run_root install -d -m 755 -o "$USER_NAME" "$share_dir"; then
+            log_step install fail "install -d ... ${share_dir} 失敗"
+            step_failed=1
+            return 1
+        fi
+    fi
 
     local bootstrap_clone="${share_dir}/.bootstrap-${TAG}"
-    run_as_llmgw rm -rf "$bootstrap_clone"
-    run_as_llmgw git clone --depth 1 --branch "$TAG" "$REPO_URL" "$bootstrap_clone"
-    run_as_llmgw bash "${bootstrap_clone}/deploy/install.sh" --tag "$TAG" --home "$BOOT_HOME"
-    run_as_llmgw rm -rf "$bootstrap_clone"
+    if ! run_as_llmgw rm -rf "$bootstrap_clone"; then
+        log_step install fail "rm -rf ${bootstrap_clone} 失敗"
+        step_failed=1
+        return 1
+    fi
+    if ! run_as_llmgw git clone --depth 1 --branch "$TAG" "$REPO_URL" "$bootstrap_clone"; then
+        log_step install fail "git clone ... 失敗"
+        step_failed=1
+        return 1
+    fi
+    if ! run_as_llmgw bash "${bootstrap_clone}/deploy/install.sh" --tag "$TAG" --home "$BOOT_HOME"; then
+        log_step install fail "bash install.sh ... 失敗"
+        step_failed=1
+        return 1
+    fi
+    if ! run_as_llmgw rm -rf "$bootstrap_clone"; then
+        log_step install fail "rm -rf ${bootstrap_clone} (清理) 失敗"
+        step_failed=1
+        return 1
+    fi
 
     log_step install changed "已安裝版本 ${TAG}"
     changed_count=$((changed_count + 1))
@@ -396,9 +521,27 @@ step_tunnel_key() {
         return 0
     fi
 
+    local grp=""
+    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     sudo_refresh
-    run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"
-    run_as_llmgw ssh-keygen -t ed25519 -N '' -C llmgateway-tunnel -f "$key_file"
+    if [[ -n "$grp" ]]; then
+        if ! run_root install -d -m 700 -o "$USER_NAME" -g "$grp" "${BOOT_HOME}/.ssh"; then
+            log_step tunnel-key fail "install -d ... .ssh 失敗"
+            step_failed=1
+            return 1
+        fi
+    else
+        if ! run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"; then
+            log_step tunnel-key fail "install -d ... .ssh 失敗"
+            step_failed=1
+            return 1
+        fi
+    fi
+    if ! run_as_llmgw ssh-keygen -t ed25519 -N '' -C llmgateway-tunnel -f "$key_file"; then
+        log_step tunnel-key fail "ssh-keygen ... 失敗"
+        step_failed=1
+        return 1
+    fi
     log_step tunnel-key changed "已產生隧道金鑰 (${key_file})"
     changed_count=$((changed_count + 1))
 }
@@ -436,12 +579,18 @@ step_deploy_key() {
     local auth_keys="${BOOT_HOME}/.ssh/authorized_keys"
 
     local needs_update=1
+    local auth_content=""
     if [[ -f "$auth_keys" ]]; then
+        if ! auth_content="$(sudo -n -u "$USER_NAME" cat "$auth_keys" 2>/dev/null)"; then
+            log_step deploy-key fail "無法讀取 authorized_keys (${auth_keys})"
+            step_failed=1
+            return 1
+        fi
         local match_count
-        match_count="$(grep -c -F "$pubkey_b64" "$auth_keys" || true)"
-        if [[ $match_count -eq 1 ]]; then
+        match_count="$(printf '%s\n' "$auth_content" | grep -c -F "$pubkey_b64" || true)"
+        if [[ "$match_count" -eq 1 ]]; then
             local matching_line
-            matching_line="$(grep -F "$pubkey_b64" "$auth_keys" || true)"
+            matching_line="$(printf '%s\n' "$auth_content" | grep -F "$pubkey_b64" || true)"
             if [[ "$matching_line" == "$target_line" ]]; then
                 needs_update=0
             fi
@@ -459,19 +608,43 @@ step_deploy_key() {
         return 0
     fi
 
+    local grp=""
+    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     sudo_refresh
-    run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"
+    if [[ -n "$grp" ]]; then
+        if ! run_root install -d -m 700 -o "$USER_NAME" -g "$grp" "${BOOT_HOME}/.ssh"; then
+            log_step deploy-key fail "install -d ... .ssh 失敗"
+            step_failed=1
+            return 1
+        fi
+    else
+        if ! run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"; then
+            log_step deploy-key fail "install -d ... .ssh 失敗"
+            step_failed=1
+            return 1
+        fi
+    fi
 
     local tmp_auth
     tmp_auth="$(mktemp "${BOOT_HOME}/.ssh/.auth.XXXXXX" 2>/dev/null || mktemp)"
-    if [[ -f "$auth_keys" ]]; then
-        grep -v -F "$pubkey_b64" "$auth_keys" > "$tmp_auth" || true
-    else
-        : > "$tmp_auth"
+    # 只在能讀到原檔時才保留其他行；讀不到原檔但檔案存在則 fail（絕不覆蓋空內容）
+    if [[ -n "${auth_content:-}" ]]; then
+        printf '%s\n' "$auth_content" | grep -v -F "$pubkey_b64" > "$tmp_auth" || true
+    elif [[ -f "$auth_keys" ]]; then
+        # 檔案存在但未取得內容（理論上已在上面 fail），保險再 fail
+        log_step deploy-key fail "無法讀取 authorized_keys 原內容，拒絕覆寫空內容"
+        rm -f "$tmp_auth"
+        step_failed=1
+        return 1
     fi
     printf '%s\n' "$target_line" >> "$tmp_auth"
 
-    run_root install -m 600 -o "$USER_NAME" "$tmp_auth" "$auth_keys"
+    if ! run_root install -m 600 -o "$USER_NAME" -g "$(id -gn "$USER_NAME" 2>/dev/null || echo "$USER_NAME")" "$tmp_auth" "$auth_keys"; then
+        log_step deploy-key fail "install -m 600 ... authorized_keys 失敗"
+        rm -f "$tmp_auth"
+        step_failed=1
+        return 1
+    fi
     rm -f "$tmp_auth"
 
     log_step deploy-key changed "已更新部署公鑰至 authorized_keys"
@@ -568,10 +741,64 @@ EOF
     fi
 
     sudo_refresh
-    run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"
-    run_root install -m 644 -o "$USER_NAME" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"
-    run_root install -d -m 755 -o "$USER_NAME" "$conf_dir"
-    run_root install -m 600 -o "$USER_NAME" "$tmp_env" "$target_env"
+    local grp=""
+    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
+    if [[ -n "$grp" ]]; then
+        if ! run_root install -d -m 700 -o "$USER_NAME" -g "$grp" "${BOOT_HOME}/.ssh"; then
+            log_step rendezvous fail "install -d ... .ssh 失敗"
+            step_failed=1
+            return 1
+        fi
+    else
+        if ! run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"; then
+            log_step rendezvous fail "install -d ... .ssh 失敗"
+            step_failed=1
+            return 1
+        fi
+    fi
+    if [[ -n "$grp" ]]; then
+        if ! run_root install -m 644 -o "$USER_NAME" -g "$grp" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
+            log_step rendezvous fail "install -m 644 ... known_hosts 失敗"
+            step_failed=1
+            return 1
+        fi
+    else
+        if ! run_root install -m 644 -o "$USER_NAME" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
+            log_step rendezvous fail "install -m 644 ... known_hosts 失敗"
+            step_failed=1
+            return 1
+        fi
+    fi
+    local grp_dir=""
+    grp_dir="$(id -gn "$USER_NAME" 2>/dev/null || true)"
+    if [[ -n "$grp_dir" ]]; then
+        if ! run_root install -d -m 755 -o "$USER_NAME" -g "$grp_dir" "$conf_dir"; then
+            log_step rendezvous fail "install -d ... conf_dir 失敗"
+            step_failed=1
+            return 1
+        fi
+    else
+        if ! run_root install -d -m 755 -o "$USER_NAME" "$conf_dir"; then
+            log_step rendezvous fail "install -d ... conf_dir 失敗"
+            step_failed=1
+            return 1
+        fi
+    fi
+    if [[ -n "${grp_dir:-}" ]]; then
+        if ! run_root install -m 600 -o "$USER_NAME" -g "$grp_dir" "$tmp_env" "$target_env"; then
+            log_step rendezvous fail "install -m 600 ... tunnel.env 失敗"
+            rm -f "$tmp_env"
+            step_failed=1
+            return 1
+        fi
+    else
+        if ! run_root install -m 600 -o "$USER_NAME" "$tmp_env" "$target_env"; then
+            log_step rendezvous fail "install -m 600 ... tunnel.env 失敗"
+            rm -f "$tmp_env"
+            step_failed=1
+            return 1
+        fi
+    fi
     rm -f "$tmp_env"
 
     run_as_llmgw systemctl --user restart llmgateway-tunnel.service
@@ -609,8 +836,35 @@ step_check() {
 
     if [[ $rc -eq 0 ]]; then
         log_step check ok "install.sh --check 通過 (rc=0)"
+    elif [[ $rc -eq 1 ]]; then
+        # 新三態 rc=1：確定不成立。
+        # 檢查是否為「隧道設定未填 (結束碼 78) / 尚未提供會合點」所致：
+        # 若主要服務 llmgateway.service 是 active，且 tunnel.env 尚未填妥 RENDEZVOUS，
+        # 則此狀態為等待會合點設定的預期 todo，而非腳本安裝失敗。
+        local conf_dir="${BOOT_HOME}/.config/llmgateway"
+        local tunnel_env="${conf_dir}/tunnel.env"
+        local tunnel_configured=0
+        if [[ -f "$tunnel_env" ]] && grep -Eq '^RENDEZVOUS=[^[:space:]]+' "$tunnel_env" 2>/dev/null; then
+            tunnel_configured=1
+        fi
+
+        local gw_active=0
+        if run_as_llmgw systemctl --user is-active --quiet llmgateway.service 2>/dev/null; then
+            gw_active=1
+        fi
+
+        if [[ $tunnel_configured -eq 0 && $gw_active -eq 1 ]]; then
+            log_step check todo "install.sh --check 未通過 (rc=1，llmgateway 正常但隧道設定未填/結束碼 78)"
+            record_todo "待完成會合點設定後使 install.sh --check 通過"
+        else
+            log_step check fail "install.sh --check 未通過 (rc=1)"
+            step_failed=1
+        fi
+    elif [[ $rc -eq 2 ]]; then
+        log_step check fail "install.sh --check 無法確認 (rc=2)"
+        step_failed=1
     else
-        log_step check fail "install.sh --check 未通過 (rc=${rc})"
+        log_step check fail "install.sh --check 異常退出 (rc=${rc})"
         step_failed=1
     fi
 }
@@ -636,7 +890,10 @@ print_summary() {
     if [[ -f "$HOSTKEY_FILE" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" || "$line" =~ ^# ]] && continue
-            printf '[127.0.0.1]:4711 %s\n' "$line"
+            # 只印前兩欄（類型 + 金鑰），去掉註解（可能帶機器名）
+            awk '{print $1, $2}' <<< "$line" | while read -r type key rest; do
+                printf '[127.0.0.1]:4711 %s %s\n' "$type" "$key"
+            done
         done < "$HOSTKEY_FILE"
     else
         echo "   (未找到 host key: ${HOSTKEY_FILE})"
@@ -656,50 +913,32 @@ print_summary() {
 # -----------------------------------------------------------------------------
 # 主程序
 # -----------------------------------------------------------------------------
-step_prereq || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_prereq
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_user || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_user
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_linger || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_linger
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_sshd || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_sshd
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_install || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_install
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_tunnel_key || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_tunnel_key
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_deploy_key || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_deploy_key
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_rendezvous || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_rendezvous
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
-step_check || true
-if [[ $step_failed -ne 0 ]]; then
-    exit 1
-fi
+step_check
+if [[ $step_failed -ne 0 ]]; then print_summary; exit 1; fi
 
 print_summary
 
