@@ -14,7 +14,16 @@
 #
 # log 只寫事件種類（tunnel_up、probe_fail、restart、config_missing、spawn_fail）；
 # 不寫設定值、不寫主機名、不寫 ssh 的 stderr 原文。
+#
+# 用法：
+#   llmgateway-tunnel               當守護程式跑。
+#   llmgateway-tunnel --probe-once  只跑一次端對端探針就結束（給 install.sh
+#                                   --check 用）：讀同一份 tunnel.env、用與
+#                                   守護程式同一套 ssh 參數。0＝HTTP 200、
+#                                   1＝不是 200 或沒回應、2＝無法執行
+#                                   （config_missing 或找不到 ssh）。不寫 log。
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +41,9 @@ DEFAULTS = {
 }
 EXIT_CONFIG_MISSING = 78
 EXIT_FAILED = 1
+EXIT_PROBE_OK = 0
+EXIT_PROBE_FAIL = 1
+EXIT_PROBE_UNAVAILABLE = 2
 PROBE_REQUEST = b"GET /v1/subscriptions HTTP/1.0\r\n\r\n"
 
 
@@ -184,7 +196,20 @@ def probe_healthy(cfg):
     return len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1] == b"200"
 
 
+def probe_once():
+    """一次端對端探針；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。"""
+    path = config_path()
+    cfg = load_config(path) if path else None
+    if cfg is None:
+        return EXIT_PROBE_UNAVAILABLE
+    if shutil.which(cfg["ssh_path"]) is None:
+        return EXIT_PROBE_UNAVAILABLE
+    return EXIT_PROBE_OK if probe_healthy(cfg) else EXIT_PROBE_FAIL
+
+
 def main():
+    if sys.argv[1:] == ["--probe-once"]:
+        return probe_once()
     path = config_path()
     cfg = load_config(path) if path else None
     if cfg is None:
