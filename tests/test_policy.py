@@ -119,12 +119,25 @@ class PolicyValidationTests(unittest.TestCase):
                     self._reload(obj)
 
     def test_舊窗口欄位被忽略(self):
-        # 舊政策檔留著 cooldown_buffer_seconds／resets_at_max_ahead_seconds 也能載入
+        # 多出來的舊欄位（cooldown_buffer_seconds／resets_at_max_ahead_seconds）會被忽略，
+        # 不影響載入；但真正的 v4 政策檔會被拒絕（缺 until_max_ahead_seconds），
+        # 見 test_v4政策檔被拒（刻意 fail-closed）。
         obj = _good_policy()
         obj["cooldown_buffer_seconds"] = 120
         obj["resets_at_max_ahead_seconds"] = 691200
         policy = self._reload(obj)
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
+
+    def test_v4政策檔被拒(self):
+        # v4 政策檔：只有舊欄位名、沒有 until_max_ahead_seconds → 拒絕（fail-closed），
+        # 不會靜靜地吃預設值。升級時政策檔跟著 tag 一起換（docs/deploy.md 4.2）。
+        with tempfile.TemporaryDirectory() as tmpdir:
+            obj = _good_policy()
+            obj.pop("until_max_ahead_seconds")
+            obj["cooldown_buffer_seconds"] = 120
+            obj["resets_at_max_ahead_seconds"] = 691200
+            with self.assertRaises(PolicyError):
+                load_policy(_write_json(tmpdir, obj))
 
     def test_bad_models_rejected(self):
         for mutate in (

@@ -1,0 +1,10 @@
+[Unit]
+Description=LLMGateway key sync (pull the encrypted key file from the private repo)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 解密密碼（只有一行 LLMGW_KEYS_PASSWORD=…，0600、擁有者 llmgw）；沒放也要能跑到
+# 由 key-sync 自己記一行 log，不要讓 systemd 直接拒跑，所以檔名前面加 -。
+EnvironmentFile=-%h/.config/llmgateway/keysync.env
+ExecStart=%h/.local/bin/key-sync

@@ -13,7 +13,7 @@ usage() {
 選項:
   --tag lgw-vX.Y.Z              要安裝的版本 (格式同 install.sh)
   --sudo-pass-file PATH         sudo 密碼檔路徑 (選填；未給則使用互動 sudo)
-  --deploy-pubkey-file PATH     部署公鑰檔案路徑 (選填，單行 OpenSSH 公鑰)
+  --decrypt-pass-file PATH      解密密碼檔路徑 (選填，單行；寫進 keysync.env 後請刪掉)
   --rendezvous ADDR             會合點 sshproxy@<host>:<port> (選填，需與 --rendezvous-known-hosts 合併使用)
   --rendezvous-known-hosts PATH 會合點 known_hosts 檔路徑 (選填)
   --check                       僅檢查現狀，不修改系統狀態
@@ -27,7 +27,7 @@ EOF
 # -----------------------------------------------------------------------------
 TAG=""
 SUDO_PASS_FILE=""
-DEPLOY_PUBKEY_FILE=""
+DECRYPT_PASS_FILE=""
 RENDEZVOUS=""
 RENDEZVOUS_KNOWN_HOSTS=""
 CHECK_ONLY=0
@@ -41,9 +41,9 @@ while [[ $# -gt 0 ]]; do
         --sudo-pass-file)
             [[ $# -ge 2 ]] || { echo "錯誤: --sudo-pass-file 缺少參數" >&2; exit 2; }
             SUDO_PASS_FILE="$2"; shift 2 ;;
-        --deploy-pubkey-file)
-            [[ $# -ge 2 ]] || { echo "錯誤: --deploy-pubkey-file 缺少參數" >&2; exit 2; }
-            DEPLOY_PUBKEY_FILE="$2"; shift 2 ;;
+        --decrypt-pass-file)
+            [[ $# -ge 2 ]] || { echo "錯誤: --decrypt-pass-file 缺少參數" >&2; exit 2; }
+            DECRYPT_PASS_FILE="$2"; shift 2 ;;
         --rendezvous)
             [[ $# -ge 2 ]] || { echo "錯誤: --rendezvous 缺少參數" >&2; exit 2; }
             RENDEZVOUS="$2"; shift 2 ;;
@@ -84,8 +84,8 @@ if [[ -n "$SUDO_PASS_FILE" && ! -f "$SUDO_PASS_FILE" ]]; then
     exit 2
 fi
 
-if [[ -n "$DEPLOY_PUBKEY_FILE" && ! -f "$DEPLOY_PUBKEY_FILE" ]]; then
-    echo "錯誤: 部署公鑰檔案不存在" >&2
+if [[ -n "$DECRYPT_PASS_FILE" && ! -f "$DECRYPT_PASS_FILE" ]]; then
+    echo "錯誤: 解密密碼檔不存在" >&2
     exit 2
 fi
 
@@ -122,6 +122,8 @@ USER_NAME="${LGW_BOOT_USER:-llmgw}"
 RUNDIR="${LGW_BOOT_RUNDIR:-/run/user}"
 HOSTKEY_FILE="${LGW_BOOT_HOSTKEY:-/etc/ssh/ssh_host_ed25519_key.pub}"
 REPO_URL="${LGW_BOOT_REPO:-https://github.com/FATESAIKOU/LLMGateway.git}"
+# 1：接在終端機時可以互動輸入解密密碼；0：完全不問（自動化用）
+DECRYPT_PROMPT="${LGW_BOOT_DECRYPT_PROMPT:-1}"
 
 resolve_home() {
     if [[ -n "${LGW_BOOT_HOME:-}" ]]; then
@@ -312,6 +314,35 @@ step_user() {
     else
         log_step user ok "帳號 ${USER_NAME} 已存在且不在 docker 群組"
     fi
+}
+
+# -----------------------------------------------------------------------------
+# 步驟 2b: gh 登入狀態（llmgw 身分）
+# -----------------------------------------------------------------------------
+# v5：key-sync 以 llmgw 跑、用 gh 拉，所以 gh 登入是使用前提。本人選 (B)：llmgw
+# 自己用瀏覽器 gh auth login，不走 token 檔（風險由本人接受）。這一步只看狀態：
+# gh 沒裝 → fail；沒登入 → todo（本人登入後重跑本腳本即可）；已登入 → ok。
+# bootstrap 不代做登入，也不碰任何 token 值。
+step_gh_auth() {
+    # 這一步第一個動作就是 sudo；沒快取時 sudo -n 必敗、會印出假 todo，
+    # 所以跟 step_sshd 一樣先刷新（同 M-F1 的理由）。
+    sudo_refresh || return 1
+
+    local out rc=0
+    # 以 llmgw 身分問；gh auth status 的輸出不含 token 值，仍不印出來
+    out="$(run_as_llmgw gh auth status 2>&1)" || rc=$?
+    if [[ "$rc" -eq 127 ]]; then
+        log_step gh-auth fail "找不到 gh（${USER_NAME} 身分要裝 gh 才能拉金鑰）"
+        step_failed=1
+        return 1
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        # 沒登入／token 失效是「要人做」，不是腳本失敗：記 todo、照常跑完印摘要
+        log_step gh-auth todo "${USER_NAME} 的 gh 尚未登入"
+        record_todo "請本人執行 sudo -u ${USER_NAME} -i 後 gh auth login（選 (B)：用瀏覽器登入，不放 token 檔），再重跑本腳本"
+        return 0
+    fi
+    log_step gh-auth ok "${USER_NAME} 已登入 gh"
 }
 
 # -----------------------------------------------------------------------------
@@ -584,109 +615,115 @@ step_tunnel_key() {
 }
 
 # -----------------------------------------------------------------------------
-# 步驟 7: 部署公鑰
+# 步驟 7: 解密密碼（keysync.env）
 # -----------------------------------------------------------------------------
-step_deploy_key() {
-    if [[ -z "$DEPLOY_PUBKEY_FILE" ]]; then
-        log_step deploy-key todo "未提供部署公鑰 (--deploy-pubkey-file)"
-        record_todo "未提供部署公鑰 (--deploy-pubkey-file)"
-        return 0
-    fi
+# v5 乙：部署公鑰與 forced command 整組拿掉；改成引導寫入 key-sync 用的解密密碼。
+# 檔案只放一行 LLMGW_KEYS_PASSWORD=…（0600、擁有者 llmgw）；密碼值不進 argv、
+# 不寫 log、不回顯。
+# 覆蓋的判準（與下面 :620 的 grep 一致）：既有檔已有「非空的密碼行」就不動它，
+# 密碼只有本人知道、要換就本人自己改。但空檔、只有註解、或那行是空值（VAR=）的
+# 檔視為「沒放」，會被 install 寫掉補上——不是無條件不覆蓋。
+KEY_SYNC_PASSWORD_VAR="LLMGW_KEYS_PASSWORD"
 
-    local lines_in_file
-    lines_in_file="$(grep -c '[^[:space:]]' "$DEPLOY_PUBKEY_FILE" || true)"
-    if [[ "$lines_in_file" -ne 1 ]] || ! ssh-keygen -l -f "$DEPLOY_PUBKEY_FILE" >/dev/null 2>&1; then
-        log_step deploy-key fail "部署公鑰檔案格式無效或非單行公鑰 (${DEPLOY_PUBKEY_FILE})"
-        step_failed=1
-        return 1
-    fi
+step_keysync() {
+    local conf_dir="${BOOT_HOME}/.config/llmgateway"
+    local target="${conf_dir}/keysync.env"
 
-    local pubkey
-    pubkey="$(grep '[^[:space:]]' "$DEPLOY_PUBKEY_FILE" | head -n 1)"
-    local pubkey_b64
-    pubkey_b64="$(awk '{print $2}' <<< "$pubkey")"
-    if [[ -z "$pubkey_b64" ]]; then
-        log_step deploy-key fail "無法解析部署公鑰 base64 內容"
-        step_failed=1
-        return 1
-    fi
-
-    local remote_deploy="${BOOT_HOME}/.local/share/llmgateway/current/deploy/remote-deploy.sh"
-    local target_line="command=\"${remote_deploy}\",restrict ${pubkey}"
-    local auth_keys="${BOOT_HOME}/.ssh/authorized_keys"
-
-    local needs_update=1
-    local auth_content=""
-    local auth_state=0
-    llmgw_exists "$auth_keys" || auth_state=$?
-    case "$auth_state" in
+    local env_state=0 existing=""
+    llmgw_exists "$target" || env_state=$?
+    case "$env_state" in
         0)
-            if ! auth_content="$(run_as_llmgw cat "$auth_keys")"; then
-                log_step deploy-key fail "無法讀取 authorized_keys (${auth_keys})"
+            if ! existing="$(run_as_llmgw cat "$target")"; then
+                log_step keysync fail "無法讀取 ${target}"
                 step_failed=1
                 return 1
             fi
-            local match_count
-            match_count="$(printf '%s\n' "$auth_content" | grep -c -F "$pubkey_b64" || true)"
-            if [[ "$match_count" -eq 1 ]]; then
-                local matching_line
-                matching_line="$(printf '%s\n' "$auth_content" | grep -F "$pubkey_b64" || true)"
-                if [[ "$matching_line" == "$target_line" ]]; then
-                    needs_update=0
-                fi
-            fi
             ;;
         1)
-            :  # 不存在 → 直接寫入
+            :  # 不存在 → 下一步才寫
             ;;
         *)
-            log_step deploy-key fail "無法判斷 authorized_keys 是否存在 (${auth_keys})，不覆寫"
+            log_step keysync fail "無法判斷 ${target} 是否存在，不覆寫"
             step_failed=1
             return 1
             ;;
     esac
 
-    if [[ $needs_update -eq 0 ]]; then
-        log_step deploy-key ok "部署公鑰已就位"
+    if grep -Eq "^[[:space:]]*${KEY_SYNC_PASSWORD_VAR}=[^[:space:]]+" <<< "$existing"; then
+        log_step keysync ok "解密密碼已就位 (${target})"
+        return 0
+    fi
+
+    local password=""
+    if [[ -n "$DECRYPT_PASS_FILE" ]]; then
+        # 密碼檔：單行、不含空白；值只進記憶體與暫存檔，不上命令列
+        local pass_lines
+        pass_lines="$(grep -c '[^[:space:]]' "$DECRYPT_PASS_FILE" || true)"
+        if [[ "$pass_lines" -ne 1 ]]; then
+            log_step keysync fail "解密密碼檔格式無效（只能有一行、不能是空的）"
+            step_failed=1
+            return 1
+        fi
+        if ! password="$(head -n 1 "$DECRYPT_PASS_FILE")"; then
+            log_step keysync fail "無法讀取解密密碼檔"
+            step_failed=1
+            return 1
+        fi
+        if [[ -z "$password" || "$password" =~ [[:space:]] ]]; then
+            log_step keysync fail "解密密碼檔格式無效（值不能有空白）"
+            step_failed=1
+            return 1
+        fi
+    elif [[ "$DECRYPT_PROMPT" != "0" && -t 0 ]]; then
+        # 互動輸入（不回顯）；只在真的接在終端機時問，管線、自動化不會卡住
+        printf '輸入解密密碼（不回顯；直接 Enter 跳過）: ' >&2
+        IFS= read -r -s password || password=""
+        printf '\n' >&2
+        if [[ "$password" =~ [[:space:]] ]]; then
+            password=""
+        fi
+    fi
+
+    if [[ -z "$password" ]]; then
+        log_step keysync todo "未提供解密密碼 (--decrypt-pass-file 或互動輸入)"
+        record_todo "未提供解密密碼（寫入 ${target} 才能讓 key-sync 拉 key）"
         return 0
     fi
 
     if [[ $CHECK_ONLY -eq 1 ]]; then
-        log_step deploy-key todo "部署公鑰待更新至 authorized_keys"
-        record_todo "部署公鑰待更新至 ${auth_keys}"
+        log_step keysync todo "解密密碼尚未就位 (--check 不改任何東西)"
+        record_todo "解密密碼尚未寫入 ${target}"
         return 0
     fi
 
     sudo_refresh || return 1
-    if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
-        log_step deploy-key fail "建立 ${BOOT_HOME}/.ssh 失敗"
+    if ! ensure_llmgw_dir "$conf_dir" 755; then
+        log_step keysync fail "建立 ${conf_dir} 失敗"
         step_failed=1
         return 1
     fi
 
-    local tmp_auth
-    tmp_auth="$(mktemp "${BOOT_HOME}/.ssh/.auth.XXXXXX" 2>/dev/null || mktemp)"
-    # 只在能讀到原檔時才保留其他行；讀不到原檔但檔案存在則 fail（絕不覆蓋空內容）
-    if [[ -n "${auth_content:-}" ]]; then
-        printf '%s\n' "$auth_content" | grep -v -F "$pubkey_b64" > "$tmp_auth" || true
-    elif [[ $auth_state -eq 0 ]]; then
-        # 檔案存在但未取得內容（理論上已在上面 fail），保險再 fail
-        log_step deploy-key fail "無法讀取 authorized_keys 原內容，拒絕覆寫空內容"
-        rm -f "$tmp_auth"
+    local tmp_env
+    tmp_env="$(mktemp "${conf_dir}/.keysync.XXXXXX" 2>/dev/null || mktemp)"
+    chmod 600 "$tmp_env" 2>/dev/null || true
+    {
+        printf '# LLMGateway key-sync 解密密碼（%s、擁有者 %s）；不要進 repo、不要貼給人。\n' \
+            "0600" "$USER_NAME"
+        printf '%s=%s\n' "$KEY_SYNC_PASSWORD_VAR" "$password"
+    } > "$tmp_env"
+    unset password
+
+    local grp=""
+    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
+    if ! run_root install -m 600 -o "$USER_NAME" -g "${grp:-$USER_NAME}" "$tmp_env" "$target"; then
+        log_step keysync fail "install -m 600 ... keysync.env 失敗"
+        rm -f "$tmp_env"
         step_failed=1
         return 1
     fi
-    printf '%s\n' "$target_line" >> "$tmp_auth"
+    rm -f "$tmp_env"
 
-    if ! run_root install -m 600 -o "$USER_NAME" -g "$(id -gn "$USER_NAME" 2>/dev/null || echo "$USER_NAME")" "$tmp_auth" "$auth_keys"; then
-        log_step deploy-key fail "install -m 600 ... authorized_keys 失敗"
-        rm -f "$tmp_auth"
-        step_failed=1
-        return 1
-    fi
-    rm -f "$tmp_auth"
-
-    log_step deploy-key changed "已更新部署公鑰至 authorized_keys"
+    log_step keysync changed "已寫入解密密碼 (${target}，0600)"
     changed_count=$((changed_count + 1))
 }
 
@@ -977,14 +1014,12 @@ print_summary() {
         echo "   (無法判斷 ${tunnel_pub} 是否存在)"
     fi
     echo ""
-    echo "2. 這台的 ed25519 host 公鑰 (給 GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS):"
+    echo "2. 這台的 ed25519 host 公鑰（手動 ssh 進來對指紋；v5 不再有部署 secret）:"
     if [[ -f "$HOSTKEY_FILE" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" || "$line" =~ ^# ]] && continue
             # 只印前兩欄（類型 + 金鑰），去掉註解（可能帶機器名）
-            awk '{print $1, $2}' <<< "$line" | while read -r type key rest; do
-                printf '[127.0.0.1]:4711 %s %s\n' "$type" "$key"
-            done
+            awk '{print $1, $2}' <<< "$line"
         done < "$HOSTKEY_FILE"
     else
         echo "   (未找到 host key: ${HOSTKEY_FILE})"
@@ -1020,11 +1055,12 @@ run_step() {
 
 run_step step_prereq
 run_step step_user
+run_step step_gh_auth
 run_step step_linger
 run_step step_sshd
 run_step step_install
 run_step step_tunnel_key
-run_step step_deploy_key
+run_step step_keysync
 run_step step_rendezvous
 run_step step_check
 

@@ -36,9 +36,8 @@
 ### 2.1 `gh` 登入（本人，以 `llmgw` 身分）
 
 - `gh` 的登入跟著 Unix 使用者走；key-sync 以 `llmgw` 跑，所以本人 `sudo -u llmgw -i` 後執行 `gh auth login`，token 存在 `~llmgw/.config/gh/`（0600）。
-- token 二選一（請本人擇一）：
-  - （甲，推薦）只讀 `FATESAIKOU/LLMGateway-keys` 單一 repo 的 fine-grained token：`gh auth login --with-token` 讀 token 登入；權限最小，就算這台的登入狀態外洩也只影響該 repo 的讀。
-  - （乙）接受預設：`gh auth login` 互動登入，token 拿到本人帳號的 repo 全權限；拿著這台登入狀態的人能讀寫本人所有 repo，本人接受此風險才選。
+- **認證方式本人已定（2026-10-12，選 B）**：`llmgw` 用瀏覽器 `gh auth login` 登入，**不用** `--with-token` 的 token 檔；憑證由 `gh` 自己管在 `~llmgw/.config/gh/`（0600），LLMGateway 不碰、不複製、不轉發它的值。
+- 選 B 的後果（**本人已知並接受**）：`gh` 的登入狀態對應本人帳號的一般權限，拿著這台 `llmgw` 登入狀態的人可能讀寫本人其他 repo，所以這台不能當成完全隔離的機器。相應地，`install.sh --check` 除了問「登入了沒」，還要實際問一次讀不讀得到 `FATESAIKOU/LLMGateway-keys`（`gh api repos/… --jq .full_name`，只問 repo 本身、不讀檔案內容）；讀不到就是不能用。
 - 不用 deploy key（本人裁定）：免在 repo 登記公鑰、免管 ssh host key；代價是服務那台要有 `gh` 且登入狀態有效，失效時 key 凍在舊版（§1.2 第 7 步）。
 
 ### 2.2 解密密碼的放置
@@ -80,7 +79,7 @@
    shred -u keys.env  # 刪明文
    git add keys.env.enc && git commit -m 'update keys' && git push
    ```
-3. **`gh` 登入（以 `llmgw` 身分）**：`sudo -u llmgw -i` 後 `gh auth login`（預設）或 `gh auth login --with-token`（只讀單一 repo 的 fine-grained token，推薦）；二選一見 §2.1。
+3. **`gh` 登入（以 `llmgw` 身分）**：`sudo -u llmgw -i` 後 `gh auth login`（選 B：用瀏覽器登入，不放 token 檔；說明見 §2.1）。
 4. **加 secret**：本 repo `llmgateway-deploy` environment 加 `GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`（解密密碼備份；AI 不經手值）；收掉五把 key secret、部署連線 4 個；請 mylinuxpool-pm 拿掉部署公鑰登記（隧道公鑰保留）。
 5. **之後換 key**：照 §3.3（改明文→重加密→刪明文→push→等一次拉取；趕時間手動觸發 key-sync→驗證）。
 
@@ -113,6 +112,6 @@
 2. worker 本機 port 預設 **4710**，可改。
 3. key-sync 放 **`ops-scripts/`**。
 4. 拉取頻率約 **10 分鐘**＋可手動觸發。
-5. 不用 deploy key：`gh` 拉，登入是使用前提（`llmgw` 身分，token 二選一）。
+5. 不用 deploy key：`gh` 拉，登入是使用前提（`llmgw` 身分，選 B：`gh auth login` 用瀏覽器登入、不放 token 檔，權限風險由本人接受）。
 6. 名稱：`FATESAIKOU/LLMGateway-keys`、`keys.env.enc`、`GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`。
 7. MyAiEntry#147 **關掉**，手機自行轉發。

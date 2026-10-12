@@ -129,5 +129,5 @@
 1. **冷卻只收 `until`**：`POST …/cooldown` 的 body 改 `{until}`；`cooldown` 欄位改單一 `{until}` 或 null；`available`＝已部署且無未來 `until`；sidecar 判讀不出恢復時間時報現在＋1 小時。
 2. **拿掉 `lgw connect`**：上文 §2.0a 整節作廢；sidecar 直接 curl 本機 port（本機 port 預設 4710，可改；worker 由 MyLinuxPool capability 建通道，Mac 用 mlp 或 ssh -J 自己轉發；手機自行轉發，LLMGateway 不提供程式，MyAiEntry#147 已關掉）。
 3. **反向隧道搬到 `ops-scripts/`**：`llmgateway-tunnel` 與其 unit 內容不變、只搬目錄；`install.sh`、`bootstrap.sh` 改從新路徑裝。
-4. **金鑰自己拉（v5 第二輪選乙）**：正本是 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`；key-sync 約每 10 分鐘用 `gh` 拉（`gh api …/contents/keys.env.enc`，blob `sha` 即版本）→解碼→解密→驗證→原子替換；`lgwd` 依 mtime 重讀；`gh` 登入是使用前提（`llmgw` 身分，token 二選一）。拿掉：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 4 secret、MyLinuxPool 部署公鑰登記（隧道公鑰保留）。升級改手動（上文 §2.4）。
+4. **金鑰自己拉（v5 第二輪選乙）**：正本是 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`；key-sync 約每 10 分鐘用 `gh` 拉（`gh api …/contents/keys.env.enc`，blob `sha` 即版本）→解碼→解密→驗證→原子替換；`lgwd` 依 mtime 重讀；`gh` 登入是使用前提（`llmgw` 身分、`gh auth login` 用瀏覽器登入，不用 token 檔）。拿掉：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 4 secret、MyLinuxPool 部署公鑰登記（隧道公鑰保留）。升級改手動（上文 §2.4）。
 5. **說法**：sshproxy 是既有設施；sidecar 內部層次不寫名。
