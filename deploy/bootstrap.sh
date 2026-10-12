@@ -5,6 +5,7 @@
 # 由具備 sudo 權限之帳號執行，可重複執行 (冪等)。
 set -euo pipefail
 
+# TAG 格式與 deploy/install.sh 的 TAG_REGEX 同值；改一邊要改另一邊。
 TAG_REGEX='^lgw-v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'
 
 usage() {

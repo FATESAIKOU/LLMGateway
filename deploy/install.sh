@@ -13,6 +13,7 @@
 set -uo pipefail
 
 LGW_REPO="https://github.com/FATESAIKOU/LLMGateway"
+# TAG 格式與 deploy/bootstrap.sh 的 TAG_REGEX 同值；改一邊要改另一邊。
 TAG_REGEX='^lgw-v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'
 
 log() {
