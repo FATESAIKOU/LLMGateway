@@ -63,7 +63,7 @@ v4 定案（2026-10-11 深夜）。v5 增補（2026-10-12）見最下面一節�
 - [ ] 3.1d′（v5 乙）拿掉 `deploy-service` workflow 與 `remote-deploy.sh` 整檔；升級改管理帳號手動 ssh 上去跑 `install.sh --tag`（手冊步驟，不寫機器名）；`tests/test_deploy_script.py`、`tests/test_workflows.py` 一併拿掉
 - [ ] 3.3′ bootstrap 拿掉部署公鑰／forced command 步驟（`--deploy-pubkey-file`、`step_deploy_key`）；初次啟動改放解密密碼（`--decrypt-pass-file` 或互動輸入，寫 `keysync.env`）；`gh` 登入由本人手動做，bootstrap 不做
 - [ ] 3.4′ 本人設定（AI 不經手值）：environment「llmgateway-deploy」留著，只放 `GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`（解密密碼備份）；收掉五把 `POOL_LLMGATEWAY__*__LLM`、部署連線 4 個（`GH_LLMGATEWAY__POOL_SSH__DEPLOY*`）、MyLinuxPool 那側部署公鑰登記（隧道公鑰保留）
-- [ ] 3.5′（新增）key-sync：小 script＋systemd timer（約每 10 分鐘）：拉→比對→解密（`-pass env:`／`fd:`）→驗證格式→原子替換→`lgwd` 依 mtime 重讀；失敗保留舊版；`lgwd` 拿掉 SIGHUP（`llmgateway.service` 拿掉 `ExecReload`）
+- [ ] 3.5′（新增）key-sync（放 `ops-scripts/`）：小 script＋systemd timer（約每 10 分鐘＋可手動觸發）：`gh api` 拉→比對 blob `sha`→解碼→解密（`-pass env:`）→驗證格式→原子替換→`lgwd` 依 mtime 重讀；失敗（含 `gh` 沒登入／token 失效）保留舊版；`lgwd` 拿掉 SIGHUP（`llmgateway.service` 拿掉 `ExecReload`）；`--check` 看得出「gh 不能用」
 - [ ] 4.1′ Mac 驗收改走自備通道（手寫 ssh -L 或 mlp）；換把驗收用 `{until}` 登錄
 - [ ] 4.2′ 升級改手動：管理帳號 ssh 上去跑 `install.sh --tag`，前後各一次 `--check`
 - [ ] 4.6′ 秘密掃描：private repo 加密檔、解密密碼不進本 repo；repo、資料庫、log、list 回覆無 key 的值

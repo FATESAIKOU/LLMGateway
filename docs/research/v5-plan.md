@@ -8,7 +8,7 @@
 
 ### 1.1 元件
 
-- **key-sync**：新增小 script（標準函式庫以外只用 `gh` 與 `openssl` 兩個外部指令；不用 `git`，本機不留 mirror），跑在服務那台的 `llmgw` 身分，由 systemd timer 約每 10 分鐘觸發一次；也允許本人手動觸發跑一次（提早生效，不用等 10 分鐘）。
+- **key-sync**：新增小 script（放 `ops-scripts/`；標準函式庫以外只用 `gh` 與 `openssl` 兩個外部指令；不用 `git`，本機不留 mirror），跑在服務那台的 `llmgw` 身分，由 systemd timer 約每 10 分鐘觸發一次；也允許本人手動觸發跑一次（提早生效，不用等 10 分鐘）。
 - **key 檔**：沿用 `~/.local/state/llmgateway/keys.env`（0600，`llmgw`），格式不變（`lgwd/keys.py` 照用）。
 - **版本記錄**：`~/.local/state/llmgateway/.keysync.sha`，記上次套用的 blob `sha`（純文字，本人讀得到）。
 
