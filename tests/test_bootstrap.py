@@ -106,8 +106,8 @@ class BootstrapScriptTests(unittest.TestCase):
         #   sudo_no_cache=1：-n 的指令必須先有 sudo -v 刷新過，否則回非零
         # 一種真的 sudo 行為模擬（環境變數）：
         #   LGW_SUDO_CACHE_PPID=1：快取跟著 parent pid 走（沒有 tty 時的真機
-        #     行為）。-v 記下呼叫者的 PPID；-n 時 PPID 不同就沒有快取，回
-        #     「sudo: interactive authentication is required」。
+        #     行為，每 PPID 一檔）。-v 記下呼叫者的 PPID；-n 時同 PPID 沒記過
+        #     就沒有快取，回「sudo: interactive authentication is required」。
         #     腳本要在同一個 shell 層級先 -v 再 -n 才過得了：$(...) 子 shell
         #     的 PPID 跟主腳本不同，只在步驟開頭刷新的快取拿不到。
         sudo_script = """#!/usr/bin/env bash
@@ -141,11 +141,13 @@ if [[ $has_S -eq 1 && $has_v -eq 0 ]]; then
 fi
 
 if [[ "${LGW_SUDO_CACHE_PPID:-0}" == "1" ]]; then
+    # 每個 PPID 各記一筆（真機沒有 tty 時的行為；#19 低-2）。
+    # 舊版只留最後一次 -v 的 PPID（單槽），A 子 shell -v→主 shell -v 蓋掉→
+    # A 子 shell -n 會被誤判失敗；現每 PPID 一檔，不互相覆蓋。
     if [[ $has_v -eq 1 ]]; then
-        echo "$PPID" > "${LGW_TEST_STATE_DIR}/sudo-v-ppid"
+        echo "1" > "${LGW_TEST_STATE_DIR}/sudo-v-ppid-$PPID"
     elif [[ $has_n -eq 1 ]]; then
-        cached_ppid="$(cat "${LGW_TEST_STATE_DIR}/sudo-v-ppid" 2>/dev/null || true)"
-        if [[ -z "$cached_ppid" || "$cached_ppid" != "$PPID" ]]; then
+        if [[ ! -f "${LGW_TEST_STATE_DIR}/sudo-v-ppid-$PPID" ]]; then
             echo "sudo: interactive authentication is required" >&2
             exit 1
         fi
@@ -1167,6 +1169,83 @@ exit 1
         self.assertIn("PubkeyAuthentication", res.stdout)
         self.assertIn("DenyUsers", res.stdout)
         self.assertIn("ListenAddress 127.0.0.1:22", res.stdout)
+
+    def test_sshd_deny_wildcard_and_userhost_are_todo(self):
+        """DenyUsers 萬用字元／user@host 不自己解析，一律轉 todo（L-R9）"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        for deny in ("llmgw*", "llmgw@127.0.0.1"):
+            with self.subTest(deny=deny):
+                self._set_state("sshd_deny", deny)
+                res = self.run_bootstrap(args)
+                self.assertEqual(res.returncode, 3, res.stdout)
+                self.assertIn("[sshd] todo", res.stdout)
+                self.assertIn("人工確認", res.stdout)
+                self.assertNotIn("[sshd] fail", res.stdout)
+
+    def test_rendezvous_tmp_leaves_nothing(self):
+        """rendezvous 暫存成功與早敗兩路都不留檔（L-R11）"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        def leftovers():
+            found = []
+            for root, _, files in os.walk(self.sandbox):
+                for fn in files:
+                    if fn.startswith(".llmgw-env."):
+                        found.append(os.path.join(root, fn))
+            return found
+
+        # 成功路：走完不斷言內容，只斷言暫存清零
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assertEqual(leftovers(), [])
+
+        # 早敗路：known_hosts 安裝失敗（rendezvous 段、暫存已建出）。
+        # 換個埠，避開「已是最新」的提前返回，確保真的走到安裝步。
+        self._set_state("sudo_fail_substr", "install -m 644")
+        res = self.run_bootstrap([
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2223",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ])
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("[rendezvous] fail", res.stdout)
+        self.assertEqual(leftovers(), [])
+
+    def test_summary_public_keys_strip_comments(self):
+        """摘要的兩處公鑰只印前兩欄：註解（含機器名）不得出現在輸出（L-R8＋備查硬化）"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assert_summary_printed(res.stdout)
+        # host key fixture 的註解 root@mockhost 不得出現，但金鑰本體要在
+        self.assertNotIn("root@mockhost", res.stdout)
+        self.assertIn("FakeHostKeyForBootstrapTest999", res.stdout)
+        # 隧道 .pub 只印前兩欄：含註解的整行不得出現，去註解的行要在
+        # （註：stdout 別處仍有 llmgateway-tunnel 字樣如 unit 名與排程提醒，
+        # 這裡只斷言公鑰行本身去註解）。
+        self.assertNotIn("FakeTunnelPubKeyGenerated123 llmgateway-tunnel", res.stdout)
+        self.assertIn(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeTunnelPubKeyGenerated123\n",
+            res.stdout)
+        self.assertIn("FakeTunnelPubKeyGenerated123", res.stdout)
 
     # -------------------------------------------------------------------------
     # #18 sudo 驗證快取跟著 parent pid

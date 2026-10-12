@@ -13,6 +13,7 @@
 set -uo pipefail
 
 LGW_REPO="https://github.com/FATESAIKOU/LLMGateway"
+# TAG 格式與 deploy/bootstrap.sh 的 TAG_REGEX 同值；改一邊要改另一邊。
 TAG_REGEX='^lgw-v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'
 
 log() {
@@ -270,6 +271,11 @@ check_unit() {
             ;;
     esac
 
+    # 隧道重啟已排程（約 60 秒後重連）：不改三態，只提醒 (L-R3)。
+    if "$SYSTEMCTL" --user is-active --quiet llmgateway-tunnel-restart.timer >/dev/null 2>&1; then
+        log INFO "llmgateway-tunnel: 重啟已排程（約 60 秒後重連），不是故障"
+    fi
+
     # 服務活著，再看金鑰拉取那條路能不能用（v5.4）。
     check_keysync
 }
@@ -277,7 +283,8 @@ check_unit() {
 # check_keysync：key-sync 能不能用（v5.4）。0 成立、1 確定不成立、2 無法確認。
 #   1. 以服務帳號身分問 gh：有沒有登入、讀不讀得到金鑰 repo
 #      （沒登入／token 失效／讀不到 repo → 1：key 會凍在舊版；
-#        gh 不存在或查詢逾時 → 2：沒法確認）；
+#        gh 不存在或查詢逾時 → 2：沒法確認；
+#        經 sudo 問而 sudo 自己失敗（要密碼、本體缺席）→ 2：連問都沒問到）；
 #   2. 解密密碼放了沒（keysync.env 有非空的一行；只看有沒有，不讀值出來）；
 #   3. 上次拉取有沒有失敗（systemd 把最後一次非零結束的 oneshot 記成 failed）。
 # 排到最後才跑：前面（unit、本機、經會合點）先確定服務是活的。
@@ -292,10 +299,12 @@ check_keysync() {
     local current_user=""
     current_user="$(id -un 2>/dev/null || true)"
     local -a gh_cmd=()
+    local use_sudo=0
     if [[ -z "$current_user" || "$current_user" == "$service_user" ]]; then
         gh_cmd=("$gh_bin")
     else
         gh_cmd=("${LGW_SUDO:-sudo}" -n -u "$service_user" "$gh_bin")
+        use_sudo=1
     fi
     # 有 timeout 就加（沒有的系統就直接跑，不擋）
     if command -v timeout >/dev/null 2>&1; then
@@ -304,6 +313,15 @@ check_keysync() {
 
     local auth_out="" rc=0
     auth_out="$("${gh_cmd[@]}" auth status 2>&1)" || rc=$?
+    # 管理帳號直跑 --check 且 sudo 快取缺時，sudo -n 自己失敗（rc=1＋sudo:…）、
+    # 不在 sudoers（該版訊息無 sudo: 前綴）或sudo 轉交的指令不存在，
+    # 都不能算成「gh 沒登入」；sudo 本體缺席的 127 同理（#13 新-低-1）。三態用 2。
+    if [[ "$use_sudo" -eq 1 ]]; then
+        if [[ "$rc" -eq 127 || "$auth_out" == *"sudo:"* || "$auth_out" == *"not in the sudoers file"* || "$auth_out" == *"command not found"* ]]; then
+            log INFO "key-sync: 無法確認（sudo 需要密碼或失敗，無法以 ${service_user} 身分問 gh）"
+            return 2
+        fi
+    fi
     if [[ "$rc" -eq 127 ]]; then
         log INFO "key-sync: 無法確認（${service_user} 身分找不到 ${gh_bin}）"
         return 2
@@ -321,11 +339,32 @@ check_keysync() {
     # 不讀任何檔案內容。
     local repo_out="" repo_rc=0
     repo_out="$("${gh_cmd[@]}" api "repos/${KEYS_REPO}" --jq .full_name 2>&1)" || repo_rc=$?
+    # 同上：經 sudo 問而 sudo 自己失敗時回 2，不是「讀不到 repo」。
+    if [[ "$use_sudo" -eq 1 ]]; then
+        if [[ "$repo_rc" -eq 127 || "$repo_out" == *"sudo:"* || "$repo_out" == *"not in the sudoers file"* || "$repo_out" == *"command not found"* ]]; then
+            log INFO "key-sync: 無法確認（sudo 需要密碼或失敗，無法以 ${service_user} 身分問 gh）"
+            return 2
+        fi
+    fi
     if [[ "$repo_rc" -eq 124 ]]; then
         log INFO "key-sync: 無法確認（讀 ${KEYS_REPO} 逾時 ${gh_timeout}s）"
         return 2
     fi
-    if [[ "$repo_rc" -ne 0 ]] || [[ "$repo_out" != "${KEYS_REPO}" ]]; then
+    # 真 gh 的 --jq .full_name 預期回裸名；某版包引號或多空白時別誤判 1
+    # （觀察-2）。純 bash 修剪（不叫 sed/tr，測試 PATH 未必有）。
+    local repo_name="$repo_out"
+    repo_name="${repo_name#"${repo_name%%[![:space:]]*}"}"
+    repo_name="${repo_name%"${repo_name##*[![:space:]]}"}"
+    if [[ "$repo_name" == '"'*'"' ]]; then
+        repo_name="${repo_name#?}"
+        repo_name="${repo_name%?}"
+    elif [[ "$repo_name" == \'*\' ]]; then
+        repo_name="${repo_name#?}"
+        repo_name="${repo_name%?}"
+    fi
+    repo_name="${repo_name#"${repo_name%%[![:space:]]*}"}"
+    repo_name="${repo_name%"${repo_name##*[![:space:]]}"}"
+    if [[ "$repo_rc" -ne 0 ]] || [[ "$repo_name" != "${KEYS_REPO}" ]]; then
         log INFO "key-sync: 不能用（讀不到 ${KEYS_REPO}：登入的帳號可能沒有讀權限）"
         return 1
     fi

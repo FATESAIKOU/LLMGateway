@@ -516,7 +516,7 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
 
 ### 5.1 key 沒有換（key-sync 的 log）
 
-看 `journalctl --user -u key-sync -n 20`，每一行是 `ok …` 或 `failed=<種類> …`（都不含值）。對照：
+看 `journalctl --user -u key-sync -n 20`，每一行是 `ok …`、`failed=<種類> …`或 `bad_config …`（都不含值）。對照：
 
 | log | 意思 | 怎麼辦 |
 |---|---|---|
@@ -532,6 +532,7 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
 | `failed=bad_response`／`decode_failed` | `gh api` 的回覆不是預期的 JSON／base64 | 手動跑一次同一條 `gh api` 指令看回什麼；檔案太大（> 1 MB）也會這樣 |
 | `failed=write_failed` | 寫 `keys.env` 失敗 | 看 `~/.local/state/llmgateway/` 的權限與磁碟空間 |
 | `failed=openssl_missing`／`code_missing`／`unexpected` | 環境缺東西（找不到 `openssl`、載不到 `lgwd` 套件）或未預期錯誤 | 照訊息補環境（1.4、1.5）；`unexpected` 要看訊息裡的例外種類再判斷 |
+| `bad_config …`（結束碼 3） | 設定錯（例如 `LGWSYNC_TIMEOUT` 非法：不是數字、非有限或 ≤0），不是同步失敗 | 修正環境變數（或 CLI `--timeout` 覆蓋）；舊 key 不動，下一次 timer 再試 |
 
 key-sync 失敗**不會**動舊 key：服務照用舊版。連續失敗才需要人看（看 log，不看 key）。要立刻套用：`systemctl --user start key-sync.service`。
 

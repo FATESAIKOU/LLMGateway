@@ -5,6 +5,7 @@
 # 由具備 sudo 權限之帳號執行，可重複執行 (冪等)。
 set -euo pipefail
 
+# TAG 格式與 deploy/install.sh 的 TAG_REGEX 同值；改一邊要改另一邊。
 TAG_REGEX='^lgw-v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'
 
 usage() {
@@ -187,8 +188,9 @@ run_as_llmgw() {
     local uid
     sudo_precheck || return 1
     uid="$(id -u "$USER_NAME" 2>/dev/null || echo "1000")"
-    # 先切到 llmgw 可讀的目錄，避免繼承管理帳號 cwd 導致 git clone 失敗 (H6)
-    sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" bash -c 'cd "${BOOT_HOME:-/home/llmgw}" || cd /; exec "$@"' bash "$@" </dev/null
+    # 先切到 llmgw 可讀的目錄，避免繼承管理帳號 cwd 導致 git clone 失敗 (H6)；
+    # BOOT_HOME 一起送進去，否則內層恆 fallback 到 /home/llmgw (L-R7)。
+    sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" BOOT_HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" bash -c 'cd "${BOOT_HOME:-/home/llmgw}" || cd /; exec "$@"' bash "$@" </dev/null
 }
 
 # llmgw_exists：以 llmgw 身分判斷路徑狀態，並把「不存在」與「讀不到」分開
@@ -422,7 +424,7 @@ step_sshd() {
     local reasons=()
     # sshd -T 拿不到輸出（指令失敗或空輸出）是「問不出來」，不是「未啟用
     # PubkeyAuthentication」：前者要記 fail 請人修（沒有權限、sshd 設定壞掉、
-    # sudo 驗證失敗都屬於這類），後者才是照設定判断。兩者混為一談會讓
+    # sudo 驗證失敗都屬於這類），後者才是照設定判斷。兩者混為一談會讓
     # 主機明明不安全卻只看到 todo (M-F1)。
     local sshd_out="" sshd_rc=0
     # run_root 讀密碼檔時是 < "$SUDO_PASS_FILE"（指令本身仍是 </dev/null），
@@ -444,10 +446,20 @@ step_sshd() {
     deny_users="$(grep -Ei '^denyusers[[:space:]]+' <<< "$sshd_out" | cut -d' ' -f2- || true)"
     if [[ -n "$deny_users" ]]; then
         for u in $deny_users; do
-            if [[ "$u" == "$USER_NAME" ]]; then
-                reasons+=("sshd DenyUsers 阻擋了 ${USER_NAME} (需自 DenyUsers 移除)")
-                break
-            fi
+            # 萬用字元或 user@host 不自己解析，一律轉 todo 請人工確認 (L-R9；
+            # 同 AllowUsers 與 DenyGroups 的做法)。
+            case "$u" in
+                *\** | *\?* | *@*)
+                    reasons+=("sshd DenyUsers 包含萬用字元或 user@host 格式（${u}），請人工確認是否阻擋 ${USER_NAME}")
+                    break
+                    ;;
+                *)
+                    if [[ "$u" == "$USER_NAME" ]]; then
+                        reasons+=("sshd DenyUsers 阻擋了 ${USER_NAME} (需自 DenyUsers 移除)")
+                        break
+                    fi
+                    ;;
+            esac
         done
     fi
 
@@ -523,7 +535,9 @@ step_sshd() {
     fi
 
     local ss_out=""
-    ss_out="$(ss -ltn 2>/dev/null || true)"
+    # ss 可能在 /usr/sbin（PATH 未含時直接跑會找不到而誤記 todo）；先經 sudo 試，
+    # 失敗退回直接跑 (L-R6 後半；分類不變，只判監聽)。
+    ss_out="$(PATH="/usr/sbin:/sbin:$PATH" run_root ss -ltn 2>/dev/null || PATH="/usr/sbin:/sbin:$PATH" ss -ltn 2>/dev/null || true)"
     if ! grep -E '(127\.0\.0\.1:22|0\.0\.0\.0:22|\*:22|\[::\]:22|:::22)([[:space:]]|$)' <<< "$ss_out" >/dev/null 2>&1; then
         reasons+=("sshd 未在 127.0.0.1:22 監聽 (需於 sshd_config 加入 ListenAddress 127.0.0.1:22 並重啟 sshd)")
     fi
@@ -864,7 +878,19 @@ step_rendezvous() {
     fi
 
     local tmp_env
-    tmp_env="$(mktemp "${conf_dir}/.env.XXXXXX" 2>/dev/null || mktemp)"
+    # 暫存含會合點位址：優先建在輸入檔同目錄（操作者自家、寫得進去處），0600；
+    # 該目錄不可寫時退回 /tmp（仍 0600，函式返回即清，不常駐）(L-R11)。
+    # 不建在 llmgw 目錄（管理帳號寫不進去，舊碼恆退 /tmp 且早敗不清）。
+    # RETURN trap 是兜底（bash 3.2 上實測可用，當第二道防線；後面
+    # 2>/dev/null || true 留著防更舊的 sh；
+    # 所有早敗路徑下面仍逐一顯式 rm，見 sudo_refresh 與 ensure 兩處）。
+    tmp_env="$(mktemp "$(dirname "$RENDEZVOUS_KNOWN_HOSTS")/.llmgw-env.XXXXXX" 2>/dev/null || mktemp 2>/dev/null)" || {
+        log_step rendezvous fail "建暫存檔失敗"
+        step_failed=1
+        return 1
+    }
+    chmod 600 "$tmp_env" 2>/dev/null || true
+    trap 'rm -f "$tmp_env"; trap - RETURN' RETURN 2>/dev/null || true
 
     # 既有內容從 stdin 餵進去，python 不直接開檔（管理帳號可能讀不到）
     if ! printf '%s' "$env_existing" | gen_env > "$tmp_env"; then
@@ -892,28 +918,32 @@ step_rendezvous() {
         return 0
     fi
 
-    sudo_refresh || return 1
+    sudo_refresh || { rm -f "$tmp_env"; return 1; }
     local grp=""
     grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
         log_step rendezvous fail "建立 ${BOOT_HOME}/.ssh 失敗"
+        rm -f "$tmp_env"
         step_failed=1
         return 1
     fi
     if ! ensure_llmgw_dir "$conf_dir" 755; then
         log_step rendezvous fail "建立 ${conf_dir} 失敗"
+        rm -f "$tmp_env"
         step_failed=1
         return 1
     fi
     if [[ -n "$grp" ]]; then
         if ! run_root install -m 644 -o "$USER_NAME" -g "$grp" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
             log_step rendezvous fail "install -m 644 ... known_hosts 失敗"
+            rm -f "$tmp_env"
             step_failed=1
             return 1
         fi
     else
         if ! run_root install -m 644 -o "$USER_NAME" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
             log_step rendezvous fail "install -m 644 ... known_hosts 失敗"
+            rm -f "$tmp_env"
             step_failed=1
             return 1
         fi
@@ -1035,7 +1065,9 @@ print_summary() {
     llmgw_exists "$tunnel_pub" || pub_state=$?
     if [[ $pub_state -eq 0 ]]; then
         if pub_content="$(run_as_llmgw cat "$tunnel_pub")"; then
-            printf '%s\n' "$pub_content"
+            # 只印前兩欄（類型 + 金鑰），去掉註解（手產 .pub 註解可能帶機器名，
+            # 同 host key 的做法；備查硬化）。
+            awk '{print $1, $2}' <<< "$pub_content"
         else
             echo "   (無法讀取 ${tunnel_pub})"
         fi

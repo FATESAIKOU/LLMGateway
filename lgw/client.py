@@ -46,7 +46,10 @@ class Result:
 
 
 class Client:
-    """只用 urllib 打三個介面；網路問題一律回 unreachable，不丟例外。"""
+    """只用 urllib 打三個介面；網路問題一律回 unreachable，不丟例外。
+
+    base_url 不得含憑證；v0 只傳 loopback URL（例如 http://127.0.0.1:4710）。
+    """
 
     def __init__(self, base_url: str, timeout: float = 10):
         self._base_url = base_url.rstrip("/")
