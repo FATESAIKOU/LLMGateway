@@ -2,7 +2,7 @@
 # deploy/install.sh
 #
 # 在常駐機器上安裝 LLMGateway：固定 tag 取碼、current symlink 原子切換、
-# systemd user unit（租用服務 lgwd 與隧道守護 llmgateway-tunnel）。放哪一台
+# systemd user unit（subscription registry lgwd 與隧道守護 llmgateway-tunnel）。放哪一台
 # 由安裝的人決定，這裡不寫機器名或 IP。
 #
 # 隧道守護承載部署連線本身，所以這裡絕不當場 restart／stop 它：沒在跑就
@@ -224,16 +224,34 @@ check_unit() {
         log INFO "llmgateway: curl 連不上或逾時（rc=${rc}）"
         return 2
     fi
-    if [[ "$code" == "200" ]]; then
-        if [[ -n "$LGW_TAG" ]]; then
-            log INFO "llmgateway 正常（${LGW_TAG}，list 探針回 200）"
-        else
-            log INFO "llmgateway 正常（list 探針回 200）"
-        fi
-        return 0
+    if [[ "$code" != "200" ]]; then
+        log INFO "llmgateway: 本機 list 探針回 ${code}，不是 200"
+        return 1
     fi
-    log INFO "llmgateway: list 探針回 ${code}，不是 200"
-    return 1
+    log INFO "llmgateway: 本機 list 探針回 200"
+
+    # 經會合點：用隧道守護同一份設定與 ssh 參數再探一次端對端。
+    local probe_bin="${BIN_DIR}/${TUNNEL_BIN}" probe_rc
+    if [[ ! -x "$probe_bin" ]]; then
+        log INFO "llmgateway: 經會合點探針無法執行（找不到 ${probe_bin}）"
+        return 2
+    fi
+    HOME="$HOME_DIR" "$probe_bin" --probe-once >/dev/null 2>&1
+    probe_rc=$?
+    case "$probe_rc" in
+        0)
+            log INFO "llmgateway: 經會合點 list 探針回 200"
+            ;;
+        1)
+            log INFO "llmgateway: 經會合點 list 探針失敗（不是 200 或沒回應）"
+            return 1
+            ;;
+        *)
+            log INFO "llmgateway: 經會合點探針無法執行（rc=${probe_rc}）"
+            return 2
+            ;;
+    esac
+    return 0
 }
 
 # cleanup_old_versions：只留 current 指著的與前一個，其他刪掉；current 指著的絕對不刪。

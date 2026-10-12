@@ -142,7 +142,7 @@ bash ~/lgw-boot/deploy/bootstrap.sh \
 | `deploy-key` | `todo`：未給 `--deploy-pubkey-file` | 等部署公鑰就緒，第二次帶上。 |
 | `deploy-key` | `fail`：不是單行公鑰 | 檔案只能有一行 OpenSSH 公鑰（`ssh-keygen -l -f <部署公鑰檔>` 要能讀）；不要給私鑰、不要多行。 |
 | `rendezvous` | `todo`：未給會合點 | 等 MyLinuxPool 登記好，第二次帶上 `--rendezvous` 與 `--rendezvous-known-hosts`。 |
-| `check` | `fail`：`install.sh --check` 不是 0 | 看 4.4 的三態。隧道還沒設定時隧道守護停在 failed（`config_missing`，見 1.5），所以第一次執行時 `check` 不通過是預期的；全部步驟做完後仍不通過，照 5.4 排錯。 |
+| `check` | `fail`：`install.sh --check` 不是 0 | 看 4.4 的三態（含經會合點的探針）。隧道還沒設定時隧道守護停在 failed（`config_missing`，見 1.5），所以第一次執行時 `check` 不通過是預期的；全部步驟做完後仍不通過，照 5.4 排錯。 |
 
 摘要最後有一份剩餘 `todo` 清單，照著一條條做完再跑一次即可。
 
@@ -283,7 +283,7 @@ command="/home/llmgw/.local/share/llmgateway/current/deploy/remote-deploy.sh",re
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8480/v1/subscriptions
 ```
 
-`--check` 回 0、`curl` 印 200。接著從 Mac 照 3.1 連一次。
+`--check` 回 0（本機與經會合點的探針都回 200）、`curl` 印 200。接著從 Mac 照 3.1 連一次。
 
 ## 2. 本人在 GitHub 的設定
 
@@ -381,7 +381,7 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`（`id
 1. 打 tag `lgw-vX.Y.Z` 並 push。
 2. Actions → **deploy-service** → Run workflow，輸入 tag，本人核准。
 3. 那台跑 `install.sh --tag <tag>`：已有完整的就重用、沒有就抓到暫存再搬；原子切換 `current`；重裝兩個 unit 與執行檔；重啟 `lgwd`。只留用中與前一個版本。
-4. 隧道守護有變更時，`install.sh` 不當場重啟它（部署連線本身就走這條隧道，當場重啟會切斷部署），而是用 `systemd-run --user --on-active=60` 排一個約 60 秒後的重啟（只有隧道執行檔或 unit 與已裝的不同時才排；隧道沒在跑就直接 start）。所以 workflow 結束後約一分鐘隧道會重連，這段時間 list／get 會斷一下，客戶端重連即可，也不要在這一分鐘內接著再部署（排程用固定的 unit 名 `llmgateway-tunnel-restart`，還沒觸發時第二次排程會失敗，已知問題，見 docs/research/v0-impl-review.md M4）。
+4. 隧道守護有變更時，`install.sh` 不當場重啟它（部署連線本身就走這條隧道，當場重啟會切斷部署），而是用 `systemd-run --user --on-active=60` 排一個約 60 秒後的重啟（只有隧道執行檔或 unit 與已裝的不同時才排；隧道沒在跑就直接 start）。已經有 `llmgateway-tunnel-restart` 排程時就跳過不重排（那次重啟會載到新檔）；排程失敗只記警告，不會讓安裝失敗，留給下一次。所以 workflow 結束後約一分鐘隧道會重連，這段時間 list／get 會斷一下，客戶端重連即可。
 
 ### 4.3 看狀態
 
@@ -392,13 +392,16 @@ worker 的 sidecar 用 pool-tunnel 既有的 `/home/worker/.ssh/id_tunnel`（`id
 
 ### 4.4 `install.sh --check`（三態）
 
+`--check` 依序檢查：兩個 unit 都 active（有給 `--tag` 時版本要與 `current` 一致）→ 本機 `GET /v1/subscriptions` 回 200 → 經會合點的同一個 list 探針回 200。本機與經會合點的結果分開印。
+
 | 結果 | 意思 |
 |---|---|
-| 0 | 兩個 unit 都 active、版本與 `current` 一致（有給 `--tag` 時）、本機 `GET /v1/subscriptions` 回 200 |
-| 1 | 確定不正常：unit 沒在跑或 failed、版本不對、探針不是 200 |
-| 2 | 無法確認：連不上 user bus、curl 逾時等 |
+| 0 | 兩個 unit 都 active、版本一致（有給 `--tag` 時）、本機與經會合點 list 探針都回 200 |
+| 1 | 確定不正常：unit 沒在跑或 failed、版本不對、本機或經會合點的探針不是 200 |
+| 2 | 無法確認：連不上 user bus、本機 curl 逾時、經會合點探針無法執行（`tunnel.env` 不能用或找不到 ssh 等） |
 
-注意：`--check` 的探針打的是**本機** `127.0.0.1:<LGW_API_PORT>`，不經會合點；隧道斷了而 `llmgateway.service` 活著時仍會回 0。隧道通不通要看 `journalctl --user -u llmgateway-tunnel`（有沒有 `tunnel_up`、`probe_fail`），或從客戶端照 3.1 連一次。
+- 經會合點那一步是 `~/.local/bin/llmgateway-tunnel --probe-once`：讀 `tunnel.env`，用與隧道守護同一套 ssh 參數跑一次 `ssh -W 127.0.0.1:<REMOTE_API>`；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。
+- 本機不是 200 時不會跑經會合點那一步（本機就確定不正常了）；本機 200 但經會合點不是 200 表示隧道斷了或會合點的 4710 探不到，照 5.4 查。兩段探針都只證明 `GET /v1/subscriptions` 回 200。
 
 ### 4.5 外洩時
 
