@@ -219,11 +219,12 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
 
 - 正本：private repo `FATESAIKOU/LLMGateway-keys` 根目錄 `keys.env.enc`（只有本人用；`openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt`，密碼經 `-pass env:`／`fd:` 傳，不上命令列）。
 - 使用前提：服務那台以 `llmgw` 身分登入過 `gh`（`gh` 的登入跟著 Unix 使用者走；本人 `sudo -u llmgw -i` 後 `gh auth login`，token 存在 `~llmgw/.config/gh/` 0600）。LLMGateway 本身不做登入引導。
-- token 權限風險：`gh` 預設拿到本人帳號的 repo 全權限——拿著這台登入狀態的人能讀寫本人所有 repo。請本人擇一：(甲) 只讀單一 repo 的 fine-grained token，`gh auth login --with-token`（推薦）；(乙) 接受預設並承擔風險。見 v5-plan §2。
+- 認證方式本人已定（2026-10-12，選 B）：`llmgw` 用瀏覽器 `gh auth login` 登入，不用 `--with-token` 的 token 檔；憑證由 `gh` 自己管在 `~llmgw/.config/gh/`（0600），LLMGateway 不碰、不複製、不轉發其值。
+- 權限風險（**本人已知並接受**）：`gh` 的登入狀態對應本人帳號的一般權限，拿著這台登入狀態的人可能讀寫本人其他 repo，因此這台不能當成完全隔離的機器。相應地 `install.sh --check` 除問「登入了沒」，還要實際驗一次讀得到 `FATESAIKOU/LLMGateway-keys`（`gh api repos/… --jq .full_name`，只問 repo 本身、不讀檔案內容）；讀不到即判不能用。見 v5-plan §2。
 - 拉取：key-sync（放 `ops-scripts/` 的小 script＋systemd timer，約每 10 分鐘＋可手動觸發）跑 `gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc`，回傳的 blob `sha` 即版本（一樣就不動；不用 clone——免在本機留 mirror 少管一份狀態）：base64 解碼→openssl 解密→驗證格式→原子替換 `keys.env`→`lgwd` 依 mtime 重讀；失敗保留舊版、記 log。`gh` 沒登入或 token 失效同失敗處理；`install.sh --check` 看得出「gh 不能用」。
 - 拿掉（乙）：`deploy-keys`／`deploy-service` 兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀（`llmgateway.service` 的 `ExecReload` 一併拿掉）、bootstrap 的部署公鑰／forced command 步驟（`--deploy-pubkey-file`、`step_deploy_key`）、部署連線 4 secret（`GH_LLMGATEWAY__POOL_SSH__DEPLOY*`）、MyLinuxPool 那側的部署公鑰登記（隧道公鑰保留）。
 - 服務程式本身怎麼升級（乙）：管理帳號手動 ssh 上去跑 `install.sh --tag`（手冊步驟，不寫機器名），前後各跑一次 `--check`。
-- 初次啟動：先以 `llmgw` 身分 `gh auth login`（token 二選一見 v5-plan §2）＋放好解密密碼（`keysync.env`，見 v5-plan），再手動跑一次 key-sync 拉下首版，`--check` 才會過。LLMGateway 不做登入引導。
+- 初次啟動：先以 `llmgw` 身分 `gh auth login`（選 B：用瀏覽器登入，不放 token 檔，說明見 v5-plan §2）＋放好解密密碼（`keysync.env`，見 v5-plan），再手動跑一次 key-sync 拉下首版，`--check` 才會過。bootstrap 有一個 `gh-auth` 步驟只查登入狀態（沒登入記 todo、gh 沒裝記 fail），登入本身由本人做；LLMGateway 不做登入引導。
 
 ### 決定 7／8 的取代：冷卻 until-only
 

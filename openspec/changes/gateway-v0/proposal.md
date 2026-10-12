@@ -58,7 +58,7 @@
 1. **冷卻只收 `until`**：登錄冷卻的 body 改為 `{until}`（RFC 3339 UTC，何時能再用），拿掉 `window`（5h／1w）；list／get 的 `cooldown` 欄位改成單一 `until`（或 null）；`available`＝已部署且沒有未來的 `until`。sidecar 拿不到恢復時間時報「現在＋1 小時」（那是 sidecar 的行為；`lgw.signals` 只負責把判讀結果轉成 `{until}`）。
 2. **拿掉 `lgw connect`**：sidecar 直接 curl 本機的 port（本機 port 預設 4710，可改）。worker 端通道由 MyLinuxPool 的 LLMGateway capability 附建通道小 script 建立（LLMGateway 只寫清楚它需要什麼：本機 loopback 4710 即 HTTP API）；Mac 用 mlp 或 ssh -J 自己轉發；手機自行用 ssh -J 等方式轉發，LLMGateway 不提供程式。
 3. **反向隧道搬到 `ops-scripts/`**：`llmgateway-tunnel` 與其 unit 從 `deploy/` 搬到 `ops-scripts/`（維運工具定位），內容不變。
-4. **金鑰正本改放 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`**：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 secret 整組拿掉（乙）；key-sync 約每 10 分鐘用 `gh` 拉（`gh` 登入是使用前提，`llmgw` 身分，token 二選一），拉到新版就換。升級改管理帳號手動 ssh 上去跑 `install.sh --tag`。細節見 `docs/research/v5-plan.md`。
+4. **金鑰正本改放 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`**：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 secret 整組拿掉（乙）；key-sync 約每 10 分鐘用 `gh` 拉（`gh` 登入是使用前提，`llmgw` 身分，`gh auth login` 用瀏覽器登入、不用 token 檔，權限風險由本人接受），拉到新版就換。升級改管理帳號手動 ssh 上去跑 `install.sh --tag`。細節見 `docs/research/v5-plan.md`。
 5. **文件說法**：sidecar 內部的 SubscriptionSource 不是 LLMGateway 的事；sshproxy 是既有設施（MyLinuxPool 維運，LLMGateway 只當會合點用）。
 
 ### Capabilities（v5 增補）
