@@ -169,6 +169,29 @@ run_as_llmgw() {
     sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" bash -c 'cd "${BOOT_HOME:-/home/llmgw}" || cd /; exec "$@"' bash "$@" </dev/null
 }
 
+# llmgw_exists：以 llmgw 身分判斷路徑狀態，並把「不存在」與「讀不到」分開
+#   回 0：存在
+#   回 1：不存在
+#   回 2：無法判斷（llmgw 進不了父目錄，例如權限或家目錄不在預期位置）
+# 管理帳號不得直接 [[ -f ]] 讀 ~llmgw 底下的檔案：家目錄 0700/0750 時會讀不到
+# (F2)；一律經這裡判斷，讀不到時呼叫者要記 fail，不要當成不存在而覆寫。
+llmgw_exists() {
+    local path="$1" dir
+    dir="$(dirname "$path")"
+    # 進得去父目錄 → test -e 的結果可信
+    if run_as_llmgw test -x "$dir"; then
+        if run_as_llmgw test -e "$path"; then
+            return 0
+        fi
+        return 1
+    fi
+    # 進不去：分「父目錄不存在」與「父目錄存在但讀不到」
+    if ! run_as_llmgw test -d "$dir"; then
+        return 1
+    fi
+    return 2
+}
+
 # -----------------------------------------------------------------------------
 # 步驟日誌與狀態追蹤
 # -----------------------------------------------------------------------------
@@ -447,8 +470,18 @@ step_install() {
     local current_link="${share_dir}/current"
     local tag_file="${current_link}/.lgw-tag"
     local installed_tag=""
-    if [[ -f "$tag_file" ]]; then
-        installed_tag="$(cat "$tag_file" 2>/dev/null || true)"
+    local tag_state=0
+    llmgw_exists "$tag_file" || tag_state=$?
+    if [[ $tag_state -eq 0 ]]; then
+        if ! installed_tag="$(run_as_llmgw cat "$tag_file")"; then
+            log_step install fail "無法讀取已安裝版本檔 (${tag_file})"
+            step_failed=1
+            return 1
+        fi
+    elif [[ $tag_state -ne 1 ]]; then
+        log_step install fail "無法判斷已安裝版本檔是否存在 (${tag_file})"
+        step_failed=1
+        return 1
     fi
 
     if [[ -n "$TAG" && "$installed_tag" == "$TAG" && $REINSTALL -eq 0 ]]; then
@@ -510,9 +543,17 @@ step_install() {
 # -----------------------------------------------------------------------------
 step_tunnel_key() {
     local key_file="${BOOT_HOME}/.ssh/id_llmgw_tunnel"
-    if [[ -f "$key_file" ]]; then
+    local key_state=0
+    llmgw_exists "$key_file" || key_state=$?
+    if [[ $key_state -eq 0 ]]; then
         log_step tunnel-key ok "隧道金鑰已存在 (${key_file})"
         return 0
+    elif [[ $key_state -ne 1 ]]; then
+        # 無法判斷是否存在就不去產生：ssh-keygen 對既有檔會問覆寫，
+        # stdin 是 /dev/null 直接讀到 EOF 放棄，第二次執行必紅 (F2)
+        log_step tunnel-key fail "無法判斷隧道金鑰是否存在 (${key_file})，不重新產生"
+        step_failed=1
+        return 1
     fi
 
     if [[ $CHECK_ONLY -eq 1 ]]; then
@@ -580,22 +621,34 @@ step_deploy_key() {
 
     local needs_update=1
     local auth_content=""
-    if [[ -f "$auth_keys" ]]; then
-        if ! auth_content="$(sudo -n -u "$USER_NAME" cat "$auth_keys" 2>/dev/null)"; then
-            log_step deploy-key fail "無法讀取 authorized_keys (${auth_keys})"
+    local auth_state=0
+    llmgw_exists "$auth_keys" || auth_state=$?
+    case "$auth_state" in
+        0)
+            if ! auth_content="$(run_as_llmgw cat "$auth_keys")"; then
+                log_step deploy-key fail "無法讀取 authorized_keys (${auth_keys})"
+                step_failed=1
+                return 1
+            fi
+            local match_count
+            match_count="$(printf '%s\n' "$auth_content" | grep -c -F "$pubkey_b64" || true)"
+            if [[ "$match_count" -eq 1 ]]; then
+                local matching_line
+                matching_line="$(printf '%s\n' "$auth_content" | grep -F "$pubkey_b64" || true)"
+                if [[ "$matching_line" == "$target_line" ]]; then
+                    needs_update=0
+                fi
+            fi
+            ;;
+        1)
+            :  # 不存在 → 直接寫入
+            ;;
+        *)
+            log_step deploy-key fail "無法判斷 authorized_keys 是否存在 (${auth_keys})，不覆寫"
             step_failed=1
             return 1
-        fi
-        local match_count
-        match_count="$(printf '%s\n' "$auth_content" | grep -c -F "$pubkey_b64" || true)"
-        if [[ "$match_count" -eq 1 ]]; then
-            local matching_line
-            matching_line="$(printf '%s\n' "$auth_content" | grep -F "$pubkey_b64" || true)"
-            if [[ "$matching_line" == "$target_line" ]]; then
-                needs_update=0
-            fi
-        fi
-    fi
+            ;;
+    esac
 
     if [[ $needs_update -eq 0 ]]; then
         log_step deploy-key ok "部署公鑰已就位"
@@ -630,7 +683,7 @@ step_deploy_key() {
     # 只在能讀到原檔時才保留其他行；讀不到原檔但檔案存在則 fail（絕不覆蓋空內容）
     if [[ -n "${auth_content:-}" ]]; then
         printf '%s\n' "$auth_content" | grep -v -F "$pubkey_b64" > "$tmp_auth" || true
-    elif [[ -f "$auth_keys" ]]; then
+    elif [[ $auth_state -eq 0 ]]; then
         # 檔案存在但未取得內容（理論上已在上面 fail），保險再 fail
         log_step deploy-key fail "無法讀取 authorized_keys 原內容，拒絕覆寫空內容"
         rm -f "$tmp_auth"
@@ -654,52 +707,38 @@ step_deploy_key() {
 # -----------------------------------------------------------------------------
 # 步驟 8: 會合點設定
 # -----------------------------------------------------------------------------
-step_rendezvous() {
-    if [[ -z "$RENDEZVOUS" ]]; then
-        log_step rendezvous todo "未提供會合點設定 (--rendezvous 與 --rendezvous-known-hosts)"
-        record_todo "未提供會合點設定 (--rendezvous 與 --rendezvous-known-hosts)"
-        return 0
-    fi
-
-    local target_kh="${BOOT_HOME}/.ssh/known_hosts_rendezvous"
-    local conf_dir="${BOOT_HOME}/.config/llmgateway"
-    local target_env="${conf_dir}/tunnel.env"
-    local target_id="${BOOT_HOME}/.ssh/id_llmgw_tunnel"
-
-    local kh_differs=1
-    if [[ -f "$target_kh" ]] && cmp -s "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
-        kh_differs=0
-    fi
-
-    local tmp_env
-    tmp_env="$(mktemp "${conf_dir}/.env.XXXXXX" 2>/dev/null || mktemp)"
-
-    python3 - "$target_env" "$RENDEZVOUS" "$target_id" "$target_kh" > "$tmp_env" << 'EOF'
+# 產生 tunnel.env：既有內容由 stdin 讀入（呼叫端以 llmgw 身分讀好），
+# 保留註解與未列出的鍵，只換 RENDEZVOUS／IDENTITY／KNOWN_HOSTS。
+gen_env() {
+python3 - "$RENDEZVOUS" "$target_id" "$target_kh" << 'PYEOF'
 import sys
 
-path, rendezvous, identity, known_hosts = sys.argv[1:5]
+rendezvous, identity, known_hosts = sys.argv[1:4]
 lines = []
 keys_seen = set()
 
 try:
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.strip()
-            if "=" in stripped and not stripped.startswith("#"):
-                k = stripped.split("=", 1)[0].strip()
-                keys_seen.add(k)
-                if k == "RENDEZVOUS":
-                    lines.append(f"RENDEZVOUS={rendezvous}\n")
-                elif k == "IDENTITY":
-                    lines.append(f"IDENTITY={identity}\n")
-                elif k == "KNOWN_HOSTS":
-                    lines.append(f"KNOWN_HOSTS={known_hosts}\n")
-                else:
-                    lines.append(line)
-            else:
-                lines.append(line)
-except FileNotFoundError:
-    pass
+    raw = sys.stdin.buffer.read().decode("utf-8")
+except (OSError, UnicodeDecodeError) as exc:
+    # 讀既有內容出錯就退出，不要 traceback 讓整支腳本當場死掉
+    print("cannot read existing tunnel.env: %s" % type(exc).__name__, file=sys.stderr)
+    sys.exit(3)
+
+for line in raw.splitlines(keepends=True):
+    stripped = line.strip()
+    if "=" in stripped and not stripped.startswith("#"):
+        k = stripped.split("=", 1)[0].strip()
+        keys_seen.add(k)
+        if k == "RENDEZVOUS":
+            lines.append(f"RENDEZVOUS={rendezvous}\n")
+        elif k == "IDENTITY":
+            lines.append(f"IDENTITY={identity}\n")
+        elif k == "KNOWN_HOSTS":
+            lines.append(f"KNOWN_HOSTS={known_hosts}\n")
+        else:
+            lines.append(line)
+    else:
+        lines.append(line)
 
 if "RENDEZVOUS" not in keys_seen:
     lines.append(f"RENDEZVOUS={rendezvous}\n")
@@ -720,10 +759,69 @@ for k, v in defaults:
         lines.append(f"{k}={v}\n")
 
 sys.stdout.write("".join(lines))
-EOF
+PYEOF
+}
+
+step_rendezvous() {
+    if [[ -z "$RENDEZVOUS" ]]; then
+        log_step rendezvous todo "未提供會合點設定 (--rendezvous 與 --rendezvous-known-hosts)"
+        record_todo "未提供會合點設定 (--rendezvous 與 --rendezvous-known-hosts)"
+        return 0
+    fi
+
+    local target_kh="${BOOT_HOME}/.ssh/known_hosts_rendezvous"
+    local conf_dir="${BOOT_HOME}/.config/llmgateway"
+    local target_env="${conf_dir}/tunnel.env"
+    local target_id="${BOOT_HOME}/.ssh/id_llmgw_tunnel"
+
+    # 兩份既有檔案都以 llmgw 身分讀，並把「不存在」與「讀不到」分開 (F2)：
+    # 讀不到就 fail，不拿空內容覆寫。
+    local kh_state=0 kh_existing=""
+    llmgw_exists "$target_kh" || kh_state=$?
+    if [[ $kh_state -eq 0 ]]; then
+        if ! kh_existing="$(run_as_llmgw cat "$target_kh")"; then
+            log_step rendezvous fail "無法讀取 known_hosts (${target_kh})"
+            step_failed=1
+            return 1
+        fi
+    elif [[ $kh_state -ne 1 ]]; then
+        log_step rendezvous fail "無法判斷 known_hosts 是否存在 (${target_kh})"
+        step_failed=1
+        return 1
+    fi
+
+    local env_state=0 env_existing=""
+    llmgw_exists "$target_env" || env_state=$?
+    if [[ $env_state -eq 0 ]]; then
+        if ! env_existing="$(run_as_llmgw cat "$target_env")"; then
+            log_step rendezvous fail "無法讀取 tunnel.env (${target_env})"
+            step_failed=1
+            return 1
+        fi
+    elif [[ $env_state -ne 1 ]]; then
+        log_step rendezvous fail "無法判斷 tunnel.env 是否存在 (${target_env})"
+        step_failed=1
+        return 1
+    fi
+
+    local kh_differs=1
+    if [[ $kh_state -eq 0 && "$(cat "$RENDEZVOUS_KNOWN_HOSTS")" == "$kh_existing" ]]; then
+        kh_differs=0
+    fi
+
+    local tmp_env
+    tmp_env="$(mktemp "${conf_dir}/.env.XXXXXX" 2>/dev/null || mktemp)"
+
+    # 既有內容從 stdin 餵進去，python 不直接開檔（管理帳號可能讀不到）
+    if ! printf '%s' "$env_existing" | gen_env > "$tmp_env"; then
+        log_step rendezvous fail "產生 tunnel.env 失敗"
+        rm -f "$tmp_env"
+        step_failed=1
+        return 1
+    fi
 
     local env_differs=1
-    if [[ -f "$target_env" ]] && cmp -s "$tmp_env" "$target_env"; then
+    if [[ $env_state -eq 0 && "$(cat "$tmp_env")" == "$env_existing" ]]; then
         env_differs=0
     fi
 
@@ -812,13 +910,15 @@ EOF
 # -----------------------------------------------------------------------------
 step_check() {
     local install_script="${BOOT_HOME}/.local/share/llmgateway/current/deploy/install.sh"
-    if [[ ! -f "$install_script" ]]; then
-        if [[ $CHECK_ONLY -eq 1 ]]; then
+    local script_state=0
+    llmgw_exists "$install_script" || script_state=$?
+    if [[ $script_state -ne 0 ]]; then
+        if [[ $script_state -eq 1 && $CHECK_ONLY -eq 1 ]]; then
             log_step check todo "current 尚未安裝，無法執行 install.sh --check"
             record_todo "current 尚未安裝，無法執行 install.sh --check"
             return 0
         fi
-        log_step check fail "找不到 ${install_script}"
+        log_step check fail "找不到或無法讀取 ${install_script}"
         step_failed=1
         return 1
     fi
@@ -844,8 +944,14 @@ step_check() {
         local conf_dir="${BOOT_HOME}/.config/llmgateway"
         local tunnel_env="${conf_dir}/tunnel.env"
         local tunnel_configured=0
-        if [[ -f "$tunnel_env" ]] && grep -Eq '^RENDEZVOUS=[^[:space:]]+' "$tunnel_env" 2>/dev/null; then
-            tunnel_configured=1
+        local tunnel_state=0
+        llmgw_exists "$tunnel_env" || tunnel_state=$?
+        if [[ $tunnel_state -eq 0 ]]; then
+            local tunnel_content=""
+            if tunnel_content="$(run_as_llmgw cat "$tunnel_env")" \
+                && grep -Eq '^RENDEZVOUS=[^[:space:]]+' <<< "$tunnel_content"; then
+                tunnel_configured=1
+            fi
         fi
 
         local gw_active=0
@@ -880,10 +986,18 @@ print_summary() {
     echo "開機設定摘要 (Bootstrap Summary)"
     echo "======================================================================"
     echo "1. 隧道公鑰 (給 MyLinuxPool TUNNEL_EXTRA_PUBKEYS):"
-    if [[ -f "$tunnel_pub" ]]; then
-        cat "$tunnel_pub"
-    else
+    local pub_state=0 pub_content=""
+    llmgw_exists "$tunnel_pub" || pub_state=$?
+    if [[ $pub_state -eq 0 ]]; then
+        if pub_content="$(run_as_llmgw cat "$tunnel_pub")"; then
+            printf '%s\n' "$pub_content"
+        else
+            echo "   (無法讀取 ${tunnel_pub})"
+        fi
+    elif [[ $pub_state -eq 1 ]]; then
         echo "   (尚未產生)"
+    else
+        echo "   (無法判斷 ${tunnel_pub} 是否存在)"
     fi
     echo ""
     echo "2. 這台的 ed25519 host 公鑰 (給 GH_LLMGATEWAY__POOL_SSH__DEPLOY_KNOWN_HOSTS):"

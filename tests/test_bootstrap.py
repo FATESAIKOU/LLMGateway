@@ -18,7 +18,7 @@ TOOLS_LIST = [
     "mkdir", "mktemp", "chmod", "mv", "ln", "rm", "cat", "date",
     "whoami", "cp", "bash", "head", "grep", "ls", "readlink",
     "cmp", "stat", "dirname", "sort", "tail", "awk", "sed", "tr", "cut", "sleep",
-    "python3", "ssh", "env"
+    "test", "python3", "ssh", "env"
 ]
 
 
