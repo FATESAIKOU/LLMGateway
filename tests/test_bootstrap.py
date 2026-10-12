@@ -706,6 +706,38 @@ exit 1
         self.assertIn("[keysync] fail", res3.stdout)
         self.assertFalse(os.path.exists(keysync_env))
 
+    def test_keysync_env沒有非空密碼行時會被補上(self):
+        """既有檔但沒有非空密碼行（空檔／只有註解／VAR= 空值）視為沒放，會被寫掉補上。
+
+        這是 bootstrap 的實際行為，腳本註解也照這樣寫（審查 #13 低-4：
+        原本註解說「絕不覆蓋」過度絕對）。
+        """
+        conf_dir = os.path.join(self.home, ".config", "llmgateway")
+        keysync_env = os.path.join(conf_dir, "keysync.env")
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        for name, content in (
+            ("empty", ""),
+            ("comment_only", "# 只有註解\n"),
+            ("blank_value", "LLMGW_KEYS_PASSWORD=\n"),
+        ):
+            with self.subTest(state=name):
+                os.makedirs(conf_dir, exist_ok=True)
+                with open(keysync_env, "w", encoding="utf-8") as f:
+                    f.write(content)
+                os.chmod(keysync_env, 0o600)
+                res = self.run_bootstrap(args)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                self.assertIn("[keysync] changed", res.stdout)
+                with open(keysync_env, "r", encoding="utf-8") as f:
+                    self.assertIn(f"LLMGW_KEYS_PASSWORD={self.decrypt_password}", f.read())
+                self.assertEqual(stat.S_IMODE(os.stat(keysync_env).st_mode), 0o600)
+
     def test_互動輸入解密密碼不回顯也不外洩(self):
         """接在終端機時（stdin 是 tty）可以互動輸入；密碼寫進 keysync.env，不進 argv／輸出"""
         import pty
