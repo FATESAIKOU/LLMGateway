@@ -48,7 +48,7 @@ v4 定案（2026-10-11 深夜）。v5 增補（2026-10-12）見最下面一節�
 - [x] 5.2 手機的轉送：MyAiEntry#147（v5：手機改走自備通道，不再經 `lgw connect`，MyAiEntry PM 已通知？待確認）
 - [ ] 5.3 另開單：把 MyLinuxPool#50 的 key 來源換成 LLMGateway，收掉 MyLinuxPool 裡的 key
 - [ ] 5.4 通知 MyAiEntry PM：手機改成經會合點 SSH 轉發＋list／get（不再有租約、沒有應用層 token）
-- [ ] 5.5（v5 新增）通知 mylinuxpool-pm：worker 通道改由 MyLinuxPool 的 LLMGateway capability 附小 script 建立（LLMGateway 只提需求：本機 loopback 某 port 即 HTTP API）；本機 port 號約定待本人決定
+- [ ] 5.5（v5 新增）通知 mylinuxpool-pm：worker 通道改由 MyLinuxPool 的 LLMGateway capability 附小 script 建立，建到本機 loopback 4710（預設，可改）；LLMGateway 只提這個需求
 
 ## v5 增補（2026-10-12；取代或新增上面標了 v5 的項）
 

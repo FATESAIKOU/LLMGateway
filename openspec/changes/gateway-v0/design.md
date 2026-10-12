@@ -207,7 +207,7 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
 ### 決定 4 的取代：不提供客戶端連線程式
 
 - 拿掉 `lgw connect`（函式庫＋指令）與 `connect.json` 整套格式。sidecar 直接 curl 本機的 port。
-- LLMGateway 對通道只提一個需求：sidecar 所在機器本機 loopback 上的某個 port，必須是會合點 API 埠的 HTTP 轉發（純 HTTP、無認證）。port 號由建通道的一方與 sidecar 約定，LLMGateway 不規定（待本人決定，見 v5-plan 疑點）。
+- LLMGateway 對通道只提一個需求：sidecar 所在機器本機 loopback 上的某個 port，必須是會合點 API 埠的 HTTP 轉發（純 HTTP、無認證）。本機 port 預設 4710，建通道的一方可經設定改（worker 由 MyLinuxPool 的 capability script 建到這個 port）。注意這和會合點上的 4710 同號純屬巧合（不同機器），兩邊各自設定。
 - worker：由 MyLinuxPool 的 LLMGateway capability 附建通道小 script（那是 MyLinuxPool 的工作）；Mac／手機：用 mlp 或 ssh -J 自己轉發。
 - `lgw` 剩 `client`（list／get／登錄冷卻，base URL 由呼叫方給）與 `signals`（判讀結果轉 `{until}` 用）。
 
@@ -270,4 +270,4 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
 ## Open Questions
 
 - opencode 讀 key 與 baseURL 的方式（例如 `OPENCODE_CONFIG_CONTENT`）：屬於 sidecar 的 AgentDriver，實作時在 opencode 1.18.35 上驗證。
-- v5 待本人決定（見 `docs/research/v5-plan.md` 疑點）：服務程式本身怎麼升級（`upgrade` 動詞與 deploy-service 去留）；worker 本機 port 的約定；反向隧道與 ops-scripts 的邊界。
+- v5 第二輪後無未決：升級方式、worker port、ops-scripts 邊界、拉取頻率、repo 與 secret 名、手機通道皆已裁定（見 v5-plan §7）。
