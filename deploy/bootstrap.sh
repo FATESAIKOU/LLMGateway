@@ -192,6 +192,18 @@ llmgw_exists() {
     return 2
 }
 
+# ensure_llmgw_dir：以 llmgw 身分建立 ~llmgw 底下的目錄。
+# 不用 root 的 install -d：install -d -o/-g 只保證最後一層，中途建出的
+# 父層（~/.local、~/.local/share）歸 root，之後 install.sh 以 llmgw 身分
+# mkdir -p 會因父層不可寫而敗，新機第一次安裝直接紅燈 (M-F2)。
+# chmod 補上權限：mkdir -p -m 對已存在的目錄不改權限。
+ensure_llmgw_dir() {
+    local dir="$1" mode="$2"
+    run_as_llmgw mkdir -p -m "$mode" "$dir" || return 1
+    run_as_llmgw chmod "$mode" "$dir" || return 1
+    return 0
+}
+
 # -----------------------------------------------------------------------------
 # 步驟日誌與狀態追蹤
 # -----------------------------------------------------------------------------
@@ -499,21 +511,11 @@ step_install() {
         return 0
     fi
 
-    local grp=""
-    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     sudo_refresh
-    if [[ -n "$grp" ]]; then
-        if ! run_root install -d -m 755 -o "$USER_NAME" -g "$grp" "$share_dir"; then
-            log_step install fail "install -d ... ${share_dir} 失敗"
-            step_failed=1
-            return 1
-        fi
-    else
-        if ! run_root install -d -m 755 -o "$USER_NAME" "$share_dir"; then
-            log_step install fail "install -d ... ${share_dir} 失敗"
-            step_failed=1
-            return 1
-        fi
+    if ! ensure_llmgw_dir "$share_dir" 755; then
+        log_step install fail "建立 ${share_dir} 失敗"
+        step_failed=1
+        return 1
     fi
 
     local bootstrap_clone="${share_dir}/.bootstrap-${TAG}"
@@ -566,21 +568,11 @@ step_tunnel_key() {
         return 0
     fi
 
-    local grp=""
-    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     sudo_refresh
-    if [[ -n "$grp" ]]; then
-        if ! run_root install -d -m 700 -o "$USER_NAME" -g "$grp" "${BOOT_HOME}/.ssh"; then
-            log_step tunnel-key fail "install -d ... .ssh 失敗"
-            step_failed=1
-            return 1
-        fi
-    else
-        if ! run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"; then
-            log_step tunnel-key fail "install -d ... .ssh 失敗"
-            step_failed=1
-            return 1
-        fi
+    if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
+        log_step tunnel-key fail "建立 ${BOOT_HOME}/.ssh 失敗"
+        step_failed=1
+        return 1
     fi
     if ! run_as_llmgw ssh-keygen -t ed25519 -N '' -C llmgateway-tunnel -f "$key_file"; then
         log_step tunnel-key fail "ssh-keygen ... 失敗"
@@ -665,21 +657,11 @@ step_deploy_key() {
         return 0
     fi
 
-    local grp=""
-    grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     sudo_refresh
-    if [[ -n "$grp" ]]; then
-        if ! run_root install -d -m 700 -o "$USER_NAME" -g "$grp" "${BOOT_HOME}/.ssh"; then
-            log_step deploy-key fail "install -d ... .ssh 失敗"
-            step_failed=1
-            return 1
-        fi
-    else
-        if ! run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"; then
-            log_step deploy-key fail "install -d ... .ssh 失敗"
-            step_failed=1
-            return 1
-        fi
+    if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
+        log_step deploy-key fail "建立 ${BOOT_HOME}/.ssh 失敗"
+        step_failed=1
+        return 1
     fi
 
     local tmp_auth
@@ -845,18 +827,15 @@ step_rendezvous() {
     sudo_refresh
     local grp=""
     grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
-    if [[ -n "$grp" ]]; then
-        if ! run_root install -d -m 700 -o "$USER_NAME" -g "$grp" "${BOOT_HOME}/.ssh"; then
-            log_step rendezvous fail "install -d ... .ssh 失敗"
-            step_failed=1
-            return 1
-        fi
-    else
-        if ! run_root install -d -m 700 -o "$USER_NAME" "${BOOT_HOME}/.ssh"; then
-            log_step rendezvous fail "install -d ... .ssh 失敗"
-            step_failed=1
-            return 1
-        fi
+    if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
+        log_step rendezvous fail "建立 ${BOOT_HOME}/.ssh 失敗"
+        step_failed=1
+        return 1
+    fi
+    if ! ensure_llmgw_dir "$conf_dir" 755; then
+        log_step rendezvous fail "建立 ${conf_dir} 失敗"
+        step_failed=1
+        return 1
     fi
     if [[ -n "$grp" ]]; then
         if ! run_root install -m 644 -o "$USER_NAME" -g "$grp" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
@@ -871,23 +850,8 @@ step_rendezvous() {
             return 1
         fi
     fi
-    local grp_dir=""
-    grp_dir="$(id -gn "$USER_NAME" 2>/dev/null || true)"
-    if [[ -n "$grp_dir" ]]; then
-        if ! run_root install -d -m 755 -o "$USER_NAME" -g "$grp_dir" "$conf_dir"; then
-            log_step rendezvous fail "install -d ... conf_dir 失敗"
-            step_failed=1
-            return 1
-        fi
-    else
-        if ! run_root install -d -m 755 -o "$USER_NAME" "$conf_dir"; then
-            log_step rendezvous fail "install -d ... conf_dir 失敗"
-            step_failed=1
-            return 1
-        fi
-    fi
-    if [[ -n "${grp_dir:-}" ]]; then
-        if ! run_root install -m 600 -o "$USER_NAME" -g "$grp_dir" "$tmp_env" "$target_env"; then
+    if [[ -n "$grp" ]]; then
+        if ! run_root install -m 600 -o "$USER_NAME" -g "$grp" "$tmp_env" "$target_env"; then
             log_step rendezvous fail "install -m 600 ... tunnel.env 失敗"
             rm -f "$tmp_env"
             step_failed=1
