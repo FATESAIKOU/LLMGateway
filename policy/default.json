@@ -27,6 +27,5 @@
       "models": {"allow": ["*"], "default": null}
     }
   },
-  "cooldown_buffer_seconds": 120,
-  "resets_at_max_ahead_seconds": 691200
+  "until_max_ahead_seconds": 691200
 }

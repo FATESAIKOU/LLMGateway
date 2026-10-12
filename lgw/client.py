@@ -2,19 +2,17 @@
 
 用法：
 
-    with lgw.connect.connect(cfg) as base_url:      # 每次操作才連、用完就關
-        client = lgw.client.Client(base_url)
-        client.list(); client.get("claude-personal", "claude-code")
-        client.cooldown("claude-personal", "5h", resets_at="2026-10-12T03:00:00Z")
+    client = lgw.client.Client("http://127.0.0.1:4710")  # base URL 由呼叫方給
+    client.list(); client.get("claude-personal", "claude-code")
+    client.cooldown("claude-personal", "2026-10-12T03:00:00Z")
 
 - list() → GET /v1/subscriptions
 - get(id, agent) → GET /v1/subscriptions/{id}?agent={agent}
-- cooldown(id, window, resets_at=None) → POST /v1/subscriptions/{id}/cooldown，
-  body {"window": "5h"|"1w", "resets_at": RFC 3339 UTC?}；成功 204。
+- cooldown(id, until) → POST /v1/subscriptions/{id}/cooldown，body {"until": RFC 3339 UTC}；成功 204。
 - 沒有應用層認證（design 決定 5a），所以不帶任何認證標頭。
 - 回 Result：ok、status、data、error、unreachable。連不上或逾時回 unreachable=True、
   不丟例外；403／404／409／400 照實回狀態碼與 error。error 可能是：
-  - 服務回的碼：bad_request｜invalid_window｜invalid_resets_at｜resets_at_out_of_range｜
+  - 服務回的碼：bad_request｜invalid_until｜until_out_of_range｜
     agent_not_allowed｜not_found｜not_deployed｜body_too_large；
   - 客戶端判讀的：unreachable（連不上或逾時）｜bad_response（回覆不是 JSON 物件）。
 - Result 的 repr 不印 data（get 的 data 裡有 key）；不要 log／print 整個 Result。
@@ -109,11 +107,9 @@ class Client:
         )
         return self._send("GET", path, None)
 
-    def cooldown(self, id: str, window: str, resets_at: str | None = None) -> Result:
-        """登錄冷卻（5h／1w）；resets_at 傳 RFC 3339 UTC 字串；成功 204。"""
-        body: dict = {"window": window}
-        if resets_at is not None:
-            body["resets_at"] = resets_at
+    def cooldown(self, id: str, until: str) -> Result:
+        """登錄冷卻；until 是何時能再用（RFC 3339 UTC 字串）；成功 204。"""
+        body: dict = {"until": until}
         path = "/v1/subscriptions/{0}/cooldown".format(
             urllib.parse.quote(str(id), safe="")
         )

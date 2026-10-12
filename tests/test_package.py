@@ -35,15 +35,15 @@ class ImportsTest(unittest.TestCase):
                         roots.add(node.module.split(".")[0])
             offenders = roots - ALLOWED_ROOTS
             self.assertFalse(offenders, "{0}: {1}".format(path.name, sorted(offenders)))
-        self.assertGreaterEqual(seen, 4)  # __init__、client、connect、signals
+        self.assertGreaterEqual(seen, 3)  # __init__、client、signals
 
     def test_lazy_submodules(self):
-        """`import lgw` 後就有 lgw.connect.connect 與 lgw.client.Client（docstring 的用法）。"""
+        """`import lgw` 後就有 lgw.client.Client 與 lgw.signals.classify（docstring 的用法）。"""
         import lgw
 
-        self.assertTrue(callable(lgw.connect.connect))
         self.assertTrue(hasattr(lgw.client, "Client"))
         self.assertTrue(hasattr(lgw.signals, "classify"))
+        self.assertFalse(hasattr(lgw, "connect"))  # v5 拿掉客戶端連線程式
 
 
 class PyprojectTest(unittest.TestCase):
@@ -58,6 +58,10 @@ class PyprojectTest(unittest.TestCase):
         self.assertEqual(project["version"], "0.1.0")
         self.assertEqual(project["requires-python"], ">=3.10")
         self.assertEqual(project.get("dependencies", []), [])
+
+    def test_description_has_no_connect(self):
+        # v5 拿掉客戶端連線程式，描述不該再提 connect
+        self.assertNotIn("connect", self.data["project"]["description"])
 
     def test_build_backend_and_packages(self):
         self.assertEqual(

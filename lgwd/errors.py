@@ -1,12 +1,11 @@
-"""API 錯誤（design 決定 6 的錯誤表）。HTTP 層把 ApiError 轉成狀態碼與 JSON。
+"""API 錯誤（design 決定 6；v5 的錯誤碼表見 design 決定 8 的取代）。HTTP 層把 ApiError 轉成狀態碼與 JSON。
 
 訊息只用固定字串；不回顯請求裡的值（值永不進例外或 log）。
 
 完整錯誤碼表（回覆 JSON 一律為 {"error": "<碼>", ...}）：
 - 400 bad_request：JSON 解析失敗、body 不是物件、缺必填（保留 "missing": [...] 欄位）
-- 400 invalid_window：window 不是 "5h" 或 "1w"
-- 400 invalid_resets_at：resets_at 不是 RFC 3339 字串（或型別不對）
-- 400 resets_at_out_of_range：resets_at 在過去或超過 8 天以後
+- 400 invalid_until：until 不是 RFC 3339 字串（或型別不對）
+- 400 until_out_of_range：until 在過去或超過 8 天以後
 - 403 agent_not_allowed：agent 不在該筆的 agents 裡
 - 404 not_found：不存在的 id 或未知路徑
 - 409 not_deployed：key 尚未部署
@@ -38,19 +37,14 @@ def bad_request(missing: list[str] | None = None) -> ApiError:
     return ApiError(400, "bad_request", **extra)
 
 
-# 400：window 不是 "5h" 或 "1w"
-def invalid_window() -> ApiError:
-    return ApiError(400, "invalid_window")
+# 400：until 不是 RFC 3339 字串（或型別不對）
+def invalid_until() -> ApiError:
+    return ApiError(400, "invalid_until")
 
 
-# 400：resets_at 不是 RFC 3339 字串（或型別不對）
-def invalid_resets_at() -> ApiError:
-    return ApiError(400, "invalid_resets_at")
-
-
-# 400：resets_at 在過去或超過 8 天以後
-def resets_at_out_of_range() -> ApiError:
-    return ApiError(400, "resets_at_out_of_range")
+# 400：until 在過去或超過 8 天以後
+def until_out_of_range() -> ApiError:
+    return ApiError(400, "until_out_of_range")
 
 
 # 403：agent 不在該筆的 agents 裡
