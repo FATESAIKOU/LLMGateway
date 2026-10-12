@@ -131,9 +131,10 @@ class JsonSchemaTest(RegistryCase):
 
     def test_models欄位(self):
         items = _by_id(self.list_items())
-        self.assertEqual(items["openrouter"]["models"]["allow"], ["*:free"])
-        self.assertIsNone(items["openrouter"]["models"]["default"])
+        self.assertEqual(items["openrouter"]["models"]["allow"], ["*:free", "openrouter/free"])
+        self.assertEqual(items["openrouter"]["models"]["default"], "openrouter/free")
         self.assertEqual(items["opencode-zen"]["models"]["allow"], ["*"])
+        self.assertIsNone(items["opencode-zen"]["models"]["default"])
 
 
 class ListTest(RegistryCase):
@@ -204,7 +205,13 @@ class GetTest(RegistryCase):
         err = self.assert_api_error(409, "not_deployed", self.get, "claude-company", "claude-code")
         self.assertNotIn("key", err.body())
 
-    def test_opencode拿Zen與OpenRouter(self):
+    def test_get_openrouter回傳default模型(self):
+        for agent in ("opencode", "claude-code"):
+            with self.subTest(agent=agent):
+                item = self.get("openrouter", agent)
+                self.assertEqual(item["key"], CANARY["openrouter"])
+                self.assertEqual(item["models"]["default"], "openrouter/free")
+                self.assertEqual(item["models"]["allow"], ["*:free", "openrouter/free"])
         self.assertEqual(self.get("opencode-zen", "opencode")["key"], CANARY["opencode-zen"])
         self.assertEqual(self.get("openrouter", "opencode")["key"], CANARY["openrouter"])
         self.assertEqual(self.get("openrouter", "claude-code")["key"], CANARY["openrouter"])

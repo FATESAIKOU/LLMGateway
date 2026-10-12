@@ -30,7 +30,8 @@ def _good_policy(**over):
     base = {
         "subscriptions": {
             "claude-personal": _sub(10, ("claude-code",)),
-            "openrouter": _sub(20, ("claude-code", "opencode"), ("*:free",)),
+            "openrouter": _sub(20, ("claude-code", "opencode"),
+                               ("*:free", "openrouter/free"), "openrouter/free"),
         },
         "until_max_ahead_seconds": 691200,
     }
@@ -46,12 +47,23 @@ class LoadDefaultPolicyTests(unittest.TestCase):
                                  "claude-company", "openrouter", "ollama-cloud"])
         self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
-        self.assertEqual(policy.subscriptions["openrouter"].models_allow, ("*:free",))
+        self.assertEqual(policy.subscriptions["openrouter"].models_allow,
+                         ("*:free", "openrouter/free"))
         self.assertIn("claude-code", policy.subscriptions["openrouter"].agents)
         self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
         self.assertFalse(hasattr(policy, "cooldown_buffer_seconds"))  # 窗口欄位拿掉
         self.assertFalse(hasattr(policy, "resets_at_max_ahead_seconds"))
+
+    def test_openrouter出廠預設openrouter_free(self):
+        # 出廠政策檔：openrouter 的 default 是 openrouter/free，allow 含 *:free 與
+        # openrouter/free 兩個樣式（literal id 也要在樣式裡才選得到）
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        or_sub = policy.subscriptions["openrouter"]
+        self.assertEqual(or_sub.models_default, "openrouter/free")
+        self.assertIn("*:free", or_sub.models_allow)
+        self.assertIn("openrouter/free", or_sub.models_allow)
+        self.assertEqual(len(or_sub.models_allow), 2)
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -95,10 +107,12 @@ class PolicyValidationTests(unittest.TestCase):
             self._reload(obj)
 
     def test_openrouter_only_free_models(self):
-        with self.assertRaises(PolicyError):
-            obj = _good_policy()
-            obj["subscriptions"]["openrouter"]["models"]["allow"] = ["*"]
-            self._reload(obj)
+        for allow in (["*"], ["*:free", "*"], ["openrouter/free"], ["*:free", "openrouter/free", "*"]):
+            with self.subTest(allow=allow):
+                with self.assertRaises(PolicyError):
+                    obj = _good_policy()
+                    obj["subscriptions"]["openrouter"]["models"]["allow"] = allow
+                    self._reload(obj)
 
     def test_bad_numbers_rejected(self):
         for mutate in (
