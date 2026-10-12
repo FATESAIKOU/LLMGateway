@@ -1168,6 +1168,30 @@ exit 1
         self.assertIn("DenyUsers", res.stdout)
         self.assertIn("ListenAddress 127.0.0.1:22", res.stdout)
 
+    def test_summary_public_keys_strip_comments(self):
+        """摘要的兩處公鑰只印前兩欄：註解（含機器名）不得出現在輸出（L-R8＋備查硬化）"""
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 0, f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        self.assert_summary_printed(res.stdout)
+        # host key fixture 的註解 root@mockhost 不得出現，但金鑰本體要在
+        self.assertNotIn("root@mockhost", res.stdout)
+        self.assertIn("FakeHostKeyForBootstrapTest999", res.stdout)
+        # 隧道 .pub 只印前兩欄：含註解的整行不得出現，去註解的行要在
+        # （註：stdout 別處仍有 llmgateway-tunnel 字樣如 unit 名與排程提醒，
+        # 這裡只斷言公鑰行本身去註解）。
+        self.assertNotIn("FakeTunnelPubKeyGenerated123 llmgateway-tunnel", res.stdout)
+        self.assertIn(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeTunnelPubKeyGenerated123\n",
+            res.stdout)
+        self.assertIn("FakeTunnelPubKeyGenerated123", res.stdout)
+
     # -------------------------------------------------------------------------
     # #18 sudo 驗證快取跟著 parent pid
     # -------------------------------------------------------------------------

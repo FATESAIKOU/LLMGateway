@@ -1063,7 +1063,9 @@ print_summary() {
     llmgw_exists "$tunnel_pub" || pub_state=$?
     if [[ $pub_state -eq 0 ]]; then
         if pub_content="$(run_as_llmgw cat "$tunnel_pub")"; then
-            printf '%s\n' "$pub_content"
+            # 只印前兩欄（類型 + 金鑰），去掉註解（手產 .pub 註解可能帶機器名，
+            # 同 host key 的做法；備查硬化）。
+            awk '{print $1, $2}' <<< "$pub_content"
         else
             echo "   (無法讀取 ${tunnel_pub})"
         fi
