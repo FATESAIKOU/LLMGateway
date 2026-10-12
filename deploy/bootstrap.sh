@@ -160,12 +160,32 @@ sudo_refresh() {
     fi
 }
 
+# sudo_precheck：每次 sudo -n 之前，在同一個 shell 層級先靜默驗證一次 (M-F5)。
+#
+# 為什麼每次都要：沒有 tty 時 sudo 的驗證快取是跟著「呼叫者的 parent pid」
+# 走的。$(...) 會 fork 出 pid 不同的子 shell，所以腳本開頭那次
+# sudo_refresh 的快取，子 shell 裡的 sudo -n 拿不到——真機實測就是
+# 「sudo: interactive authentication is required」：第二次跑讀已安裝版本檔、
+# check 讀 tunnel.env、摘要讀隧道公鑰、sshd -T 全中。
+# 在同一層級（同一個函式、沒有多一層 subshell）接著做 -v，接下來的 -n
+# 才拿得到快取。
+#
+# 只在有 SUDO_PASS_FILE 時做：沒給密碼檔就維持現行行為（互動 sudo 自己問，
+# 加上每個步驟開頭的 sudo_refresh）。密碼只從 stdin 進，絕不上命令列、
+# 不進 log（-p '' 連提示都不印）。驗證失敗就回非零，由呼叫者記 fail。
+sudo_precheck() {
+    [[ -n "$SUDO_PASS_FILE" ]] || return 0
+    sudo -S -p '' -v < "$SUDO_PASS_FILE"
+}
+
 run_root() {
+    sudo_precheck || return 1
     sudo -n "$@" </dev/null
 }
 
 run_as_llmgw() {
     local uid
+    sudo_precheck || return 1
     uid="$(id -u "$USER_NAME" 2>/dev/null || echo "1000")"
     # 先切到 llmgw 可讀的目錄，避免繼承管理帳號 cwd 導致 git clone 失敗 (H6)
     sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" bash -c 'cd "${BOOT_HOME:-/home/llmgw}" || cd /; exec "$@"' bash "$@" </dev/null
