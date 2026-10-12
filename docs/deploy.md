@@ -433,7 +433,9 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
    已有完整的 tag 目錄就重用、沒有就抓到暫存再搬；原子切換 `current`；重裝 unit 與執行檔（含 `ops-scripts/` 來的隧道與 key-sync）；重啟 `lgwd`；`key-sync.timer` 已在跑就不動它。
 4. 隧道守護有變更時，`install.sh` 不當場重啟它（管理連線本身就走這條隧道，當場重啟會切斷連線），而是用 `systemd-run --user --on-active=60` 排一個約 60 秒後的重啟（只有隧道執行檔或 unit 與已裝的不同時才排；隧道沒在跑就直接 start）。已經有 `llmgateway-tunnel-restart` 排程時就跳過不重排；排程失敗只記警告，不會讓安裝失敗。所以升級後約一分鐘隧道會重連，這段時間 list／get 會斷一下，客戶端重連即可。
 
-政策檔跟著 tag 一起換：`lgwd` 讀的是 `~/.local/share/llmgateway/current/policy/default.json`（`--policy` 指向 `current`），所以升級就是把那一版的 `policy/default.json` 換上，不用（也不該）手動搬舊政策檔。`lgwd` 只在啟動時讀政策（v5 沒有 SIGHUP 熱重載），`install.sh` 升級時會重啟 `lgwd`，所以新版政策升級後就生效；反過來說，單獨手改政策檔要重啟 `lgwd` 才生效。政策檔是 **fail-closed** 的：v4 的欄位（`cooldown_buffer_seconds`、`resets_at_max_ahead_seconds`）在 v5 會被拒（`lgwd` 起不來），所以不要把 v4 的政策檔搬到 v5。
+政策檔跟著 tag 一起換：`lgwd` 讀的是 `~/.local/share/llmgateway/current/policy/default.json`（`--policy` 指向 `current`），所以升級就是把那一版的 `policy/default.json` 換上，不用（也不該）手動搬舊政策檔。`lgwd` 只在啟動時讀政策（v5 沒有熱重載），`install.sh` 升級時會重啟 `lgwd`，所以新版政策升級後就生效；反過來說，單獨手改政策檔要重啟 `lgwd` 才生效。
+
+政策檔是 **fail-closed** 的，被拒的是**缺欄位**：v4 的政策檔沒有 `until_max_ahead_seconds`，所以會被拒（`lgwd` 起不來，`--check` 不會過）。要自己改過政策檔（跨版沿用同一份），得補上這個新欄位；舊欄位（`cooldown_buffer_seconds`、`resets_at_max_ahead_seconds`）**留著無妨**，loader 會忽略多出來的欄位。所以：不要想著「把舊欄位清掉就好」，要補的是新欄位。
 
 ### 4.3 看狀態
 
