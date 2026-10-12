@@ -32,7 +32,7 @@ ITEM = {
     "models": {"allow": ["*"], "default": None},
     "endpoint": None,
     "key": "fake-key-in-get-reply",
-    "cooldown": {"5h": None, "1w": None},
+    "cooldown": None,
     "available": True,
 }
 LIST = {
@@ -165,12 +165,12 @@ class ApiTest(ServerCase):
     def test_cooldown_204(self):
         status, payload = self.call(
             "POST", "/v1/subscriptions/claude-personal/cooldown",
-            {"window": "5h", "resets_at": "2026-10-11T15:00:00Z"})
+            {"until": "2026-10-11T15:00:00Z"})
         self.assertEqual(status, 204)
         self.assertEqual(payload, b"")  # 204 不帶 body
         self.assertEqual(self.fake.calls[-1],
                          ("register_cooldown", "claude-personal",
-                          {"window": "5h", "resets_at": "2026-10-11T15:00:00Z"}))
+                          {"until": "2026-10-11T15:00:00Z"}))
 
     def test_cooldown_空body到service(self):
         status, _ = self.call("POST", "/v1/subscriptions/claude-personal/cooldown")
@@ -179,17 +179,16 @@ class ApiTest(ServerCase):
 
     def test_cooldown錯誤對應(self):
         cases = [
-            (errors.invalid_window(), 400, "invalid_window"),
-            (errors.invalid_resets_at(), 400, "invalid_resets_at"),
-            (errors.resets_at_out_of_range(), 400, "resets_at_out_of_range"),
-            (errors.bad_request(missing=["window"]), 400, "bad_request"),
+            (errors.invalid_until(), 400, "invalid_until"),
+            (errors.until_out_of_range(), 400, "until_out_of_range"),
+            (errors.bad_request(missing=["until"]), 400, "bad_request"),
             (errors.not_found(), 404, "not_found"),
         ]
         for exc, code, err in cases:
             with self.subTest(code=err):
                 self.fake.raise_for["register_cooldown"] = exc
                 status, payload = self.call(
-                    "POST", "/v1/subscriptions/ghost/cooldown", {"window": "24h"})
+                    "POST", "/v1/subscriptions/ghost/cooldown", {"until": "2026-10-11T15:00:00Z"})
                 self.assertEqual(status, code)
                 data = self.json_of(payload)
                 self.assertEqual(data["error"], err)
@@ -255,7 +254,7 @@ class ApiTest(ServerCase):
         with self.assertLogs("lgwd.http", level="INFO") as logs:
             self.call(
                 "POST", "/v1/subscriptions/claude-personal/cooldown",
-                {"window": "5h", "resets_at": secret},
+                {"until": secret},
                 headers={"Authorization": "Bearer " + secret, "X-Canary": secret},
             )
         text = "\n".join(logs.output)
@@ -281,13 +280,14 @@ class ApiTest(ServerCase):
         self.assertFalse(self.fake.calls)  # 沒進 service
 
     def test_body_exactly_1mb_ok(self):
-        pad = 1024 * 1024 - len('{"window":"5h","pad":""}'.encode())
-        raw = b'{"window":"5h","pad":"' + b"a" * pad + b'"}'
+        prefix = b'{"until":"2026-10-11T15:00:00Z","pad":"'
+        pad = 1024 * 1024 - len(prefix) - len(b'"}')
+        raw = prefix + b"a" * pad + b'"}'
         self.assertEqual(len(raw), 1024 * 1024)
         status, _ = self.call(
             "POST", "/v1/subscriptions/claude-personal/cooldown", raw=raw)
         self.assertEqual(status, 204)  # 邊界：超過才擋
-        self.assertEqual(self.fake.calls[-1][2]["window"], "5h")
+        self.assertEqual(self.fake.calls[-1][2]["until"], "2026-10-11T15:00:00Z")
 
 
 class RealServiceHttpTest(ServerCase):
@@ -340,59 +340,57 @@ class RealServiceHttpTest(ServerCase):
         self.assertEqual(data["missing"], ["agent"])
         self.assertNotIn("detail", data)
 
-        # 4. bad_request: cooldown 缺 window
+        # 4. bad_request: cooldown 缺 until
         status, payload = self.call("POST", "/v1/subscriptions/claude-personal/cooldown", {})
         self.assertEqual(status, 400)
         data = self.json_of(payload)
         self.assertEqual(data["error"], "bad_request")
-        self.assertEqual(data["missing"], ["window"])
+        self.assertEqual(data["missing"], ["until"])
         self.assertNotIn("detail", data)
 
-        # 5. invalid_window: window 不是 5h 或 1w
-        for w in ("24h", "1d", "", "invalid"):
-            with self.subTest(window=w):
-                status, payload = self.call("POST", "/v1/subscriptions/claude-personal/cooldown", {"window": w})
-                self.assertEqual(status, 400)
-                data = self.json_of(payload)
-                self.assertEqual(data["error"], "invalid_window")
-                self.assertNotIn("detail", data)
-
-        # 6. invalid_resets_at: 型別或格式不是 RFC 3339
-        for resets in ("not-a-time", "2026-99-99", 123, True):
-            with self.subTest(resets=resets):
+        # 5. invalid_until: 型別或格式不是 RFC 3339
+        for until in ("not-a-time", "2026-99-99", 123, True):
+            with self.subTest(until=until):
                 status, payload = self.call(
                     "POST", "/v1/subscriptions/claude-personal/cooldown",
-                    {"window": "5h", "resets_at": resets}
+                    {"until": until}
                 )
                 self.assertEqual(status, 400)
                 data = self.json_of(payload)
-                self.assertEqual(data["error"], "invalid_resets_at")
+                self.assertEqual(data["error"], "invalid_until")
                 self.assertNotIn("detail", data)
 
-        # 7. resets_at_out_of_range: 過去 1 秒（2026-10-10T23:59:59Z）
+        # 6. until_out_of_range: 過去 1 秒（2026-10-10T23:59:59Z）
         status, payload = self.call(
             "POST", "/v1/subscriptions/claude-personal/cooldown",
-            {"window": "5h", "resets_at": "2026-10-10T23:59:59Z"}
+            {"until": "2026-10-10T23:59:59Z"}
         )
         self.assertEqual(status, 400)
         data = self.json_of(payload)
-        self.assertEqual(data["error"], "resets_at_out_of_range")
+        self.assertEqual(data["error"], "until_out_of_range")
         self.assertNotIn("detail", data)
 
-        # 8. resets_at_out_of_range: 超過 8 天 1 秒（2026-10-19T00:00:01Z）
+        # 7. until_out_of_range: 超過 8 天 1 秒（2026-10-19T00:00:01Z）
         status, payload = self.call(
             "POST", "/v1/subscriptions/claude-personal/cooldown",
-            {"window": "5h", "resets_at": "2026-10-19T00:00:01Z"}
+            {"until": "2026-10-19T00:00:01Z"}
         )
         self.assertEqual(status, 400)
         data = self.json_of(payload)
-        self.assertEqual(data["error"], "resets_at_out_of_range")
+        self.assertEqual(data["error"], "until_out_of_range")
         self.assertNotIn("detail", data)
 
-        # 9. 邊界成功：剛好 8 天（2026-10-19T00:00:00Z）
+        # 8. 邊界成功：剛好 8 天（2026-10-19T00:00:00Z）
         status, payload = self.call(
             "POST", "/v1/subscriptions/claude-personal/cooldown",
-            {"window": "5h", "resets_at": "2026-10-19T00:00:00Z"}
+            {"until": "2026-10-19T00:00:00Z"}
+        )
+        self.assertEqual(status, 204)
+
+        # 9. 邊界成功：剛好現在（2026-10-11T00:00:00Z）
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/opencode-zen/cooldown",
+            {"until": "2026-10-11T00:00:00Z"}
         )
         self.assertEqual(status, 204)
 

@@ -1,6 +1,6 @@
 """lgwd/registry.py 的測試：真 RegistryService（暫存 SQLite、假 key 檔、FakeClock）。
 
-測試名稱照 spec subscription-registry／key-vault 的 Scenario。key 檔的值全是假 canary。
+測試名稱照 spec subscription-registry／key-vault 的 Scenario（v5：until-only）。key 檔的值全是假 canary。
 """
 
 import datetime as _dt
@@ -17,6 +17,7 @@ from lgwd.registry import RegistryService
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 POLICY_PATH = str(REPO_ROOT / "policy" / "default.json")
+UTC = _dt.timezone.utc
 
 # 假資料：絕不是真的 key
 CANARY = {
@@ -64,10 +65,10 @@ class RegistryCase(unittest.TestCase):
     def get(self, subscription, agent):
         return self.service.get_subscription(subscription, agent)
 
-    def cooldown(self, subscription, window, resets_at=None):
-        body = {"window": window}
-        if resets_at is not None:
-            body["resets_at"] = resets_at
+    def cooldown(self, subscription, until):
+        return self.service.register_cooldown(subscription, {"until": until})
+
+    def cooldown_raw(self, subscription, body):
         return self.service.register_cooldown(subscription, body)
 
     def assert_api_error(self, code, err, fn, *args, **kwargs):
@@ -88,6 +89,7 @@ class JsonSchemaTest(RegistryCase):
         self.assertEqual(item["kind"], "claude-subscription")
         self.assertEqual(item["agents"], ["claude-code"])
         self.assertIsNone(item["endpoint"])
+        self.assertIsNone(item["cooldown"])
         blob = json.dumps(item, ensure_ascii=False)
         self.assertNotIn("OAUTH_TOKEN", blob)  # 不帶環境變數名
         self.assertNotIn("ANTHROPIC_", blob)
@@ -123,8 +125,8 @@ class JsonSchemaTest(RegistryCase):
         )
         self.keys.reload()
         self.assertFalse(_by_id(self.list_items())["opencode-zen"]["available"])
-        # 其中一個窗口在冷卻 → false
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
+        # 有未來的 until → false
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         self.assertFalse(_by_id(self.list_items())["claude-personal"]["available"])
 
     def test_models欄位(self):
@@ -153,15 +155,18 @@ class ListTest(RegistryCase):
         )
 
     def test_冷卻反映在list(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         item = _by_id(self.list_items())["claude-personal"]
         self.assertFalse(item["available"])
-        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T15:02:00Z"})
-        self.assertIsNone(item["cooldown"]["1w"])
-        self.clock.set(_dt.datetime(2026, 10, 11, 15, 2, 0, tzinfo=_dt.timezone.utc))
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        # 到期前 1 秒還在冷卻
+        self.clock.set(_dt.datetime(2026, 10, 11, 14, 59, 59, tzinfo=UTC))
+        self.assertFalse(_by_id(self.list_items())["claude-personal"]["available"])
+        # 到期（含相等）自動解除
+        self.clock.set(_dt.datetime(2026, 10, 11, 15, 0, 0, tzinfo=UTC))
         item = _by_id(self.list_items())["claude-personal"]
         self.assertTrue(item["available"])
-        self.assertIsNone(item["cooldown"]["5h"])
+        self.assertIsNone(item["cooldown"])
 
 
 class GetTest(RegistryCase):
@@ -174,9 +179,10 @@ class GetTest(RegistryCase):
         self.assertNotIn("key", err.body())
 
     def test_冷卻中仍可get(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         item = self.get("claude-personal", "claude-code")
         self.assertFalse(item["available"])
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
         self.assertEqual(item["key"], CANARY["claude-personal"])
 
     def test_缺agent回400(self):
@@ -206,23 +212,24 @@ class GetTest(RegistryCase):
 
 
 class CooldownTest(RegistryCase):
-    def test_帶重置時刻(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
+    def test_帶恢復時刻(self):
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         item = _by_id(self.list_items())["claude-personal"]
-        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T15:02:00Z"})
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
         self.assertFalse(item["available"])
-        self.assertEqual(self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z"), None)
+        self.assertEqual(self.cooldown("claude-personal", "2026-10-11T15:00:00Z"), None)
 
-    def test_resets_at型別或格式不對回invalid_resets_at(self):
-        for resets in ("not-a-time", "2026-99-99", 123, True, ["2026-10-11T15:00:00Z"]):
-            with self.subTest(resets=resets):
+    def test_until型別或格式不對回invalid_until(self):
+        for until in ("not-a-time", "2026-99-99", "2026-10-11T15:00:00",
+                      123, True, ["2026-10-11T15:00:00Z"]):
+            with self.subTest(until=until):
                 err = self.assert_api_error(
-                    400, "invalid_resets_at", self.cooldown, "claude-personal", "5h", resets)
+                    400, "invalid_until", self.cooldown_raw, "claude-personal", {"until": until})
                 self.assertNotIn("detail", err.body())
                 item = _by_id(self.list_items())["claude-personal"]
-                self.assertIsNone(item["cooldown"]["5h"])  # 冷卻不變
+                self.assertIsNone(item["cooldown"])  # 冷卻不變
 
-    def test_resets_at在過去或超過八天回resets_at_out_of_range(self):
+    def test_until在過去或超過八天回until_out_of_range(self):
         # 邊界：過去 1 秒、超過 8 天 1 秒，以及遠過去與遠未來
         cases = [
             ("2026-10-10T23:59:59Z", "過去1秒"),
@@ -230,85 +237,83 @@ class CooldownTest(RegistryCase):
             ("2020-01-01T00:00:00Z", "遠過去"),
             ("2099-01-01T00:00:00Z", "遠未來"),
         ]
-        for resets, label in cases:
-            with self.subTest(label=label, resets=resets):
+        for until, label in cases:
+            with self.subTest(label=label, until=until):
                 err = self.assert_api_error(
-                    400, "resets_at_out_of_range", self.cooldown, "claude-personal", "5h", resets)
+                    400, "until_out_of_range", self.cooldown, "claude-personal", until)
                 self.assertNotIn("detail", err.body())
                 item = _by_id(self.list_items())["claude-personal"]
-                self.assertIsNone(item["cooldown"]["5h"])
+                self.assertIsNone(item["cooldown"])
 
     def test_八天整可以剛好超過不行(self):
-        self.cooldown("claude-personal", "5h", "2026-10-19T00:00:00Z")  # 剛好 8 天
-        self.assertIsNotNone(
-            _by_id(self.list_items())["claude-personal"]["cooldown"]["5h"])
+        self.cooldown("claude-personal", "2026-10-19T00:00:00Z")  # 剛好 8 天
+        self.assertEqual(
+            _by_id(self.list_items())["claude-personal"]["cooldown"],
+            {"until": "2026-10-19T00:00:00Z"})
         err = self.assert_api_error(
-            400, "resets_at_out_of_range", self.cooldown, "claude-personal", "5h", "2026-10-19T00:00:01Z")
+            400, "until_out_of_range", self.cooldown, "claude-personal", "2026-10-19T00:00:01Z")
         self.assertNotIn("detail", err.body())
 
     def test_剛好現在的時刻可以(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T00:00:00Z")  # 剛好現在（00:00:00）
+        # 不是過去就收；等於現在不是「未來」，登錄後立即不冷卻
+        self.cooldown("claude-personal", "2026-10-11T00:00:00Z")
         item = _by_id(self.list_items())["claude-personal"]
-        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T00:02:00Z"})
+        self.assertIsNone(item["cooldown"])
+        self.assertTrue(item["available"])
 
-    def test_沒有重置時刻(self):
-        self.cooldown("claude-personal", "1w")
+    def test_同一筆重複登錄取較晚的(self):
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        self.cooldown("claude-personal", "2026-10-11T14:00:00Z")  # 較早，不覆蓋
         item = _by_id(self.list_items())["claude-personal"]
-        self.assertEqual(item["cooldown"]["1w"], {"until": "2026-10-18T00:00:00Z"})
-        self.assertIsNone(item["cooldown"]["5h"])
-
-    def test_沒給resets的5h用5小時(self):
-        self.cooldown("claude-personal", "5h")
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        self.cooldown("claude-personal", "2026-10-11T16:00:00Z")  # 較晚，覆蓋
         item = _by_id(self.list_items())["claude-personal"]
-        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T05:00:00Z"})
-
-    def test_同一窗口取較晚的(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
-        self.cooldown("claude-personal", "5h", "2026-10-11T14:00:00Z")  # 較早，不覆蓋
-        item = _by_id(self.list_items())["claude-personal"]
-        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T15:02:00Z"})
-        self.cooldown("claude-personal", "5h", "2026-10-11T16:00:00Z")  # 較晚，覆蓋
-        item = _by_id(self.list_items())["claude-personal"]
-        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T16:02:00Z"})
-
-    def test_窗口各自獨立(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
-        self.cooldown("claude-personal", "1w", "2026-10-14T00:00:00Z")
-        item = _by_id(self.list_items())["claude-personal"]
-        self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T15:02:00Z"})
-        self.assertEqual(item["cooldown"]["1w"], {"until": "2026-10-14T00:02:00Z"})
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T16:00:00Z"})
+        # 稽核記的是有效的（較晚的）時刻
+        rows = self.service._store.audit_all()
+        self.assertEqual(
+            [r["until"] for r in rows],
+            ["2026-10-11T15:00:00Z", "2026-10-11T15:00:00Z", "2026-10-11T16:00:00Z"])
 
     def test_到時自動解除(self):
-        self.cooldown("claude-personal", "1w")
+        self.cooldown("claude-personal", "2026-10-18T00:00:00Z")
         self.assertFalse(_by_id(self.list_items())["claude-personal"]["available"])
-        self.clock.set(_dt.datetime(2026, 10, 18, 0, 0, 0, tzinfo=_dt.timezone.utc))
+        self.clock.set(_dt.datetime(2026, 10, 18, 0, 0, 0, tzinfo=UTC))
         item = _by_id(self.list_items())["claude-personal"]
         self.assertTrue(item["available"])
-        self.assertIsNone(item["cooldown"]["1w"])
+        self.assertIsNone(item["cooldown"])
 
-    def test_窗口不是5h或1w回invalid_window(self):
-        for window in (None, "", "24h", "1d", 5, True):
-            with self.subTest(window=window):
-                err = self.assert_api_error(400, "invalid_window", self.cooldown, "claude-personal", window)
+    def test_未知欄位忽略(self):
+        self.cooldown_raw("claude-personal", {
+            "until": "2026-10-11T15:00:00Z", "window": "5h", "resets_at": "x", "extra": 1,
+        })
+        item = _by_id(self.list_items())["claude-personal"]
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+
+    def test_缺until欄位回bad_request(self):
+        for body in ({}, {"window": "5h"}, {"resets_at": "2026-10-11T15:00:00Z"}):
+            with self.subTest(body=body):
+                err = self.assert_api_error(
+                    400, "bad_request", self.cooldown_raw, "claude-personal", body)
+                self.assertEqual(err.body()["missing"], ["until"])
                 self.assertNotIn("detail", err.body())
 
-    def test_缺window欄位回bad_request(self):
-        err = self.assert_api_error(
-            400, "bad_request", self.service.register_cooldown, "claude-personal", {})
-        self.assertEqual(err.body()["missing"], ["window"])
-        self.assertNotIn("detail", err.body())
+    def test_帶時差的時刻正規化成UTC(self):
+        self.cooldown("claude-personal", "2026-10-11T23:00:00+08:00")
+        item = _by_id(self.list_items())["claude-personal"]
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
 
     def test_不存在的id回404(self):
         self.assert_api_error(
-            404, "not_found", self.cooldown, "ghost", "5h", "2026-10-11T15:00:00Z")
+            404, "not_found", self.cooldown, "ghost", "2026-10-11T15:00:00Z")
 
     def test_冷卻跨重啟(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         self.service.close()
         reopened = RegistryService(self.db_path, self.policy, self.keys, self.clock)
         try:
             item = _by_id(reopened.list_subscriptions()["subscriptions"])["claude-personal"]
-            self.assertEqual(item["cooldown"]["5h"], {"until": "2026-10-11T15:02:00Z"})
+            self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
         finally:
             reopened.close()
 
@@ -323,23 +328,23 @@ class AuditTest(RegistryCase):
         self.assertEqual(row["subscription"], "claude-personal")
         self.assertEqual(row["agent"], "claude-code")
         self.assertEqual(row["ts"], "2026-10-11T00:00:00Z")
-        self.assertIsNone(row["window"])
         self.assertIsNone(row["until"])
+        self.assertNotIn("window", row)  # 窗口欄位沒了
 
     def test_登錄冷卻留下紀錄(self):
-        self.cooldown("claude-personal", "5h", "2026-10-11T15:00:00Z")
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         rows = self.service._store.audit_all()
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["action"], "cooldown")
-        self.assertEqual(row["window"], "5h")
-        self.assertEqual(row["until"], "2026-10-11T15:02:00Z")
+        self.assertEqual(row["until"], "2026-10-11T15:00:00Z")
         self.assertIsNone(row["agent"])
+        self.assertNotIn("window", row)
 
     def test_稽核只追加且沒有key(self):
         self.get("claude-personal", "claude-code")
         self.get("openrouter", "opencode")
-        self.cooldown("openrouter", "1w")
+        self.cooldown("openrouter", "2026-10-18T00:00:00Z")
         rows = self.service._store.audit_all()
         self.assertEqual([r["action"] for r in rows], ["get", "get", "cooldown"])
         # 資料庫檔案（含所有表）沒有任何 key 的值

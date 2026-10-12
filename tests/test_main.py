@@ -176,20 +176,20 @@ class ApiTest(MainCase):
 
     def test_冷卻流程(self):
         status, _ = http_post(self.base + "/v1/subscriptions/claude-personal/cooldown",
-                              {"window": "5h", "resets_at": "2026-10-11T15:00:00Z"})
+                              {"until": "2026-10-11T15:00:00Z"})
         self.assertEqual(status, 204)
         item = self.list_items()["claude-personal"]
         self.assertFalse(item["available"])
-        self.assertEqual(item["cooldown"]["5h"]["until"], "2026-10-11T15:02:00Z")
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
         self.clock.advance(hours=16)
         self.assertTrue(self.list_items()["claude-personal"]["available"])
 
     def test_冷卻錯誤對應(self):
         status, _ = http_post(self.base + "/v1/subscriptions/ghost/cooldown",
-                              {"window": "5h"})
+                              {"until": "2026-10-11T15:00:00Z"})
         self.assertEqual(status, 404)
         status, _ = http_post(self.base + "/v1/subscriptions/claude-personal/cooldown",
-                              {"window": "24h"})
+                              {"until": "2026-10-10T00:00:00Z"})
         self.assertEqual(status, 400)
 
     def test_其他路徑404(self):
