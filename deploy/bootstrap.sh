@@ -878,7 +878,17 @@ step_rendezvous() {
     fi
 
     local tmp_env
-    tmp_env="$(mktemp "${conf_dir}/.env.XXXXXX" 2>/dev/null || mktemp)"
+    # 暫存含會合點位址：建在管理帳號自家（輸入檔同目錄，管理帳號可寫），0600；
+    # 不再建在 llmgw 目錄（管理帳號寫不進去）也不常駐共用 /tmp (L-R11)。
+    # RETURN trap 是兜底（bash 3.2 無此 trap，後面 2>/dev/null || true 吃掉；
+    # 所有早敗路徑下面仍逐一顯式 rm，見 sudo_refresh 與 ensure 兩處）。
+    tmp_env="$(mktemp "$(dirname "$RENDEZVOUS_KNOWN_HOSTS")/.llmgw-env.XXXXXX" 2>/dev/null || mktemp 2>/dev/null)" || {
+        log_step rendezvous fail "建暫存檔失敗"
+        step_failed=1
+        return 1
+    }
+    chmod 600 "$tmp_env" 2>/dev/null || true
+    trap 'rm -f "$tmp_env"; trap - RETURN' RETURN 2>/dev/null || true
 
     # 既有內容從 stdin 餵進去，python 不直接開檔（管理帳號可能讀不到）
     if ! printf '%s' "$env_existing" | gen_env > "$tmp_env"; then
@@ -906,28 +916,32 @@ step_rendezvous() {
         return 0
     fi
 
-    sudo_refresh || return 1
+    sudo_refresh || { rm -f "$tmp_env"; return 1; }
     local grp=""
     grp="$(id -gn "$USER_NAME" 2>/dev/null || true)"
     if ! ensure_llmgw_dir "${BOOT_HOME}/.ssh" 700; then
         log_step rendezvous fail "建立 ${BOOT_HOME}/.ssh 失敗"
+        rm -f "$tmp_env"
         step_failed=1
         return 1
     fi
     if ! ensure_llmgw_dir "$conf_dir" 755; then
         log_step rendezvous fail "建立 ${conf_dir} 失敗"
+        rm -f "$tmp_env"
         step_failed=1
         return 1
     fi
     if [[ -n "$grp" ]]; then
         if ! run_root install -m 644 -o "$USER_NAME" -g "$grp" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
             log_step rendezvous fail "install -m 644 ... known_hosts 失敗"
+            rm -f "$tmp_env"
             step_failed=1
             return 1
         fi
     else
         if ! run_root install -m 644 -o "$USER_NAME" "$RENDEZVOUS_KNOWN_HOSTS" "$target_kh"; then
             log_step rendezvous fail "install -m 644 ... known_hosts 失敗"
+            rm -f "$tmp_env"
             step_failed=1
             return 1
         fi
