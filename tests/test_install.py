@@ -836,6 +836,92 @@ exec "$@"
         ok_again = check()
         self.assertEqual(ok_again.returncode, 0, ok_again.stdout + ok_again.stderr)
 
+    def test_check_keysync_sudo_failure_is_unknown(self):
+        """管理帳號直跑 --check 且 sudo 要密碼／缺席時回 2，不是「gh 沒登入」（#13 新-低-1）"""
+        res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.write_probe_config()
+        base_env = {"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0",
+                    "FAKE_PROBE_CODE": "200",
+                    "LGW_SERVICE_USER": "llmgw-test-user"}
+
+        # install.sh 用 `id -un` 判斷目前身分；測試 PATH 裡本來沒有 id
+        # （缺 id 時當成服務帳號自己、直連），這裡補假 id 讓它走 sudo 分支。
+        fake_id = os.path.join(self.fakebin, "id")
+        with open(fake_id, "w", encoding="utf-8") as f:
+            f.write('#!/usr/bin/env bash\n'
+                    'echo "manager"\n'
+                    'exit 0\n')
+        os.chmod(fake_id, 0o755)
+
+        def check(**overrides):
+            env = dict(base_env)
+            env.update(overrides)
+            return self.run_install(["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+                                    env_overrides=env)
+
+        # 假 sudo：一律要密碼（auth 那步就失敗）
+        sudo_fail = os.path.join(self.sandbox, "fake-sudo-needs-password")
+        with open(sudo_fail, "w", encoding="utf-8") as f:
+            f.write('#!/usr/bin/env bash\n'
+                    'echo "sudo $*" >> "${SANDBOX:?}/sudo-argv.log"\n'
+                    'echo "sudo: a password is required" >&2\n'
+                    'exit 1\n')
+        os.chmod(sudo_fail, 0o755)
+
+        r1 = check(LGW_SUDO=sudo_fail)
+        self.assertEqual(r1.returncode, 2, r1.stdout)
+        self.assertIn("無法確認", r1.stdout)
+        self.assertIn("sudo", r1.stdout)
+        self.assertNotIn("gh 沒登入", r1.stdout)
+
+        # sudo 本體缺席：同樣回 2（不是「找不到 gh」）
+        r2 = check(LGW_SUDO="/nonexistent/no-such-sudo")
+        self.assertEqual(r2.returncode, 2, r2.stdout)
+        self.assertIn("無法確認", r2.stdout)
+        self.assertIn("sudo", r2.stdout)
+
+        # 第二步（讀 repo）才 sudo 失效：auth 過，api 那步回 2
+        sudo_fail_api = os.path.join(self.sandbox, "fake-sudo-fail-api")
+        with open(sudo_fail_api, "w", encoding="utf-8") as f:
+            f.write('#!/usr/bin/env bash\n'
+                    'echo "sudo $*" >> "${SANDBOX:?}/sudo-argv.log"\n'
+                    'args=()\n'
+                    'skip_next=0\n'
+                    'for a in "$@"; do\n'
+                    '    if [[ "$skip_next" == "1" ]]; then skip_next=0; continue; fi\n'
+                    '    case "$a" in -n) continue;; -u) skip_next=1; continue;; *) args+=("$a");; esac\n'
+                    'done\n'
+                    'if [[ "${args[*]}" == *" api "* ]]; then\n'
+                    '    echo "sudo: a password is required" >&2\n'
+                    '    exit 1\n'
+                    'fi\n'
+                    'exec "${args[@]}"\n')
+        os.chmod(sudo_fail_api, 0o755)
+
+        r3 = check(LGW_SUDO=sudo_fail_api)
+        self.assertEqual(r3.returncode, 2, r3.stdout)
+        self.assertIn("無法確認", r3.stdout)
+        self.assertIn("sudo", r3.stdout)
+        self.assertNotIn("讀不到 FATESAIKOU/LLMGateway-keys", r3.stdout)
+
+        # sudo 正常轉交時仍回 0（沒把成功路徑修壞）
+        sudo_ok = os.path.join(self.sandbox, "fake-sudo-passthrough")
+        with open(sudo_ok, "w", encoding="utf-8") as f:
+            f.write('#!/usr/bin/env bash\n'
+                    'echo "sudo $*" >> "${SANDBOX:?}/sudo-argv.log"\n'
+                    'args=()\n'
+                    'skip_next=0\n'
+                    'for a in "$@"; do\n'
+                    '    if [[ "$skip_next" == "1" ]]; then skip_next=0; continue; fi\n'
+                    '    case "$a" in -n) continue;; -u) skip_next=1; continue;; *) args+=("$a");; esac\n'
+                    'done\n'
+                    'exec "${args[@]}"\n')
+        os.chmod(sudo_ok, 0o755)
+
+        r0 = check(LGW_SUDO=sudo_ok)
+        self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+
     def test_missing_or_old_python(self):
         # Missing python3 in PATH
         res_nopy = self.run_install(
