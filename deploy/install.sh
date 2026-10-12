@@ -2,8 +2,11 @@
 # deploy/install.sh
 #
 # 在常駐機器上安裝 LLMGateway：固定 tag 取碼、current symlink 原子切換、
-# systemd user unit（subscription registry lgwd 與隧道守護 llmgateway-tunnel）。放哪一台
-# 由安裝的人決定，這裡不寫機器名或 IP。
+# systemd user unit（subscription registry lgwd、隧道守護 llmgateway-tunnel、
+# key-sync 的 timer）。放哪一台由安裝的人決定，這裡不寫機器名或 IP。
+#
+# 隧道守護與 key-sync 的檔案在 repo 的 ops-scripts/（維運工具定位）；從取到的
+# tag 目錄裝，不從執行中的這份腳本旁邊裝。
 #
 # 隧道守護承載部署連線本身，所以這裡絕不當場 restart／stop 它：沒在跑就
 # start，有更新時用 systemd-run 排一個約 60 秒後的重啟。
@@ -62,6 +65,7 @@ TAG_FILE="${CURRENT_LINK}/.lgw-tag"
 CONF_DIR="${HOME_DIR}/.config/llmgateway"
 ENV_FILE="${CONF_DIR}/llmgateway.env"
 TUNNEL_ENV_FILE="${CONF_DIR}/tunnel.env"
+KEYSYNC_ENV_FILE="${CONF_DIR}/keysync.env"
 STATE_DIR="${HOME_DIR}/.local/state/llmgateway"
 KEYS_FILE="${STATE_DIR}/keys.env"
 BIN_DIR="${HOME_DIR}/.local/bin"
@@ -69,6 +73,11 @@ UNIT_DIR="${HOME_DIR}/.config/systemd/user"
 SERVICE_NAME="llmgateway.service"
 TUNNEL_SERVICE_NAME="llmgateway-tunnel.service"
 TUNNEL_BIN="llmgateway-tunnel"
+KEY_SYNC_BIN="key-sync"
+KEY_SYNC_SERVICE="key-sync.service"
+KEY_SYNC_TIMER="key-sync.timer"
+KEY_SYNC_PASSWORD_VAR="LLMGW_KEYS_PASSWORD"
+OPS_DIR="ops-scripts"
 
 # 測試可換成假指令。
 SYSTEMCTL="${LGW_SYSTEMCTL:-systemctl}"
@@ -162,8 +171,15 @@ fetch_code() {
         rm -rf "$tag_tmp"
         return 1
     fi
-    if [[ ! -f "${tag_tmp}/deploy/${TUNNEL_BIN}" ]] || [[ ! -f "${tag_tmp}/deploy/${TUNNEL_SERVICE_NAME}" ]]; then
-        log ERROR "取到的版本缺 deploy/${TUNNEL_BIN} 或 deploy/${TUNNEL_SERVICE_NAME}"
+    if [[ ! -f "${tag_tmp}/${OPS_DIR}/${TUNNEL_BIN}" ]] || [[ ! -f "${tag_tmp}/${OPS_DIR}/${TUNNEL_SERVICE_NAME}" ]]; then
+        log ERROR "取到的版本缺 ${OPS_DIR}/${TUNNEL_BIN} 或 ${OPS_DIR}/${TUNNEL_SERVICE_NAME}"
+        rm -rf "$tag_tmp"
+        return 1
+    fi
+    if [[ ! -f "${tag_tmp}/${OPS_DIR}/${KEY_SYNC_BIN}" ]] \
+        || [[ ! -f "${tag_tmp}/${OPS_DIR}/${KEY_SYNC_SERVICE}" ]] \
+        || [[ ! -f "${tag_tmp}/${OPS_DIR}/${KEY_SYNC_TIMER}" ]]; then
+        log ERROR "取到的版本缺 ${OPS_DIR}/${KEY_SYNC_BIN} 或它的 unit／timer"
         rm -rf "$tag_tmp"
         return 1
     fi
@@ -251,6 +267,46 @@ check_unit() {
             return 2
             ;;
     esac
+
+    # 服務活著，再看金鑰拉取那條路能不能用（v5.4）。
+    check_keysync
+}
+
+# check_keysync：key-sync 能不能用（v5.4）。0 成立、1 確定不成立。
+#   1. gh 在不在、有沒有登入（沒登入／token 失效時 key 會凍在舊版）；
+#   2. 解密密碼放了沒（keysync.env 有非空的一行；只看有沒有，不讀值出來）；
+#   3. 上次拉取有沒有失敗（systemd 把最後一次非零結束的 oneshot 記成 failed）。
+# 排到最後才跑：前面（unit、本機、經會合點）先確定服務是活的。
+check_keysync() {
+    local gh_bin="${LGW_GH:-gh}"
+    if ! command -v "$gh_bin" >/dev/null 2>&1; then
+        log INFO "key-sync: 不能用（找不到 ${gh_bin}）"
+        return 1
+    fi
+    if ! "$gh_bin" auth status >/dev/null 2>&1; then
+        log INFO "key-sync: 不能用（gh 沒登入或 token 失效）"
+        return 1
+    fi
+    log INFO "key-sync: gh 已登入"
+
+    if [[ ! -f "$KEYSYNC_ENV_FILE" ]]; then
+        log INFO "key-sync: 還沒放解密密碼（${KEYSYNC_ENV_FILE}）"
+        return 1
+    fi
+    if ! grep -Eq "^[[:space:]]*${KEY_SYNC_PASSWORD_VAR}=[^[:space:]]+" "$KEYSYNC_ENV_FILE" 2>/dev/null; then
+        log INFO "key-sync: 解密密碼檔裡沒有非空的 ${KEY_SYNC_PASSWORD_VAR}"
+        return 1
+    fi
+    log INFO "key-sync: 解密密碼已放"
+
+    local rc=0
+    "$SYSTEMCTL" --user is-failed --quiet "$KEY_SYNC_SERVICE" >/dev/null 2>&1
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        log INFO "key-sync: 最近一次執行失敗（看 journalctl --user -u ${KEY_SYNC_SERVICE%.service}）"
+        return 1
+    fi
+    # rc ≠ 0：沒失敗，或查不到 unit（舊安裝）——後者不當成失敗
     return 0
 }
 
@@ -361,17 +417,25 @@ install_file "${TAG_DIR}/deploy/llmgateway.service" "${UNIT_DIR}/${SERVICE_NAME}
 
 # 隧道執行檔或 unit 有變更嗎（不存在＝有變更）；要在覆蓋前比。
 tunnel_changed=0
-if ! cmp -s "${TAG_DIR}/deploy/${TUNNEL_BIN}" "${BIN_DIR}/${TUNNEL_BIN}" 2>/dev/null; then
+if ! cmp -s "${TAG_DIR}/${OPS_DIR}/${TUNNEL_BIN}" "${BIN_DIR}/${TUNNEL_BIN}" 2>/dev/null; then
     tunnel_changed=1
 fi
-if ! cmp -s "${TAG_DIR}/deploy/${TUNNEL_SERVICE_NAME}" "${UNIT_DIR}/${TUNNEL_SERVICE_NAME}" 2>/dev/null; then
+if ! cmp -s "${TAG_DIR}/${OPS_DIR}/${TUNNEL_SERVICE_NAME}" "${UNIT_DIR}/${TUNNEL_SERVICE_NAME}" 2>/dev/null; then
     tunnel_changed=1
 fi
 
-install_file "${TAG_DIR}/deploy/${TUNNEL_BIN}" "${BIN_DIR}/${TUNNEL_BIN}" 755 || {
+install_file "${TAG_DIR}/${OPS_DIR}/${TUNNEL_BIN}" "${BIN_DIR}/${TUNNEL_BIN}" 755 || {
     log ERROR "裝 ${TUNNEL_BIN} 失敗"; exit 1; }
-install_file "${TAG_DIR}/deploy/${TUNNEL_SERVICE_NAME}" "${UNIT_DIR}/${TUNNEL_SERVICE_NAME}" 644 || {
+install_file "${TAG_DIR}/${OPS_DIR}/${TUNNEL_SERVICE_NAME}" "${UNIT_DIR}/${TUNNEL_SERVICE_NAME}" 644 || {
     log ERROR "裝隧道 systemd unit 失敗"; exit 1; }
+
+# key-sync 與它的 unit／timer（v5.4：金鑰自己拉）；timer 只負責定期觸發。
+install_file "${TAG_DIR}/${OPS_DIR}/${KEY_SYNC_BIN}" "${BIN_DIR}/${KEY_SYNC_BIN}" 755 || {
+    log ERROR "裝 ${KEY_SYNC_BIN} 失敗"; exit 1; }
+install_file "${TAG_DIR}/${OPS_DIR}/${KEY_SYNC_SERVICE}" "${UNIT_DIR}/${KEY_SYNC_SERVICE}" 644 || {
+    log ERROR "裝 ${KEY_SYNC_SERVICE} 失敗"; exit 1; }
+install_file "${TAG_DIR}/${OPS_DIR}/${KEY_SYNC_TIMER}" "${UNIT_DIR}/${KEY_SYNC_TIMER}" 644 || {
+    log ERROR "裝 ${KEY_SYNC_TIMER} 失敗"; exit 1; }
 
 "$SYSTEMCTL" --user daemon-reload || { log ERROR "daemon-reload 失敗"; exit 1; }
 if "$SYSTEMCTL" --user is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
@@ -394,6 +458,16 @@ elif [[ "$tunnel_changed" -eq 1 ]]; then
         "$SYSTEMCTL" --user restart "$TUNNEL_SERVICE_NAME" 2>/dev/null; then
         log WARN "llmgateway-tunnel: 排程重啟失敗（忽略）"
     fi
+fi
+
+# key-sync 的 timer：只 enable；沒在跑才 start（已在跑就不動它，免得把排程重來）。
+"$SYSTEMCTL" --user enable "$KEY_SYNC_TIMER" || {
+    log ERROR "enable ${KEY_SYNC_TIMER} 失敗"; exit 1; }
+if "$SYSTEMCTL" --user is-active --quiet "$KEY_SYNC_TIMER" >/dev/null 2>&1; then
+    log INFO "${KEY_SYNC_TIMER}: 已在跑"
+else
+    "$SYSTEMCTL" --user start "$KEY_SYNC_TIMER" || \
+        log WARN "${KEY_SYNC_TIMER}: start 未成功（可稍後 systemctl --user start ${KEY_SYNC_TIMER}）"
 fi
 
 log INFO "installed llmgateway ${LGW_TAG}"

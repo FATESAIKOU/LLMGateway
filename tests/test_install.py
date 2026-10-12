@@ -10,8 +10,11 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 INSTALL_SH = os.path.join(REPO_ROOT, "deploy", "install.sh")
 RUN_WRAPPER = os.path.join(REPO_ROOT, "deploy", "llmgateway-run")
 SERVICE_UNIT = os.path.join(REPO_ROOT, "deploy", "llmgateway.service")
-TUNNEL_DAEMON = os.path.join(REPO_ROOT, "deploy", "llmgateway-tunnel")
-TUNNEL_UNIT = os.path.join(REPO_ROOT, "deploy", "llmgateway-tunnel.service")
+TUNNEL_DAEMON = os.path.join(REPO_ROOT, "ops-scripts", "llmgateway-tunnel")
+TUNNEL_UNIT = os.path.join(REPO_ROOT, "ops-scripts", "llmgateway-tunnel.service")
+KEY_SYNC = os.path.join(REPO_ROOT, "ops-scripts", "key-sync")
+KEY_SYNC_SERVICE = os.path.join(REPO_ROOT, "ops-scripts", "key-sync.service")
+KEY_SYNC_TIMER = os.path.join(REPO_ROOT, "ops-scripts", "key-sync.timer")
 
 TOOLS_LIST = [
     "mkdir", "mktemp", "chmod", "mv", "ln", "rm", "cat", "date",
@@ -62,7 +65,7 @@ if [[ "${1:-}" != "clone" ]]; then
     exit 1
 fi
 dest="${@: -1}"
-mkdir -p "$dest/policy" "$dest/deploy"
+mkdir -p "$dest/policy" "$dest/deploy" "$dest/ops-scripts"
 printf '{}\\n' > "$dest/policy/default.json"
 if [[ -n "${WRAPPER_MARKER:-}" ]]; then
     printf '#!/bin/sh\\n# %s\\nexit 0\\n' "$WRAPPER_MARKER" > "$dest/deploy/llmgateway-run"
@@ -76,15 +79,31 @@ else
     cat "${REAL_SERVICE:?}" > "$dest/deploy/llmgateway.service"
 fi
 if [[ -n "${TUNNEL_MARKER:-}" ]]; then
-    printf '#!/bin/sh\\n# %s\\nexit 0\\n' "$TUNNEL_MARKER" > "$dest/deploy/llmgateway-tunnel"
+    printf '#!/bin/sh\\n# %s\\nexit 0\\n' "$TUNNEL_MARKER" > "$dest/ops-scripts/llmgateway-tunnel"
 else
-    cat "${REAL_TUNNEL:?}" > "$dest/deploy/llmgateway-tunnel"
+    cat "${REAL_TUNNEL:?}" > "$dest/ops-scripts/llmgateway-tunnel"
 fi
-chmod +x "$dest/deploy/llmgateway-tunnel"
+chmod +x "$dest/ops-scripts/llmgateway-tunnel"
 if [[ -n "${TUNNEL_UNIT_MARKER:-}" ]]; then
-    printf '[Unit]\\n# %s\\n' "$TUNNEL_UNIT_MARKER" > "$dest/deploy/llmgateway-tunnel.service"
+    printf '[Unit]\\n# %s\\n' "$TUNNEL_UNIT_MARKER" > "$dest/ops-scripts/llmgateway-tunnel.service"
 else
-    cat "${REAL_TUNNEL_UNIT:?}" > "$dest/deploy/llmgateway-tunnel.service"
+    cat "${REAL_TUNNEL_UNIT:?}" > "$dest/ops-scripts/llmgateway-tunnel.service"
+fi
+if [[ -n "${KEY_SYNC_MARKER:-}" ]]; then
+    printf '#!/bin/sh\\n# %s\\nexit 0\\n' "$KEY_SYNC_MARKER" > "$dest/ops-scripts/key-sync"
+else
+    cat "${REAL_KEY_SYNC:?}" > "$dest/ops-scripts/key-sync"
+fi
+chmod +x "$dest/ops-scripts/key-sync"
+if [[ -n "${KEY_SYNC_SERVICE_MARKER:-}" ]]; then
+    printf '[Unit]\\n# %s\\n' "$KEY_SYNC_SERVICE_MARKER" > "$dest/ops-scripts/key-sync.service"
+else
+    cat "${REAL_KEY_SYNC_SERVICE:?}" > "$dest/ops-scripts/key-sync.service"
+fi
+if [[ -n "${KEY_SYNC_TIMER_MARKER:-}" ]]; then
+    printf '[Unit]\\n# %s\\n' "$KEY_SYNC_TIMER_MARKER" > "$dest/ops-scripts/key-sync.timer"
+else
+    cat "${REAL_KEY_SYNC_TIMER:?}" > "$dest/ops-scripts/key-sync.timer"
 fi
 exit 0
 """
@@ -99,6 +118,13 @@ exec "${REAL_PYTHON:?}" "$@"
 """
         sys_script = """#!/usr/bin/env bash
 echo "systemctl $*" >> "${SANDBOX:?}/systemctl-argv.log"
+if [[ "$*" == *"is-failed"* ]]; then
+    # 0＝failed；其他＝沒失敗或查不到 unit
+    if [[ "$*" == *"key-sync.service"* && "${SYS_KEYSYNC_FAILED:-0}" == "1" ]]; then
+        exit 0
+    fi
+    exit 1
+fi
 if [[ "$*" == *"is-active"* ]]; then
     if [[ "${SYS_NOBUS:-0}" == "1" ]]; then
         echo "fake systemctl: no bus" >&2
@@ -146,6 +172,24 @@ exit 0
             f.write(probe_ssh_script)
         os.chmod(self.probe_ssh, 0o755)
 
+        # 假 gh：只支援 `gh auth status`（install.sh --check 用）
+        gh_script = """#!/usr/bin/env bash
+echo "gh $*" >> "${SANDBOX:?}/gh-argv.log"
+if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
+    if [[ "${FAKE_GH_MODE:-ok}" == "fail" ]]; then
+        echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2
+        exit 1
+    fi
+    exit 0
+fi
+echo "fake gh: unsupported: $*" >&2
+exit 1
+"""
+        gh_target = os.path.join(self.fakebin, "gh")
+        with open(gh_target, "w", encoding="utf-8") as f:
+            f.write(gh_script)
+        os.chmod(gh_target, 0o755)
+
         for name, content in [
             ("git", git_script),
             ("python3", py_script),
@@ -158,12 +202,12 @@ exit 0
                 f.write(content)
             os.chmod(target, 0o755)
 
-        # nopy: symlink git, systemctl, systemd-run, curl
-        for name in ["git", "systemctl", "systemd-run", "curl"]:
+        # nopy: symlink git, systemctl, systemd-run, curl, gh
+        for name in ["git", "systemctl", "systemd-run", "curl", "gh"]:
             os.symlink(os.path.join(self.fakebin, name), os.path.join(self.fakebin_nopy, name))
 
-        # nosys: symlink git, python3, curl（沒有 systemctl）
-        for name in ["git", "python3", "curl"]:
+        # nosys: symlink git, python3, curl, gh（沒有 systemctl）
+        for name in ["git", "python3", "curl", "gh"]:
             os.symlink(os.path.join(self.fakebin, name), os.path.join(self.fakebin_nosys, name))
 
     def run_install(self, args, home=None, env_overrides=None, path_mode="full"):
@@ -176,6 +220,9 @@ exit 0
             "REAL_SERVICE": SERVICE_UNIT,
             "REAL_TUNNEL": TUNNEL_DAEMON,
             "REAL_TUNNEL_UNIT": TUNNEL_UNIT,
+            "REAL_KEY_SYNC": KEY_SYNC,
+            "REAL_KEY_SYNC_SERVICE": KEY_SYNC_SERVICE,
+            "REAL_KEY_SYNC_TIMER": KEY_SYNC_TIMER,
             "REAL_PYTHON": sys.executable,
             "PROBE_SSH_LOG": self.probe_ssh_log,
             "FAKE_PROBE_CODE": "200",
@@ -202,6 +249,18 @@ exit 0
         with open(log_path, "r", encoding="utf-8") as f:
             return f.read()
 
+    def write_keysync_env(self, home=None, value="FakeKeysyncPassword_ForTests_01"):
+        """解密密碼檔（假值）：key-sync 用，install.sh --check 會看有沒有放。"""
+        if home is None:
+            home = self.home
+        conf_dir = os.path.join(home, ".config", "llmgateway")
+        os.makedirs(conf_dir, exist_ok=True)
+        path = os.path.join(conf_dir, "keysync.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"LLMGW_KEYS_PASSWORD={value}\n")
+        os.chmod(path, 0o600)
+        return path
+
     def write_probe_config(self, home=None, **overrides):
         if home is None:
             home = self.home
@@ -217,6 +276,8 @@ exit 0
         with open(os.path.join(conf_dir, "tunnel.env"), "w", encoding="utf-8") as f:
             for key, value in values.items():
                 f.write(f"{key}={value}\n")
+        if not os.path.exists(os.path.join(conf_dir, "keysync.env")):
+            self.write_keysync_env(home)
 
     def test_prerequisites_and_file_modes(self):
         self.assertTrue(os.path.isfile(INSTALL_SH))
@@ -258,6 +319,32 @@ exit 0
             text=True,
         )
         self.assertEqual(res.returncode, 0, res.stderr)
+
+        # key-sync（v5.4）：script 與它的 unit／timer 都在 ops-scripts/
+        self.assertTrue(os.path.isfile(KEY_SYNC))
+        self.assertTrue(os.access(KEY_SYNC, os.X_OK))
+        res = subprocess.run([sys.executable, "-m", "py_compile", KEY_SYNC],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        self.assertTrue(os.path.isfile(KEY_SYNC_SERVICE))
+        with open(KEY_SYNC_SERVICE, "r", encoding="utf-8") as f:
+            keysync_service = f.read()
+        self.assertIn("ExecStart=%h/.local/bin/key-sync", keysync_service)
+        self.assertIn("EnvironmentFile=-%h/.config/llmgateway/keysync.env", keysync_service)
+
+        self.assertTrue(os.path.isfile(KEY_SYNC_TIMER))
+        with open(KEY_SYNC_TIMER, "r", encoding="utf-8") as f:
+            keysync_timer = f.read()
+        self.assertIn("Unit=key-sync.service", keysync_timer)
+        self.assertIn("OnUnitActiveSec=10min", keysync_timer)
+
+        # 搬家後的引用：install.sh 只從 ops-scripts/ 裝（別再指到 deploy/）
+        with open(INSTALL_SH, "r", encoding="utf-8") as f:
+            install_content = f.read()
+        self.assertIn('OPS_DIR="ops-scripts"', install_content)
+        self.assertNotIn("deploy/${TUNNEL_BIN}", install_content)
+        self.assertNotIn("deploy/${KEY_SYNC_BIN}", install_content)
 
     def test_first_install(self):
         res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
@@ -315,6 +402,15 @@ exit 0
         )
         self.assertTrue(os.path.isfile(installed_tunnel_unit))
 
+        # key-sync 的執行檔與 unit／timer（從 ops-scripts/ 裝）
+        installed_keysync = os.path.join(self.home, ".local", "bin", "key-sync")
+        self.assertTrue(os.path.isfile(installed_keysync))
+        self.assertTrue(os.access(installed_keysync, os.X_OK))
+        for unit in ("key-sync.service", "key-sync.timer"):
+            self.assertTrue(
+                os.path.isfile(os.path.join(self.home, ".config", "systemd", "user", unit)),
+                unit)
+
         git_log = self.read_log("git")
         self.assertIn("clone --depth 1 --branch lgw-v0.1.0 https://github.com/FATESAIKOU/LLMGateway", git_log)
 
@@ -325,6 +421,8 @@ exit 0
         self.assertIn("start llmgateway-tunnel.service", sys_log)
         self.assertNotIn("stop llmgateway-tunnel.service", sys_log)
         self.assertNotIn("restart llmgateway-tunnel.service", sys_log)
+        self.assertIn("enable key-sync.timer", sys_log)
+        self.assertIn("start key-sync.timer", sys_log)
 
         leftovers = [f for f in os.listdir(share_dir) if f.startswith(".")]
         self.assertEqual(leftovers, [])
@@ -614,6 +712,63 @@ exit 0
         )
         self.assertEqual(res_curl_fail.returncode, 2)
 
+    def test_check_keysync_states(self):
+        """--check 看得出「gh 不能用」「解密密碼沒放」「key-sync 最近失敗」（v5.4）"""
+        res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.write_probe_config()
+        base_env = {"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0",
+                    "FAKE_PROBE_CODE": "200"}
+
+        def check(**overrides):
+            env = dict(base_env)
+            env.update(overrides)
+            return self.run_install(["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+                                    env_overrides=env)
+
+        # 0：gh 已登入、解密密碼放了、上次沒失敗
+        ok = check()
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertIn("key-sync: gh 已登入", ok.stdout)
+        self.assertIn("key-sync: 解密密碼已放", ok.stdout)
+        self.assertIn("gh auth status", self.read_log("gh"))
+
+        # 1：gh 沒登入／token 失效
+        gh_fail = check(FAKE_GH_MODE="fail")
+        self.assertEqual(gh_fail.returncode, 1, gh_fail.stdout)
+        self.assertIn("key-sync: 不能用（gh 沒登入或 token 失效）", gh_fail.stdout)
+        self.assertNotIn("解密密碼已放", gh_fail.stdout)
+
+        # 1：找不到 gh
+        no_gh = check(LGW_GH="/nonexistent/gh-not-here")
+        self.assertEqual(no_gh.returncode, 1, no_gh.stdout)
+        self.assertIn("找不到", no_gh.stdout)
+
+        # 1：解密密碼沒放（keysync.env 不存在）
+        keysync_env = os.path.join(self.home, ".config", "llmgateway", "keysync.env")
+        os.remove(keysync_env)
+        no_pass = check()
+        self.assertEqual(no_pass.returncode, 1, no_pass.stdout)
+        self.assertIn("還沒放解密密碼", no_pass.stdout)
+
+        # 1：密碼行是空的
+        with open(keysync_env, "w", encoding="utf-8") as f:
+            f.write("LLMGW_KEYS_PASSWORD=\n")
+        empty_pass = check()
+        self.assertEqual(empty_pass.returncode, 1, empty_pass.stdout)
+        self.assertIn("沒有非空的", empty_pass.stdout)
+
+        # 1：key-sync 最近一次執行失敗
+        self.write_keysync_env()
+        failed_run = check(SYS_KEYSYNC_FAILED="1")
+        self.assertEqual(failed_run.returncode, 1, failed_run.stdout)
+        self.assertIn("最近一次執行失敗", failed_run.stdout)
+        self.assertIn("is-failed --quiet key-sync.service", self.read_log("systemctl"))
+
+        # 回到 0：密碼放著、上次失敗的狀態清掉
+        ok_again = check()
+        self.assertEqual(ok_again.returncode, 0, ok_again.stdout + ok_again.stderr)
+
     def test_missing_or_old_python(self):
         # Missing python3 in PATH
         res_nopy = self.run_install(
@@ -647,13 +802,16 @@ exit 0
         res_notag = self.run_install(["--home", self.home])
         self.assertEqual(res_notag.returncode, 2)
 
-    def test_files_installed_from_new_version_deploy(self):
-        # Wrapper, units and tunnel daemon must come from the checked out tag's
-        # deploy/, not from the running script's dir
+    def test_files_installed_from_new_version_ops_scripts(self):
+        # Wrapper 與 unit 從取到的 tag 的 deploy/，隧道與 key-sync 從 ops-scripts/；
+        # 都不是從執行中的這份腳本旁邊裝
         wrapper_marker = "TEST_WRAPPER_V2_MARKER_99"
         service_marker = "TEST_SERVICE_V2_MARKER_88"
         tunnel_marker = "TEST_TUNNEL_V2_MARKER_77"
         tunnel_unit_marker = "TEST_TUNNEL_UNIT_V2_MARKER_66"
+        keysync_marker = "TEST_KEYSYNC_V2_MARKER_55"
+        keysync_service_marker = "TEST_KEYSYNC_SERVICE_V2_MARKER_44"
+        keysync_timer_marker = "TEST_KEYSYNC_TIMER_V2_MARKER_33"
 
         res = self.run_install(
             ["--tag", "lgw-v0.2.0", "--home", self.home],
@@ -662,6 +820,9 @@ exit 0
                 "SERVICE_MARKER": service_marker,
                 "TUNNEL_MARKER": tunnel_marker,
                 "TUNNEL_UNIT_MARKER": tunnel_unit_marker,
+                "KEY_SYNC_MARKER": keysync_marker,
+                "KEY_SYNC_SERVICE_MARKER": keysync_service_marker,
+                "KEY_SYNC_TIMER_MARKER": keysync_timer_marker,
             }
         )
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -687,6 +848,16 @@ exit 0
         with open(installed_tunnel_unit, "r", encoding="utf-8") as f:
             tunnel_unit_content = f.read()
         self.assertIn(tunnel_unit_marker, tunnel_unit_content)
+
+        # key-sync 也從取到的 tag 的 ops-scripts/ 裝
+        installed_keysync = os.path.join(self.home, ".local", "bin", "key-sync")
+        with open(installed_keysync, "r", encoding="utf-8") as f:
+            self.assertIn(keysync_marker, f.read())
+        unit_dir = os.path.join(self.home, ".config", "systemd", "user")
+        with open(os.path.join(unit_dir, "key-sync.service"), "r", encoding="utf-8") as f:
+            self.assertIn(keysync_service_marker, f.read())
+        with open(os.path.join(unit_dir, "key-sync.timer"), "r", encoding="utf-8") as f:
+            self.assertIn(keysync_timer_marker, f.read())
 
     def test_tunnel_files_changed_schedules_delayed_restart(self):
         first = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])

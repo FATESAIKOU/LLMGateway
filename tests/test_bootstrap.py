@@ -313,6 +313,13 @@ exit 0
         systemctl_script = """#!/usr/bin/env bash
 set -euo pipefail
 echo "systemctl $*" >> "${LOG_DIR}/systemctl-argv.log"
+if [[ "$*" == *"is-failed"* ]]; then
+    # 0＝failed；其他＝沒失敗
+    if [[ "$(cat "${STATE_DIR}/keysync_failed" 2>/dev/null || echo 0)" == "1" ]]; then
+        exit 0
+    fi
+    exit 1
+fi
 if [[ "$*" == *"is-active"* ]]; then
     if [[ "$*" == *"llmgateway-tunnel.service"* ]]; then
         tunnel_env="${LGW_BOOT_HOME:-}/.config/llmgateway/tunnel.env"
@@ -403,6 +410,23 @@ fi
 exit 0
 """
 
+        # 15. gh（install.sh --check 看「gh 能不能用」）
+        # 注意：狀態檔要用 LGW_TEST_STATE_DIR——install.sh 自己會覆寫 STATE_DIR，
+        # 傳下去的 STATE_DIR 不會是測試的狀態目錄。
+        gh_script = """#!/usr/bin/env bash
+set -uo pipefail
+echo "gh $*" >> "${LOG_DIR}/gh-argv.log"
+if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
+    if [[ "$(cat "${LGW_TEST_STATE_DIR}/gh_auth" 2>/dev/null || echo ok)" != "ok" ]]; then
+        echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2
+        exit 1
+    fi
+    exit 0
+fi
+echo "fake gh: unsupported: $*" >&2
+exit 1
+"""
+
         scripts = [
             ("sudo", sudo_script),
             ("useradd", useradd_script),
@@ -418,6 +442,7 @@ exit 0
             ("install", install_script),
             ("curl", curl_script),
             ("ssh", ssh_script),
+            ("gh", gh_script),
         ]
 
         for name, content in scripts:
@@ -955,6 +980,27 @@ exit 0
         self.assertIn("3. 待辦事項 (Pending Todos):", res.stdout)
         self.assertIn("未提供解密密碼", res.stdout)
         self.assertIn("未提供會合點設定", res.stdout)
+
+    def test_gh沒登入時check會說gh不能用(self):
+        """v5：gh 登入是使用前提、bootstrap 不做登入；--check 看得出 gh 不能用"""
+        self._set_state("gh_auth", "fail")
+        args = [
+            "--tag", "lgw-v0.1.0",
+            "--decrypt-pass-file", self.decrypt_pass_file,
+            "--rendezvous", "sshproxy@jump.example.com:2222",
+            "--rendezvous-known-hosts", self.known_hosts_file,
+        ]
+
+        res = self.run_bootstrap(args)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("[check] fail", res.stdout)
+        self.assertIn("gh 沒登入或 token 失效", res.stdout)
+
+        # bootstrap 只問 gh 狀態，不代做登入
+        gh_log = self.read_log("gh")
+        self.assertIn("auth status", gh_log)
+        self.assertNotIn("auth login", gh_log)
+        self.assertNotIn("auth token", gh_log)
 
     def test_sshd_todo_reporting(self):
         """sshd 不符時回 todo 且說明要改什麼"""

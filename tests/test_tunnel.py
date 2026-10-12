@@ -8,7 +8,7 @@ import time
 import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-TUNNEL = os.path.join(REPO_ROOT, "deploy", "llmgateway-tunnel")
+TUNNEL = os.path.join(REPO_ROOT, "ops-scripts", "llmgateway-tunnel")
 
 FAKE_USER = "fakeuser"
 FAKE_HOST = "rendezvous.invalid"
