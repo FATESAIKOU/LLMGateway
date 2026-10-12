@@ -106,8 +106,8 @@ class BootstrapScriptTests(unittest.TestCase):
         #   sudo_no_cache=1：-n 的指令必須先有 sudo -v 刷新過，否則回非零
         # 一種真的 sudo 行為模擬（環境變數）：
         #   LGW_SUDO_CACHE_PPID=1：快取跟著 parent pid 走（沒有 tty 時的真機
-        #     行為）。-v 記下呼叫者的 PPID；-n 時 PPID 不同就沒有快取，回
-        #     「sudo: interactive authentication is required」。
+        #     行為，每 PPID 一檔）。-v 記下呼叫者的 PPID；-n 時同 PPID 沒記過
+        #     就沒有快取，回「sudo: interactive authentication is required」。
         #     腳本要在同一個 shell 層級先 -v 再 -n 才過得了：$(...) 子 shell
         #     的 PPID 跟主腳本不同，只在步驟開頭刷新的快取拿不到。
         sudo_script = """#!/usr/bin/env bash
@@ -141,11 +141,13 @@ if [[ $has_S -eq 1 && $has_v -eq 0 ]]; then
 fi
 
 if [[ "${LGW_SUDO_CACHE_PPID:-0}" == "1" ]]; then
+    # 每個 PPID 各記一筆（真機沒有 tty 時的行為；#19 低-2）。
+    # 舊版只留最後一次 -v 的 PPID（單槽），A 子 shell -v→主 shell -v 蓋掉→
+    # A 子 shell -n 會被誤判失敗；現每 PPID 一檔，不互相覆蓋。
     if [[ $has_v -eq 1 ]]; then
-        echo "$PPID" > "${LGW_TEST_STATE_DIR}/sudo-v-ppid"
+        echo "1" > "${LGW_TEST_STATE_DIR}/sudo-v-ppid-$PPID"
     elif [[ $has_n -eq 1 ]]; then
-        cached_ppid="$(cat "${LGW_TEST_STATE_DIR}/sudo-v-ppid" 2>/dev/null || true)"
-        if [[ -z "$cached_ppid" || "$cached_ppid" != "$PPID" ]]; then
+        if [[ ! -f "${LGW_TEST_STATE_DIR}/sudo-v-ppid-$PPID" ]]; then
             echo "sudo: interactive authentication is required" >&2
             exit 1
         fi
