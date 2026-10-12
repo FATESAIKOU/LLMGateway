@@ -2,20 +2,20 @@
 
 把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；正本是 private repo 的加密檔，服務定期自己拉；客戶端經會合點的 SSH 轉發用 get 拿到，其他地方不再放 key。
 
-> v5（2026-10-12）：`key 只保管在一處`搬到下面的 MODIFIED（全文更新）；新增`拉取與輪替`。`值不外洩`、`不做應用層認證`、`服務不對外`不變。
+> v5（2026-10-12）：`key 只保管在一處`搬到下面的 MODIFIED（全文更新）；新增`拉取與輪替`。`值不外洩`、`不做應用層認證`、`服務不對外`不變。第二輪（同日，本人）：拉取改 `gh api`，repo 寫死，`gh` 登入是使用前提。
 
 ## ADDED Requirements
 
 ### Requirement: 拉取與輪替
-服務 SHALL 約每 10 分鐘從 private repo 拉一次加密檔，流程固定為：拉取→比對版本（解密後內容沒變就不動）→解密→驗證格式（同 `keys.env` 五個 `KEY=VALUE`）→原子替換 `keys.env`→`lgwd` 重讀。任一步失敗 MUST 保留舊版並記 log，不讓服務斷 key。值在過程中 MUST NOT 上命令列、不寫進 log。
+key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一次 `keys.env.enc`，流程固定為：`gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc` 取回 base64 內容與 blob `sha`→比對 `sha`（和上次套用的一樣就不動）→base64 解碼→`openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a -pass env:…` 解密→驗證格式（同 `keys.env` 五個 `KEY=VALUE`）→原子替換 `keys.env`→`lgwd` 重讀。使用前提是服務那台以 `llmgw` 身分登入過 `gh`（LLMGateway 本身不做登入引導）。`gh` 沒登入或 token 失效時 MUST 記一行 log（不含值）、保留舊版，下次再試。值在過程中 MUST NOT 上命令列、不寫進 log。
 
 #### Scenario: 拉到新版
-- **WHEN** private repo 的加密檔更新，本人改了某把 key
+- **WHEN** 本人更新加密檔並 push（blob `sha` 變了）
 - **THEN** 下一次拉取後那台的 key 檔更新，`lgwd` 重讀後 get 回新值
 
-#### Scenario: 拉取失敗
-- **WHEN** 拉取、解密或驗證任一步失敗
-- **THEN** `keys.env` 不動，服務照用舊 key，只多一行 log
+#### Scenario: gh 不能用
+- **WHEN** `gh` 沒登入或 token 失效
+- **THEN** key-sync 記一行 log、`keys.env` 不動，服務照用舊 key；`install.sh --check` 看得出「gh 不能用」
 
 ### Requirement: 值不外洩
 key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務的 log、list 的回覆、錯誤訊息。值只出現在 get 的回覆，以及由 sidecar 開的 agent 的環境。
@@ -45,7 +45,7 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 ## MODIFIED Requirements
 
 ### Requirement: key 只保管在一處
-五把 key 的正本 SHALL 是 private repo 裡的加密檔（格式與加密方式見 design v5；值由本人更新，AI 不經手值）。LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密驗證過的內容寫到放服務那台、只有服務帳號讀得到的檔案（權限 0600）。拉取與解密過程中 MUST NOT 把值放在命令列或寫進 log。
+五把 key 的正本 SHALL 是 private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `keys.env.enc`（格式與加密方式見 design v5；值由本人更新，AI 不經手值）。使用前提是服務那台以 `llmgw` 身分登入過 `gh`（token 在該帳號家目錄；LLMGateway 不做登入引導）。LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密驗證過的內容寫到放服務那台、只有服務帳號讀得到的檔案（權限 0600）。拉取與解密過程中 MUST NOT 把值放在命令列或寫進 log。
 
 #### Scenario: 部署
 - **WHEN** 本人更新加密檔並等一次拉取

@@ -99,8 +99,8 @@
 
 - 本人：「沒事，我選 a，反正洩漏我換 key 很簡單」。
 - **本人已接受的風險**：sshproxy 上的所有金鑰都連得到 API 埠，也就讀得到全部五把 key。這包括所有 provider、worker 的隧道金鑰，以及家人維修機共用的那把。
-- **發現外洩時**：在 LLMGateway 的 secret 換掉五把 key，重新部署。換 key 不需要動任何客戶端，因為客戶端不持有 key。
-- **客戶端裝置遺失時**（例如手機）：裝置上有 sshproxy 的金鑰就等於 key 已外洩。先請 MyLinuxPool 把那把金鑰從 sshproxy 撤掉，再換掉五把 key 並重新部署；撤銷之前那把金鑰仍然讀得到。
+- **發現外洩時**：在 LLMGateway 的 secret 換掉五把 key，重新部署。換 key 不需要動任何客戶端，因為客戶端不持有 key。（v5：改更新加密檔等一次拉取，見下「決定 5／5b 的取代」）
+- **客戶端裝置遺失時**（例如手機）：裝置上有 sshproxy 的金鑰就等於 key 已外洩。先請 MyLinuxPool 把那把金鑰從 sshproxy 撤掉，再換掉五把 key 並重新部署；撤銷之前那把金鑰仍然讀得到。（v5：後半改更新加密檔等一次拉取）
 - 稽核紀錄只看得到「從會合點來的連線」，分不出是哪一把 SSH 金鑰（本人接受，v0 不分辨是哪台 worker）。
 
 ### 決定 5b：key 的保管與服務的形狀
@@ -215,12 +215,14 @@ impl branch 上已寫好的租約核心、管理 API、狀態板、用量查詢�
 
 - `deploy/llmgateway-tunnel` 與 `deploy/llmgateway-tunnel.service` 搬到 `ops-scripts/`（維運工具定位），內容不變；`install.sh`、`bootstrap.sh` 改從新路徑裝。決定 3 的行為（探針、重啟語意）不變。
 
-### 決定 5／5b 的取代：金鑰自己拉
+### 決定 5／5b 的取代：金鑰自己拉（本人第二輪，2026-10-12：`gh` 方式；升級選乙見下）
 
-- 正本：private repo 的加密檔（`openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt`，密碼經 `-pass env:`／`fd:` 傳，不上命令列）；檔名、內容格式、版本判斷見 v5-plan。
-- 服務那台跑 key-sync（小 script＋systemd timer，約每 10 分鐘）：拉→比對→解密→驗證格式→原子替換 `keys.env`；失敗保留舊版。`lgwd` 每次請求前比對 `keys.env` 的 mtime，變了就重讀（失敗沿用舊的、記 log）。
+- 正本：private repo `FATESAIKOU/LLMGateway-keys` 根目錄 `keys.env.enc`（只有本人用；`openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt`，密碼經 `-pass env:`／`fd:` 傳，不上命令列）。
+- 使用前提：服務那台以 `llmgw` 身分登入過 `gh`（`gh` 的登入跟著 Unix 使用者走；本人 `sudo -u llmgw -i` 後 `gh auth login`，token 存在 `~llmgw/.config/gh/` 0600）。LLMGateway 本身不做登入引導。
+- token 權限風險：`gh` 預設拿到本人帳號的 repo 全權限——拿著這台登入狀態的人能讀寫本人所有 repo。請本人擇一：(甲) 只讀單一 repo 的 fine-grained token，`gh auth login --with-token`（推薦）；(乙) 接受預設並承擔風險。見 v5-plan §2。
+- 拉取：key-sync（小 script＋systemd timer，約每 10 分鐘）跑 `gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc`，回傳的 blob `sha` 即版本（一樣就不動；不用 clone——免在本機留 mirror 少管一份狀態）：base64 解碼→openssl 解密→驗證格式→原子替換 `keys.env`→`lgwd` 依 mtime 重讀；失敗保留舊版、記 log。`gh` 沒登入或 token 失效同失敗處理；`install.sh --check` 看得出「gh 不能用」。
 - 拿掉：`deploy-keys` workflow、`remote-deploy.sh` 的 `keys` 動詞、SIGHUP 重讀（`llmgateway.service` 的 `ExecReload` 一併拿掉）、bootstrap 的部署公鑰／forced command 步驟、部署私鑰整組 secret。
-- 初次啟動引導（GitHub 登入方式的比較與推薦、解密密碼的放置）見 v5-plan；引導完手動跑一次 key-sync 拉下首版，`--check` 才會過。
+- 初次啟動：先以 `llmgw` 身分 `gh auth login`（token 二選一見 v5-plan §2）＋放好解密密碼（`keysync.env`，見 v5-plan），再手動跑一次 key-sync 拉下首版，`--check` 才會過。LLMGateway 不做登入引導。
 - 服務程式本身怎麼升級（`upgrade` 動詞與 deploy-service 去留）待本人決定。
 
 ### 決定 7／8 的取代：冷卻 until-only

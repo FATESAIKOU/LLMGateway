@@ -4,57 +4,54 @@
 
 這是 public repo：本檔只有變數名、檔名、流程，沒有任何值、機器名、IP、私人系統名稱。
 
-## 1. 金鑰拉取流程（提案）
+## 1. 金鑰拉取流程（本人第二輪：`gh` 方式，不用 deploy key）
 
 ### 1.1 元件
 
-- **key-sync**：新增小 script（標準函式庫以外只用 `git` 與 `openssl` 兩個外部指令），跑在服務那台的 `llmgw` 身分，由 systemd timer 約每 10 分鐘觸發一次；也允許本人手動觸發跑一次（提早生效，不用等 10 分鐘）。
+- **key-sync**：新增小 script（標準函式庫以外只用 `gh` 與 `openssl` 兩個外部指令；不用 `git`，本機不留 mirror），跑在服務那台的 `llmgw` 身分，由 systemd timer 約每 10 分鐘觸發一次；也允許本人手動觸發跑一次（提早生效，不用等 10 分鐘）。
 - **key 檔**：沿用 `~/.local/state/llmgateway/keys.env`（0600，`llmgw`），格式不變（`lgwd/keys.py` 照用）。
-- **版本記錄**：`~/.local/state/llmgateway/.keysync.sha`，記上次套用的 private repo commit SHA（純文字，本人讀得到）。
+- **版本記錄**：`~/.local/state/llmgateway/.keysync.sha`，記上次套用的 blob `sha`（純文字，本人讀得到）。
 
 ### 1.2 時序（每次觸發）
 
-1. **拉取**：`git -C <mirror> fetch origin`（ssh＋唯讀 deploy key，只取不合併），讀 `FETCH_HEAD` 的 SHA。
-2. **比對版本**：SHA 與 `.keysync.sha` 相同 → 直接結束（不解密、不碰 key 檔）。不同才往下。
-3. **解密**：`git show <SHA>:keys.env.enc` 取出→ `openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a -pass env:LLMGW_KEYS_PASSWORD` 解密。密碼只經環境變數傳，**不用 `-pass pass:`**（會上命令列、`ps` 看得到）。
+1. **拉取**：`gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc`（走 `llmgw` 的登入狀態，見 §2），取回 base64 內容與 blob `sha`。不用 clone／fetch：少在本機留一份 mirror，少管一份狀態。
+2. **比對版本**：`sha` 與 `.keysync.sha` 相同 → 直接結束（不解碼、不解密、不碰 key 檔）。不同才往下。
+3. **解碼＋解密**：base64 解碼 → `openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a -pass env:LLMGW_KEYS_PASSWORD` 解密。密碼只經環境變數傳，**不用 `-pass pass:`**（會上命令列、`ps` 看得到）。
 4. **驗證格式**：解密結果丟給現有的 key 檔解析（同 `lgwd/keys.py` 規則：五個 `KEY=VALUE` 都要有、不重複、值不含空白引號）。不過就停。
-5. **原子替換**：驗過才寫暫存檔（0600）→ rename 成 `keys.env`；再把新 SHA 寫進 `.keysync.sha`。
+5. **原子替換**：驗過才寫暫存檔（0600）→ rename 成 `keys.env`；再把新 `sha` 寫進 `.keysync.sha`。
 6. **`lgwd` 重讀（提案：自己偵測）**：`lgwd` 每次處理請求前 `stat` 一次 `keys.env` 的 mtime，變了就重讀（沿用現有 `reload()` 語意：失敗沿用舊的、記 log、不含值）。**不推薦**由 key-sync 送 SIGHUP：多一個跨行程約定，mtime 偵測少一個動件。`llmgateway.service` 的 `ExecReload` HUP 行一併拿掉。
-7. **失敗時保留舊版**：上面 1–5 任一步失敗（斷網、SHA 讀不到、解密失敗、格式不過）→ key 檔不動、SHA 不寫、記一行 log（不含值），服務照用舊 key；下一次 timer 再試。連續失敗才需要人看（看 log，不看 key）。
+7. **失敗時保留舊版**：上面 1–5 任一步失敗（`gh` 沒登入、token 失效、斷網、`sha` 讀不到、解密失敗、格式不過）→ key 檔不動、`sha` 不寫、記一行 log（不含值），服務照用舊 key；下一次 timer 再試。連續失敗才需要人看（看 log，不看 key）。
 
-### 1.3 加密檔格式（提案）
+### 1.3 加密檔格式
 
-- **位置**：新 private repo 根目錄，**檔名提案 `keys.env.enc`**。
+- **位置**：private repo `FATESAIKOU/LLMGateway-keys` 根目錄，**檔名 `keys.env.enc`**（已定）。
 - **加密（本人在自己電腦做）**：`openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt -pass env:…`（32 字元隨機英數密碼，同 MyLinuxPool 做法；`-pass` 只用 `env:`／`fd:`）。
 - **解密後內容**：五行 `KEY=VALUE`（名字沿用：`CLAUDE_PERSONAL_OAUTH_TOKEN`、`CLAUDE_COMPANY_OAUTH_TOKEN`、`OPENROUTER_API_KEY`、`OPENCODE_ZEN_API_KEY`、`OLLAMA_API_KEY`），外加一行人類看的版本註解（例 `# version: 2026-10-12-01`；機器不靠它判斷，只供本人對帳）。
-- **版本判斷**：機器只認 private repo 的 **commit SHA**（§1.2 第 2 步）＋解密後內容的 sha256（與現行 `keys.env` 比，不同才寫，避免 mtime 空轉）。不另設版本號欄位，加密檔格式以後想加欄位也不用改比對邏輯。
+- **版本判斷**：機器只認 `gh api` 回傳的 blob `sha`（§1.2 第 2 步）＋解密後內容的 sha256（與現行 `keys.env` 比，不同才寫，避免 mtime 空轉）。不另設版本號欄位，加密檔格式以後想加欄位也不用改比對邏輯。
 
-## 2. 初次啟動引導（提案）
+## 2. 初次啟動（`gh` 前提；LLMGateway 不做登入引導）
 
-前提：`keys.env` 不存在時 `lgwd` 照舊不啟動（現行語意保留）。引導完本人手動跑一次 key-sync 拉下首版，`install.sh --check` 過了才算完。
+前提：`keys.env` 不存在時 `lgwd` 照舊不啟動。順序：`gh` 登入 → 放解密密碼 → 手動跑一次 key-sync 拉下首版 → `--check` 過。
 
-### 2.1 GitHub 登入（三方案比較，推薦 b）
+### 2.1 `gh` 登入（本人，以 `llmgw` 身分）
 
-| 方案 | 做法 | 優點 | 缺點 |
-|---|---|---|---|
-| a. `gh auth login` device flow | 服務那台裝 `gh`，本人開瀏覽器輸碼授權 | 本人熟悉，一次授權 | token 權限大（跟著本人帳號）、續期／撤銷麻煩、服務那台多一個 `gh` 相依 |
-| b. **唯讀 deploy key（推薦）** | 服務那台產一對 key（私鑰不離開那台，同隧道金鑰模式），本人把公鑰加到 private repo 的 Deploy keys（Read-only 打勾） | 權限最小（唯讀單一 repo）、無過期問題、撤銷容易（repo 頁面刪掉就好） | 本人要手動加一次公鑰；clone 只能走 ssh（要 github.com 的 host key，bootstrap 已有 known_hosts 機制可複用） |
-| c. fine-grained PAT | 本人開只讀單一 repo 的 token | 不用加公鑰 | token 有過期日（要輪替）、本人要保管、洩漏面比 deploy key 大 |
+- `gh` 的登入跟著 Unix 使用者走；key-sync 以 `llmgw` 跑，所以本人 `sudo -u llmgw -i` 後執行 `gh auth login`，token 存在 `~llmgw/.config/gh/`（0600）。
+- token 二選一（請本人擇一）：
+  - （甲，推薦）只讀 `FATESAIKOU/LLMGateway-keys` 單一 repo 的 fine-grained token：`gh auth login --with-token` 讀 token 登入；權限最小，就算這台的登入狀態外洩也只影響該 repo 的讀。
+  - （乙）接受預設：`gh auth login` 互動登入，token 拿到本人帳號的 repo 全權限；拿著這台登入狀態的人能讀寫本人所有 repo，本人接受此風險才選。
+- 不用 deploy key（本人裁定）：免在 repo 登記公鑰、免管 ssh host key；代價是服務那台要有 `gh` 且登入狀態有效，失效時 key 凍在舊版（§1.2 第 7 步）。
 
-推薦 b：和 v4 隧道金鑰同一套「私鑰不離開那台、本人只登記公鑰」的習慣，本人做過一次。
+### 2.2 解密密碼的放置
 
-### 2.2 解密密碼的放置（提案）
-
-- bootstrap 引導本人提供解密密碼（互動輸入或 `--decrypt-pass-file <檔>`，檔 0600、用完就刪），寫入 `~/.config/llmgateway/keysync.env`（**0600，擁有者 `llmgw`**），內容只有一行 `LLMGW_KEYS_PASSWORD=…`。
+- 本人提供解密密碼（bootstrap 引導：互動輸入或 `--decrypt-pass-file <檔>`，檔 0600、用完就刪），寫入 `~/.config/llmgateway/keysync.env`（**0600，擁有者 `llmgw`**），內容只有一行 `LLMGW_KEYS_PASSWORD=…`。
 - key-sync 的 systemd unit 用 `EnvironmentFile=` 讀它，再以 `-pass env:LLMGW_KEYS_PASSWORD` 調 openssl。密碼不進 repo、不進 log、不上命令列。
 - 密碼遺失＝加密檔打不開＝換不了 key：重建方式是本人重設新密碼、整檔重加密後 push（§3.3 同流程）。所以密碼另有一份在 GitHub secret 備份（§3.2）。
 
 ## 3. 需要本人做的事
 
-### 3.1 開新的 private repo（提案名 `LLMGateway-keys`，待本人定）
+### 3.1 開 private repo `FATESAIKOU/LLMGateway-keys`（已定）
 
-- private（key 正本，不進 public repo）。
-- 加上 §2.1 的唯讀 deploy key（公鑰由 bootstrap 印出，本人貼上）。
+- private（key 正本，不進 public repo；只有本人用）。
 - 根目錄放 `keys.env.enc`（§1.3）。
 
 ### 3.2 secret（命名照 `<存取方>__<被存取方>__<動作>`）
