@@ -210,6 +210,26 @@ class ApiTest(MainCase):
         self.gw.stop()
         self.gw.stop()
 
+    def test_SIGHUP整組已拿掉(self):
+        # v5.4：沒有 SIGHUP 重讀了。程式裡不該再有 handler 或「SIGHUP 會做 X」的說明，
+        # unit 也不該再有 ExecReload（審查 #13 低-1：policy.py 的註解曾殘留）。
+        service = (REPO / "deploy" / "llmgateway.service").read_text(encoding="utf-8")
+        self.assertNotIn("ExecReload", service)
+        forbidden = ("signal.SIGHUP", "hasattr(signal,", "on_hup", "SIGHUP 時",
+                     "SIGHUP 重讀", "SIGHUP：")
+        narrative = ("沒有", "不再", "拿掉", "移除", "v5", "無熱重載")
+        for module in ("main.py", "policy.py", "keys.py"):
+            src = (REPO / "lgwd" / module).read_text(encoding="utf-8")
+            for line in src.splitlines():
+                if "SIGHUP" not in line:
+                    continue
+                for bad in forbidden:
+                    self.assertNotIn(bad, line, f"{module} 還在講 SIGHUP 的舊行為：{line.strip()}")
+                # 剩下的是敘述性提及（例如「不再用 SIGHUP」），必須寫明是拿掉了
+                self.assertTrue(
+                    any(word in line for word in narrative),
+                    f"{module} 的 SIGHUP 提及沒說明已拿掉：{line.strip()}")
+
 
 class ReloadTest(MainCase):
     def _get_key(self, sub="claude-personal", agent="claude-code"):

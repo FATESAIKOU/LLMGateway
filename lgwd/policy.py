@@ -1,8 +1,12 @@
-"""政策檔（design 決定 7；tasks 1.2）。由 review 實作。
+"""政策檔（design 決定 7；tasks 1.2）。
 
-load_policy(path) 讀 JSON、驗證、回傳 Policy；不合法丟 PolicyError（服務啟動時不啟動、SIGHUP 時沿用舊的）。
+load_policy(path) 讀 JSON、驗證、回傳 Policy；不合法丟 PolicyError。
 政策檔只管 priority、agents、models（與 provider 有關的欄位在 lgwd/providers.py）。
 PolicyError 的訊息只用固定字串，不回顯檔案裡的字串（值永不進例外）。
+
+載入時機：只在啟動時（lgwd 啟動失敗就不啟動）。v5 沒有熱重載、沒有 SIGHUP，
+換政策要重啟 lgwd（政策檔跟著 tag 換，見 docs/deploy.md 4.2）。key 檔是另一回事：
+那個由 key-sync 換檔後 lgwd 依 mtime 自動重讀。
 """
 
 from __future__ import annotations
