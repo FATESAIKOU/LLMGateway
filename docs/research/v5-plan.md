@@ -1,6 +1,6 @@
 # v5 實作計畫（C）：金鑰自己拉、初次引導、估工、疑點
 
-前言：v5 五件事見 `openspec/changes/gateway-v0/proposal.md`「v5 變更」；spec 見同目錄三份 delta；檔案盤點見 `v5-inventory.md`。本檔是 v5.4（金鑰正本改 private repo 加密檔、服務自己拉）的實作提案，外加估工與要本人決定的事。
+前言：v5 五件事見 `openspec/changes/gateway-v0/proposal.md`「v5 變更」；spec 見同目錄三份 delta；檔案盤點見 `v5-inventory.md`。本檔是 v5.4（金鑰正本改 private repo 加密檔、服務自己拉）的實作提案，外加估工與本人第二輪裁定（2026-10-12 同日）。
 
 這是 public repo：本檔只有變數名、檔名、流程，沒有任何值、機器名、IP、私人系統名稱。
 
@@ -65,7 +65,7 @@
 1. 在自己電腦寫明文（五行 `KEY=VALUE`，值怎麼拿照舊；**AI 不經手值**）。
 2. `openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt` 加密成 `keys.env.enc`（密碼經 `env:` 傳）。
 3. 刪掉明文（`shred -u` 或同等）。
-4. commit＋push 到 `LLMGateway-keys`。
+4. commit＋push 到 `FATESAIKOU/LLMGateway-keys`。
 5. 等一次拉取（≤約 10 分鐘；趕時間就上服務那台手動觸發 key-sync 跑一次）。
 6. 驗證：`curl` 經本機通道打 list（`available` 回來了）或等 sidecar 換把成功。log 只看 key-sync 的成敗行。
 
