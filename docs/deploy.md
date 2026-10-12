@@ -1,12 +1,12 @@
 # LLMGateway 部署與維運手冊（v4）
 
-> **v5 改寫大綱（2026-10-12，本人定方向；內文仍是 v4，實作階段才全文重寫）**。細節見 `docs/research/v5-plan.md`，spec 見 `openspec/changes/gateway-v0/`。
-> - §0 全貌：`lgw connect`→自備通道；隧道守護搬 `ops-scripts/`；key 改 key-sync 自己拉；`deploy-keys` 整節刪。
-> - §1：1.9 放部署公鑰整節刪（含 bootstrap `--deploy-pubkey-file`）；新增「初次啟動引導」（GitHub 登入＋解密密碼放置＋手動跑一次 key-sync）；隧道檔路徑改 `ops-scripts/`。
-> - §2：部署連線 4 secret 整組刪；五把 key secret 整組刪，改為 private repo 加密檔＋解密密碼 secret（提案見 v5-plan）；`upgrade`／deploy-service 去留待本人決定。
-> - §3：3.1 改自備通道（ssh -L／mlp 手寫）；3.2 改 MyLinuxPool capability 建通道（LLMGateway 只提需求）；`connect.json` 整節刪。
-> - §4：4.1 換 key 改「更新加密檔等一次拉取」；4.2 升級待定；4.5 外洩時改加密檔流程；部署私鑰外洩一條刪。
-> - §5：5.1–5.3（`deploy-keys` 結束碼、SIGHUP、workflow ssh）改寫或刪；5.5 `lgw connect` 排錯改自備通道；API 錯誤碼改 until 版。
+> **v5 改寫大綱（2026-10-12，本人兩輪裁定；內文仍是 v4，實作階段才全文重寫）**。細節見 `docs/research/v5-plan.md`，spec 見 `openspec/changes/gateway-v0/`。
+> - §0 全貌：`lgw connect`→自備通道；隧道守護與 key-sync 放 `ops-scripts/`；key 改 key-sync 用 `gh` 自己拉（使用前提：`llmgw` 身分登入過 `gh`）；兩個 workflow 整組刪；升級改手動。
+> - §1：1.9 放部署公鑰整節刪；新增「`gh` 登入（`sudo -u llmgw -i` 後，token 二選一）＋解密密碼放置＋手動跑一次 key-sync」；隧道檔路徑改 `ops-scripts/`。
+> - §2：部署連線 4 secret 與五把 key secret 整組收；只剩 `GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`（解密密碼備份）；private repo `FATESAIKOU/LLMGateway-keys`。
+> - §3：3.1 改自備通道（ssh -L／mlp 手寫）；3.2 改 MyLinuxPool capability 建通道到本機 4710（預設，可改）；`connect.json` 整節刪；手機段落改「手機自行用 ssh -J 等方式轉發，不提供程式」（MyAiEntry#147 已關掉）。
+> - §4：4.1 換 key 改「更新加密檔等一次拉取（或手動觸發）」；4.2 升級改手動 `install.sh --tag`（前後 `--check`）；4.5 外洩時改加密檔流程；部署私鑰外洩一條刪。
+> - §5：workflow 排錯整節刪；新增 `gh` 不能用（沒登入／token 失效）的排錯；`--check` 看得出「gh 不能用」；API 錯誤碼改 until 版。
 
 給本人（或本人授權的人）做「放服務的那台」的一次性設定、GitHub 的設定、日常維運與排錯。設計見 `openspec/changes/gateway-v0/`（design 決定 2、3、4、5a、5b）。
 
