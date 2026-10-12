@@ -916,10 +916,19 @@ step_check() {
         llmgw_exists "$tunnel_env" || tunnel_state=$?
         if [[ $tunnel_state -eq 0 ]]; then
             local tunnel_content=""
-            if tunnel_content="$(run_as_llmgw cat "$tunnel_env")" \
-                && grep -Eq '^RENDEZVOUS=[^[:space:]]+' <<< "$tunnel_content"; then
+            if ! tunnel_content="$(run_as_llmgw cat "$tunnel_env")"; then
+                # 分不出「隧道沒設定」與「讀不到」就不能分類，記 fail 不記 todo (M-F3)
+                log_step check fail "無法讀取 tunnel.env (${tunnel_env})，不判定 check 結果"
+                step_failed=1
+                return 1
+            fi
+            if grep -Eq '^RENDEZVOUS=[^[:space:]]+' <<< "$tunnel_content"; then
                 tunnel_configured=1
             fi
+        elif [[ $tunnel_state -ne 1 ]]; then
+            log_step check fail "無法判斷 tunnel.env 是否存在 (${tunnel_env})，不判定 check 結果"
+            step_failed=1
+            return 1
         fi
 
         local gw_active=0
