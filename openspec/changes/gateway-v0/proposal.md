@@ -58,7 +58,7 @@
 1. **冷卻只收 `until`**：登錄冷卻的 body 改為 `{until}`（RFC 3339 UTC，何時能再用），拿掉 `window`（5h／1w）；list／get 的 `cooldown` 欄位改成單一 `until`（或 null）；`available`＝已部署且沒有未來的 `until`。sidecar 拿不到恢復時間時報「現在＋1 小時」（那是 sidecar 的行為；`lgw.signals` 只負責把判讀結果轉成 `{until}`）。
 2. **拿掉 `lgw connect`**：sidecar 直接 curl 本機的 port。worker 端通道由 MyLinuxPool 的 LLMGateway capability 附建通道小 script 建立（LLMGateway 只寫清楚它需要什麼：本機 loopback 某 port 即 HTTP API）；Mac／手機用 mlp 或 ssh -J 自己轉發。
 3. **反向隧道搬到 `ops-scripts/`**：`llmgateway-tunnel` 與其 unit 從 `deploy/` 搬到 `ops-scripts/`（維運工具定位），內容不變。
-4. **金鑰正本改放 private repo 加密檔**：`deploy-keys` workflow、`remote-deploy.sh` 的 `keys` 動詞、SIGHUP 重讀拿掉，改由 LLMGateway 自己定期拉（約每 10 分鐘），拉到新版就換。加密方式、檔格式、初次啟動引導、要本人做的事見 `docs/research/v5-plan.md`。服務程式本身怎麼升級（`upgrade` 動詞與 deploy-service 去留）待本人決定。
+4. **金鑰正本改放 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`**：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 secret 整組拿掉（乙）；key-sync 約每 10 分鐘用 `gh` 拉（`gh` 登入是使用前提，`llmgw` 身分，token 二選一），拉到新版就換。升級改管理帳號手動 ssh 上去跑 `install.sh --tag`。細節見 `docs/research/v5-plan.md`。
 5. **文件說法**：sidecar 內部的 SubscriptionSource 不是 LLMGateway 的事；sshproxy 是既有設施（MyLinuxPool 維運，LLMGateway 只當會合點用）。
 
 ### Capabilities（v5 增補）
@@ -84,7 +84,7 @@
 
 - **MyAiStorage（sidecar v4）**：用 list、get、登錄冷卻；挑選與換把在 sidecar 內部；env 對應在 AgentDriver。
 - **MyLinuxPool**（mylinuxpool-pm 提最小的做法，PMO 協調）：
-  - 在 sshproxy 登記 LLMGateway 的兩把公鑰（隧道、部署）；
+  - 在 sshproxy 登記 LLMGateway 的隧道公鑰（v5 乙：部署公鑰不登記了）；
   - 確認 worker 的 sidecar 讀得到 id_tunnel；
   - #69、#70 不需要。
 - **MyAiEntry#147**：手機一樣經會合點連線（App 內做 SSH 轉發），用 list／get。

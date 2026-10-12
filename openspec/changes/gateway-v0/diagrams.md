@@ -7,9 +7,9 @@
 ## 1. 實體圖
 
 **實體**
-- GitHub（LLMGateway repo）（v5：key 的 secret 與 `deploy-keys` 拿掉，見文末）：
-  - secret：五把 key、部署金鑰與部署連線資訊；
-  - workflow：`deploy-keys`、`deploy-service`（手動觸發、本人核准）。
+- GitHub（LLMGateway repo）（v5 第二輪：兩個 workflow 整組拿掉；secret 只剩解密密碼備份）：
+  - secret：`GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`（解密密碼備份）；
+  - private repo `FATESAIKOU/LLMGateway-keys`：`keys.env.enc` 正本（只有本人用）。
 - 會合點（用設定指定的一台 SSH 主機；v0 是池跳板機上現有的 sshproxy 帳號，本人指定）：
   - 127.0.0.1:4710（API）、127.0.0.1:4711（服務那台的 sshd）：服務那台以 reverse tunnel 公開過來的；
   - `GatewayPorts no`，只綁 loopback。
@@ -17,7 +17,7 @@
   - 帳號 `llmgw`（LLMGateway）：
     - `lgwd`（list／get／登錄冷卻，只綁 127.0.0.1）；
     - 隧道守護（自己的 `ssh -R` 到會合點＋健康探針；v5：程式搬到 `ops-scripts/`，行為不變）；
-    - `remote-deploy.sh`（動詞 `keys`、`upgrade`；v5：`keys` 拿掉，`upgrade` 待本人決定）；
+    - key-sync（v5：約每 10 分鐘用 `gh` 拉加密檔，見文末）；
     - `keys.env`（0600，五把 key；v5：改由 key-sync 從 private repo 加密檔拉下來換）；
     - SQLite（冷卻、稽核；v5：單一 `until`）。
   - 池的管理帳號（MyLinuxPool 的服務）：和 LLMGateway 無關。
@@ -32,8 +32,6 @@
 **連線（誰 → 誰：做什麼）**
 - 隧道守護 → 會合點：`ssh -R`，把 lgwd 的 API 埠與那台的 sshd 公開到會合點的 127.0.0.1；斷了就重連。
 - 隧道守護 → 會合點 → lgwd：每 60 秒端對端探一次。
-- workflow → 會合點（sshproxy，用部署金鑰）→ 服務那台的 `llmgw`：SSH，只能跑部署腳本；寫 key、升級。
-- 部署腳本 → `lgwd`：重讀或重啟。
 - sidecar（worker 與 Mac）→ 本機轉發 →（跳板）→ 會合點（sshproxy）→ `lgwd`：list、get、登錄冷卻（不做應用層認證；v5：不再經 `lgw connect`，sidecar 直接 curl 本機 port）。
 - sidecar → agent：開子行程，env 由 AgentDriver 從 get 的結果推出，不上命令列。
 - sidecar → agora：開啟時繼承 Session，停掉時寫回。
@@ -79,10 +77,10 @@
 2. key-sync（約每 10 分鐘）→ private repo：拉→比對→解密→驗證→原子替換 `keys.env`。
 3. `lgwd`：依 mtime 偵測到換檔就重讀（失敗沿用舊的）。
 
-### 2.4 升級服務（v5：待本人決定；`upgrade` 動詞與 deploy-service 去留未定，見 v5-plan 疑點）
-1. 本人 → GitHub：手動觸發 `deploy-service`（輸入 tag），在 environment 核准。
-2. workflow → 會合點 → `llmgw`：動詞 `upgrade <tag>`。
-3. 安裝程式：固定 tag 取碼（已有就重用）、current 原子切換、裝 unit、重啟 `lgwd`；舊版本只留前一個。
+### 2.4 升級服務（v5 第二輪選乙：手動，不再有 deploy-service）
+1. 本人打 tag `lgw-vX.Y.Z` 並 push。
+2. 本人以管理帳號 ssh 上服務那台，跑 `install.sh --tag <tag>`（手冊步驟，不寫機器名），前後各跑一次 `--check`。
+3. 舊版本只留前一個；`keys.env` 與 `tunnel.env` 不隨版本。
 
 ### 2.5 建 worker（MyLinuxPool；v5：通道由 MyLinuxPool 的 capability 建）
 1. create-worker：照常建容器（id_tunnel 本來就有）。
@@ -108,13 +106,6 @@
 - `cooldown{until}`（v5：單一 `{until}` 或 null，不再分窗口）、`available`。
 - **不含**環境變數名：由 sidecar 的 AgentDriver 推出。
 
-**共通 JSON schema（LLMGateway 與 sidecar 一致）**
-- `schema`、`id`、`provider`、`kind`（`claude-subscription`／`api-key`）；
-- `agents`（`claude-code`／`opencode`）、`priority`、`models{allow, default}`、`endpoint`；
-- `key`（只在 get）；
-- `cooldown{5h, 1w}`（各為 `{until}` 或 null）、`available`。
-- **不含**環境變數名：由 sidecar 的 AgentDriver 推出。
-
 **LLMGateway 內部（介面與實作分開）**
 - `CredentialProvider`：一種 provider 一個實作（anthropic、openrouter、ollama-cloud、opencode-zen），負責 schema 中與 provider 有關的欄位。
 - 政策檔：priority、models、agents。是資料，不是介面。
@@ -137,5 +128,5 @@
 1. **冷卻只收 `until`**：`POST …/cooldown` 的 body 改 `{until}`；`cooldown` 欄位改單一 `{until}` 或 null；`available`＝已部署且無未來 `until`；sidecar 判讀不出恢復時間時報現在＋1 小時。
 2. **拿掉 `lgw connect`**：上文 §2.0a 整節作廢；sidecar 直接 curl 本機 port（worker 由 MyLinuxPool capability 建通道，Mac／手機用 mlp 或 ssh -J）。
 3. **反向隧道搬到 `ops-scripts/`**：`llmgateway-tunnel` 與其 unit 內容不變、只搬目錄；`install.sh`、`bootstrap.sh` 改從新路徑裝。
-4. **金鑰自己拉**：正本是 private repo 加密檔；key-sync 約每 10 分鐘拉→比對→解密→驗證→原子替換；`lgwd` 依 mtime 重讀；上文 §2.3 整節由本節取代。服務程式升級方式（§2.4）待本人決定。
+4. **金鑰自己拉（v5 第二輪選乙）**：正本是 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`；key-sync 約每 10 分鐘用 `gh` 拉（`gh api …/contents/keys.env.enc`，blob `sha` 即版本）→解碼→解密→驗證→原子替換；`lgwd` 依 mtime 重讀；`gh` 登入是使用前提（`llmgw` 身分，token 二選一）。拿掉：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 4 secret、MyLinuxPool 部署公鑰登記（隧道公鑰保留）。升級改手動（上文 §2.4）。
 5. **說法**：sshproxy 是既有設施；sidecar 內部層次不寫名。

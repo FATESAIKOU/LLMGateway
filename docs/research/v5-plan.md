@@ -54,11 +54,11 @@
 - private（key 正本，不進 public repo；只有本人用）。
 - 根目錄放 `keys.env.enc`（§1.3）。
 
-### 3.2 secret（命名照 `<存取方>__<被存取方>__<動作>`）
+### 3.2 secret（命名照 `<存取方>__<被存取方>__<動作>`；乙已定）
 
-- 提案新增 **`GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`**（解密密碼；參考既有的 `GH_MYLINUXPOOL__LINODE_GATEWAYFILES__DECRYPT`）：放本 repo 的 `llmgateway-deploy` environment（required reviewer＝本人），用途是密碼備份與將來驗證加密檔格式的 CI；AI 不經手值。
-- 收掉的：五把 `POOL_LLMGATEWAY__*__LLM`、部署連線 4 個（`GH_LLMGATEWAY__POOL_SSH__DEPLOY*`）——**若 deploy-service 精簡保留（疑點 1 選甲），部署連線 4 個與部署公鑰登記要留**，只收五把 key。
-- MyLinuxPool 那側 `TUNNEL_EXTRA_PUBKEYS` 裡的**部署公鑰**：同上，選甲才留、選乙就請 mylinuxpool-pm 拿掉；隧道公鑰照留。
+- 新增 **`GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT`**（解密密碼的備份；參考既有的 `GH_MYLINUXPOOL__LINODE_GATEWAYFILES__DECRYPT`）：放本 repo 的 `llmgateway-deploy` environment（required reviewer＝本人）；AI 不經手值。
+- 收掉的：五把 `POOL_LLMGATEWAY__*__LLM`、部署連線 4 個（`GH_LLMGATEWAY__POOL_SSH__DEPLOY*`）。
+- MyLinuxPool 那側 `TUNNEL_EXTRA_PUBKEYS` 裡的**部署公鑰**請 mylinuxpool-pm 拿掉；隧道公鑰照留。
 
 ### 3.3 更新金鑰檔的步驟（本人，每次換 key）
 
