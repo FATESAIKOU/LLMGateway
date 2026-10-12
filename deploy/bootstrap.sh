@@ -188,8 +188,9 @@ run_as_llmgw() {
     local uid
     sudo_precheck || return 1
     uid="$(id -u "$USER_NAME" 2>/dev/null || echo "1000")"
-    # 先切到 llmgw 可讀的目錄，避免繼承管理帳號 cwd 導致 git clone 失敗 (H6)
-    sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" bash -c 'cd "${BOOT_HOME:-/home/llmgw}" || cd /; exec "$@"' bash "$@" </dev/null
+    # 先切到 llmgw 可讀的目錄，避免繼承管理帳號 cwd 導致 git clone 失敗 (H6)；
+    # BOOT_HOME 一起送進去，否則內層恆 fallback 到 /home/llmgw (L-R7)。
+    sudo -n -u "$USER_NAME" env HOME="$BOOT_HOME" BOOT_HOME="$BOOT_HOME" XDG_RUNTIME_DIR="${RUNDIR}/${uid}" bash -c 'cd "${BOOT_HOME:-/home/llmgw}" || cd /; exec "$@"' bash "$@" </dev/null
 }
 
 # llmgw_exists：以 llmgw 身分判斷路徑狀態，並把「不存在」與「讀不到」分開
