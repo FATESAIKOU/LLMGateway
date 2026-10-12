@@ -42,6 +42,9 @@ class InstallScriptTests(unittest.TestCase):
                 raise RuntimeError(f"missing system tool {t}")
             os.symlink(p, os.path.join(self.tools, t))
 
+        self.probe_ssh = os.path.join(self.sandbox, "fake-ssh-probe")
+        self.probe_ssh_log = os.path.join(self.sandbox, "probe-ssh-argv.log")
+
         self._create_fake_tools()
 
     def tearDown(self):
@@ -91,7 +94,8 @@ if [[ "${1:-}" == "--version" ]]; then
     echo "Python ${FAKE_PY_VERSION:-3.12.0}"
     exit 0
 fi
-exit 0
+# 其他呼叫照真 python3 執行（隧道執行檔的 shebang 會走到這裡）。
+exec "${REAL_PYTHON:?}" "$@"
 """
         sys_script = """#!/usr/bin/env bash
 echo "systemctl $*" >> "${SANDBOX:?}/systemctl-argv.log"
@@ -127,6 +131,21 @@ echo "curl $*" >> "${SANDBOX:?}/curl-argv.log"
 printf '%s' "${CURL_CODE:-200}"
 exit "${CURL_RC:-0}"
 """
+        probe_ssh_script = """#!/usr/bin/env bash
+printf 'argv: %s\\n' "$*" >> "${PROBE_SSH_LOG:?}"
+request="$(cat)"
+printf 'request: %s\\n' "$request" >> "${PROBE_SSH_LOG}"
+case "${FAKE_PROBE_CODE:-200}" in
+    200) printf 'HTTP/1.0 200 OK\\r\\n\\r\\n' ;;
+    503) printf 'HTTP/1.0 503 Service Unavailable\\r\\n\\r\\n' ;;
+    none) ;;
+esac
+exit 0
+"""
+        with open(self.probe_ssh, "w", encoding="utf-8") as f:
+            f.write(probe_ssh_script)
+        os.chmod(self.probe_ssh, 0o755)
+
         for name, content in [
             ("git", git_script),
             ("python3", py_script),
@@ -157,6 +176,9 @@ exit "${CURL_RC:-0}"
             "REAL_SERVICE": SERVICE_UNIT,
             "REAL_TUNNEL": TUNNEL_DAEMON,
             "REAL_TUNNEL_UNIT": TUNNEL_UNIT,
+            "REAL_PYTHON": sys.executable,
+            "PROBE_SSH_LOG": self.probe_ssh_log,
+            "FAKE_PROBE_CODE": "200",
         }
         if path_mode == "full":
             env["PATH"] = f"{self.fakebin}:{self.tools}"
@@ -179,6 +201,22 @@ exit "${CURL_RC:-0}"
             return ""
         with open(log_path, "r", encoding="utf-8") as f:
             return f.read()
+
+    def write_probe_config(self, home=None, **overrides):
+        if home is None:
+            home = self.home
+        conf_dir = os.path.join(home, ".config", "llmgateway")
+        os.makedirs(conf_dir, exist_ok=True)
+        values = {
+            "RENDEZVOUS": "fakeuser@rendezvous.invalid:2200",
+            "IDENTITY": "/tmp/does-not-exist/id_fake_tunnel",
+            "KNOWN_HOSTS": "/tmp/does-not-exist/known_hosts_fake",
+            "SSH_PATH": self.probe_ssh,
+        }
+        values.update(overrides)
+        with open(os.path.join(conf_dir, "tunnel.env"), "w", encoding="utf-8") as f:
+            for key, value in values.items():
+                f.write(f"{key}={value}\n")
 
     def test_prerequisites_and_file_modes(self):
         self.assertTrue(os.path.isfile(INSTALL_SH))
@@ -380,18 +418,71 @@ exit "${CURL_RC:-0}"
     def test_check_three_states_with_tag(self):
         res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
         self.assertEqual(res.returncode, 0, res.stderr)
+        self.write_probe_config()
 
-        # 0: 兩個 unit 都 active、tag 相符、list 探針回 200
+        # 0: 兩個 unit 都 active、tag 相符、本機與經會合點 list 探針都回 200
         res_ok = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0", "FAKE_PROBE_CODE": "200"}
         )
         self.assertEqual(res_ok.returncode, 0, res_ok.stdout + res_ok.stderr)
+        self.assertIn("本機", res_ok.stdout)
+        self.assertIn("經會合點", res_ok.stdout)
 
         curl_log = self.read_log("curl")
         self.assertIn("/v1/subscriptions", curl_log)
         self.assertNotIn("/v1/board", curl_log)
         self.assertNotIn("Authorization", curl_log)
+
+        probe_log = self.read_log("probe-ssh")
+        self.assertIn("-W 127.0.0.1:4710", probe_log)
+        self.assertIn("GET /v1/subscriptions HTTP/1.0", probe_log)
+
+        # 1: 本機 200 但經會合點不是 200
+        res_probe_503 = self.run_install(
+            ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0", "FAKE_PROBE_CODE": "503"}
+        )
+        self.assertEqual(res_probe_503.returncode, 1, res_probe_503.stdout + res_probe_503.stderr)
+        self.assertIn("經會合點", res_probe_503.stdout)
+
+        # 1: 經會合點沒回應（空輸出）
+        res_probe_none = self.run_install(
+            ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0", "FAKE_PROBE_CODE": "none"}
+        )
+        self.assertEqual(res_probe_none.returncode, 1, res_probe_none.stdout + res_probe_none.stderr)
+
+        # 2: 經會合點的設定不能用（tunnel.env 必填是空的）
+        tunnel_env = os.path.join(self.home, ".config", "llmgateway", "tunnel.env")
+        with open(tunnel_env, "w", encoding="utf-8") as f:
+            f.write("RENDEZVOUS=\nIDENTITY=\nKNOWN_HOSTS=\n")
+        res_probe_cfg = self.run_install(
+            ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
+        )
+        self.assertEqual(res_probe_cfg.returncode, 2, res_probe_cfg.stdout + res_probe_cfg.stderr)
+
+        # 2: 找不到 ssh
+        self.write_probe_config(SSH_PATH="/nonexistent/no-such-ssh")
+        res_probe_ssh = self.run_install(
+            ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
+        )
+        self.assertEqual(res_probe_ssh.returncode, 2, res_probe_ssh.stdout + res_probe_ssh.stderr)
+
+        # 2: 隧道執行檔不在（安裝不完整）
+        self.write_probe_config()
+        tunnel_bin = os.path.join(self.home, ".local", "bin", "llmgateway-tunnel")
+        os.rename(tunnel_bin, tunnel_bin + ".bak")
+        try:
+            res_probe_nobin = self.run_install(
+                ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
+                env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
+            )
+            self.assertEqual(res_probe_nobin.returncode, 2, res_probe_nobin.stdout + res_probe_nobin.stderr)
+        finally:
+            os.rename(tunnel_bin + ".bak", tunnel_bin)
 
         # 1: Service inactive
         res_inact = self.run_install(
@@ -422,12 +513,15 @@ exit "${CURL_RC:-0}"
         with open(tag_file, "w", encoding="utf-8") as f:
             f.write("lgw-v0.1.0\n")
 
-        # 1: list 回非 200（例如 401 或 500）
+        # 1: list 回非 200（例如 401 或 500）；本機不是 200 時不跑經會合點那段
+        if os.path.exists(self.probe_ssh_log):
+            os.remove(self.probe_ssh_log)
         res_401 = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
             env_overrides={"SYS_STATE": "active", "CURL_CODE": "401", "CURL_RC": "0"}
         )
         self.assertEqual(res_401.returncode, 1)
+        self.assertEqual(self.read_log("probe-ssh"), "")
 
         res_500 = self.run_install(
             ["--check", "--tag", "lgw-v0.1.0", "--home", self.home],
@@ -466,13 +560,21 @@ exit "${CURL_RC:-0}"
     def test_check_without_tag(self):
         res = self.run_install(["--tag", "lgw-v0.1.0", "--home", self.home])
         self.assertEqual(res.returncode, 0, res.stderr)
+        self.write_probe_config()
 
-        # 兩個 unit active + 200 -> 0 even without --tag
+        # 兩個 unit active、本機與經會合點都 200 -> 0 even without --tag
         res_ok = self.run_install(
             ["--check", "--home", self.home],
-            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0"}
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0", "FAKE_PROBE_CODE": "200"}
         )
-        self.assertEqual(res_ok.returncode, 0)
+        self.assertEqual(res_ok.returncode, 0, res_ok.stdout + res_ok.stderr)
+
+        # 經會合點不是 200 -> 1
+        res_probe_503 = self.run_install(
+            ["--check", "--home", self.home],
+            env_overrides={"SYS_STATE": "active", "CURL_CODE": "200", "CURL_RC": "0", "FAKE_PROBE_CODE": "503"}
+        )
+        self.assertEqual(res_probe_503.returncode, 1, res_probe_503.stdout + res_probe_503.stderr)
 
         # Does not check version tag: even if .lgw-tag differs, it passes
         tag_file = os.path.join(self.home, ".local", "share", "llmgateway", "lgw-v0.1.0", ".lgw-tag")

@@ -70,6 +70,7 @@ if [[ "$mode" == "probe" ]]; then
         200) printf 'HTTP/1.0 200 OK\\r\\n\\r\\n' ;;
         503) printf 'HTTP/1.0 503 Service Unavailable\\r\\n\\r\\n' ;;
         none) ;;
+        hang) sleep 30 ;;
     esac
     exit 0
 fi
@@ -140,6 +141,23 @@ while :; do sleep 0.05; done
                 self.proc.kill()
                 self.proc.wait(timeout=5)
         return self.proc.returncode
+
+    def run_probe_once(self, env=None):
+        full_env = {
+            "HOME": self.home,
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "FAKE_SSH_LOG": self.ssh_log,
+            "FAKE_PROBE_CODE": "200",
+        }
+        if env:
+            full_env.update(env)
+        return subprocess.run(
+            [sys.executable, TUNNEL, "--probe-once"],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=REPO_ROOT,
+        )
 
     def wait_exit(self, timeout=20):
         try:
@@ -259,6 +277,54 @@ while :; do sleep 0.05; done
         stderr = self.read_stderr()
         self.assertIn("probe_fail", stderr)
         self.assertIn("restart", stderr)
+
+    def test_probe_once_returns_0_and_uses_daemon_ssh_options(self):
+        self.write_config()
+        res = self.run_probe_once()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stderr, "")
+        ssh_log = self.read_ssh_log()
+        self.assertIn("-W 127.0.0.1:4710", ssh_log)
+        self.assertIn("GET /v1/subscriptions HTTP/1.0", ssh_log)
+        self.assertIn("-i " + FAKE_IDENTITY, ssh_log)
+        self.assertIn("-o UserKnownHostsFile=" + FAKE_KNOWN_HOSTS, ssh_log)
+        self.assertIn("-o GlobalKnownHostsFile=/dev/null", ssh_log)
+        self.assertIn("-o IdentitiesOnly=yes", ssh_log)
+        self.assertIn("-o StrictHostKeyChecking=yes", ssh_log)
+        self.assertIn("-o BatchMode=yes", ssh_log)
+        self.assertIn("-p " + FAKE_PORT, ssh_log)
+        self.assertIn(FAKE_USER + "@" + FAKE_HOST, ssh_log)
+        self.assertNotIn("-N", ssh_log)
+
+    def test_probe_once_returns_1_on_non_200_or_no_response(self):
+        for code in ("503", "none"):
+            with self.subTest(code=code):
+                self.write_config()
+                res = self.run_probe_once(env={"FAKE_PROBE_CODE": code})
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+    def test_probe_once_returns_1_on_timeout(self):
+        self.write_config(PROBE_INTERVAL="0.1")
+        res = self.run_probe_once(env={"FAKE_PROBE_CODE": "hang"})
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+    def test_probe_once_returns_2_when_cannot_execute(self):
+        # 設定檔不存在
+        res = self.run_probe_once()
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertEqual(self.read_ssh_log(), "")
+
+        # 必填缺一（RENDEZVOUS 空）
+        self.write_config(RENDEZVOUS="")
+        res = self.run_probe_once()
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertEqual(self.read_ssh_log(), "")
+
+        # 找不到 ssh
+        self.write_config(SSH_PATH="/nonexistent/no-such-ssh")
+        res = self.run_probe_once()
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertEqual(self.read_ssh_log(), "")
 
     def test_tunnel_child_exit_ends_daemon(self):
         self.write_config()
