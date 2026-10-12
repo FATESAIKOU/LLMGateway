@@ -758,6 +758,20 @@ exit 1
         self.assertEqual(empty_pass.returncode, 1, empty_pass.stdout)
         self.assertIn("沒有非空的", empty_pass.stdout)
 
+        # 1：讀不到解密密碼檔（權限被改壞）要講自己的話，不是「沒有非空的 …」。
+        # 審查 #13 低-6：兩個問題分開講，別把人往錯的方向指。
+        os.chmod(keysync_env, 0o000)
+        try:
+            if os.access(keysync_env, os.R_OK):
+                self.skipTest("這個使用者讀得到 000 的檔（root），測不了讀不到的情況")
+            unreadable = check()
+            self.assertEqual(unreadable.returncode, 1, unreadable.stdout)
+            self.assertIn("讀不到解密密碼檔", unreadable.stdout)
+            self.assertIn("檢查權限", unreadable.stdout)
+            self.assertNotIn("沒有非空的", unreadable.stdout)
+        finally:
+            os.chmod(keysync_env, 0o600)
+
         # 1：key-sync 最近一次執行失敗
         self.write_keysync_env()
         failed_run = check(SYS_KEYSYNC_FAILED="1")

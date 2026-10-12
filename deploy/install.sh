@@ -293,6 +293,12 @@ check_keysync() {
         log INFO "key-sync: 還沒放解密密碼（${KEYSYNC_ENV_FILE}）"
         return 1
     fi
+    # 分不出「讀不到」（權限被改壞等）與「沒有那行」就不該講同一句話：前者請人修
+    # 權限，後者請人放密碼（審查 #13 低-6；同 bootstrap step_check 的 M-F3 精神）。
+    if [[ ! -r "$KEYSYNC_ENV_FILE" ]]; then
+        log INFO "key-sync: 讀不到解密密碼檔（${KEYSYNC_ENV_FILE}，檢查權限）"
+        return 1
+    fi
     if ! grep -Eq "^[[:space:]]*${KEY_SYNC_PASSWORD_VAR}=[^[:space:]]+" "$KEYSYNC_ENV_FILE" 2>/dev/null; then
         log INFO "key-sync: 解密密碼檔裡沒有非空的 ${KEY_SYNC_PASSWORD_VAR}"
         return 1
