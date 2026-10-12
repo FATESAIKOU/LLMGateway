@@ -5,6 +5,8 @@ classify(agent, text, now=None, tz=None) → Classification(kind, signal, resets
 - 規則放 RULES（list of dict：agent、pattern、signal、kind、reset 解析法，可另帶
   require／exclude）；第一個命中的生效；順序即優先順序（額度標記一律在暫時錯誤之前）。
 - resets_at 一律回 UTC 的 aware datetime；判讀不出就回 None（不斷言）。
+- 登錄冷卻的 body 是 {"until": RFC 3339 UTC}（v5）；Signal.to_cooldown_body() 只負責轉換，
+  resets_at 判讀不出（None）時由呼叫方以「現在＋1 小時」登錄。
 - 注意：Claude Code 的 resets 時刻是 agent 所在機器的本地時間，呼叫方（sidecar）
   要傳那台機器的 tz；沒傳時用本機時區（在本機跑 sidecar 時兩者相同）。
 - 只用 re、datetime；不引用 subprocess、herdr、agora，不做平台判斷。
@@ -32,34 +34,28 @@ class Classification:
 class Signal:
     """結構化額度事件的判讀結果。
 
-    欄位設計直接對應 LLMGateway 的 POST /v1/subscriptions/{id}/cooldown {window, resets_at}：
+    欄位設計直接對應 LLMGateway 的 POST /v1/subscriptions/{id}/cooldown {until}：
     - exhausted: 是否額度用完。
-    - window: 冷卻窗口（"5h" | "1w" | None）。若為 None（例如 opencode 未提供窗口資訊），
-      由呼叫方（例如 sidecar）自行決定要登錄哪個窗口（例如依訂閱政策預設）。
     - resets_at: UTC aware 的 datetime，或 None（判讀不出或無重置時間）。
+      判讀不出時由呼叫方（例如 sidecar）以呼叫當下＋1 小時為 until 登錄。
     - source: 事件來源識別字串（如 "opencode"、"claude-code"）。
     """
 
     exhausted: bool
-    window: str | None  # "5h" | "1w" | None
     resets_at: datetime | None  # UTC aware
     source: str
 
-    def to_cooldown_body(self, fallback_window: str | None = None) -> dict[str, str]:
-        """產生 POST /v1/subscriptions/{id}/cooldown 的 body 字典。
+    def to_cooldown_body(self) -> dict[str, str]:
+        """產生 POST /v1/subscriptions/{id}/cooldown 的 body 字典 {"until": RFC 3339 UTC}。
 
-        若 window 為 None 且提供了 fallback_window，則使用 fallback_window。
-        若 window 與 fallback_window 皆為 None，丟出 ValueError。
-        resets_at 會轉為 RFC 3339 UTC 字串。
+        resets_at 為 None（判讀不出恢復時間）時丟 ValueError；約定由呼叫方
+        改用「現在＋1 小時」登錄（spec subscription-registry）。
         """
-        win = self.window if self.window is not None else fallback_window
-        if win is None:
-            raise ValueError("window is None and no fallback_window provided")
-        body: dict[str, str] = {"window": win}
-        if self.resets_at is not None:
-            body["resets_at"] = (
-                self.resets_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-            )
+        if self.resets_at is None:
+            raise ValueError("resets_at is None; caller must use now + 1 hour")
+        body: dict[str, str] = {
+            "until": self.resets_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        }
         return body
 
 
@@ -221,8 +217,8 @@ def from_opencode_status(obj: dict) -> Signal | None:
 
     規則：
     - status.type == "retry" 且 status.action.reason 為額度類（OPENCODE_QUOTA_REASONS）：
-      額度用完，回傳 Signal(exhausted=True, window=None, resets_at=..., source="opencode")。
-      status.next 是 epoch 毫秒，轉成 UTC datetime；window 為 None（opencode 沒給窗口）。
+      額度用完，回傳 Signal(exhausted=True, resets_at=..., source="opencode")。
+      status.next 是 epoch 毫秒，轉成 UTC datetime。
     - status.type 為 "busy"、"idle" 或其他 retry 原因：回傳 None。
     - 欄位缺漏、型別不對、非 dict：回傳 None，不丟例外。
     """
@@ -264,7 +260,6 @@ def from_opencode_status(obj: dict) -> Signal | None:
 
     return Signal(
         exhausted=True,
-        window=None,
         resets_at=resets_at,
         source="opencode",
     )
@@ -279,9 +274,8 @@ def from_claude_rate_limit_event(obj: dict) -> Signal | None:
       {"status": ..., "rateLimitType": ..., ...}
 
     規則：
-    - rate_limit_info.status != "allowed"：額度用完，回傳 Signal(exhausted=True, window=..., resets_at=..., source="claude-code")。
+    - rate_limit_info.status != "allowed"：額度用完，回傳 Signal(exhausted=True, resets_at=..., source="claude-code")。
     - rate_limit_info.status == "allowed"：回傳 None。
-    - rateLimitType：five_hour -> "5h"、seven_day -> "1w"，其他 -> None。
     - resetsAt 是 epoch 秒，轉成 UTC datetime。
     - 欄位缺漏、型別不對、非 dict：回傳 None，不丟例外。
     """
@@ -305,14 +299,6 @@ def from_claude_rate_limit_event(obj: dict) -> Signal | None:
     if status == "allowed":
         return None
 
-    rl_type = info.get("rateLimitType")
-    if rl_type == "five_hour":
-        window: str | None = "5h"
-    elif rl_type == "seven_day":
-        window = "1w"
-    else:
-        window = None
-
     resets_at_raw = info.get("resetsAt")
     resets_at: datetime | None = None
     if resets_at_raw is not None:
@@ -325,7 +311,6 @@ def from_claude_rate_limit_event(obj: dict) -> Signal | None:
 
     return Signal(
         exhausted=True,
-        window=window,
         resets_at=resets_at,
         source="claude-code",
     )

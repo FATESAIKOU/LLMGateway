@@ -28,7 +28,7 @@ SUBSCRIPTION = {
     "priority": 10,
     "models": {"allow": ["*"], "default": None},
     "endpoint": None,
-    "cooldown": {"5h": None, "1w": None},
+    "cooldown": None,
     "available": True,
 }
 
@@ -63,8 +63,11 @@ class FakeService:
             sub_id = urllib.parse.unquote(path.split("/")[3])
             if sub_id == "gone":
                 return 404, {"error": "not_found"}
-            if body.get("window") not in ("5h", "1w"):
-                return 400, {"error": "bad_request"}
+            if sub_id == "past":
+                return 400, {"error": "until_out_of_range"}
+            until = body.get("until")
+            if not isinstance(until, str) or not until.endswith("Z"):
+                return 400, {"error": "invalid_until"}
             return 204, {}
         return 404, {"error": "not_found"}
 
@@ -197,7 +200,7 @@ class GetTest(ClientCase):
 
 class CooldownTest(ClientCase):
     def test_cooldown_204(self):
-        res = self.client.cooldown("claude-personal", "5h")
+        res = self.client.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         self.assertTrue(res.ok)
         self.assertEqual(res.status, 204)
         self.assertEqual(res.data, {})
@@ -205,27 +208,25 @@ class CooldownTest(ClientCase):
         self.assertEqual(
             (method, path), ("POST", "/v1/subscriptions/claude-personal/cooldown")
         )
-        self.assertEqual(body, {"window": "5h"})  # 沒給 resets_at 就不送
+        self.assertEqual(body, {"until": "2026-10-11T15:00:00Z"})
         self.assertIsNone(auth)
 
-    def test_cooldown_resets_at(self):
-        res = self.client.cooldown(
-            "claude-personal", "1w", resets_at="2026-10-19T00:00:00Z"
-        )
-        self.assertTrue(res.ok)
-        _, _, _, body, _ = self.fake.requests[-1]
-        self.assertEqual(
-            body, {"window": "1w", "resets_at": "2026-10-19T00:00:00Z"}
-        )
-
-    def test_cooldown_400_bad_window(self):
-        res = self.client.cooldown("claude-personal", "2h")
+    def test_cooldown_400_invalid_until(self):
+        res = self.client.cooldown("claude-personal", "not-a-time")
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 400)
-        self.assertEqual(res.error, "bad_request")
+        self.assertEqual(res.error, "invalid_until")
+        _, _, _, body, _ = self.fake.requests[-1]
+        self.assertEqual(body, {"until": "not-a-time"})  # 原樣送出，判讀在服務
+
+    def test_cooldown_400_until_out_of_range(self):
+        res = self.client.cooldown("past", "2020-01-01T00:00:00Z")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 400)
+        self.assertEqual(res.error, "until_out_of_range")
 
     def test_cooldown_404(self):
-        res = self.client.cooldown("gone", "5h")
+        res = self.client.cooldown("gone", "2026-10-11T15:00:00Z")
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 404)
         self.assertEqual(res.error, "not_found")

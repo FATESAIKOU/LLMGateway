@@ -260,7 +260,6 @@ class OpencodeStatusTest(unittest.TestCase):
         sig = from_opencode_status(sample)
         self.assertIsNotNone(sig)
         self.assertTrue(sig.exhausted)
-        self.assertIsNone(sig.window)
         self.assertEqual(sig.source, "opencode")
         self.assertEqual(sig.resets_at, at_utc(2026, 10, 12, 0, 0))
 
@@ -278,7 +277,6 @@ class OpencodeStatusTest(unittest.TestCase):
         sig = from_opencode_status(status)
         self.assertIsNotNone(sig)
         self.assertTrue(sig.exhausted)
-        self.assertIsNone(sig.window)
         self.assertEqual(sig.source, "opencode")
         self.assertEqual(sig.resets_at, at_utc(2026, 10, 12, 0, 0))
 
@@ -336,7 +334,6 @@ class ClaudeRateLimitEventTest(unittest.TestCase):
         sig = from_claude_rate_limit_event(event)
         self.assertIsNotNone(sig)
         self.assertTrue(sig.exhausted)
-        self.assertEqual(sig.window, "5h")
         self.assertEqual(sig.source, "claude-code")
         self.assertEqual(sig.resets_at, at_utc(2026, 10, 11, 19, 50))
 
@@ -348,17 +345,18 @@ class ClaudeRateLimitEventTest(unittest.TestCase):
         sig = from_claude_rate_limit_event(info)  # 直接傳 rate_limit_info 層
         self.assertIsNotNone(sig)
         self.assertTrue(sig.exhausted)
-        self.assertEqual(sig.window, "1w")
         self.assertEqual(sig.source, "claude-code")
         self.assertEqual(sig.resets_at, at_utc(2026, 10, 17, 7, 0))
 
-    def test_other_rate_limit_type_gives_none_window(self):
+    def test_other_rate_limit_type_still_exhausted(self):
         info = dict(self.sample["rate_limit_info"])
         info["status"] = "rejected"
         info["rateLimitType"] = "other_window"
         sig = from_claude_rate_limit_event({"type": "rate_limit_event", "rate_limit_info": info})
         self.assertIsNotNone(sig)
-        self.assertIsNone(sig.window)
+        self.assertTrue(sig.exhausted)
+        self.assertEqual(sig.source, "claude-code")
+        self.assertEqual(sig.resets_at, at_utc(2026, 10, 11, 19, 50))
 
 
 class StructuralSignalEdgeCasesTest(unittest.TestCase):
@@ -491,31 +489,28 @@ class StructuralSignalEdgeCasesTest(unittest.TestCase):
     def test_signal_dataclass_features(self):
         sig = Signal(
             exhausted=True,
-            window="5h",
             resets_at=at_utc(2026, 10, 11, 19, 50),
             source="claude-code",
         )
         self.assertTrue(sig.exhausted)
-        self.assertEqual(sig.window, "5h")
         self.assertEqual(sig.source, "claude-code")
         self.assertEqual(
             sig.to_cooldown_body(),
-            {"window": "5h", "resets_at": "2026-10-11T19:50:00Z"},
+            {"until": "2026-10-11T19:50:00Z"},
         )
 
-        # with window=None and fallback_window provided
-        sig_no_win = Signal(
+        # 帶時差的 resets_at 轉成 UTC 的 until
+        sig_tz = Signal(
             exhausted=True,
-            window=None,
-            resets_at=at_utc(2026, 10, 12, 0, 0),
+            resets_at=datetime(2026, 10, 12, 3, 0, tzinfo=TZ8),  # +08:00
             source="opencode",
         )
-        self.assertEqual(
-            sig_no_win.to_cooldown_body(fallback_window="5h"),
-            {"window": "5h", "resets_at": "2026-10-12T00:00:00Z"},
-        )
+        self.assertEqual(sig_tz.to_cooldown_body(), {"until": "2026-10-11T19:00:00Z"})
+
+        # 判讀不出恢復時間：丟 ValueError，由呼叫方用「現在＋1 小時」登錄
+        sig_no_reset = Signal(exhausted=True, resets_at=None, source="opencode")
         with self.assertRaises(ValueError):
-            sig_no_win.to_cooldown_body()
+            sig_no_reset.to_cooldown_body()
 
         # frozen check
         with self.assertRaises(Exception):
