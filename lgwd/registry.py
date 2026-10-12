@@ -1,9 +1,10 @@
-"""Subscription registry 的服務邏輯（design 決定 6、7、8、10；spec subscription-registry）。
+"""Subscription registry 的服務邏輯（design 決定 6、7、8、10 與 v5 的決定 8 取代；spec subscription-registry）。
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；
 - get_subscription(id, agent)：一筆的共通 JSON，含 key（agent 必填、要在該筆的 agents 裡、key 要已部署）；
-- register_cooldown(id, body)：登錄 5h／1w 冷卻（resets_at＋2 分鐘或窗口預設長度；同一窗口取較晚；到時自動解除）。
-- 每次 get 與登錄冷卻記一筆只追加的稽核（時刻、subscription id、agent 或窗口與結束時刻；不含 key）。
+- register_cooldown(id, body)：登錄冷卻，body {"until": RFC 3339 UTC}（過去或超過上限拒絕；
+  同一筆重複登錄取較晚的 until；到時自動解除）。
+- 每次 get 與登錄冷卻記一筆只追加的稽核（時刻、subscription id、agent 或 until；不含 key）。
 - 所有時刻經注入的 Clock；對外是 RFC 3339 UTC。
 
 HTTP 層把 ApiError 轉成狀態碼與 JSON；這裡不碰 HTTP。
@@ -17,11 +18,10 @@ from .clock import Clock, from_rfc3339, to_rfc3339
 from .errors import (
     agent_not_allowed,
     bad_request,
-    invalid_resets_at,
-    invalid_window,
+    invalid_until,
     not_deployed,
     not_found,
-    resets_at_out_of_range,
+    until_out_of_range,
 )
 from .keys import KeyStore
 from .policy import Policy
@@ -29,9 +29,6 @@ from .providers import PROVIDERS, provider_for
 from .store import Store
 
 SCHEMA_VERSION = 1
-
-WINDOWS = ("5h", "1w")
-WINDOW_DEFAULT_SECONDS = {"5h": 5 * 60 * 60, "1w": 7 * 24 * 60 * 60}
 
 
 class RegistryService:
@@ -82,46 +79,41 @@ class RegistryService:
         return item
 
     def register_cooldown(self, subscription: str, body: dict) -> None:
-        """POST /v1/subscriptions/{id}/cooldown：成功為 None（HTTP 204）。"""
+        """POST /v1/subscriptions/{id}/cooldown {until}：成功為 None（HTTP 204）。
+
+        未知欄位忽略；同一筆重複登錄取較晚的 until。
+        """
         if subscription not in self._policy.subscriptions:
             raise not_found()
-        if "window" not in body:
-            raise bad_request(missing=["window"])
-        window = body["window"]
-        if window not in WINDOWS:
-            raise invalid_window()
+        if "until" not in body:
+            raise bad_request(missing=["until"])
         now = self._clock.now()
-        until = self._cooldown_until(window, body.get("resets_at"), now)
+        until = self._cooldown_until(body["until"], now)
         stamp = to_rfc3339(now)
         with self._store.txn() as cur:
-            prev = self._store.cooldown_get(cur, subscription, window)
+            prev = self._store.cooldown_get(cur, subscription)
             effective = until
             if prev is not None and from_rfc3339(prev["until"]) > until:
                 effective = from_rfc3339(prev["until"])
-            self._store.cooldown_set(cur, subscription, window, to_rfc3339(until))
+            self._store.cooldown_set(cur, subscription, to_rfc3339(effective))
             self._store.audit_add(
-                cur, stamp, subscription, "cooldown",
-                window=window, until=to_rfc3339(effective),
+                cur, stamp, subscription, "cooldown", until=to_rfc3339(effective),
             )
 
-    def _cooldown_until(
-        self, window: str, resets_at, now: _dt.datetime
-    ) -> _dt.datetime:
-        buffer = _dt.timedelta(seconds=self._policy.cooldown_buffer_seconds)
-        if resets_at not in (None, ""):
-            if not isinstance(resets_at, str):
-                raise invalid_resets_at()
-            try:
-                resets = from_rfc3339(resets_at)
-            except ValueError:
-                raise invalid_resets_at() from None
-            if resets < now:
-                raise resets_at_out_of_range()
-            max_ahead = _dt.timedelta(seconds=self._policy.resets_at_max_ahead_seconds)
-            if resets > now + max_ahead:
-                raise resets_at_out_of_range()
-            return resets + buffer
-        return now + _dt.timedelta(seconds=WINDOW_DEFAULT_SECONDS[window])
+    def _cooldown_until(self, until, now: _dt.datetime) -> _dt.datetime:
+        """驗 until 並回 UTC datetime；型別／格式不對丟 invalid_until，過去或超過上限丟 until_out_of_range。"""
+        if not isinstance(until, str):
+            raise invalid_until()
+        try:
+            moment = from_rfc3339(until)
+        except ValueError:
+            raise invalid_until() from None
+        if moment < now:
+            raise until_out_of_range()
+        max_ahead = _dt.timedelta(seconds=self._policy.until_max_ahead_seconds)
+        if moment > now + max_ahead:
+            raise until_out_of_range()
+        return moment
 
     # --- 內部 ---
     def _item(
@@ -148,13 +140,12 @@ class RegistryService:
         if key is not None:
             item["key"] = key
         item["cooldown"] = cooldown
-        item["available"] = deployed and all(v is None for v in cooldown.values())
+        item["available"] = deployed and cooldown is None
         return item
 
-    def _cooldown(self, cur, subscription: str, now: _dt.datetime) -> dict:
-        """{"5h": null|{until}, "1w": null|{until}}；過了結束時刻自動解除。"""
-        out: dict = {window: None for window in WINDOWS}
-        for row in self._store.cooldown_for(cur, subscription):
-            if row["window"] in out and from_rfc3339(row["until"]) > now:
-                out[row["window"]] = {"until": row["until"]}
-        return out
+    def _cooldown(self, cur, subscription: str, now: _dt.datetime) -> dict | None:
+        """{"until": …} 或 null；過了 until（含相等）自動解除。"""
+        row = self._store.cooldown_get(cur, subscription)
+        if row is not None and from_rfc3339(row["until"]) > now:
+            return {"until": row["until"]}
+        return None

@@ -1,8 +1,8 @@
-"""SQLite 細節（design 決定 5b、8、10；spec subscription-registry、key-vault）。只用標準函式庫。
+"""SQLite 細節（design 決定 5b、8、10 與 v5 的決定 8 取代；spec subscription-registry、key-vault）。只用標準函式庫。
 
 只剩兩張表：
-- cooldowns：subscription × 窗口（5h／1w）→ 結束時刻；同一窗口取較晚的；
-- audit：只追加。get 記（時刻、subscription id、agent）；登錄冷卻記（時刻、subscription id、窗口、結束時刻）。
+- cooldowns：subscription → until（何時能再用；重複登錄取較晚的）；
+- audit：只追加。get 記（時刻、subscription id、agent）；登錄冷卻記（時刻、subscription id、until）。
 絕不存 key 的值，也不記客戶端（沒有應用層認證）。
 
 單一連線＋RLock；會改變狀態的動作一律經 txn()（BEGIN IMMEDIATE）。
@@ -17,10 +17,8 @@ from collections.abc import Iterator
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cooldowns (
-    subscription TEXT NOT NULL,
-    window TEXT NOT NULL,
-    until TEXT NOT NULL,
-    PRIMARY KEY (subscription, window)
+    subscription TEXT PRIMARY KEY,
+    until TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,7 +26,6 @@ CREATE TABLE IF NOT EXISTS audit (
     subscription TEXT NOT NULL,
     action TEXT NOT NULL,
     agent TEXT,
-    window TEXT,
     until TEXT
 );
 """
@@ -63,26 +60,18 @@ class Store:
                 cur.close()
 
     # --- 冷卻 ---
-    def cooldown_get(self, cur: sqlite3.Cursor, subscription: str, window: str) -> sqlite3.Row | None:
-        return cur.execute(
-            "SELECT * FROM cooldowns WHERE subscription = ? AND window = ?",
-            (subscription, window),
-        ).fetchone()
-
-    def cooldown_for(self, cur: sqlite3.Cursor, subscription: str) -> list[sqlite3.Row]:
+    def cooldown_get(self, cur: sqlite3.Cursor, subscription: str) -> sqlite3.Row | None:
         return cur.execute(
             "SELECT * FROM cooldowns WHERE subscription = ?", (subscription,)
-        ).fetchall()
+        ).fetchone()
 
-    def cooldown_set(
-        self, cur: sqlite3.Cursor, subscription: str, window: str, until: str
-    ) -> None:
-        """寫入；同一窗口取較晚的結束時刻（UPSERT 只在新的較晚時更新）。"""
+    def cooldown_set(self, cur: sqlite3.Cursor, subscription: str, until: str) -> None:
+        """寫入；同一 subscription 取較晚的 until（UPSERT 只在新的較晚時更新）。"""
         cur.execute(
-            "INSERT INTO cooldowns (subscription, window, until) VALUES (?, ?, ?)"
-            " ON CONFLICT(subscription, window) DO UPDATE SET until = excluded.until"
+            "INSERT INTO cooldowns (subscription, until) VALUES (?, ?)"
+            " ON CONFLICT(subscription) DO UPDATE SET until = excluded.until"
             " WHERE excluded.until > cooldowns.until",
-            (subscription, window, until),
+            (subscription, until),
         )
 
     # --- 稽核（只追加） ---
@@ -93,19 +82,18 @@ class Store:
         subscription: str,
         action: str,
         agent: str | None = None,
-        window: str | None = None,
         until: str | None = None,
     ) -> None:
         cur.execute(
-            "INSERT INTO audit (ts, subscription, action, agent, window, until)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, subscription, action, agent, window, until),
+            "INSERT INTO audit (ts, subscription, action, agent, until)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (ts, subscription, action, agent, until),
         )
 
     def audit_all(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT seq, ts, subscription, action, agent, window, until"
+                "SELECT seq, ts, subscription, action, agent, until"
                 " FROM audit ORDER BY seq"
             ).fetchall()
             return [dict(r) for r in rows]
