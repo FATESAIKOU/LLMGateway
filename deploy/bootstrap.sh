@@ -878,8 +878,9 @@ step_rendezvous() {
     fi
 
     local tmp_env
-    # 暫存含會合點位址：建在管理帳號自家（輸入檔同目錄，管理帳號可寫），0600；
-    # 不再建在 llmgw 目錄（管理帳號寫不進去）也不常駐共用 /tmp (L-R11)。
+    # 暫存含會合點位址：優先建在輸入檔同目錄（操作者自家、寫得進去處），0600；
+    # 該目錄不可寫時退回 /tmp（仍 0600，函式返回即清，不常駐）(L-R11)。
+    # 不建在 llmgw 目錄（管理帳號寫不進去，舊碼恆退 /tmp 且早敗不清）。
     # RETURN trap 是兜底（bash 3.2 無此 trap，後面 2>/dev/null || true 吃掉；
     # 所有早敗路徑下面仍逐一顯式 rm，見 sudo_refresh 與 ensure 兩處）。
     tmp_env="$(mktemp "$(dirname "$RENDEZVOUS_KNOWN_HOSTS")/.llmgw-env.XXXXXX" 2>/dev/null || mktemp 2>/dev/null)" || {
