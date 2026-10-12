@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "subscriptions": {
+    "claude-personal": {
+      "priority": 10,
+      "agents": ["claude-code"],
+      "models": {"allow": ["*"], "default": null}
+    },
+    "claude-company": {
+      "priority": 20,
+      "agents": ["claude-code"],
+      "models": {"allow": ["*"], "default": null}
+    },
+    "opencode-zen": {
+      "priority": 10,
+      "agents": ["opencode"],
+      "models": {"allow": ["*"], "default": null}
+    },
+    "openrouter": {
+      "priority": 20,
+      "agents": ["claude-code", "opencode"],
+      "models": {"allow": ["*:free"], "default": null}
+    },
+    "ollama-cloud": {
+      "priority": 30,
+      "agents": ["claude-code", "opencode"],
+      "models": {"allow": ["*"], "default": null}
+    }
+  },
+  "until_max_ahead_seconds": 691200
+}

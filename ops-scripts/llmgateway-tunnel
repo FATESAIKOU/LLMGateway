@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+# llmgateway-tunnel：伺服器端的隧道守護（design 決定 3）。
+# 用自己的金鑰與自己的 SSH 連線，把本機 API 埠與本機 sshd 以 reverse tunnel
+# 公開到會合點的 127.0.0.1；定時經會合點做端對端探針（GET /v1/subscriptions，
+# 只有 HTTP 200 算健康）。連線斷掉、公開失敗或連續探針失敗就結束，由
+# systemd 重開（llmgateway-tunnel.service）。
+#
+# 設定：~/.config/llmgateway/tunnel.env（KEY=VALUE）
+#   RENDEZVOUS=user@host:port（必填）、IDENTITY（必填）、KNOWN_HOSTS（必填）、
+#   REMOTE_API=4710、REMOTE_SSH=4711、LOCAL_API=8480、
+#   PROBE_INTERVAL=60、PROBE_FAILS=3、SSH_PATH=ssh。
+# 必填缺一（或值不能用）時：log 寫一行 config_missing、以 78 結束；unit 的
+# RestartPreventExitStatus=78 讓它不會在設定填好前反覆重開。
+#
+# log 只寫事件種類（tunnel_up、probe_fail、restart、config_missing、spawn_fail）；
+# 不寫設定值、不寫主機名、不寫 ssh 的 stderr 原文。
+#
+# 用法：
+#   llmgateway-tunnel               當守護程式跑。
+#   llmgateway-tunnel --probe-once  只跑一次端對端探針就結束（給 install.sh
+#                                   --check 用）：讀同一份 tunnel.env、用與
+#                                   守護程式同一套 ssh 參數。0＝HTTP 200、
+#                                   1＝不是 200 或沒回應、2＝無法執行
+#                                   （config_missing 或找不到 ssh）。不寫 log。
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+
+CONFIG_REL = os.path.join(".config", "llmgateway", "tunnel.env")
+REQUIRED_KEYS = ("RENDEZVOUS", "IDENTITY", "KNOWN_HOSTS")
+DEFAULTS = {
+    "REMOTE_API": "4710",
+    "REMOTE_SSH": "4711",
+    "LOCAL_API": "8480",
+    "PROBE_INTERVAL": "60",
+    "PROBE_FAILS": "3",
+    "SSH_PATH": "ssh",
+}
+EXIT_CONFIG_MISSING = 78
+EXIT_FAILED = 1
+EXIT_PROBE_OK = 0
+EXIT_PROBE_FAIL = 1
+EXIT_PROBE_UNAVAILABLE = 2
+PROBE_REQUEST = b"GET /v1/subscriptions HTTP/1.0\r\n\r\n"
+
+
+def log(event):
+    print(event, file=sys.stderr, flush=True)
+
+
+def parse_env_file(path):
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+def parse_rendezvous(value):
+    user_host, sep, port_text = value.rpartition(":")
+    if not sep or "@" not in user_host:
+        return None
+    user, _, host = user_host.rpartition("@")
+    if not user or not host:
+        return None
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return user, host, port
+
+
+def load_config(path):
+    values = parse_env_file(path)
+    for key in REQUIRED_KEYS:
+        if not values.get(key):
+            return None
+    rendezvous = parse_rendezvous(values["RENDEZVOUS"])
+    if rendezvous is None:
+        return None
+    merged = {}
+    for key, default in DEFAULTS.items():
+        merged[key] = values.get(key) or default
+    try:
+        remote_api = int(merged["REMOTE_API"])
+        remote_ssh = int(merged["REMOTE_SSH"])
+        local_api = int(merged["LOCAL_API"])
+        probe_interval = float(merged["PROBE_INTERVAL"])
+        probe_fails = int(merged["PROBE_FAILS"])
+    except ValueError:
+        return None
+    for port in (remote_api, remote_ssh, local_api):
+        if not 1 <= port <= 65535:
+            return None
+    if probe_interval <= 0 or probe_fails < 1:
+        return None
+    user, host, ssh_port = rendezvous
+    return {
+        "identity": values["IDENTITY"],
+        "known_hosts": values["KNOWN_HOSTS"],
+        "remote_api": remote_api,
+        "remote_ssh": remote_ssh,
+        "local_api": local_api,
+        "probe_interval": probe_interval,
+        "probe_fails": probe_fails,
+        "ssh_path": merged["SSH_PATH"],
+        "user": user,
+        "host": host,
+        "ssh_port": ssh_port,
+    }
+
+
+def config_path():
+    home = os.environ.get("HOME")
+    if not home:
+        return None
+    return os.path.join(home, CONFIG_REL)
+
+
+def _ssh_common(cfg):
+    return [
+        "-i", cfg["identity"],
+        "-o", "UserKnownHostsFile=" + cfg["known_hosts"],
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "BatchMode=yes",
+        "-p", str(cfg["ssh_port"]),
+        cfg["user"] + "@" + cfg["host"],
+    ]
+
+
+def tunnel_argv(cfg):
+    return [
+        cfg["ssh_path"], "-N",
+        "-R", "127.0.0.1:%d:127.0.0.1:%d" % (cfg["remote_api"], cfg["local_api"]),
+        "-R", "127.0.0.1:%d:127.0.0.1:22" % cfg["remote_ssh"],
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+    ] + _ssh_common(cfg)
+
+
+def probe_argv(cfg):
+    return [
+        cfg["ssh_path"],
+        "-W", "127.0.0.1:%d" % cfg["remote_api"],
+    ] + _ssh_common(cfg)
+
+
+def probe_healthy(cfg):
+    argv = probe_argv(cfg)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    timeout = max(2.0, min(cfg["probe_interval"], 30.0))
+    try:
+        out, _ = proc.communicate(PROBE_REQUEST, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return False
+    status_line = out.split(b"\n", 1)[0].strip()
+    parts = status_line.split()
+    return len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1] == b"200"
+
+
+def probe_once():
+    """一次端對端探針；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。"""
+    path = config_path()
+    cfg = load_config(path) if path else None
+    if cfg is None:
+        return EXIT_PROBE_UNAVAILABLE
+    if shutil.which(cfg["ssh_path"]) is None:
+        return EXIT_PROBE_UNAVAILABLE
+    return EXIT_PROBE_OK if probe_healthy(cfg) else EXIT_PROBE_FAIL
+
+
+def main():
+    if sys.argv[1:] == ["--probe-once"]:
+        return probe_once()
+    path = config_path()
+    cfg = load_config(path) if path else None
+    if cfg is None:
+        log("config_missing")
+        return EXIT_CONFIG_MISSING
+
+    state = {"shutdown": False}
+    stop = threading.Event()
+    try:
+        tunnel = subprocess.Popen(
+            tunnel_argv(cfg),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        log("spawn_fail")
+        return EXIT_FAILED
+
+    def on_signal(signum, frame):
+        state["shutdown"] = True
+        stop.set()
+        if tunnel.poll() is None:
+            tunnel.terminate()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    log("tunnel_up")
+
+    def watch():
+        fails = 0
+        while not stop.wait(cfg["probe_interval"]):
+            if probe_healthy(cfg):
+                fails = 0
+                continue
+            fails += 1
+            log("probe_fail")
+            if fails >= cfg["probe_fails"]:
+                log("restart")
+                stop.set()
+                if tunnel.poll() is None:
+                    tunnel.terminate()
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    tunnel.wait()
+    stop.set()
+    watcher.join(timeout=5)
+    if state["shutdown"]:
+        return 0
+    return EXIT_FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

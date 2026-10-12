@@ -1,0 +1,11 @@
+[Unit]
+Description=LLMGateway subscription registry (lgwd)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/llmgateway-run
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
