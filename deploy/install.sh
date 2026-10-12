@@ -271,6 +271,11 @@ check_unit() {
             ;;
     esac
 
+    # 隧道重啟已排程（約 60 秒後重連）：不改三態，只提醒 (L-R3)。
+    if "$SYSTEMCTL" --user is-active --quiet llmgateway-tunnel-restart.timer >/dev/null 2>&1; then
+        log INFO "llmgateway-tunnel: 重啟已排程（約 60 秒後重連），不是故障"
+    fi
+
     # 服務活著，再看金鑰拉取那條路能不能用（v5.4）。
     check_keysync
 }
