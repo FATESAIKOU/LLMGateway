@@ -1,11 +1,11 @@
 # v5 檔案盤點（A）：impl/gateway-v0-core 每個檔案在 v5 下的處置
 
-基準：`scope/gateway-v5` worktree 當前狀態（v4 實作完成）。v5 以 v4 為底，只改五件事：
+基準：`scope/gateway-v5` worktree 當前狀態（v4 實作完成）。v5 以 v4 為底（本人 2026-10-12 兩輪裁定）：
 v5.1 冷卻只收 `until`（拿掉 `window` 5h／1w；list／get 的 `cooldown` 欄位改成單一 `until` 或 null）；
 v5.2 拿掉 `lgw connect`（sidecar 直接 curl 本機 port，通道由 MyLinuxPool capability／mlp／ssh -J 提供）；
 v5.3 反向隧道（`llmgateway-tunnel` 與其 unit）搬到 `ops-scripts/`；
-v5.4 金鑰正本改放 private repo 加密檔，服務自己定期拉（拿掉 deploy-keys workflow、`keys` 動詞、SIGHUP 重讀）；
-v5.5 sidecar 內部的 SubscriptionSource 與 sshproxy 不是 LLMGateway 的事（只改文件說法）。
+v5.4 金鑰正本是 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`，key-sync（放 `ops-scripts/`）約每 10 分鐘用 `gh` 拉（使用前提：以 `llmgw` 身分登入過 `gh`，token 二選一）；拿掉兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 secret（升級選乙：管理帳號手動 ssh 上去跑 `install.sh --tag`）；
+v5.5 worker 本機 port 預設 4710（可改）；手機自行用 ssh -J 等方式轉發（MyAiEntry#147 關掉，LLMGateway 不提供程式）；sidecar 內部層次與 sshproxy 只改文件說法。
 
 處置只有四種：保留／修改／拿掉／搬移。每項一句理由。
 
@@ -32,18 +32,18 @@ v5.5 sidecar 內部的 SubscriptionSource 與 sshproxy 不是 LLMGateway 的事�
 
 ## deploy/（服務那台的安裝與部署入口）
 
-- `deploy/bootstrap.sh`：**修改**——拿掉部署公鑰步驟（`--deploy-pubkey-file`、`step_deploy_key`、authorized_keys forced command）；隧道執行檔與 unit 的引用路徑改到 `ops-scripts/`；初次啟動引導（GitHub 登入、解密密碼放置）是新增步驟，實作階段加。
-- `deploy/install.sh`：**修改**——隧道執行檔與 unit 改從 `ops-scripts/` 安裝；其餘（tag 取碼、current 切換、unit 安裝）不變。
+- `deploy/bootstrap.sh`：**修改**——拿掉部署公鑰步驟（`--deploy-pubkey-file`、`step_deploy_key`、authorized_keys forced command）；隧道執行檔與 unit 的引用路徑改到 `ops-scripts/`；改放解密密碼（`--decrypt-pass-file` 或互動輸入，寫 `keysync.env`）；`gh` 登入由本人手動做，bootstrap 不做。
+- `deploy/install.sh`：**修改**——隧道執行檔與 unit 改從 `ops-scripts/` 安裝；`--check` 加上「`gh` 能不能用」；其餘（tag 取碼、current 切換、unit 安裝）不變。
 - `deploy/llmgateway-run`：**保留**——組 `python3 -m lgwd` 參數的 wrapper，與 v5 五件事都無關。
 - `deploy/llmgateway-tunnel`：**搬移**——內容不變，搬到 `ops-scripts/`（維運工具定位，v5.3）。
 - `deploy/llmgateway-tunnel.service`：**搬移**——同上，跟著隧道守護走。
 - `deploy/llmgateway.service`：**修改**——只拿掉 `ExecReload … HUP` 那一行（SIGHUP 重讀沒了）；其餘不變。
-- `deploy/remote-deploy.sh`：**修改**——拿掉 `keys` 動詞（金鑰不再經 stdin 送）；`upgrade` 動詞去留待本人決定（見 v5-plan 疑點：服務程式本身怎麼升級、還要不要 deploy-service）。
+- `deploy/remote-deploy.sh`：**拿掉**——升級選乙，部署入口整組不用了，升級改手動跑 `install.sh --tag`。
 
 ## .github/workflows/
 
-- `.github/workflows/deploy-keys.yml`：**拿掉**——金鑰改由服務自己從 private repo 定期拉，不再經 workflow 送。
-- `.github/workflows/deploy-service.yml`：**待本人決定（修改或拿掉二選一）**——若保留自助升級就修改（只剩 upgrade），若服務升級改走別的方式就拿掉；見 v5-plan 疑點。
+- `.github/workflows/deploy-keys.yml`：**拿掉**——金鑰改由 key-sync 用 `gh` 從 private repo 定期拉，不再經 workflow 送。
+- `.github/workflows/deploy-service.yml`：**拿掉**——升級選乙，改手動跑 `install.sh --tag`。
 
 ## tests/
 
@@ -51,9 +51,9 @@ v5.5 sidecar 內部的 SubscriptionSource 與 sshproxy 不是 LLMGateway 的事�
 - `tests/test_bootstrap.py`：**修改**——拿掉 deploy-key 步驟的測試，隧道路徑改 `ops-scripts/`。
 - `tests/test_client.py`：**修改**——cooldown 新 body `{until}` 與新錯誤碼。
 - `tests/test_connect.py`：**拿掉**——跟著 `lgw/connect.py` 走。
-- `tests/test_deploy_script.py`：**修改**——拿掉 `keys` 動詞的測試；`upgrade` 測試去留跟著 remote-deploy.sh 待定；key-sync 的測試是新增，實作階段加。
+- `tests/test_deploy_script.py`：**拿掉**——跟著 `remote-deploy.sh` 整檔走。
 - `tests/test_http.py`：**修改**——冷卻路由的新語意與錯誤碼。
-- `tests/test_install.py`：**修改**——隧道檔改從 `ops-scripts/` 裝的斷言。
+- `tests/test_install.py`：**修改**——隧道檔改從 `ops-scripts/` 裝的斷言，加上「`gh` 能不能用」的 `--check` 斷言。
 - `tests/test_keys.py`：**保留**——格式驗證邏輯不變。
 - `tests/test_main.py`：**修改**——拿掉 SIGHUP 重讀的測試，改測 mtime 偵測重讀（提案見 v5-plan）。
 - `tests/test_package.py`：**修改**——子模組剩三個（`__init__`、`client`、`signals`），拿掉 `lgw.connect` 斷言。
@@ -61,11 +61,11 @@ v5.5 sidecar 內部的 SubscriptionSource 與 sshproxy 不是 LLMGateway 的事�
 - `tests/test_registry.py`：**修改**——單一 `until` 的登錄、查詢、`available`。
 - `tests/test_signals.py`：**修改**——until-based 的 `Signal` 與 fallback（現在＋1 小時在 sidecar，函式庫只負責轉 `{until}`）。
 - `tests/test_tunnel.py`：**修改**——測試留 `tests/`，只改被測檔路徑到 `ops-scripts/`。
-- `tests/test_workflows.py`：**修改**——拿掉 deploy-keys 的斷言；deploy-service 的斷言去留跟著 workflow 待定。
+- `tests/test_workflows.py`：**拿掉**——兩個 workflow 都沒了，無檔可測。
 
 ## docs/
 
-- `docs/deploy.md`：**修改（只寫改寫大綱，不全文重寫）**——§1.9 放部署公鑰、§2 部署連線 secrets、§4.1 換 key、§4.2 升級（待定）、§4.5 外洩時、§5.1–5.3 排錯都要重寫；大綱見本檔 B 件（deploy.md 頂端 v5 橫幅）。
+- `docs/deploy.md`：**修改（只寫改寫大綱，不全文重寫）**——§0 全貌（自備通道、ops-scripts、`gh` 前提、手動升級）、§1（1.9 放部署公鑰整節刪、`gh` 登入與解密密碼、隧道路徑）、§2（部署連線與 key secret 整組收、只剩 DECRYPT 備份）、§3（自備通道、本機 port 預設 4710、手機自行轉發）、§4（4.1 換 key 改等拉取、4.2 升級改手動、4.5 外洩改加密檔流程）、§5（workflow 排錯整節刪、加 `gh` 排錯）都要重寫；大綱見 deploy.md 頂端橫幅。
 - `docs/research/*.md`（既有研究）：**保留**——歷史調查，`quota-signals` 與 `claude-failover` 仍是 sidecar 判讀額度訊號的依據。
 - `docs/research/v5-plan.md`：**新增（C 件）**——金鑰拉取流程、初次啟動引導、要本人做的事、估工、疑點。
 
@@ -79,15 +79,14 @@ v5.5 sidecar 內部的 SubscriptionSource 與 sshproxy 不是 LLMGateway 的事�
 
 ## 特別問題（逐一回答）
 
-- `deploy-keys.yml`：拿掉（理由同上，不再經 workflow 送 key）。
-- `deploy-service.yml`：待本人決定；服務程式本身的升級方式未定（v5-plan 疑點第一條）。
-- `remote-deploy.sh` 的 `keys` 動詞：拿掉；`upgrade` 動詞：跟著上一條待定。
-- `bootstrap.sh` 的部署公鑰與 forced command 步驟：拿掉（部署私鑰／公鑰整組不用了；初次引導改放 GitHub deploy key 與解密密碼）。
+- `deploy-keys.yml`：拿掉（key-sync 用 `gh` 拉，不再經 workflow 送）。
+- `deploy-service.yml`：拿掉（升級選乙，改手動）。
+- `remote-deploy.sh` 整檔：拿掉（同上）。
+- `bootstrap.sh` 的部署公鑰與 forced command 步驟：拿掉（部署私鑰／公鑰整組不用了；改放解密密碼，`gh` 登入由本人手動做）。
 - `lgw/connect.py`：拿掉（v5.2；worker 通道是 MyLinuxPool capability 的事，Mac／手機用 mlp 或 ssh -J）。
 - `pyproject`：還需要（`lgw` 照樣給 sidecar 當函式庫用，只改描述）。
 
 ## 實作階段的新增檔案（不在 v4 盤點內，先列供 C 件估工用）
 
-- `ops-scripts/` 目錄（從 `deploy/` 搬入隧道守護與其 unit）。
-- key-sync 小程式＋systemd timer（每約 10 分鐘拉 private repo 加密檔、解密、驗證、原子替換；失敗保留舊版）。
-- private repo 的加密檔正本（檔名與格式提案見 v5-plan）。
+- `ops-scripts/` 目錄（從 `deploy/` 搬入隧道守護與其 unit；key-sync 也放這裡，用 `gh`＋`openssl`，不用 `git`）。
+- private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `keys.env.enc`（檔格式見 v5-plan §1.3）。
