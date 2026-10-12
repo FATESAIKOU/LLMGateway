@@ -497,6 +497,7 @@ exit 0
         self.assertIn("Unit=key-sync.service", timer)
         self.assertIn("OnActiveSec=10min", timer)
         self.assertIn("OnUnitActiveSec=10min", timer)
+        self.assertIn("Persistent=true", timer)  # 停機期間錯過的 tick 開機後補跑
         self.assertIn("WantedBy=timers.target", timer)
 
     def test_help(self):

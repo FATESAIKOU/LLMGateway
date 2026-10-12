@@ -7,6 +7,9 @@ Unit=key-sync.service
 # 趕時間就手動跑一次：systemctl --user start key-sync.service。
 OnActiveSec=10min
 OnUnitActiveSec=10min
+# 機器停機期間錯過的 tick，開機後補跑一次，別等滿 10 分鐘
+# （審查 #13 低-7）。
+Persistent=true
 
 [Install]
 WantedBy=timers.target
