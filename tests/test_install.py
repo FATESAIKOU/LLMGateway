@@ -229,7 +229,7 @@ exit 0
         with open(SERVICE_UNIT, "r", encoding="utf-8") as f:
             svc_content = f.read()
         self.assertIn("ExecStart=%h/.local/bin/llmgateway-run", svc_content)
-        self.assertIn("ExecReload=/bin/kill -HUP $MAINPID", svc_content)
+        self.assertNotIn("ExecReload", svc_content)  # v5：沒有 SIGHUP 重讀了
         self.assertNotIn(".mylinuxpool", svc_content)
 
         self.assertTrue(os.path.isfile(TUNNEL_DAEMON))

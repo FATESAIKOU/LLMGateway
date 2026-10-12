@@ -5,7 +5,6 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/llmgateway-run
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 
 [Install]

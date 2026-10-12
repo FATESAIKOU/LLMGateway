@@ -1,7 +1,8 @@
 """lgwd/main.py 的測試：假 key 檔、真 policy/default.json、隨機埠。
 
 涵蓋 spec subscription-registry 與 key-vault 的服務端 Scenario 在主程式裡的行為
-（不帶應用層憑證、換 key、只綁 loopback、SIGHUP／SIGTERM）。
+（不帶應用層憑證、換 key、只綁 loopback、SIGTERM）。v5：key 檔由 mtime 偵測重讀，
+沒有 SIGHUP／ExecReload；policy 只在啟動時讀。
 """
 
 from __future__ import annotations
@@ -9,12 +10,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 import urllib.error
@@ -37,6 +36,15 @@ def key_text(values):
         if sub in values:
             lines.append(f"{name}={values[sub]}")
     return "\n".join(lines) + "\n"
+
+
+def rotate(path, text):
+    """像 key-sync 一樣原子換檔：寫暫存（0600）→ rename（inode 一定變）。"""
+    tmp = f"{path}.tmp-{os.getpid()}-{time.time_ns()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 
 def http_get(url):
@@ -204,47 +212,63 @@ class ApiTest(MainCase):
 
 
 class ReloadTest(MainCase):
-    def test_換key(self):
+    def _get_key(self, sub="claude-personal", agent="claude-code"):
         status, raw = http_get(
-            self.base + "/v1/subscriptions/claude-personal?agent=claude-code")
-        self.assertEqual(json.loads(raw)["key"], FAKE_KEYS["claude-personal"])
+            self.base + f"/v1/subscriptions/{sub}?agent={agent}")
+        if status != 200:
+            return status, None
+        return status, json.loads(raw)["key"]
+
+    def test_換key_mtime變了請求前重讀(self):
+        # spec key-vault「換 key」：本人更新加密檔 → key-sync 換檔 → lgwd 自己重讀
+        self.assertEqual(self._get_key()[1], FAKE_KEYS["claude-personal"])
         rotated = dict(FAKE_KEYS, **{"claude-personal": "test-main-rotated-111"})
-        (self.root / "keys.env").write_text(key_text(rotated), encoding="utf-8")
-        self.gw.reload()
-        status, raw = http_get(
-            self.base + "/v1/subscriptions/claude-personal?agent=claude-code")
+        rotate(self.root / "keys.env", key_text(rotated))  # 不呼叫 reload()
+
+        status, key = self._get_key()
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(raw)["key"], "test-main-rotated-111")
+        self.assertEqual(key, "test-main-rotated-111")
         blob = http_get(self.base + "/v1/subscriptions")[1].decode()
         self.assertNotIn("test-main-rotated-111", blob)
+        # 沒換回舊的：再問一次還是新的
+        self.assertEqual(self._get_key()[1], "test-main-rotated-111")
 
-    def test_SIGHUP壞key檔沿用舊的(self):
-        (self.root / "keys.env").write_text("NOT A LINE\n", encoding="utf-8")
-        self.gw.reload()
-        status, raw = http_get(
-            self.base + "/v1/subscriptions/claude-personal?agent=claude-code")
+    def test_沒變就不重讀(self):
+        calls = []
+        real = self.gw.keys.reload
+        self.gw.keys.reload = lambda: (calls.append(1), real())[1]
+        try:
+            self.assertEqual(http_get(self.base + "/v1/subscriptions")[0], 200)
+            self.assertEqual(self._get_key()[0], 200)
+        finally:
+            self.gw.keys.reload = real
+        self.assertEqual(calls, [])  # 檔案沒動就不做白工
+
+    def test_壞key檔沿用舊的(self):
+        rotate(self.root / "keys.env", "NOT A LINE\n")
+        status, key = self._get_key()
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(raw)["key"], FAKE_KEYS["claude-personal"])
+        self.assertEqual(key, FAKE_KEYS["claude-personal"])
         self.assertIsNotNone(self.gw.keys.last_reload_error)
         for value in (*FAKE_KEYS.values(), "NOT A LINE"):
             self.assertNotIn(value, self.gw.keys.last_reload_error or "")
 
-    def test_SIGHUP壞policy沿用舊的(self):
-        svc_before = self.gw.service
-        (self.root / "policy.json").write_text("{bad json", encoding="utf-8")
-        self.gw.reload()
-        self.assertIs(self.gw.service, svc_before)
-        self.assertEqual(len(self.list_items()), 5)
+    def test_壞key檔之後再換好的會重讀(self):
+        rotate(self.root / "keys.env", "NOT A LINE\n")
+        self.assertEqual(self._get_key()[1], FAKE_KEYS["claude-personal"])
+        rotated = dict(FAKE_KEYS, **{"claude-personal": "test-main-second-222"})
+        rotate(self.root / "keys.env", key_text(rotated))
+        self.assertEqual(self._get_key()[1], "test-main-second-222")
+        self.assertIsNone(self.gw.keys.last_reload_error)
 
-    def test_SIGHUP好policy換上新的(self):
+    def test_policy不再熱重載(self):
+        # v5：拿掉 SIGHUP 之後 policy 只在啟動時讀，改政策要重啟服務
         data = json.loads((self.root / "policy.json").read_text(encoding="utf-8"))
         data["subscriptions"]["ollama-cloud"]["priority"] = 1
         (self.root / "policy.json").write_text(json.dumps(data), encoding="utf-8")
-        self.gw.reload()
-        status, raw = http_get(self.base + "/v1/subscriptions")
-        self.assertEqual(status, 200)
-        first = json.loads(raw)["subscriptions"][0]["id"]
-        self.assertEqual(first, "ollama-cloud")
+        self.assertEqual(http_get(self.base + "/v1/subscriptions")[0], 200)
+        first = self.list_items()["ollama-cloud"]
+        self.assertNotEqual(first["priority"], 1)
 
     def test_python_m_lgwd_help(self):
         proc = subprocess.run([sys.executable, "-m", "lgwd", "--help"],
@@ -260,8 +284,7 @@ class ReloadTest(MainCase):
         sock.close()
         return port
 
-    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "no SIGHUP")
-    def test_子程序_SIGHUP與SIGTERM_log(self):
+    def test_子程序_換key與SIGTERM_log(self):
         api_port = self._free_port()
         env = dict(os.environ,
                    LGWD_DB=str(self.root / "child.db"),
@@ -285,14 +308,27 @@ class ReloadTest(MainCase):
                     pass
                 time.sleep(0.1)
             self.assertTrue(up)
-            proc.send_signal(signal.SIGHUP)
-            time.sleep(1.0)
+            # 子程序活著時換檔：下一次請求就該看到新值（mtime 偵測，沒有 SIGHUP）
+            rotated = dict(FAKE_KEYS, **{"claude-personal": "test-main-child-333"})
+            rotate(self.root / "keys.env", key_text(rotated))
+            deadline = time.time() + 10
+            seen = None
+            while time.time() < deadline:
+                status, raw = http_get(
+                    f"http://127.0.0.1:{api_port}/v1/subscriptions/claude-personal"
+                    "?agent=claude-code")
+                if status == 200:
+                    seen = json.loads(raw)["key"]
+                    if seen == "test-main-child-333":
+                        break
+                time.sleep(0.1)
+            self.assertEqual(seen, "test-main-child-333")
             proc.terminate()  # SIGTERM
             _, stderr = proc.communicate(timeout=15)
             self.assertEqual(proc.returncode, 0)
-            self.assertIn(b"reload ok", stderr)
+            self.assertIn(b"keys reload ok", stderr)
             self.assertIn(b"SIGTERM", stderr)
-            for value in FAKE_KEYS.values():
+            for value in (*FAKE_KEYS.values(), "test-main-child-333"):
                 self.assertNotIn(value.encode(), stderr)
         finally:
             if proc.poll() is None:
