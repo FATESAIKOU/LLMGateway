@@ -53,6 +53,20 @@
 - `agent-lease`：全部移除（REMOVED），改由 `subscription-registry` 與 sidecar 取代。
 - `usage-record`：全部移除（REMOVED）。
 
+## v5 變更（本人，2026-10-12；以 v4 為底，只列改的地方）
+
+1. **冷卻只收 `until`**：登錄冷卻的 body 改為 `{until}`（RFC 3339 UTC，何時能再用），拿掉 `window`（5h／1w）；list／get 的 `cooldown` 欄位改成單一 `until`（或 null）；`available`＝已部署且沒有未來的 `until`。sidecar 拿不到恢復時間時報「現在＋1 小時」（那是 sidecar 的行為；`lgw.signals` 只負責把判讀結果轉成 `{until}`）。
+2. **拿掉 `lgw connect`**：sidecar 直接 curl 本機的 port（本機 port 預設 4710，可改）。worker 端通道由 MyLinuxPool 的 LLMGateway capability 附建通道小 script 建立（LLMGateway 只寫清楚它需要什麼：本機 loopback 4710 即 HTTP API）；Mac 用 mlp 或 ssh -J 自己轉發；手機自行用 ssh -J 等方式轉發，LLMGateway 不提供程式。
+3. **反向隧道搬到 `ops-scripts/`**：`llmgateway-tunnel` 與其 unit 從 `deploy/` 搬到 `ops-scripts/`（維運工具定位），內容不變。
+4. **金鑰正本改放 `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`**：兩個 workflow、`remote-deploy.sh` 整檔、SIGHUP 重讀、部署公鑰／forced command、部署連線 secret 整組拿掉（乙）；key-sync 約每 10 分鐘用 `gh` 拉（`gh` 登入是使用前提，`llmgw` 身分，token 二選一），拉到新版就換。升級改管理帳號手動 ssh 上去跑 `install.sh --tag`。細節見 `docs/research/v5-plan.md`。
+5. **文件說法**：sidecar 內部的 SubscriptionSource 不是 LLMGateway 的事；sshproxy 是既有設施（MyLinuxPool 維運，LLMGateway 只當會合點用）。
+
+### Capabilities（v5 增補）
+
+- `subscription-registry`：MODIFIED（冷卻 until-only；`cooldown` 欄位、`available`、錯誤碼跟著改）。
+- `connectivity`：MODIFIED（拿掉客戶端連線程式，加客戶端自備通道；服務端隧道守護保留，只搬目錄）。
+- `key-vault`：MODIFIED（key 正本改 private repo 加密檔，加定期拉取與輪替）。
+
 ## 本人的決定（2026-10-11 深夜）
 
 - **認證**：選 (a)，不做應用層認證。本人知道 sshproxy 上所有金鑰（provider、worker、家人維修機共用的那把）都讀得到全部 key，並接受這個風險。
@@ -68,12 +82,12 @@
 
 ## 銜接
 
-- **MyAiStorage（sidecar v3）**：用 list、get、登錄冷卻；挑選與換把在 sidecar 內部；env 對應在 AgentDriver。
+- **MyAiStorage（sidecar v4）**：用 list、get、登錄冷卻；挑選與換把在 sidecar 內部；env 對應在 AgentDriver。
 - **MyLinuxPool**（mylinuxpool-pm 提最小的做法，PMO 協調）：
-  - 在 sshproxy 登記 LLMGateway 的兩把公鑰（隧道、部署）；
+  - 在 sshproxy 登記 LLMGateway 的隧道公鑰（v5 乙：部署公鑰不登記了）；
   - 確認 worker 的 sidecar 讀得到 id_tunnel；
   - #69、#70 不需要。
-- **MyAiEntry#147**：手機一樣經會合點連線（App 內做 SSH 轉發），用 list／get。
+- **MyAiEntry#147 已關掉**（本人裁定）：不做 App 內轉發；手機自行用 ssh -J 等方式轉發，LLMGateway 不提供程式。
 
 ## 不做
 
