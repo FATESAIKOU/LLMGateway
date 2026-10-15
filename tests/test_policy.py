@@ -227,6 +227,8 @@ class PolicyValidationTests(unittest.TestCase):
         with self.assertRaises(PolicyError) as ctx:
             self._reload(obj)
         self.assertIn("claude-personal", str(ctx.exception))
+        # 例外不回顯檔案裡的值：訊息不含 default 的值（審查低-1）
+        self.assertNotIn("muse-spark-1.3", str(ctx.exception))
 
     def test_default是null時不檢查涵蓋(self):
         # default 為 null 時不做涵蓋檢查（呼叫方自己選）
