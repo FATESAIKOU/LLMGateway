@@ -139,6 +139,85 @@ class JsonSchemaTest(RegistryCase):
             "opencode/muse-spark-1.3-contributor-free",
         )
 
+    def test_get與list照出廠值帶出models_default(self):
+        # get 與 list 的回覆逐筆帶出出廠的 models.default；Claude 兩筆是 JSON
+        # 的 null（不是空字串、也沒有缺欄）。
+        expected = {
+            "claude-personal": None,
+            "claude-company": None,
+            "opencode-zen": "opencode/muse-spark-1.3-contributor-free",
+            "openrouter": "openrouter/free",
+            "ollama-cloud": "deepseek-v4.1-flash",
+        }
+        agents = {
+            "claude-personal": "claude-code",
+            "claude-company": "claude-code",
+            "opencode-zen": "opencode",
+            "openrouter": "opencode",
+            "ollama-cloud": "opencode",
+        }
+        listed = _by_id(self.list_items())
+        self.assertEqual(set(listed), set(expected))
+        for sub, default in expected.items():
+            with self.subTest(subscription=sub):
+                for source, payload in (("list", listed[sub]),
+                                        ("get", self.get(sub, agents[sub]))):
+                    self.assertIn("default", payload["models"])
+                    self.assertEqual(payload["models"]["default"], default)
+                    # JSON 往返後照樣（Claude 兩筆仍是 null）
+                    roundtrip = json.loads(json.dumps(payload, ensure_ascii=False))
+                    self.assertEqual(roundtrip["models"]["default"], default)
+                    if default is None:
+                        self.assertIsNone(roundtrip["models"]["default"])
+                        self.assertIn('"default": null', json.dumps(payload))
+
+
+class ModelsDefaultSemanticsTest(RegistryCase):
+    """spec subscription-registry「models.default 的語意」的兩個 Scenario。"""
+
+    def _service_with_policy(self, obj) -> RegistryService:
+        path = self.root / "policy-under-test.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        return RegistryService(self.db_path, load_policy(str(path)),
+                               self.keys, self.clock)
+
+    def test_Claude訂閱沒有預設(self):
+        # Scenario: Claude 訂閱沒有預設—讀 claude-personal 的共通 JSON，
+        # models.default 為 null；呼叫方不帶模型參數，用 Claude Code 自己的預設。
+        item = self.get("claude-personal", "claude-code")
+        self.assertEqual(item["kind"], "claude-subscription")
+        self.assertIn("default", item["models"])
+        self.assertIsNone(item["models"]["default"])
+        listed = _by_id(self.list_items())["claude-personal"]
+        self.assertIsNone(listed["models"]["default"])
+        # JSON 的 null，不是空字串
+        blob = json.dumps(item, ensure_ascii=False)
+        self.assertIn('"default": null', blob)
+        self.assertEqual(json.loads(blob)["models"]["default"], None)
+
+    def test_其他kind沒有預設(self):
+        # Scenario: 其他 kind 沒有預設—非 claude-subscription 的 default 為
+        # null 時服務不代選（照樣回 null），呼叫方自己依非空的 allow 選一個
+        # 模型來用，或不用這一筆。用假政策檔（ollama-cloud 的 default 改成
+        # null），不動出廠政策檔。
+        with open(REPO_ROOT / "policy" / "default.json", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        obj["subscriptions"]["ollama-cloud"]["models"]["default"] = None
+        service = self._service_with_policy(obj)
+        try:
+            item = service.get_subscription("ollama-cloud", "opencode")
+            self.assertEqual(item["kind"], "api-key")
+            self.assertNotEqual(item["kind"], "claude-subscription")
+            self.assertIn("default", item["models"])
+            self.assertIsNone(item["models"]["default"])
+            self.assertTrue(item["models"]["allow"])  # 呼叫方有 allow 可選
+            listed = _by_id(service.list_subscriptions()["subscriptions"])["ollama-cloud"]
+            self.assertIsNone(listed["models"]["default"])
+            self.assertIn('"default": null',
+                          json.dumps(listed, ensure_ascii=False))
+        finally:
+            service.close()
+
 
 class ListTest(RegistryCase):
     def test_不含秘密(self):

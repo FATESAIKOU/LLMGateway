@@ -1,5 +1,6 @@
 """policy/default.json 載入與驗證規則的測試。只用假資料。"""
 
+import fnmatch
 import json
 import tempfile
 import unittest
@@ -64,6 +65,31 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertIn("*:free", or_sub.models_allow)
         self.assertIn("openrouter/free", or_sub.models_allow)
         self.assertEqual(len(or_sub.models_allow), 2)
+
+    def test_出廠五筆訂閱的models_default(self):
+        # 出廠政策檔逐筆釘住：Claude 兩筆維持 null（kind=claude-subscription 時
+        # 表示用 Claude Code 自己的預設），其餘三筆各自有 default。非 null 的
+        # default 必須被同一筆的 allow 樣式涵蓋（allow 是 fnmatch 樣式；
+        # lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        expected = {
+            "claude-personal": None,
+            "claude-company": None,
+            "opencode-zen": "opencode/muse-spark-1.3-contributor-free",
+            "openrouter": "openrouter/free",
+            "ollama-cloud": "deepseek-v4.1-flash",
+        }
+        self.assertEqual(set(policy.subscriptions), set(expected))
+        for name, default in expected.items():
+            with self.subTest(subscription=name):
+                sub = policy.subscriptions[name]
+                self.assertEqual(sub.models_default, default)
+                if default is not None:
+                    self.assertTrue(
+                        any(fnmatch.fnmatchcase(default, pattern)
+                            for pattern in sub.models_allow),
+                        f"{name} 的 default 沒有被 models.allow 涵蓋",
+                    )
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
