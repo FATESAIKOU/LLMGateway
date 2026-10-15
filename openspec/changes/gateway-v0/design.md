@@ -156,11 +156,11 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
   "provider": "openrouter",
   "kind": "api-key",
   "agents": ["claude-code", "opencode"],
-  "priority": 30,
-  "models": {"allow": ["*:free"], "default": null},
+  "priority": 20,
+  "models": {"allow": ["*:free", "openrouter/free"], "default": "openrouter/free"},
   "endpoint": "https://openrouter.ai/api",
   "key": "（只在 get 回）",
-  "cooldown": {"5h": null, "1w": {"until": "2026-10-18T00:02:00Z"}},
+  "cooldown": {"until": "2026-10-18T00:02:00Z"},
   "available": false
 }
 ```
