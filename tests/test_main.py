@@ -163,6 +163,13 @@ class ApiTest(MainCase):
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(raw), {"error": "agent_not_allowed"})
 
+    def test_ClaudeCode拿不到openrouter(self):
+        # 出廠政策（#23）：openrouter 只給 opencode
+        status, raw = http_get(
+            self.base + "/v1/subscriptions/openrouter?agent=claude-code")
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(raw), {"error": "agent_not_allowed"})
+
     def test_缺agent回400(self):
         status, _ = http_get(self.base + "/v1/subscriptions/claude-personal")
         self.assertEqual(status, 400)

@@ -50,7 +50,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
         self.assertEqual(policy.subscriptions["openrouter"].models_allow,
                          ("*:free", "openrouter/free"))
-        self.assertIn("claude-code", policy.subscriptions["openrouter"].agents)
+        self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
         self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
         self.assertFalse(hasattr(policy, "cooldown_buffer_seconds"))  # 窗口欄位拿掉
