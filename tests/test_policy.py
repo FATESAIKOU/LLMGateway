@@ -75,7 +75,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         expected = {
             "claude-personal": None,
             "claude-company": None,
-            "opencode-zen": "opencode/muse-spark-1.3-contributor-free",
+            "opencode-zen": "muse-spark-1.3-contributor-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
@@ -89,6 +89,13 @@ class LoadDefaultPolicyTests(unittest.TestCase):
                         any(fnmatch.fnmatchcase(default, pattern)
                             for pattern in sub.models_allow),
                         f"{name} 的 default 沒有被 models.allow 涵蓋",
+                    )
+                    # 供應商自己的模型 id：不帶 agent 專用的 provider 前綴
+                    # （例如 opencode 的 "opencode/"；前綴由呼叫方的 agent
+                    # driver 自己加）
+                    self.assertFalse(
+                        default.startswith("opencode/"),
+                        f"{name} 的 default 帶了 agent 專用的 provider 前綴",
                     )
 
     def test_priority_order_stable_on_ties(self):

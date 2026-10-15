@@ -136,7 +136,7 @@ class JsonSchemaTest(RegistryCase):
         self.assertEqual(items["opencode-zen"]["models"]["allow"], ["*"])
         self.assertEqual(
             items["opencode-zen"]["models"]["default"],
-            "opencode/muse-spark-1.3-contributor-free",
+            "muse-spark-1.3-contributor-free",
         )
 
     def test_get與list照出廠值帶出models_default(self):
@@ -145,7 +145,7 @@ class JsonSchemaTest(RegistryCase):
         expected = {
             "claude-personal": None,
             "claude-company": None,
-            "opencode-zen": "opencode/muse-spark-1.3-contributor-free",
+            "opencode-zen": "muse-spark-1.3-contributor-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
