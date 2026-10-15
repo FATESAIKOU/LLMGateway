@@ -14,7 +14,7 @@
     "opencode-zen": {
       "priority": 10,
       "agents": ["opencode"],
-      "models": {"allow": ["*"], "default": null}
+      "models": {"allow": ["*"], "default": "muse-spark-1.3-contributor-free"}
     },
     "openrouter": {
       "priority": 20,
@@ -24,7 +24,7 @@
     "ollama-cloud": {
       "priority": 30,
       "agents": ["claude-code", "opencode"],
-      "models": {"allow": ["*"], "default": null}
+      "models": {"allow": ["*"], "default": "deepseek-v4.1-flash"}
     }
   },
   "until_max_ahead_seconds": 691200

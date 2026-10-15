@@ -32,6 +32,21 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 - **WHEN** 某把在冷卻中，有人 get 它
 - **THEN** 照樣回覆（`available` 為 false），由呼叫方決定要不要用
 
+### Requirement: models.default 的語意
+`models.default` SHALL 是**供應商自己的模型 id**，也就是 provider 端 API 認得的名字（例如 `openrouter/free`、`muse-spark-1.3-contributor-free`、`deepseek-v4.1-flash`），也可以是 null。這個欄位 MUST NOT 帶 agent 專用的 provider 前綴（例如 opencode 的 `opencode/`）；要組成 agent 專用的字串（例如 opencode 的 `provider/model`）時，由呼叫方的 agent driver 負責。null 的語意依 `kind` 而定：`kind` 為 `claude-subscription` 時表示用 agent 自己的預設模型（呼叫方不指定模型）；其他 `kind` 為 null 時表示這筆沒有預設，服務不代選，呼叫方 SHALL 自己依 `models.allow` 選一個模型，或不用這一筆。
+
+#### Scenario: 供應商自己的模型 id
+- **WHEN** 讀取 `opencode-zen` 的共通 JSON
+- **THEN** `models.default` 為 `muse-spark-1.3-contributor-free`（不帶 `opencode/` 前綴；opencode 用的 `opencode/<模型>` 由呼叫方的 agent driver 自己組成）
+
+#### Scenario: Claude 訂閱沒有預設
+- **WHEN** 讀取 `claude-personal` 的共通 JSON
+- **THEN** `models.default` 為 null，呼叫方不帶模型參數，用 Claude Code 自己的預設模型
+
+#### Scenario: 其他 kind 沒有預設
+- **WHEN** 某筆非 `claude-subscription` 的 `models.default` 為 null
+- **THEN** 服務不代選模型；呼叫方自己從 `allow` 選一個模型來用，或不用這一筆
+
 ## MODIFIED Requirements
 
 ### Requirement: 共通 JSON schema
