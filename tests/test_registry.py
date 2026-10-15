@@ -162,8 +162,10 @@ class JsonSchemaTest(RegistryCase):
             with self.subTest(subscription=sub):
                 for source, payload in (("list", listed[sub]),
                                         ("get", self.get(sub, agents[sub]))):
-                    self.assertIn("default", payload["models"])
-                    self.assertEqual(payload["models"]["default"], default)
+                    self.assertIn("default", payload["models"],
+                                  f"{sub} 的 {source} 缺 default 欄")
+                    self.assertEqual(payload["models"]["default"], default,
+                                     f"{sub} 的 {source} 回傳的 default 不對")
                     # JSON 往返後照樣（Claude 兩筆仍是 null）
                     roundtrip = json.loads(json.dumps(payload, ensure_ascii=False))
                     self.assertEqual(roundtrip["models"]["default"], default)
