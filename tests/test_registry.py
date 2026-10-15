@@ -134,7 +134,10 @@ class JsonSchemaTest(RegistryCase):
         self.assertEqual(items["openrouter"]["models"]["allow"], ["*:free", "openrouter/free"])
         self.assertEqual(items["openrouter"]["models"]["default"], "openrouter/free")
         self.assertEqual(items["opencode-zen"]["models"]["allow"], ["*"])
-        self.assertIsNone(items["opencode-zen"]["models"]["default"])
+        self.assertEqual(
+            items["opencode-zen"]["models"]["default"],
+            "opencode/muse-spark-1.3-contributor-free",
+        )
 
 
 class ListTest(RegistryCase):
