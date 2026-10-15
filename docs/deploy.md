@@ -581,7 +581,7 @@ key-sync 失敗**不會**動舊 key：服務照用舊版。連續失敗才需要
 
 客戶端側（`lgw.client` 的 `Result.error`）另有兩個自己判讀的值：`unreachable`（連不上或逾時，先看 5.4 與 5.3）與 `bad_response`（回覆不是 JSON 物件，通常是連到不是 `lgwd` 的東西，查會合點上 4710 是誰在聽）。
 
-**403 `agent_not_allowed`**：`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403，這是預期的。其他組合要改 `policy/default.json` 並發新版。
+**403 `agent_not_allowed`**：`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403；openrouter 只給 `opencode`（Claude Code 只用 Claude 訂閱與 Ollama，免費模型只經過 opencode 使用），claude-code 拿 OpenRouter 也是 403。這些都是預期的。其他組合要改 `policy/default.json` 並發新版。
 
 ### 5.6 `available` 為 false，或 get 回 409 `not_deployed`
 
