@@ -155,7 +155,7 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
   "id": "openrouter",
   "provider": "openrouter",
   "kind": "api-key",
-  "agents": ["claude-code", "opencode"],
+  "agents": ["opencode"],
   "priority": 20,
   "models": {"allow": ["*:free", "openrouter/free"], "default": "openrouter/free"},
   "endpoint": "https://openrouter.ai/api",
@@ -166,10 +166,10 @@ JSON over HTTP，沒有應用層認證（決定 5a）。
 ```
 
 - `kind` 是 `claude-subscription` 或 `api-key`。
-- Claude 訂閱的 `agents` 只有 `claude-code`；Zen 只有 `opencode`（沒有官方的 Claude Code 接法）。
+- Claude 訂閱的 `agents` 只有 `claude-code`；Zen 只有 `opencode`（沒有官方的 Claude Code 接法）；openrouter 只有 `opencode`（Claude Code 只用 Claude 訂閱與 Ollama，免費模型只經過 opencode 使用；Claude Code 碰到 `openrouter/free` 會 unrecognized_model）。
 - `priority` 是預設挑選順序。本人說之後可能改成外部注入的函式計算；挑選本來就在 sidecar（可替換的小介面），LLMGateway 照樣回這個欄位。claude-code 是個人 10 → 公司 20；opencode 是 Zen 10 → OpenRouter 20（只允許免費模型）→ Ollama 30。這些定義在政策檔，不是介面。
 - **不帶環境變數名**：由 sidecar 的 AgentDriver 依 `provider`、`kind`、`endpoint`、`key`、`models.default` 推出。例如 Claude 訂閱推出 `CLAUDE_CODE_OAUTH_TOKEN`，OpenRouter 給 claude-code 推出 `ANTHROPIC_BASE_URL`＋`ANTHROPIC_AUTH_TOKEN`＋`ANTHROPIC_API_KEY=""`。理由是環境變數名跟著 agent 版本變，而 agent 和 sidecar 一起釘在映像裡。
-- `models.default` 是**供應商自己的模型 id**，也就是 provider 端 API 認得的名字（例 `openrouter/free`、`muse-spark-1.3-contributor-free`、`deepseek-v4.1-flash`），不帶 agent 專用的 provider 前綴；要組成 agent 專用的字串（例如 opencode 的 `provider/model`）時，由呼叫方的 agent driver 負責。為 null 時：`kind` 是 `claude-subscription` 表示用 agent 自己的預設（呼叫方不帶模型參數），其他 `kind` 表示沒有預設，服務不代選，呼叫方自己依 `allow` 選或拒絕。
+- `models.default` 是**供應商自己的模型 id**，也就是 provider 端 API 認得的名字（例 `openrouter/free`、`muse-spark-1.3-contributor-free`、`deepseek-v4.1-flash`），不帶 agent 專用的 provider 前綴；要組成 agent 專用的字串（例如 opencode 的 `provider/model`）時，由呼叫方的 agent driver 負責。非 null 的 `default` 必須被同一筆 `allow` 的樣式涵蓋，載入政策檔時 fail-closed 檢查、蓋不進就拒收（`PolicyError`）。為 null 時：`kind` 是 `claude-subscription` 表示用 agent 自己的預設（呼叫方不帶模型參數），其他 `kind` 表示沒有預設，服務不代選，呼叫方自己依 `allow` 選或拒絕。
 - 內部仍分兩個介面（實作分離）：
   - `CredentialProvider`：每種 provider 一個實作，負責 schema 中與 provider 有關的欄位；
   - 政策檔：priority、models、agents。

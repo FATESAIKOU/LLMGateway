@@ -47,6 +47,13 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 - **WHEN** 某筆非 `claude-subscription` 的 `models.default` 為 null
 - **THEN** 服務不代選模型；呼叫方自己從 `allow` 選一個模型來用，或不用這一筆
 
+### Requirement: models.default 必須被 allow 涵蓋
+政策檔載入時 SHALL 檢查：`models.default` 不是 null 時，必須被同一筆 `models.allow` 的樣式涵蓋（fnmatch）；不符合 MUST 載入失敗（`PolicyError`），服務不啟動。`default` 為 null 時不做這項檢查。
+
+#### Scenario: default 蓋不進 allow
+- **WHEN** 政策檔某筆的 `models.default` 是 `muse-spark-1.3`，同一筆的 `models.allow` 只有 `*-free` 與 `big-pickle`
+- **THEN** 載入失敗（`PolicyError`），訊息指出是哪一筆
+
 ## MODIFIED Requirements
 
 ### Requirement: 共通 JSON schema
@@ -60,11 +67,15 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 - `cooldown`：`{"until": RFC 3339 UTC}` 或 null（v5：單一，不再分窗口）；
 - `available`：key 已部署，而且沒有未來的 `until`。
 
-這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 key 變成哪些環境變數由 sidecar 的 agent driver 決定。Claude 訂閱的 `agents` MUST 只有 `claude-code`。
+這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 key 變成哪些環境變數由 sidecar 的 agent driver 決定。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（Claude Code 只用 Claude 訂閱與 Ollama，免費模型只經過 opencode 使用；Claude Code 碰到 `openrouter/free` 會 unrecognized_model）。
 
 #### Scenario: Claude 訂閱的描述
 - **WHEN** 讀取 `claude-personal` 的描述
 - **THEN** `provider` 為 anthropic、`kind` 為 claude-subscription、`agents` 只有 `claude-code`，形狀裡沒有任何環境變數名
+
+#### Scenario: openrouter 只給 opencode
+- **WHEN** 以 `agent=claude-code` get `openrouter`
+- **THEN** 回 403 `agent_not_allowed`，不含 key
 
 #### Scenario: 能不能用
 - **WHEN** 某把的 key 已部署，而且沒有未來的 `until`
