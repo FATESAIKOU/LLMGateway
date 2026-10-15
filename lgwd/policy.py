@@ -2,7 +2,7 @@
 
 load_policy(path) 讀 JSON、驗證、回傳 Policy；不合法丟 PolicyError。
 政策檔只管 priority、agents、models（與 provider 有關的欄位在 lgwd/providers.py）。
-PolicyError 的訊息只用固定字串，不回顯檔案裡的字串（值永不進例外）。
+PolicyError 的訊息只用固定字串與固定的訂閱 id，不回顯檔案裡的其他字串（值永不進例外）。
 
 載入時機：只在啟動時（lgwd 啟動失敗就不啟動）。v5 沒有熱重載、沒有 SIGHUP，
 換政策要重啟 lgwd（政策檔跟著 tag 換，見 docs/deploy.md 4.2）。key 檔是另一回事：
@@ -11,6 +11,7 @@ PolicyError 的訊息只用固定字串，不回顯檔案裡的字串（值永�
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from dataclasses import dataclass
 
@@ -81,6 +82,14 @@ def _parse_subscription(name: str, spec: object) -> SubscriptionPolicy:
     default = models.get("default")
     if default is not None and (not isinstance(default, str) or not default):
         raise PolicyError("subscription models.default must be a non-empty string or null")
+    if default is not None and not any(
+        fnmatch.fnmatchcase(default, pattern) for pattern in allow
+    ):
+        # fail-closed：default 蓋不進 allow 的政策檔直接拒收（訊息只帶訂閱 id；
+        # 值本身照模組原則不進例外）
+        raise PolicyError(
+            f"subscription {name} models.default must be covered by models.allow"
+        )
     return SubscriptionPolicy(
         name=name,
         priority=priority,
@@ -96,6 +105,7 @@ def load_policy(path: str) -> Policy:
     - claude-personal／claude-company 的 agents 只能剛好是 ["claude-code"]（條款）；
     - opencode-zen 的 agents 只能剛好是 ["opencode"]（沒有官方的 Claude Code 接法）；
     - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
+    - 非 null 的 models.default 必須被同一筆的 models.allow 樣式涵蓋（fnmatch；fail-closed）；
     - priority 為非負整數；cooldown 的 until 上限為正整數。
     """
     try:
