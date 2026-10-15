@@ -36,7 +36,7 @@ v4 定案（2026-10-11 深夜）。v5 增補（2026-10-12）見最下面一節�
 - [ ] 4.1 Mac：sidecar 以 list／get 開 Claude Code，回得了一則最短的訊息
 - [ ] 4.2 換把：用假的額度用完訊號 → sidecar 登錄冷卻（v5：`{until}`） → list 顯示 `claude-personal` 不能用 → sidecar 挑到 `claude-company` 重開並接回；冷卻到期後 list 恢復
 - [ ] 4.3 opencode 拿不到 Claude 訂閱（403）；opencode 對 Zen、OpenRouter（免費模型）、Ollama 各跑通一次
-- [ ] 4.4 要用 key 的驗證（PM 或本人）：OpenRouter、Ollama Cloud 讓 Claude Code 跑一則最短的訊息；opencode 讀 key 的方式
+- [ ] 4.4 要用 key 的驗證（PM 或本人）：Ollama Cloud 讓 Claude Code 跑一則最短的訊息；OpenRouter（只經過 opencode）與 Zen 由 opencode 讀 key
 - [ ] 4.5 worker：在一台 worker 用自備通道（v5：不再經 `lgw connect`）連線並驗收換把
 - [ ] 4.5a 隧道：殺掉隧道連線後自動恢復；佔住遠端埠時守護程式重試而不假裝健康
 - [ ] 4.6 秘密掃描：repo、資料庫、log、list 的回覆沒有任何 key 的值
