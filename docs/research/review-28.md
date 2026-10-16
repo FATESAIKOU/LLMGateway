@@ -100,3 +100,5 @@ exit=0
 - 兩個呼叫方 Scenario 的「不覆寫內建 provider 的 baseURL」寫法，正好對應這次的 404 事故（把 `https://ollama.com` 直接當 OpenAI baseURL）；語意收在 spec，driver 端要怎麼做留給 sidecar，範圍拿捏正確。
 
 可以開 PR
+
+處理：低-1 已修（5569edd）；資訊-1、資訊-2 不改（資訊-2 交給 MyLinuxPool#176 實機驗證時確認）
