@@ -54,6 +54,25 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 - **WHEN** 政策檔某筆的 `models.default` 是 `muse-spark-1.3`，同一筆的 `models.allow` 只有 `*-free` 與 `big-pickle`
 - **THEN** 載入失敗（`PolicyError`），訊息指出是哪一筆
 
+### Requirement: endpoint 的語意
+`endpoint` SHALL 是 provider 的**根位址**（值以 `lgwd/providers.py` 為準），`kind` 為 `claude-subscription` 時 MUST 為 null（由 agent 直連）。出廠值與形狀：
+- `openrouter` 的 `https://openrouter.ai/api` 與 `ollama-cloud` 的 `https://ollama.com`：Anthropic 相容的 base，可以直接當 Claude Code 的 `ANTHROPIC_BASE_URL`；OpenAI 相容的路徑要由呼叫方自己組（例如再接 `/v1`）；
+- `opencode-zen` 的 `https://opencode.ai/zen/v1`：OpenAI 相容的 base。
+
+呼叫方（agent driver）MUST NOT 假設 `endpoint` 是某種協定的完整路徑；要依 `provider` 組出自己要的接法，或使用 agent 內建的 provider 設定。
+
+#### Scenario: opencode driver 拿到 ollama-cloud 的 endpoint
+- **WHEN** opencode 的 driver 拿到 `ollama-cloud` 的 `endpoint`（`https://ollama.com`）
+- **THEN** 它自己組 OpenAI 相容的路徑（例如再接 `/v1`），或不覆寫內建 provider 的 baseURL；服務回的 `endpoint` 不變
+
+#### Scenario: Claude Code 拿到 ollama-cloud 的 endpoint
+- **WHEN** Claude Code 的 driver 拿到 `ollama-cloud` 的 `endpoint`
+- **THEN** 直接當 `ANTHROPIC_BASE_URL` 用（這個值是 Anthropic 相容的 base）
+
+#### Scenario: Claude 訂閱沒有 endpoint
+- **WHEN** 讀取 `claude-personal` 的共通 JSON
+- **THEN** `endpoint` 為 null，agent 直連、不使用 base
+
 ## MODIFIED Requirements
 
 ### Requirement: 共通 JSON schema
