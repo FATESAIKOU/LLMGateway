@@ -115,6 +115,31 @@ class JsonSchemaTest(RegistryCase):
                 self.assertEqual(items[sub]["endpoint"], endpoint)
         self.assertEqual(set(items), set(expected))
 
+    def test_endpoint出廠值(self):
+        # spec subscription-registry：endpoint 是 provider 的根位址（值以
+        # lgwd/providers.py 為準）；Claude 訂閱是 null（由 agent 直連）。
+        expected = {
+            "claude-personal": None,
+            "claude-company": None,
+            "openrouter": "https://openrouter.ai/api",
+            "ollama-cloud": "https://ollama.com",
+            "opencode-zen": "https://opencode.ai/zen/v1",
+        }
+        agents = {
+            "claude-personal": "claude-code",
+            "claude-company": "claude-code",
+            "openrouter": "opencode",
+            "ollama-cloud": "opencode",
+            "opencode-zen": "opencode",
+        }
+        listed = _by_id(self.list_items())
+        self.assertEqual(set(listed), set(expected))
+        for sub, endpoint in expected.items():
+            with self.subTest(subscription=sub):
+                self.assertEqual(listed[sub]["endpoint"], endpoint)
+                # get 也一樣（含 key 的那條路）
+                self.assertEqual(self.get(sub, agents[sub])["endpoint"], endpoint)
+
     def test_能不能用(self):
         items = _by_id(self.list_items())
         self.assertTrue(items["claude-personal"]["available"])
