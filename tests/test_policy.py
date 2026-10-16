@@ -40,6 +40,11 @@ def _good_policy(**over):
     return base
 
 
+def _covered(sub, model_id):
+    """model_id 是否被該筆的 allow 樣式涵蓋（與 lgwd 的檢查同一個 fnmatch）。"""
+    return any(fnmatch.fnmatchcase(model_id, pattern) for pattern in sub.models_allow)
+
+
 class LoadDefaultPolicyTests(unittest.TestCase):
     def test_default_policy_loads(self):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
@@ -50,7 +55,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
         self.assertEqual(policy.subscriptions["openrouter"].models_allow,
                          ("*:free", "openrouter/free"))
-        self.assertIn("claude-code", policy.subscriptions["openrouter"].agents)
+        self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
         self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
         self.assertFalse(hasattr(policy, "cooldown_buffer_seconds"))  # 窗口欄位拿掉
@@ -97,6 +102,18 @@ class LoadDefaultPolicyTests(unittest.TestCase):
                         default.startswith("opencode/"),
                         f"{name} 的 default 帶了 agent 專用的 provider 前綴",
                     )
+
+    def test_zen_allow涵蓋default與免費模型(self):
+        # 出廠政策（#26）：zen 的 allow 是 ["*-free", "big-pickle"]；default 與
+        # big-pickle 被涵蓋，其他 *-free 的 id 也被涵蓋；付費的 id（例如
+        # muse-spark-1.3）不被涵蓋。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        zen = policy.subscriptions["opencode-zen"]
+        self.assertEqual(zen.models_allow, ("*-free", "big-pickle"))
+        self.assertTrue(_covered(zen, "muse-spark-1.3-contributor-free"))  # default
+        self.assertTrue(_covered(zen, "big-pickle"))
+        self.assertTrue(_covered(zen, "spark-2-free"))  # 其他 *-free 的 id
+        self.assertFalse(_covered(zen, "muse-spark-1.3"))  # 付費的 id
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -199,6 +216,27 @@ class PolicyValidationTests(unittest.TestCase):
                     obj = _good_policy()
                     mutate(obj)
                     self._reload(obj)
+
+    def test_default必須被allow涵蓋(self):
+        # 非 null 的 default 蓋不進同一筆的 allow → 拒收（fail-closed），訊息指出
+        # 是哪一筆；這裡用合法的訂閱 id，不是檔案裡的自由字串。
+        obj = _good_policy()
+        obj["subscriptions"]["claude-personal"]["models"] = {
+            "allow": ["*-free"], "default": "muse-spark-1.3",
+        }
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertIn("claude-personal", str(ctx.exception))
+        # 例外不回顯檔案裡的值：訊息不含 default 的值（審查低-1）
+        self.assertNotIn("muse-spark-1.3", str(ctx.exception))
+
+    def test_default是null時不檢查涵蓋(self):
+        # default 為 null 時不做涵蓋檢查（呼叫方自己選）
+        obj = _good_policy()
+        obj["subscriptions"]["opencode-zen"] = _sub(
+            10, ("opencode",), ("*-free", "big-pickle"), None)
+        policy = self._reload(obj)
+        self.assertIsNone(policy.subscriptions["opencode-zen"].models_default)
 
     def test_bad_json_and_missing_file_rejected(self):
         with self.assertRaises(PolicyError):

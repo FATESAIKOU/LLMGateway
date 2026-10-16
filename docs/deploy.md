@@ -461,7 +461,7 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
 
 政策檔跟著 tag 一起換：`lgwd` 讀的是 `~/.local/share/llmgateway/current/policy/default.json`（`--policy` 指向 `current`），所以升級就是把那一版的 `policy/default.json` 換上，不用（也不該）手動搬舊政策檔。`lgwd` 只在啟動時讀政策（v5 沒有熱重載），`install.sh` 升級時會重啟 `lgwd`，所以新版政策升級後就生效；反過來說，單獨手改政策檔要重啟 `lgwd` 才生效。
 
-政策檔是 **fail-closed** 的，被拒的是**缺欄位**：v4 的政策檔沒有 `until_max_ahead_seconds`，所以會被拒（`lgwd` 起不來，`--check` 不會過）。要自己改過政策檔（跨版沿用同一份），得補上這個新欄位；舊欄位（`cooldown_buffer_seconds`、`resets_at_max_ahead_seconds`）**留著無妨**，loader 會忽略多出來的欄位。所以：不要想著「把舊欄位清掉就好」，要補的是新欄位。
+政策檔是 **fail-closed** 的，被拒的是**缺欄位**：v4 的政策檔沒有 `until_max_ahead_seconds`，所以會被拒（`lgwd` 起不來，`--check` 不會過）。要自己改過政策檔（跨版沿用同一份），得補上這個新欄位；舊欄位（`cooldown_buffer_seconds`、`resets_at_max_ahead_seconds`）**留著無妨**，loader 會忽略多出來的欄位。所以：不要想著「把舊欄位清掉就好」，要補的是新欄位。另外，非 null 的 `models.default` 必須被同一筆的 `models.allow` 涵蓋（載入時檢查），蓋不進的政策檔一樣拒收。
 
 ### 4.3 看狀態
 
@@ -488,6 +488,7 @@ key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysy
   - 找不到 `gh`，或 `gh` 查詢逾時（`timeout`，可經 `LGW_GH_TIMEOUT` 調，預設 30 秒）→ 回 2（無法確認，不是確定壞掉）。
   - `keysync.env` 沒放、沒有非空的值、**或讀不到該檔**（權限壞掉）→ 回 1，三種分別印不同的訊息。
   - `key-sync.service` 上次失敗 → 回 1。
+- 用 `sudo -u llmgw -i` 的身分跑 `--check` 前，先 `export XDG_RUNTIME_DIR=/run/user/$(id -u)` 與 `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`：`sudo -u` 進去的 shell 不會自己帶這兩個，沒帶就連不上 user bus，`--check` 回 2（無法確認，不是確定壞掉）。
 
 ### 4.5 外洩時
 
@@ -542,6 +543,7 @@ key-sync 失敗**不會**動舊 key：服務照用舊版。連續失敗才需要
 - 跳板過了但 `Connection refused`：會合點的 4711 沒人在聽，表示隧道斷了，看 5.3。這時 ssh 也進不去，要另外登入那台處理。
 - `Host key verification failed`：自己的 known_hosts 少了 `[<跳板機>]:<埠>` 或（換機後）那台的 host key 變了；用 1.A.4 摘要印出的 host 公鑰比對。
 - 目標那一段 `Permission denied`：sshd 擋了 `llmgw`／管理帳號（1.3），或帳號沒有該做的事的權限。
+- 跳板機（會合點）端的 sshd：那台的 sshd unit 名稱不是 `ssh`／`sshd`，查 log 時用全量的 `journalctl` 再 grep（例如 `journalctl | grep -i ssh`），不要只 `journalctl -u sshd`。
 
 ### 5.3 隧道守護一直重開
 
@@ -581,7 +583,7 @@ key-sync 失敗**不會**動舊 key：服務照用舊版。連續失敗才需要
 
 客戶端側（`lgw.client` 的 `Result.error`）另有兩個自己判讀的值：`unreachable`（連不上或逾時，先看 5.4 與 5.3）與 `bad_response`（回覆不是 JSON 物件，通常是連到不是 `lgwd` 的東西，查會合點上 4710 是誰在聽）。
 
-**403 `agent_not_allowed`**：`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403，這是預期的。其他組合要改 `policy/default.json` 並發新版。
+**403 `agent_not_allowed`**：`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403；openrouter 只給 `opencode`（Claude Code 只用 Claude 訂閱與 Ollama，免費模型只經過 opencode 使用），claude-code 拿 OpenRouter 也是 403。這些都是預期的。其他組合要改 `policy/default.json` 並發新版。
 
 ### 5.6 `available` 為 false，或 get 回 409 `not_deployed`
 

@@ -133,7 +133,7 @@ class JsonSchemaTest(RegistryCase):
         items = _by_id(self.list_items())
         self.assertEqual(items["openrouter"]["models"]["allow"], ["*:free", "openrouter/free"])
         self.assertEqual(items["openrouter"]["models"]["default"], "openrouter/free")
-        self.assertEqual(items["opencode-zen"]["models"]["allow"], ["*"])
+        self.assertEqual(items["opencode-zen"]["models"]["allow"], ["*-free", "big-pickle"])
         self.assertEqual(
             items["opencode-zen"]["models"]["default"],
             "muse-spark-1.3-contributor-free",
@@ -290,16 +290,19 @@ class GetTest(RegistryCase):
         self.assertNotIn("key", err.body())
 
     def test_get_openrouter回傳default模型(self):
-        for agent in ("opencode", "claude-code"):
-            with self.subTest(agent=agent):
-                item = self.get("openrouter", agent)
-                self.assertEqual(item["key"], CANARY["openrouter"])
-                self.assertEqual(item["models"]["default"], "openrouter/free")
-                self.assertEqual(item["models"]["allow"], ["*:free", "openrouter/free"])
+        item = self.get("openrouter", "opencode")
+        self.assertEqual(item["key"], CANARY["openrouter"])
+        self.assertEqual(item["models"]["default"], "openrouter/free")
+        self.assertEqual(item["models"]["allow"], ["*:free", "openrouter/free"])
         self.assertEqual(self.get("opencode-zen", "opencode")["key"], CANARY["opencode-zen"])
-        self.assertEqual(self.get("openrouter", "opencode")["key"], CANARY["openrouter"])
-        self.assertEqual(self.get("openrouter", "claude-code")["key"], CANARY["openrouter"])
         self.assertEqual(self.get("ollama-cloud", "claude-code")["key"], CANARY["ollama-cloud"])
+
+    def test_ClaudeCode不能拿openrouter(self):
+        # 出廠政策（#23）：openrouter 只給 opencode（Claude Code 碰到
+        # openrouter/free 會 unrecognized_model）
+        err = self.assert_api_error(
+            403, "agent_not_allowed", self.get, "openrouter", "claude-code")
+        self.assertNotIn("key", err.body())
 
 
 class CooldownTest(RegistryCase):
