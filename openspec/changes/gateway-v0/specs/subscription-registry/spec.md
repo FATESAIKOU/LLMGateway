@@ -56,7 +56,7 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 
 ### Requirement: endpoint 的語意
 `endpoint` SHALL 是 provider 的**根位址**（值以 `lgwd/providers.py` 為準），`kind` 為 `claude-subscription` 時 MUST 為 null（由 agent 直連）。出廠值與形狀：
-- `openrouter` 的 `https://openrouter.ai/api` 與 `ollama-cloud` 的 `https://ollama.com`：Anthropic 相容的 base，可以直接當 Claude Code 的 `ANTHROPIC_BASE_URL`；OpenAI 相容的路徑要由呼叫方自己組（例如再接 `/v1`）；
+- `ollama-cloud` 的 `https://ollama.com` 可以直接當 Claude Code 的 `ANTHROPIC_BASE_URL`；`openrouter` 的 `https://openrouter.ai/api` 同屬 Anthropic 相容的 base（本系統只給 opencode，接法由 opencode driver 決定）；兩者的 OpenAI 相容路徑由呼叫方自己組（例如再接 `/v1`）；
 - `opencode-zen` 的 `https://opencode.ai/zen/v1`：OpenAI 相容的 base。
 
 呼叫方（agent driver）MUST NOT 假設 `endpoint` 是某種協定的完整路徑；要依 `provider` 組出自己要的接法，或使用 agent 內建的 provider 設定。
