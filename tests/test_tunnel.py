@@ -9,6 +9,7 @@ import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TUNNEL = os.path.join(REPO_ROOT, "ops-scripts", "llmgateway-tunnel")
+TUNNEL_UNIT = os.path.join(REPO_ROOT, "deploy", "units", "llmgateway-tunnel.service")
 
 FAKE_USER = "fakeuser"
 FAKE_HOST = "rendezvous.invalid"
@@ -91,7 +92,8 @@ while :; do sleep 0.05; done
             self.stderr_fh.close()
             self.stderr_fh = None
 
-    def write_config(self, **overrides):
+    def write_config(self, path=None, **overrides):
+        path = self.config if path is None else path
         rendezvous = overrides.pop(
             "RENDEZVOUS", "%s@%s:%s" % (FAKE_USER, FAKE_HOST, FAKE_PORT)
         )
@@ -105,7 +107,7 @@ while :; do sleep 0.05; done
         ]
         for key, value in overrides.items():
             lines.append("%s=%s" % (key, value))
-        with open(self.config, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
     def start_daemon(self, env=None):
@@ -142,13 +144,15 @@ while :; do sleep 0.05; done
                 self.proc.wait(timeout=5)
         return self.proc.returncode
 
-    def run_probe_once(self, env=None):
+    def run_probe_once(self, env=None, base=None):
         full_env = {
             "HOME": self.home,
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "FAKE_SSH_LOG": self.ssh_log,
             "FAKE_PROBE_CODE": "200",
         }
+        if base is not None:
+            full_env = dict(base)
         if env:
             full_env.update(env)
         return subprocess.run(
@@ -368,6 +372,78 @@ while :; do sleep 0.05; done
         self.assertIn(other_user + "@" + other_host, ssh_log)
         self.assertNotIn(FAKE_HOST, ssh_log)
         self.assertEqual(self.stop_daemon(), 0)
+
+    # --- #35 T3：LGW_TUNNEL_ENV 換設定檔路徑（system unit 用） -----------------
+    def _write_override_config(self, host="other-target.invalid", port="2999"):
+        path = os.path.join(self.sandbox, "other-tunnel.env")
+        self.write_config(path, RENDEZVOUS="otheruser@%s:%s" % (host, port))
+        return path
+
+    def test_LGW_TUNNEL_ENV覆寫設定檔路徑_探針(self):
+        other = self._write_override_config()
+        self.write_config()  # 預設路徑也有一份合法的，確保真的用了覆寫那份
+        res = self.run_probe_once(env={"LGW_TUNNEL_ENV": other})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        ssh_log = self.read_ssh_log()
+        self.assertIn("other-target.invalid", ssh_log)
+        self.assertIn("-p 2999", ssh_log)
+        self.assertNotIn(FAKE_HOST, ssh_log)
+
+    def test_LGW_TUNNEL_ENV覆寫設定檔路徑_守護程式(self):
+        other = self._write_override_config()
+        self.start_daemon(env={"LGW_TUNNEL_ENV": other})
+        self.assertTrue(wait_until(lambda: "tunnel_up" in self.read_stderr()))
+        self.assertTrue(wait_until(lambda: "argv:" in self.read_ssh_log()))
+        ssh_log = self.read_ssh_log()
+        self.assertIn("other-target.invalid", ssh_log)
+        self.assertNotIn(FAKE_HOST, ssh_log)
+        self.assertEqual(self.stop_daemon(), 0)
+
+    def test_LGW_TUNNEL_ENV空字串時用預設路徑(self):
+        self.write_config()
+        res = self.run_probe_once(env={"LGW_TUNNEL_ENV": ""})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(FAKE_HOST, self.read_ssh_log())
+
+    def test_LGW_TUNNEL_ENV指到不存在的檔不回頭用預設(self):
+        self.write_config()  # 預設路徑合法；覆寫指到不存在的檔時不可以拿它來用
+        res = self.run_probe_once(
+            env={"LGW_TUNNEL_ENV": os.path.join(self.sandbox, "no-such-tunnel.env")})
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertEqual(self.read_ssh_log(), "")
+
+    def test_LGW_TUNNEL_ENV覆寫時不需要HOME(self):
+        other = self._write_override_config()
+        base = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "FAKE_SSH_LOG": self.ssh_log,
+            "FAKE_PROBE_CODE": "200",
+        }
+        res = self.run_probe_once(base=base, env={"LGW_TUNNEL_ENV": other})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("other-target.invalid", self.read_ssh_log())
+
+
+class TunnelUnitFileTests(unittest.TestCase):
+    """#35 T3：system 層的隧道 unit 檔（新版面 /etc/llmgateway/tunnel.env）。"""
+
+    def read_unit(self):
+        with open(TUNNEL_UNIT, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_system層unit內容(self):
+        unit = self.read_unit()
+        self.assertIn("User=llmgw", unit)
+        self.assertIn("Environment=LGW_TUNNEL_ENV=/etc/llmgateway/tunnel.env", unit)
+        self.assertIn("ExecStart=/opt/llmgateway/current/ops-scripts/llmgateway-tunnel",
+                      unit)
+        self.assertIn("Restart=always", unit)
+        self.assertIn("RestartSec=10", unit)
+        self.assertIn("RestartPreventExitStatus=78", unit)
+        self.assertIn("After=llmgateway.service", unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertNotIn("WantedBy=default.target", unit)  # 這是 system 層，不是 user unit
+        self.assertNotIn("%h/", unit)  # 不用 user 層的 %h 路徑
 
 
 if __name__ == "__main__":
