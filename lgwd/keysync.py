@@ -8,6 +8,8 @@
   不能用（路徑不存在／不是執行檔）。
 - 逾時（預設 120 秒）就殺掉子行程（連它的行程群一起殺）；失敗、逾時與任何例外
   都只吞掉並記一行不含值的 log。獨立執行緒，**不得影響 API 服務**。
+- 子行程的 stdout 直接丟掉、stderr 只在背景執行緒留最後 4KB（`_failed_reason`
+  只需要最後一個 `failed=`）：它的輸出不會灌進 API 行程的記憶體。
 - 子行程的環境另外放 `LGWD_KEYS`（跟 lgwd 讀同一個 keys.env；key-sync 的預設值
   還是舊版面）與 `LGWD_CODE_DIR`（從 `<current>/ops-scripts/key-sync` 推出
   `<current>`，讓 key-sync 用同一份 lgwd/keys.py 驗證）。
@@ -16,7 +18,7 @@
   的環境變數；MUST NOT 進 argv、log、狀態檔。
 - 每次結果原子寫進 `keys.env` 同目錄的 `.keysync.status`（一行 JSON、0644）：
 
-  `{"ts": <epoch 秒>, "ok": true/false, "reason": "<ok｜key-sync 的 failed= 代碼｜timeout｜spawn_failed｜exit_<碼>／signal_<號>>"}`
+  `{"ts": <epoch 秒>, "ok": true/false, "reason": "<ok｜key-sync 的 failed= 代碼（白名單，不認得的記 unknown）｜timeout｜spawn_failed｜exit_<碼>／signal_<號>>"}`
 
   給 `llmgwctl check` 讀；不含任何 key 值或密碼。
 """
@@ -51,9 +53,19 @@ SYNC_SUBPATH = os.path.join("ops-scripts", "key-sync")
 REASON_OK = "ok"
 REASON_TIMEOUT = "timeout"
 REASON_SPAWN_FAILED = "spawn_failed"
+REASON_UNKNOWN = "unknown"
+
+# key-sync（ops-scripts/key-sync）既有的 failed= 代碼；其他的子行程失敗一律記
+# unknown，不把子行程輸出裡的任意字串寫進狀態檔／log（低-4）。
+KNOWN_FAILED_TAGS = frozenset({
+    "bad_response", "code_missing", "decode_failed", "decrypt_failed", "format_failed",
+    "gh_auth", "gh_failed", "gh_missing", "gh_not_found", "gh_timeout",
+    "openssl_missing", "password_missing", "unexpected", "write_failed",
+})
 
 _FAILED_RE = re.compile(r"failed=([A-Za-z_][A-Za-z0-9_]*)")
 _SHUTDOWN_GRACE = 5.0       # stop() 等子行程與執行緒收乾淨的秒數
+STDERR_TAIL_LIMIT = 4096    # 子行程 stderr 只留最後這些位元組（低-3）
 
 
 def default_script(env=None) -> str:
@@ -104,25 +116,62 @@ def read_password(env=None) -> str | None:
 
 
 def _failed_reason(stderr: bytes, returncode: int) -> str:
-    """從 key-sync 的 log 抓最後一個 failed= 代碼；抓不到就用結束方式當代碼。"""
+    """從 key-sync 的 log 抓最後一個 failed= 代碼；抓不到就用結束方式當代碼。
+
+    只認 KNOWN_FAILED_TAGS 裡的值，其他一律 unknown（低-4：不把子行程輸出裡的
+    任意字串原樣寫進狀態檔與 log）。
+    """
     text = (stderr or b"").decode("utf-8", "replace")
     tags = _FAILED_RE.findall(text)
     if tags:
-        return tags[-1]
+        return tags[-1] if tags[-1] in KNOWN_FAILED_TAGS else REASON_UNKNOWN
     return f"signal_{-returncode}" if returncode < 0 else f"exit_{returncode}"
 
 
+def _read_tail(stream, holder: list, limit: int = STDERR_TAIL_LIMIT) -> None:
+    """把子行程的 stderr 管線讀乾，只留最後 limit 位元組（低-3：記憶體有上限）。
+
+    在背景執行緒跑：子行程輸出比管線緩衝大時才不會卡住；讀完把尾巴放進 holder。
+    """
+    buf = bytearray()
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > limit:
+                del buf[:-limit]
+    except (OSError, ValueError):
+        pass  # 關閉或管線斷掉：留著已經讀到的部分
+    holder.append(bytes(buf))
+
+
+def _spawn(script: str, env: dict) -> subprocess.Popen:
+    """起 key-sync 子行程：stdout 丟掉、stderr 只讀尾巴、獨立行程群。
+
+    包成一支是為了測試能模擬「spawn 還沒回來的窗口」（低-1）。
+    """
+    return subprocess.Popen(
+        [script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+
+
 def _signal_child(proc: subprocess.Popen, sig: int) -> None:
-    """把子行程含它的行程群叫停；殺不到就算了（關閉流程不因此卡住）。"""
-    pgid = None
-    if hasattr(os, "killpg"):
+    """把子行程（start_new_session 起的，pgid＝pid）連它的行程群叫停。
+
+    直接用 spawn 當下記下的 pid 當 pgid，不在要殺的時候重查 getpgid（低-2：
+    重查的瞬間 PID 可能已被回收再配置，killpg 就會打到無關的行程群）。
+    """
+    pid = proc.pid
+    if hasattr(os, "killpg") and pid != os.getpgid(0):  # 護欄：不要打到自己的群
         try:
-            pgid = os.getpgid(proc.pid)
-        except OSError:
-            pgid = None
-    if pgid is not None and pgid != os.getpgid(0):
-        try:
-            os.killpg(pgid, sig)
+            os.killpg(pid, sig)
             return
         except OSError:
             pass
@@ -157,7 +206,7 @@ class KeySyncTimer:
     """背景計時器：`run_once()` 跑一次；`start()`／`stop()` 啟停執行緒。
 
     - 執行緒是 daemon（SIGTERM 後不拖住主程式），但 `stop()` 仍會明確叫停：
-      先叫停跑中的子行程，再等執行緒收乾淨。
+      先叫停跑中的子行程，再等執行緒收乾淨；join 逾時就對行程群升級 SIGKILL。
     - 任何例外都在這裡吞掉，只記一行不含值的 log；狀態檔永遠不含值或密碼。
     - 被 `stop()` 打斷的那次不寫狀態檔（上一次的結果留著，不記成失敗）。
     """
@@ -182,25 +231,39 @@ class KeySyncTimer:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
-        if self._thread is not None or self.interval <= 0:
-            if self._thread is None:
-                _LOG.info("keysync disabled: interval=0")  # 保險：正常由 make_keysync 擋掉
+        if self.running:
             return
+        if self.interval <= 0:
+            _LOG.info("keysync disabled: interval=0")  # 保險：正常由 make_keysync 擋掉
+            return
+        self._stop.clear()
         _LOG.info("keysync enabled: script=%s interval=%gs timeout=%gs",
                   self.script, self.interval, self.timeout)
         self._thread = threading.Thread(target=self._loop, name="keysync", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = _SHUTDOWN_GRACE) -> None:
-        """停止旗標＋叫停子行程＋等執行緒；可以重複呼叫。"""
+        """停止旗標＋叫停子行程＋等執行緒；可以重複呼叫。
+
+        `_proc`／`_thread` 都跟 spawn 用同一把鎖讀，所以不會漏掉「剛 spawn 完、
+        還沒登記」的子行程（低-1）。`_thread` 不設回 None：執行緒真的還在跑時
+        `running` 要照實回報。join 逾時就對該行程群升級 SIGKILL 並記一行 log。
+        """
         self._stop.set()
+        with self._lock:
+            proc, thread = self._proc, self._thread
+        if proc is not None and proc.poll() is None:
+            _signal_child(proc, signal.SIGTERM)
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=timeout)
+        if not thread.is_alive():
+            return
         with self._lock:
             proc = self._proc
         if proc is not None and proc.poll() is None:
-            _signal_child(proc, signal.SIGTERM)
-        thread, self._thread = self._thread, None
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
+            _signal_child(proc, signal.SIGKILL)
+        _LOG.warning("keysync shutdown timeout (%gs): escalated to SIGKILL", timeout)
 
     def _loop(self) -> None:
         while True:
@@ -226,40 +289,44 @@ class KeySyncTimer:
             child_env[ENV_CODE_DIR] = self.code_dir
         proc = None
         try:
-            # start_new_session：子行程自成一組，逾時可以整組殺乾淨
-            proc = subprocess.Popen(
-                [self.script],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=child_env,
-                start_new_session=True,
-            )
+            # 同一把鎖包住 spawn 與登記：stop() 不會落在中間（低-1）
+            with self._lock:
+                proc = _spawn(self.script, child_env)
+                self._proc = proc
         except OSError as exc:
             _LOG.warning("keysync cannot run script: %s", type(exc).__name__)
 
         if proc is not None:
-            with self._lock:
-                self._proc = proc
-            stderr = b""
+            tail: list[bytes] = []
+            reader = threading.Thread(target=_read_tail, args=(proc.stderr, tail),
+                                      name="keysync-stderr", daemon=True)
+            reader.start()
+            timed_out = False
             try:
-                _out, stderr = proc.communicate(timeout=self.timeout)
+                proc.wait(timeout=self.timeout)
             except subprocess.TimeoutExpired:
+                timed_out = True
                 _signal_child(proc, signal.SIGKILL)
                 try:
-                    _out, stderr = proc.communicate(timeout=5)
-                except (subprocess.TimeoutExpired, OSError):
-                    stderr = b""
-                reason = REASON_TIMEOUT
-            else:
-                if proc.returncode == 0:
-                    ok, reason = True, REASON_OK
-                else:
-                    reason = _failed_reason(stderr, proc.returncode)
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
             finally:
                 with self._lock:
                     if self._proc is proc:
                         self._proc = None
+            reader.join(timeout=5)
+            stderr_tail = tail[0] if tail else b""
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
+            if timed_out:
+                reason = REASON_TIMEOUT
+            elif proc.returncode == 0:
+                ok, reason = True, REASON_OK
+            else:
+                reason = _failed_reason(stderr_tail, proc.returncode)
 
         self.runs += 1
         if ok:

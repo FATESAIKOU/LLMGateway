@@ -15,10 +15,13 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
+import tracemalloc
 import unittest
 import urllib.request
 
+import lgwd.keysync as keysync_module
 from lgwd.clock import FakeClock
 from lgwd.keys import KEY_NAMES
 from lgwd.keysync import (
@@ -38,6 +41,13 @@ PASSWORD_ENV = "LLMGW_KEYS_PASSWORD"
 FAKE_SCRIPT_TEMPLATE = """#!/usr/bin/env bash
 set -uo pipefail
 log="${FAKE_KS_LOG:-/dev/null}"
+mode="ok"
+if [ -n "${FAKE_KS_MODE_FILE:-}" ] && [ -f "${FAKE_KS_MODE_FILE}" ]; then
+  mode="$(cat "${FAKE_KS_MODE_FILE}")"
+fi
+if [ "$mode" = "stubborn" ]; then
+  trap '' TERM  # 先裝好才記 pid：測試等到 pid 就保證 SIGTERM 會被忽略
+fi
 {
   printf 'argv:%s\\n' "$*"
   printf 'pid:%s\\n' "$$"
@@ -45,14 +55,16 @@ log="${FAKE_KS_LOG:-/dev/null}"
   printf 'code_dir: %s\\n' "${LGWD_CODE_DIR:-none}"
   PYTHON_CMD -c 'import hashlib, os; pw = os.environ.get("LLMGW_KEYS_PASSWORD") or ""; print("password_sha: " + (hashlib.sha256(pw.encode()).hexdigest() if pw else "none"))'
 } >> "$log"
-mode="ok"
-if [ -n "${FAKE_KS_MODE_FILE:-}" ] && [ -f "${FAKE_KS_MODE_FILE}" ]; then
-  mode="$(cat "${FAKE_KS_MODE_FILE}")"
-fi
 case "$mode" in
   ok) exit 0 ;;
   fail) echo "failed=gh_auth gh 沒登入（假）" >&2; exit 5 ;;
   hang) exec sleep 30 ;;
+  stubborn) while :; do sleep 0.2; done ;;
+  noisy)
+    PYTHON_CMD -c 'import sys; sys.stdout.write("x" * 4194304); sys.stderr.write("y" * 4194304)'
+    echo "failed=gh_auth gh 沒登入（假）" >&2
+    exit 5 ;;
+  weird) echo "failed=FakeSecretValue_do_not_store" >&2; exit 5 ;;
 esac
 exit 1
 """
@@ -138,6 +150,13 @@ class TimerCase(unittest.TestCase):
     def status_file(self):
         return status_path_for(self.keys_path)
 
+    def status_file_raw(self):
+        try:
+            with open(self.status_file(), encoding="utf-8") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return ""
+
     def read_status(self):
         with open(self.status_file(), encoding="utf-8") as fh:
             return json.loads(fh.read())
@@ -203,6 +222,33 @@ class TimerCase(unittest.TestCase):
         self.assertEqual(reason, "spawn_failed")
         self.assertEqual(self.read_status()["reason"], "spawn_failed")
 
+    def test_failed代碼不在白名單時記unknown(self):
+        # 低-4：reason 只認 key-sync 既有的 failed= 代碼；其他字串不進狀態檔與 log
+        self.set_mode("weird")
+        timer = self.new_timer()
+        with self.assertLogs("lgwd.keysync", level="INFO") as logs:
+            ok, reason = timer.run_once()
+        self.assertFalse(ok)
+        self.assertEqual(reason, "unknown")
+        self.assertEqual(self.read_status()["reason"], "unknown")
+        self.assertNotIn("FakeSecretValue", "\n".join(logs.output))
+        self.assertNotIn("FakeSecretValue", self.status_file_raw())
+
+    def test_子行程大量輸出_只留尾巴且記憶體有上限(self):
+        # 低-3：stdout 丟掉；stderr 只留最後 4KB（記憶體不隨輸出成長）
+        self.set_mode("noisy")
+        timer = self.new_timer()
+        tracemalloc.start()
+        try:
+            ok, reason = timer.run_once()
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertFalse(ok)
+        self.assertEqual(reason, "gh_auth")  # 尾巴仍抓得到最後的 failed=
+        self.assertEqual(self.read_status()["reason"], "gh_auth")
+        self.assertLess(peak, 4 * 1024 * 1024, f"峰值 {peak} 太大（輸出 8MB）")
+
     # --- 計時啟動與關閉 ------------------------------------------------------
     def test_計時啟動後照interval跑_stop後不再跑(self):
         timer = self.new_timer(interval=0.05, timeout=5.0)
@@ -234,6 +280,77 @@ class TimerCase(unittest.TestCase):
             self.assertTrue(wait_until(lambda: not is_pid_alive(pid), timeout=5))
         finally:
             timer.stop()
+
+    # --- 低-1／低-2：stop 與 spawn 的窗口、殺子行程的鎖與 pgid -----------------
+    def test_spawn還沒回來時stop_仍殺得到子行程且running誠實(self):
+        self.set_mode("hang")
+        original_spawn = keysync_module._spawn
+        entered = threading.Event()
+        spawned = []
+
+        def slow_spawn(script, env):
+            entered.set()
+            time.sleep(0.5)  # 模擬 fork/exec 還沒回來的窗口
+            proc = original_spawn(script, env)
+            spawned.append(proc.pid)
+            return proc
+
+        keysync_module._spawn = slow_spawn
+        timer = self.new_timer(interval=0.05, timeout=30.0)
+        try:
+            timer.start()
+            self.assertTrue(entered.wait(5))
+            stop_thread = threading.Thread(target=timer.stop)
+            started = time.monotonic()
+            stop_thread.start()
+            stop_thread.join(timeout=20)
+            elapsed = time.monotonic() - started
+            self.assertFalse(stop_thread.is_alive())
+            # 舊寫法會等滿 grace（子行程變孤兒）；現在 stop 等到 spawn 完就殺得到
+            self.assertLess(elapsed, 4.0)
+        finally:
+            keysync_module._spawn = original_spawn
+            timer.stop()
+        self.assertEqual(len(spawned), 1)
+        pid = spawned[0]
+        self.assertTrue(wait_until(lambda: not is_pid_alive(pid), timeout=5),
+                        "spawn 窗口裡的子行程沒被殺掉")
+        self.assertFalse(timer.running)  # 執行緒真的收乾淨了，不是 _thread=None 的假象
+
+    def test_子行程不理SIGTERM時_join逾時升級SIGKILL並記log(self):
+        self.set_mode("stubborn")
+        timer = self.new_timer(interval=0.05, timeout=30.0)
+        timer.start()
+        try:
+            self.assertTrue(wait_until(lambda: self.last_child_pid() is not None, timeout=10))
+            pid = self.last_child_pid()
+            with self.assertLogs("lgwd.keysync", level="WARNING") as logs:
+                timer.stop(timeout=0.5)
+            self.assertIn("shutdown timeout", "\n".join(logs.output))
+            self.assertIn("SIGKILL", "\n".join(logs.output))
+            self.assertTrue(wait_until(lambda: not is_pid_alive(pid), timeout=5))
+        finally:
+            timer.stop()
+
+    def test_殺子行程時不重查pgid(self):
+        # 低-2：pgid＝spawn 當時的 pid（start_new_session），殺的時候不 getpgid 重查
+        self.set_mode("hang")
+        timer = self.new_timer(interval=0.05, timeout=30.0)
+        timer.start()
+        calls = []
+        original_getpgid = os.getpgid
+        try:
+            self.assertTrue(wait_until(lambda: self.last_child_pid() is not None, timeout=10))
+            pid = self.last_child_pid()
+            os.getpgid = lambda target: (calls.append(target), original_getpgid(target))[1]
+            try:
+                timer.stop()
+            finally:
+                os.getpgid = original_getpgid
+        finally:
+            timer.stop()
+        self.assertNotIn(pid, calls)  # 沒有對子行程重查（只有護欄查自己的群）
+        self.assertIn(0, calls)
 
     # --- 密碼來源與不外洩 ----------------------------------------------------
     def test_密碼_憑證目錄優先於環境變數(self):

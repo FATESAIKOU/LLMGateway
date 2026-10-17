@@ -209,7 +209,8 @@ class KeysyncApiTest(unittest.TestCase):
 
     # --- 測試 -------------------------------------------------------------
     def test_成功_狀態ok_API照樣200_SIGTERM乾淨(self):
-        self.start(FAKE_KS_MODE="ok")
+        # interval 拉長（5s）讓「啟動後先跑一次、還沒跑第二次」這段沒有競態（低-6）
+        self.start(FAKE_KS_MODE="ok", LGW_KEYSYNC_INTERVAL="5")
         data = self.wait_status(lambda d: d["reason"] == "ok")
         self.assertTrue(data["ok"])
         self.assertEqual(set(data), {"ts", "ok", "reason"})
@@ -218,8 +219,8 @@ class KeysyncApiTest(unittest.TestCase):
         self.assertEqual(self.status_raw().count("\n"), 1)
         self.assertEqual(self.list_status(), 200)
         self.assertIsNone(self.proc.poll())  # 服務還活著
-        self.assertEqual(self.read_log().count("run"), 1)  # 啟動後先跑一次
-        # 啟動後第二次（interval 0.2）
+        self.assertEqual(self.read_log().count("run"), 1)  # 啟動後先跑一次（不等 interval）
+        # 之後照 interval：第二次在 ~5 秒後
         self.assertTrue(wait_until(lambda: self.read_log().count("run") >= 2, timeout=15))
         self.assertIn("password_sha: " + hashlib.sha256(PASSWORD.encode()).hexdigest(),
                       self.read_log())
