@@ -153,6 +153,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn("已存在", out)
         self.assertEqual(box.log("useradd.log"), "")
 
+    @unittest.skipIf(os.geteuid() == 0, "root 身分下沒有 prefix 會動真機，略過")
     def test_install_needs_root_without_prefix(self):
         env = {name: value for name, value in self.box.env.items()
                if name != "LLMGW_PREFIX"}

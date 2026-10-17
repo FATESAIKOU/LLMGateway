@@ -11,8 +11,8 @@
   ``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
   （key 拉取可能被關閉或還沒跑過）；``ok:false``→fail；``ok:true`` 但 ``ts``
-  超過 30 分鐘（3 個 interval）沒更新→fail。順便印 ``keys.env`` 年齡
-  （只看時間，不看值）。
+  超過 3 個 interval（預設 30 分鐘，``LLMGW_KEYSYNC_STALE`` 可調）沒更新→fail。
+  順便印 ``keys.env`` 年齡（只看時間，不看值）。
 - ``policy``：當版 ``policy/default.json`` dry-run 載入（fail-closed）。
 - ``gh-keys-repo``：以服務帳號身分問 ``gh`` 讀不讀得到私有 repo（只看 repo，
   不讀內容、不讀值）。

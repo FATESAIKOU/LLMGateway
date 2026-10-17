@@ -90,8 +90,8 @@ def _write_text(path: str, text: str, mode: int) -> None:
 
 
 def _chown(layout, path: str) -> None:
-    """把檔案／目錄給服務帳號；不是 root 就跳過（測試的 prefix 模式）。"""
-    if layout.euid != 0:
+    """把檔案／目錄給服務帳號；不是 root 或 prefix 模式就跳過（測試沙箱）。"""
+    if layout.prefix or layout.euid != 0:
         return
     info = pwd.getpwnam(layout.service_user)
     os.chown(path, info.pw_uid, info.pw_gid)
@@ -132,20 +132,14 @@ def _step_account(layout, report) -> bool:
 
 def _step_dirs(layout, report) -> bool:
     ssh_dir = os.path.join(layout.service_home, ".ssh")
-    dirs = (
-        (layout.opt_dir, 0o755),
-        (layout.etc_dir, 0o755),
-        (layout.state_dir, 0o700),
-        (layout.unit_dir, 0o755),
-        (layout.bin_dir, 0o755),
-        (layout.service_home, 0o755),
-        (ssh_dir, 0o700),
-    )
+    dirs = (layout.opt_dir, layout.etc_dir, layout.state_dir, layout.unit_dir,
+            layout.bin_dir, layout.service_home, ssh_dir)
     try:
-        for path, mode in dirs:
+        for path in dirs:
             os.makedirs(path, exist_ok=True)
-            os.chmod(path, mode)
+        # 安全相關的兩個目錄權限一律校正（其他沿用系統預設／既有設定）。
         for path in (layout.state_dir, ssh_dir):
+            os.chmod(path, 0o700)
             _chown(layout, path)
     except OSError as exc:
         report.fail("dirs", f"目錄或權限沒弄好（{type(exc).__name__}）")

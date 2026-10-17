@@ -105,6 +105,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(rc, 0, out + err)
         self.assertIn("password-env no", self.box.log("keysync.log"))
 
+    @unittest.skipIf(os.geteuid() == 0, "root 身分下沒有 prefix 會動真機，略過")
     def test_sync_needs_root_without_prefix(self):
         env = {name: value for name, value in self.box.env.items()
                if name != "LLMGW_PREFIX"}

@@ -123,6 +123,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(has_line(out, "tag", "fail"), out)
         self.assertEqual(self.box.log("git.log"), "")
 
+    @unittest.skipIf(os.geteuid() == 0, "root 身分下沒有 prefix 會動真機，略過")
     def test_upgrade_needs_root_without_prefix(self):
         env = {name: value for name, value in self.box.env.items()
                if name != "LLMGW_PREFIX"}
