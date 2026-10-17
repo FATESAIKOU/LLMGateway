@@ -92,15 +92,17 @@ unit 加固：`NoNewPrivileges`、`ProtectSystem=strict`、`ReadWritePaths=/var/
 
 - 管理連線經隧道進來，切換會重啟隧道：由分離執行＋反向保險處理；萬一連線斷了，保險仍會在 10 分鐘內把舊版開回來。
 - `gh` 登入狀態搬到 system 層服務後要確認 `llmgw` 的 HOME 與權限（演練要驗）。
-- 密碼檔改位置後的權限；`LoadCredential=` 需要 systemd ≥ 250（演練機與真機都要確認版本，未確認前標「推測」）。
+- 密碼檔改位置後的權限；`LoadCredential=` 需要 systemd ≥ 250（真機為 259，已確認；演練 VM 要記錄版本）。
 - 「內建 key 拉取」改動 `lgwd`：失敗不得影響 API 服務（獨立執行緒＋逾時＋subprocess），要有測試。
 
-## 7. 需要本人／PMO 決定
+## 7. 已決定（本人 2026-10-18，經 PMO）
 
-1. 方向 A（system 層 unit＋內建拉取＋`llmgwctl`）是否同意；B、C 不做。
-2. 觀察期長度（建議 3 天）與是否要求演練機（建議要）。
-3. 隧道金鑰放哪：維持 `~llmgw/.ssh`（遷移最小）或搬到 `/etc/llmgateway/tunnel/`（權限集中）。建議先維持原位。
-4. 真機切換窗口時間與授權（含上述停損條件）。
+1. 方向 A（system 層 unit＋`lgwd` 內建拉 key＋`llmgwctl`）；B、C 不做。照 §8 拆 T1〜T4。
+2. 演練機：worker 不能用（PID 1 不是 systemd）。改在 Mac 上用 Lima 開一台一次性 Ubuntu VM（有 systemd），假 key、假會合點，把 install→check→upgrade→rollback→自動回滾→反向保險（不 confirm 時 10 分鐘自動回舊版）都跑過，跑完刪 VM。演練紀錄寫進 #35。
+3. 隧道金鑰維持原位（`~llmgw/.ssh`），不搬 `/etc`。
+4. 真機授權：本人已授權，條件是「演練通過＋非作者審查過且高、中都修完」；之後由 PM 自己挑時間切，不用再問。停損照 §5（5 分鐘內本機或經會合點 list 非 200、`check` 非 0、10 分鐘沒 confirm → 自動回舊版）；觀察期 3 天，期內 `rollback-to-user` 一個指令回去，過了才拆舊 unit 與 linger。切換前在 #35 留一行「要切了」，切完把結果（含 `check` 輸出，不含值）留在 #35。
+
+已確認：真機 systemd 版本為 259，`LoadCredential=` 可用（§6 原本標「推測」的部分成立）。演練 VM 的 systemd 版本要不低於 250，演練時記錄。
 
 ## 8. 工作切分（同意方向後）
 
