@@ -14,8 +14,9 @@ import sys
 from . import run as runmod
 from .report import Report
 
-# $0＝sh、$1＝keys.pass、$2＝key-sync、$3＝keys.env、$4＝當版目錄。
-SHELL_SCRIPT = 'set -a; . "$1" || exit 3; exec "$2" --keys "$3" --code-dir "$4"'
+# $0＝sh、$1＝keys.pass、$2＝key-sync、$3＝keys.env、$4＝當版目錄、$5＝gh。
+SHELL_SCRIPT = ('set -a; . "$1" || exit 3; '
+                'exec "$2" --keys "$3" --code-dir "$4" --gh "$5"')
 
 
 def run(layout, *, report: Report | None = None, out=None, err=None) -> int:
@@ -33,7 +34,7 @@ def run(layout, *, report: Report | None = None, out=None, err=None) -> int:
         return 1
 
     argv = [layout.sh, "-c", SHELL_SCRIPT, "sh",
-            layout.keys_pass_file, script, layout.keys_env, layout.current_link]
+            layout.keys_pass_file, script, layout.keys_env, layout.current_link, layout.gh]
     argv = runmod.service_user_argv(layout, argv)
     try:
         proc = runmod.run(argv, env=layout.child_env(HOME=layout.service_home),

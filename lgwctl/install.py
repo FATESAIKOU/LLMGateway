@@ -231,7 +231,8 @@ def _step_service(layout, report) -> bool:
         report.ok("start", f"{SERVICE_NAME} 已在跑（不動它）")
         return True
     if not units.start(layout, SERVICE_NAME):
-        report.fail("start", f"{SERVICE_NAME} 起不來（journalctl -u {SERVICE_NAME}）")
+        report.fail("start",
+                    f"{SERVICE_NAME} 起不來（{layout.journalctl} -u {SERVICE_NAME}）")
         return False
     report.ok("start", SERVICE_NAME)
     return True
@@ -251,7 +252,7 @@ def _step_tunnel(layout, report, ready: bool, missing: str) -> None:
         report.ok("tunnel-run", TUNNEL_SERVICE_NAME)
     else:
         report.todo("tunnel-run",
-                    f"start 未成功（journalctl -u {TUNNEL_SERVICE_NAME}；會自己重試）")
+                    f"start 未成功（{layout.journalctl} -u {TUNNEL_SERVICE_NAME}；會自己重試）")
 
 
 def _keys_pass_filled(layout) -> bool:
@@ -269,13 +270,17 @@ def _keys_pass_filled(layout) -> bool:
 
 
 def _gh_logged_in(layout) -> bool | None:
-    """以服務帳號身分問 gh 有沒有登入；無法確認回 None。"""
+    """以服務帳號身分問 gh 有沒有登入；無法確認（找不到 gh／sudo 失敗）回 None。"""
     argv = runmod.service_user_argv(layout, [layout.gh, "auth", "status"])
     try:
         proc = runmod.run(argv, env=layout.child_env())
     except runmod.RunError:
         return None
-    return proc.returncode == 0
+    if proc.returncode == 0:
+        return True
+    if runmod.needs_sudo(layout) and runmod.sudo_failed(proc.stderr or ""):
+        return None
+    return False
 
 
 def _step_todos(layout, report) -> None:
@@ -309,7 +314,11 @@ def run(layout, *, tag: str, repo: str | None = None, report: Report | None = No
     tag_dir = release.fetch(layout, tag, repo, report)
     if tag_dir is None:
         return report.exit_code(todo_ok=True)
-    old_tag = release.switch_current(layout, tag)
+    try:
+        old_tag = release.switch_current(layout, tag)
+    except OSError as exc:
+        report.fail("current", f"切 current 失敗（{type(exc).__name__}）")
+        return report.exit_code(todo_ok=True)
     if old_tag and old_tag != tag:
         report.ok("current", f"{old_tag} → {tag}")
     else:

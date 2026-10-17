@@ -150,11 +150,6 @@ def _check_policy(layout, report) -> None:
         report.ok("policy")
 
 
-def _sudo_failed(text: str) -> bool:
-    return any(needle in text for needle in
-               ("sudo:", "not in the sudoers file", "command not found"))
-
-
 def _check_gh_repo(layout, report) -> None:
     argv = runmod.service_user_argv(layout, [layout.gh, "api", f"repos/{KEYS_REPO}",
                                               "--jq", ".full_name"])
@@ -182,7 +177,7 @@ def _check_gh_repo(layout, report) -> None:
     if "http 403" in low or "http 404" in low:
         report.fail("gh-keys-repo", f"讀不到 {KEYS_REPO}（登入的帳號沒有讀權限）")
         return
-    if _sudo_failed(stderr) or proc.returncode == 127:
+    if runmod.sudo_failed(stderr) or proc.returncode == 127:
         report.todo("gh-keys-repo", "無法以服務帳號確認（sudo 失敗或找不到）")
         return
     report.todo("gh-keys-repo", f"無法確認（gh rc={proc.returncode}）")

@@ -4,8 +4,9 @@
 是 install 產生的 wrapper，會先切進 current。
 
 遷移用的子指令（``prepare-migration``、``cutover``、``confirm``、``rollback-to-user``）
-在 ``lgwctl/migrate.py``（成員 C 寫，T1 只預留分派）：那個檔不在時給明確的錯誤
-與結束碼 3，不會 traceback。
+在 ``lgwctl/migrate.py``（成員 C 寫，T1 只預留分派）：那個模組要提供
+``main(argv)``，argv 是完整的子指令 argv（含子指令名）。模組不在或沒有 ``main()``
+時給明確的錯誤與結束碼 3，不會 traceback。
 """
 
 from __future__ import annotations

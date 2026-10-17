@@ -213,6 +213,18 @@ class UpgradeTests(unittest.TestCase):
         text = out + err
         self.assertNotIn(FAKE_KEY_VALUE, text)
 
+    # -- 壞環境（不該 traceback）-------------------------------------------
+
+    def test_unwritable_opt_dir_is_a_fail_not_a_traceback(self):
+        opt_dir = self.box.opt()
+        os.chmod(opt_dir, 0o555)
+        self.addCleanup(os.chmod, opt_dir, 0o755)
+        rc, out, err = self.upgrade()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "fetch", "fail"), out)
+        self.assertNotIn("Traceback", out + err)
+        self.assertEqual(self.current(), FAKE_TAG)
+
 
 if __name__ == "__main__":
     unittest.main()

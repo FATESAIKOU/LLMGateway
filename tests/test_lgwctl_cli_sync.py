@@ -55,6 +55,7 @@ class SyncTests(unittest.TestCase):
         log = box.log("keysync.log")
         self.assertIn(f"--keys {box.state('keys.env')}", log)
         self.assertIn(f"--code-dir {box.current_link}", log)
+        self.assertIn(f"--gh {box.fakebin}/gh", log)
         self.assertIn("password-env yes", log)
         self.assertIn(f"home {box.service_home}", log)
         self.assertEqual(box.log("sudo.log"), "")

@@ -82,6 +82,12 @@ def require_root(layout, report) -> bool:
     return False
 
 
+def sudo_failed(text: str) -> bool:
+    """stderr 看起來是 sudo 自己的問題（不是被叫的那個指令的問題）。"""
+    return any(needle in (text or "") for needle in
+               ("sudo:", "not in the sudoers file", "command not found"))
+
+
 def trimmed(text: str | None) -> str:
     """去掉前後空白與一層引號（gh 的 ``--jq .full_name`` 某些版本會包引號）。"""
     value = (text or "").strip()

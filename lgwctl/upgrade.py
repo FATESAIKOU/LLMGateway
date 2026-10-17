@@ -62,11 +62,15 @@ def upgrade(layout, *, tag: str, repo: str | None = None,
 
     old_current = layout.current_tag()
     old_previous = layout.previous_tag()
-    if old_current != tag:
-        old = release.switch_current(layout, tag)
-        report.ok("current", f"{old or '（沒有）'} → {tag}")
-    else:
-        report.ok("current", f"{tag}（已經是同版）")
+    try:
+        if old_current != tag:
+            old = release.switch_current(layout, tag)
+            report.ok("current", f"{old or '（沒有）'} → {tag}")
+        else:
+            report.ok("current", f"{tag}（已經是同版）")
+    except OSError as exc:
+        report.fail("current", f"切 current 失敗（{type(exc).__name__}）")
+        return report.exit_code(todo_ok=True)
 
     if not _restart_service(layout, report):
         release.restore_links(layout, old_current, old_previous)
@@ -99,9 +103,13 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
         report.fail("rollback", f"previous 的目錄不在（{previous}）")
         return 1
 
-    release.write_link(layout, layout.current_link, layout.tag_dir(previous))
-    if old_current:
-        release.write_link(layout, layout.previous_link, layout.tag_dir(old_current))
+    try:
+        release.write_link(layout, layout.current_link, layout.tag_dir(previous))
+        if old_current:
+            release.write_link(layout, layout.previous_link, layout.tag_dir(old_current))
+    except OSError as exc:
+        report.fail("rollback", f"切 link 失敗（{type(exc).__name__}）")
+        return 1
     report.ok("current", f"{old_current or '（沒有）'} → {previous}")
 
     if not _restart_service(layout, report):

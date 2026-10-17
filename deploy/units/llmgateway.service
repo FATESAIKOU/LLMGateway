@@ -7,6 +7,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Type 不寫：有 LoadCredential= 時 systemd 用 exec 語意（啟動失敗會反映在
+# systemctl 的結束碼上）。
 User=llmgw
 Group=llmgw
 WorkingDirectory=/opt/llmgateway/current

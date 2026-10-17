@@ -294,6 +294,13 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(rc, 0, out + err)
         self.assertIn("unknown", out)
 
+    def test_check_on_an_empty_machine_does_not_crash(self):
+        """什麼都還沒裝時 check 要照樣給三態行（policy 一定是 fail），不要 traceback。"""
+        rc, out, err = self.box.run_cli(["check", "--no-remote"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "policy", "fail"), out)
+        self.assertNotIn("Traceback", out + err)
+
 
 if __name__ == "__main__":
     unittest.main()

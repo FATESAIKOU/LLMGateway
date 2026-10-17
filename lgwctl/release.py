@@ -94,8 +94,12 @@ def fetch(layout, tag: str, repo: str | None, report) -> str | None:
         report.ok("fetch", f"{tag} 已存在（沿用）")
         return tag_dir
     repo_url = repo or layout.repo
-    os.makedirs(layout.opt_dir, exist_ok=True)
-    tmp = tempfile.mkdtemp(prefix=f".{tag}.", dir=layout.opt_dir)
+    try:
+        os.makedirs(layout.opt_dir, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix=f".{tag}.", dir=layout.opt_dir)
+    except OSError as exc:
+        report.fail("fetch", f"建暫存目錄失敗（{type(exc).__name__}：{layout.opt_dir}）")
+        return None
     try:
         proc = run([layout.git, "clone", "--depth", "1", "--branch", tag, repo_url, tmp],
                    env=layout.child_env(), timeout=CLONE_TIMEOUT)
