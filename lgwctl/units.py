@@ -77,6 +77,16 @@ def is_active(layout, unit: str) -> bool:
     return unit_state(layout, unit) == "active"
 
 
+def raw(layout, *args):
+    """systemctl 的原始呼叫（要用結束碼／stderr 才判斷得了的場合）。
+
+    回 ``CompletedProcess``；跑不起來丟 ``RunError``，由呼叫方決定 ok／todo／fail。
+    遷移（lgwctl/migrate.py）停 unit、取消 transient timer 時要分「unit 不在」與
+    「真的失敗」，所以走這裡而不是上面那些只回 bool 的包裝。
+    """
+    return _systemctl(layout, *args)
+
+
 def daemon_reload(layout) -> bool:
     try:
         return _systemctl(layout, "daemon-reload").returncode == 0

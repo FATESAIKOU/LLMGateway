@@ -121,6 +121,10 @@ class MigrateDispatchTests(unittest.TestCase):
         self.addCleanup(self.box.close)
 
     def test_missing_migrate_module_is_a_clear_error(self):
+        # migrate.py 現在在了（成員 C 的檔案）；這條測的是「找不到那個模組」的
+        # 分派路徑，所以把 sys.modules 的那一格設成 None（find_spec 就會回 None）。
+        sys.modules["lgwctl.migrate"] = None
+        self.addCleanup(sys.modules.pop, "lgwctl.migrate", None)
         rc, out, err = self.box.run_cli(["cutover"])
         self.assertEqual(rc, 3)
         self.assertIn("lgwctl/migrate.py", err)
@@ -130,7 +134,7 @@ class MigrateDispatchTests(unittest.TestCase):
         calls = []
         fake = types.ModuleType("lgwctl.migrate")
         fake.__spec__ = importlib.machinery.ModuleSpec("lgwctl.migrate", None)
-        fake.main = lambda argv: (calls.append(list(argv)) or 7)
+        fake.main = lambda argv, env=None: (calls.append(list(argv)) or 7)
         sys.modules["lgwctl.migrate"] = fake
         self.addCleanup(sys.modules.pop, "lgwctl.migrate", None)
         rc, out, err = self.box.run_cli(["confirm", "--tag", FAKE_TAG])
@@ -175,7 +179,14 @@ class EntryPointTests(unittest.TestCase):
         self.assertIn(FAKE_TAG, proc.stdout)
 
     def test_migrate_entry_point(self):
-        proc = self.run_module(["prepare-migration"])
+        # migrate.py 現在在了；這條測的是「模組不在」時入口給的訊息，所以在
+        # 子行程裡把 sys.modules 的那一格設成 None（find_spec 就會回 None）。
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.modules['lgwctl.migrate'] = None; "
+             "from lgwctl.cli import main; sys.exit(main(['prepare-migration']))"],
+            cwd=REPO_ROOT, env=self.box.env, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 3)
         self.assertIn("lgwctl/migrate.py", proc.stderr)
 

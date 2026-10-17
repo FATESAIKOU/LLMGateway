@@ -3,10 +3,10 @@
 ``python3 -m lgwctl <子指令>``（cwd 要在某一版的目錄）；``/usr/local/bin/llmgwctl``
 是 install 產生的 wrapper，會先切進 current。
 
-遷移用的子指令（``prepare-migration``、``cutover``、``confirm``、``rollback-to-user``）
-在 ``lgwctl/migrate.py``（成員 C 寫，T1 只預留分派）：那個模組要提供
-``main(argv)``，argv 是完整的子指令 argv（含子指令名）。模組不在或沒有 ``main()``
-時給明確的錯誤與結束碼 3，不會 traceback。
+遷移用的子指令（``prepare-migration``、``cutover``、``confirm``、
+``rollback-to-user``、``finalize-migration``）在 ``lgwctl/migrate.py``（成員 C 寫）：
+那個模組要提供 ``main(argv, env=None)``，argv 是完整的子指令 argv（含子指令名）。
+模組不在或沒有 ``main()`` 時給明確的錯誤與結束碼 3，不會 traceback。
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from . import check, install, status, sync, upgrade
 from .layout import DEFAULT_REPO, Layout
 from .report import Report
 
-MIGRATE_COMMANDS = ("prepare-migration", "cutover", "confirm", "rollback-to-user")
+MIGRATE_COMMANDS = ("prepare-migration", "cutover", "confirm", "rollback-to-user",
+                    "finalize-migration")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _migrate(argv) -> int:
+def _migrate(argv, env=None) -> int:
     """轉給 lgwctl/migrate.py；沒有那個檔就明確說一聲（結束碼 3）。"""
     import importlib.util
 
@@ -65,13 +66,13 @@ def _migrate(argv) -> int:
         print(f"llmgwctl: {argv[0]} 還沒有實作（lgwctl/migrate.py 沒有 main()）",
               file=sys.stderr)
         return 3
-    return migrate.main(list(argv))
+    return migrate.main(list(argv), env=env)
 
 
 def main(argv=None, env=None) -> int:
     args_in = list(sys.argv[1:] if argv is None else argv)
     if args_in and args_in[0] in MIGRATE_COMMANDS:
-        return _migrate(args_in)
+        return _migrate(args_in, env)
     args = build_parser().parse_args(args_in)
     layout = Layout.from_env(env)
     report = Report()
