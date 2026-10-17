@@ -80,7 +80,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         expected = {
             "claude-personal": None,
             "claude-company": None,
-            "opencode-zen": "muse-spark-1.3-contributor-free",
+            "opencode-zen": "mimo-v2.6-flash-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
@@ -110,7 +110,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         zen = policy.subscriptions["opencode-zen"]
         self.assertEqual(zen.models_allow, ("*-free", "big-pickle"))
-        self.assertTrue(_covered(zen, "muse-spark-1.3-contributor-free"))  # default
+        self.assertTrue(_covered(zen, "mimo-v2.6-flash-free"))  # default
         self.assertTrue(_covered(zen, "big-pickle"))
         self.assertTrue(_covered(zen, "spark-2-free"))  # 其他 *-free 的 id
         self.assertFalse(_covered(zen, "muse-spark-1.3"))  # 付費的 id
