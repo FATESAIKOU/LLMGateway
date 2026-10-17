@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -40,6 +41,8 @@ log="${FAKE_KS_LOG:-/dev/null}"
 {
   printf 'argv:%s\\n' "$*"
   printf 'pid:%s\\n' "$$"
+  printf 'keys_env: %s\\n' "${LGWD_KEYS:-none}"
+  printf 'code_dir: %s\\n' "${LGWD_CODE_DIR:-none}"
   PYTHON_CMD -c 'import hashlib, os; pw = os.environ.get("LLMGW_KEYS_PASSWORD") or ""; print("password_sha: " + (hashlib.sha256(pw.encode()).hexdigest() if pw else "none"))'
 } >> "$log"
 mode="ok"
@@ -272,6 +275,30 @@ class TimerCase(unittest.TestCase):
         env = self.env(**{"CREDENTIALS_DIRECTORY": os.path.join(self.root, "missing"),
                           PASSWORD_ENV: PASSWORD})
         self.assertEqual(read_password(env), PASSWORD)
+
+    # --- 告訴 key-sync 要用哪個 keys.env 與哪份程式（新版面） ------------------
+    def test_子行程拿到同一個keys路徑與程式目錄(self):
+        current = os.path.join(self.root, "opt", "llmgateway", "current")
+        ops_dir = os.path.join(current, "ops-scripts")
+        os.makedirs(ops_dir)
+        script = os.path.join(ops_dir, "key-sync")
+        shutil.copy(self.script, script)  # copy 保留執行權限
+        timer = KeySyncTimer(script, 600.0, timeout=5.0, keys_path=self.keys_path,
+                             env=self.env())
+        self.assertEqual(timer.code_dir, current)
+        ok, _ = timer.run_once()
+        self.assertTrue(ok)
+        log = self.read_log()
+        self.assertIn("keys_env: " + os.path.abspath(self.keys_path), log)
+        self.assertIn("code_dir: " + current, log)
+
+    def test_自訂script路徑時不傳程式目錄(self):
+        timer = self.new_timer()  # script 在 <root>/bin/key-sync，不是 ops-scripts
+        self.assertIsNone(timer.code_dir)
+        self.assertTrue(timer.run_once()[0])
+        log = self.read_log()
+        self.assertIn("keys_env: " + os.path.abspath(self.keys_path), log)
+        self.assertIn("code_dir: none", log)
 
     # --- 狀態檔的原子寫 ------------------------------------------------------
     def test_狀態檔原子寫_rename失敗時原檔不動不留暫存(self):

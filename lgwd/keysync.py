@@ -8,6 +8,9 @@
   不能用（路徑不存在／不是執行檔）。
 - 逾時（預設 120 秒）就殺掉子行程（連它的行程群一起殺）；失敗、逾時與任何例外
   都只吞掉並記一行不含值的 log。獨立執行緒，**不得影響 API 服務**。
+- 子行程的環境另外放 `LGWD_KEYS`（跟 lgwd 讀同一個 keys.env；key-sync 的預設值
+  還是舊版面）與 `LGWD_CODE_DIR`（從 `<current>/ops-scripts/key-sync` 推出
+  `<current>`，讓 key-sync 用同一份 lgwd/keys.py 驗證）。
 - 解密密碼只從 `$CREDENTIALS_DIRECTORY/keys.pass`（單行
   `LLMGW_KEYS_PASSWORD=…`）或自己的環境 `LLMGW_KEYS_PASSWORD` 取，只放進子行程
   的環境變數；MUST NOT 進 argv、log、狀態檔。
@@ -37,6 +40,8 @@ DEFAULT_TIMEOUT = 120.0     # 子行程逾時秒數；逾時就殺
 DEFAULT_PASSWORD_ENV = "LLMGW_KEYS_PASSWORD"
 ENV_PREFIX = "LLMGW_PREFIX"
 ENV_CREDENTIALS_DIRECTORY = "CREDENTIALS_DIRECTORY"
+ENV_KEYS = "LGWD_KEYS"           # key-sync 讀的環境變數名（見 ops-scripts/key-sync）
+ENV_CODE_DIR = "LGWD_CODE_DIR"  # key-sync 載 lgwd/keys.py 的目錄
 CREDENTIAL_NAME = "keys.pass"
 STATUS_FILENAME = ".keysync.status"
 # 預設的 key-sync：<LLMGW_PREFIX>/opt/llmgateway/current/ops-scripts/key-sync
@@ -61,6 +66,19 @@ def default_script(env=None) -> str:
 def status_path_for(keys_path: str) -> str:
     """狀態檔路徑＝keys.env 同目錄的 `.keysync.status`（新版面即 /var/lib/llmgateway）。"""
     return os.path.join(os.path.dirname(os.path.abspath(keys_path)), STATUS_FILENAME)
+
+
+def code_dir_for(script: str) -> str | None:
+    """從 `<current>/ops-scripts/key-sync` 推出 `<current>`（key-sync 的程式目錄）。
+
+    新版面（/opt/llmgateway/current）下 key-sync 的預設值還是舊版面，所以要把
+    `LGWD_KEYS`／`LGWD_CODE_DIR` 傳給它；不是 ops-scripts 底下的路徑就回 None
+    （讓 key-sync 用自己的預設值）。
+    """
+    ops_dir = os.path.dirname(os.path.abspath(script))
+    if os.path.basename(ops_dir) != "ops-scripts":
+        return None
+    return os.path.dirname(ops_dir)
 
 
 def read_password(env=None) -> str | None:
@@ -149,7 +167,9 @@ class KeySyncTimer:
         self.script = str(script)
         self.interval = float(interval)
         self.timeout = float(timeout)
-        self.status_path = status_path_for(keys_path) if keys_path else None
+        self.keys_path = os.path.abspath(keys_path) if keys_path else None
+        self.status_path = status_path_for(self.keys_path) if self.keys_path else None
+        self.code_dir = code_dir_for(self.script)
         self._env = None if env is None else dict(env)
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -199,6 +219,11 @@ class KeySyncTimer:
         password = read_password(child_env)
         if password:
             child_env[DEFAULT_PASSWORD_ENV] = password  # 只經環境，不進 argv
+        if self.keys_path:
+            # key-sync 的預設路徑還是舊版面；跟 lgwd 讀同一個 keys.env、同一份程式
+            child_env[ENV_KEYS] = self.keys_path
+        if self.code_dir:
+            child_env[ENV_CODE_DIR] = self.code_dir
         proc = None
         try:
             # start_new_session：子行程自成一組，逾時可以整組殺乾淨
