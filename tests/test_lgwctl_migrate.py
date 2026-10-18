@@ -242,6 +242,10 @@ class MigrateSandbox(Sandbox):
         env.update(env_extra)
         return self.run_cli(list(argv), env=env)
 
+    def ctl(self, *parts) -> str:
+        """遷移控制檔（狀態、鎖）的目錄：root 專屬（不在服務帳號可寫的 state）。"""
+        return os.path.join(self.prefix, "var", "lib", "llmgateway-ctl", *parts)
+
     # -- 舊佈局（v0.1.4，user 層）------------------------------------------
 
     def old_conf(self, *parts) -> str:
@@ -317,10 +321,10 @@ class MigrateSandbox(Sandbox):
     def write_cutover_state(self, **fields) -> None:
         data = {"ts": time.time()}
         data.update(fields)
-        self.write(self.state(".cutover.state"), json.dumps(data, sort_keys=True) + "\n")
+        self.write(self.ctl(".cutover.state"), json.dumps(data, sort_keys=True) + "\n")
 
     def cutover_state(self) -> dict:
-        return json.loads(self.read(self.state(".cutover.state")))
+        return json.loads(self.read(self.ctl(".cutover.state")))
 
     def age(self, path: str, seconds: float) -> None:
         """把 mtime 調成 now+seconds（測「新的有沒有比較新」）。"""
@@ -338,7 +342,7 @@ class MigrationTestCase(unittest.TestCase):
     def assert_no_values(self, out: str, err: str) -> None:
         text = out + err
         logs = "".join(self.box.log(name) for name in LOG_NAMES)
-        state_path = self.box.state(".cutover.state")
+        state_path = self.box.ctl(".cutover.state")
         state = self.box.read(state_path) if os.path.isfile(state_path) else ""
         for value in (FAKE_PASSWORD, FAKE_KEY_VALUE):
             self.assertNotIn(value, text, "輸出含 key 值或密碼")
@@ -516,7 +520,7 @@ class CutoverTests(MigrationTestCase):
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
         self.assertFalse(self.box.active("llmgateway.service"))
         self.assertEqual(self.box.actions(), [])
-        self.assertFalse(os.path.exists(self.box.state(".cutover.state")))
+        self.assertFalse(os.path.exists(self.box.ctl(".cutover.state")))
         self.assertIn("lgw-cutover", out)
         self.assert_no_values(out, err)
 
@@ -617,7 +621,7 @@ class CutoverTests(MigrationTestCase):
         self.assertFalse(any("systemctl enable" in line for line in self.box.order()))
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
         self.assertEqual(self.box.actions(), [])
-        self.assertFalse(os.path.exists(self.box.state(".cutover.state")))
+        self.assertFalse(os.path.exists(self.box.ctl(".cutover.state")))
 
     def test_stop_old_failure_aborts_and_cancels_insurance(self):
         self.box.fail_action("stop", "llmgateway.service", layer="user")
@@ -677,6 +681,16 @@ class ConfirmTests(MigrationTestCase):
         self.assertTrue(has_level(out, "revert-cancel", "skip"), out)
         self.assertEqual(self.box.cutover_state()["phase"], "confirmed")
 
+    def test_confirm_refuses_a_state_file_that_names_another_unit(self):
+        """狀態檔塞別的 unit（高-3）：confirm 不得拿它去呼叫 systemctl。"""
+        self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,
+                                     revert_unit="sshd.service")
+        rc, out, err = self.box.run_migrate(["confirm"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "revert-unit", "fail"), out)
+        self.assertEqual(self.box.order(), [])
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
     def test_confirm_refuses_when_not_pending(self):
         self.box.write_cutover_state(phase="reverted", tag=FAKE_TAG)
         rc, out, err = self.box.run_migrate(["confirm"])
@@ -687,7 +701,7 @@ class ConfirmTests(MigrationTestCase):
         self.assertEqual(self.box.cutover_state()["phase"], "reverted")
 
     def test_confirm_refuses_without_a_state_file(self):
-        os.unlink(self.box.state(".cutover.state"))
+        os.unlink(self.box.ctl(".cutover.state"))
         rc, out, err = self.box.run_migrate(["confirm"])
         self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "confirm", "fail"), out)
@@ -787,7 +801,7 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertEqual(self.box.cutover_state()["phase"], "reverted")
 
     def test_rollback_skips_when_insurance_holds_the_lock(self):
-        lock_path = self.box.state(".cutover.lock")
+        lock_path = self.box.ctl(".cutover.lock")
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -827,8 +841,18 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertEqual(state["phase"], "reverted")
         self.assertFalse(state["local_ok"])
 
+    def test_rollback_never_calls_a_unit_from_the_state_file(self):
+        """狀態檔塞別的 unit（高-3）：回滾只用固定的 lgw-revert.timer。"""
+        self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,
+                                     revert_unit="sshd.service")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "revert-unit", "fail"), out)
+        self.assertFalse(any("sshd" in line for line in self.box.order()), self.box.order())
+        self.assertIn("systemctl stop lgw-revert.timer", self.box.order())
+
     def test_rollback_without_any_state_is_still_safe(self):
-        os.unlink(self.box.state(".cutover.state"))
+        os.unlink(self.box.ctl(".cutover.state"))
         rc, out, err = self.rollback()
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.box.cutover_state()["phase"], "reverted")
@@ -1050,7 +1074,7 @@ class StateFileTests(MigrationTestCase):
         layout = Layout.from_env(self.box.env)
         migrate.write_state(layout, phase="pending-confirm", tag=FAKE_TAG,
                             revert_unit="lgw-revert.timer")
-        text = self.box.read(self.box.state(".cutover.state"))
+        text = self.box.read(self.box.ctl(".cutover.state"))
         self.assertEqual(len(text.splitlines()), 1)
         data = json.loads(text)
         self.assertEqual(data["phase"], "pending-confirm")
@@ -1060,15 +1084,30 @@ class StateFileTests(MigrationTestCase):
         self.assertNotIn(FAKE_KEY_VALUE, text)
         # 再寫一次是合併（不會把舊欄位弄丟）
         migrate.write_state(layout, phase="confirmed", confirmed_ts=123.0)
-        data = json.loads(self.box.read(self.box.state(".cutover.state")))
+        data = json.loads(self.box.read(self.box.ctl(".cutover.state")))
         self.assertEqual(data["phase"], "confirmed")
         self.assertEqual(data["tag"], FAKE_TAG)
         self.assertEqual(data["confirmed_ts"], 123.0)
 
+    def test_state_lives_in_the_root_only_ctl_dir(self):
+        """狀態檔與鎖在 root 專屬目錄（0700／0600），不在服務帳號可寫的 state（高-3）。"""
+        from lgwctl import migrate
+        from lgwctl.layout import Layout
+
+        self.box.make_old_layout()
+        self.box.install_new_state(FAKE_TAG)
+        layout = Layout.from_env(self.box.env)
+        migrate.write_state(layout, phase="pending-confirm", tag=FAKE_TAG)
+        state_path = self.box.ctl(".cutover.state")
+        self.assertTrue(os.path.isfile(state_path))
+        self.assertFalse(os.path.exists(self.box.state(".cutover.state")))
+        self.assertEqual(stat.S_IMODE(os.stat(state_path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.box.ctl()).st_mode), 0o700)
+
     def test_broken_state_file_is_treated_as_absent(self):
         self.box.make_old_layout()
         self.box.install_new_state(FAKE_TAG)
-        self.box.write(self.box.state(".cutover.state"), "not json\n")
+        self.box.write(self.box.ctl(".cutover.state"), "not json\n")
         rc, out, err = self.box.run_migrate(["confirm"])
         self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "confirm", "fail"), out)

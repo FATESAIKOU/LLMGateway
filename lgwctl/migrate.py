@@ -72,6 +72,9 @@ CUTOVER_UNIT = "lgw-cutover"
 REVERT_UNIT = "lgw-revert"
 REVERT_TIMER_UNIT = REVERT_UNIT + ".timer"
 DEFAULT_REVERT_AFTER = "10m"
+# 遷移控制檔（狀態、鎖）放 root 專屬目錄，服務帳號（llmgw）寫不到（高-3）：
+# 這些欄位會被 root 的指令當輸入用，不能留在 llmgw 擁有的 state 目錄裡。
+CTL_DIR = "/var/lib/llmgateway-ctl"
 CUTOVER_STATE_NAME = ".cutover.state"
 CUTOVER_LOCK_NAME = ".cutover.lock"
 ARCHIVE_DIR_NAME = "old-user-layout"
@@ -98,6 +101,10 @@ PHASE_CONFIRMED = "confirmed"
 PHASE_REVERTED = "reverted"
 PHASE_FINALIZED = "finalized"
 PHASE_ABORTED = "aborted"
+
+# 狀態檔裡的 unit 名是不可信輸入（服務帳號以前寫得到那個檔）：只接受保險
+# 自己的兩個固定值，其他一律不當 systemctl 的參數（高-3）。
+STATE_UNIT_NAMES = (REVERT_TIMER_UNIT, REVERT_UNIT + ".service")
 
 # 環境變數（測試用的假指令與可調的等待）。
 ENV_SYSTEMD_RUN = "LLMGW_SYSTEMD_RUN"
@@ -288,12 +295,26 @@ def _chown_root_group(layout, path: str) -> None:
 # -- 狀態檔 ---------------------------------------------------------------
 
 
+def ctl_dir(layout) -> str:
+    """遷移控制檔的目錄（<prefix>/var/lib/llmgateway-ctl）：root 專屬（高-3）。"""
+    return os.path.join(layout.prefix, CTL_DIR.lstrip("/"))
+
+
 def cutover_state_path(layout) -> str:
-    return os.path.join(layout.state_dir, CUTOVER_STATE_NAME)
+    return os.path.join(ctl_dir(layout), CUTOVER_STATE_NAME)
 
 
 def cutover_lock_path(layout) -> str:
-    return os.path.join(layout.state_dir, CUTOVER_LOCK_NAME)
+    return os.path.join(ctl_dir(layout), CUTOVER_LOCK_NAME)
+
+
+def _ensure_ctl_dir(layout) -> None:
+    """建控制目錄並鎖成 0700 root:root（prefix 模式不 chown，照樣 chmod）。"""
+    directory = ctl_dir(layout)
+    os.makedirs(directory, exist_ok=True)
+    os.chmod(directory, 0o700)
+    if not layout.prefix and layout.euid == 0:
+        os.chown(directory, 0, 0)
 
 
 def read_state(layout) -> dict:
@@ -307,14 +328,24 @@ def read_state(layout) -> dict:
 
 
 def write_state(layout, **fields) -> dict:
-    """合併欄位後原子寫一行 JSON（值只有階段、時間、單元名與代碼）。"""
+    """合併欄位後原子寫一行 JSON（值只有階段、時間、單元名與代碼）。
+
+    互斥由呼叫方的 ``_Lock`` 負責（confirm／inner／rollback／finalize 都在鎖內
+    寫）；這裡只做 read-merge-write。
+    """
     data = read_state(layout)
     data.update(fields)
     data["ts"] = time.time()
-    os.makedirs(layout.state_dir, exist_ok=True)
+    _ensure_ctl_dir(layout)
     atomic.write_text(cutover_state_path(layout), json.dumps(data, sort_keys=True) + "\n",
-                        0o644)
+                      0o600)
     return data
+
+
+def _checked_state_unit(value) -> str | None:
+    """狀態檔裡的 unit 名只接受保險的固定值（高-3：不可信輸入）。"""
+    name = str(value or "")
+    return name if name in STATE_UNIT_NAMES else None
 
 
 class _Lock:
@@ -325,7 +356,12 @@ class _Lock:
         self.fd: int | None = None
 
     def acquire(self) -> bool:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        directory = os.path.dirname(self.path) or "."
+        os.makedirs(directory, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -813,7 +849,11 @@ def confirm(layout, *, report: MigrationReport | None = None) -> int:
         report.fail("confirm", f"狀態不是 {PHASE_PENDING}（現在："
                                f"{phase or '（沒有狀態檔）'}）；拒絕")
         return 1
-    unit = str(state.get("revert_unit") or REVERT_TIMER_UNIT)
+    unit = _checked_state_unit(state.get("revert_unit"))
+    if unit is None:
+        report.fail("revert-unit", "狀態檔的 revert_unit 不是認得的值；拒絕"
+                                  "（不會拿它去呼叫 systemctl）")
+        return 1
     if not _cancel_revert(layout, unit, report):
         report.fail("confirm", f"{unit} 停不掉；保險還在，先人工處理再 confirm")
         return 1
@@ -852,7 +892,7 @@ def rollback_to_user(layout, *, old_home: str | None = None,
             report.ok("rollback", "狀態已經是 reverted（人工與保險重複觸發也安全）")
             _start_old_units(layout, report)
             ok = _wait_old_list(layout, report)
-            _cancel_revert(layout, _state_revert_unit(state), report)
+            _cancel_revert(layout, _state_revert_unit(state, report), report)
             return 0 if ok else 1
 
         _stop_new_units(layout, report)
@@ -860,7 +900,7 @@ def rollback_to_user(layout, *, old_home: str | None = None,
         _restore_keys_env(layout, old, report)
         started = _start_old_units(layout, report)
         ok = _wait_old_list(layout, report)
-        _cancel_revert(layout, _state_revert_unit(state), report)
+        _cancel_revert(layout, _state_revert_unit(state, report), report)
         try:
             write_state(layout, phase=PHASE_REVERTED, local_ok=bool(ok and started))
         except OSError as exc:
@@ -870,8 +910,16 @@ def rollback_to_user(layout, *, old_home: str | None = None,
         lock.release()
 
 
-def _state_revert_unit(state: dict) -> str:
-    return str(state.get("revert_unit") or REVERT_TIMER_UNIT)
+def _state_revert_unit(state: dict, report=None) -> str:
+    """保險的 unit 名（只接受固定值；其他一律用常數，不進 systemctl，高-3）。"""
+    unit = _checked_state_unit(state.get("revert_unit"))
+    if unit is None:
+        if report is not None:
+            report.fail("revert-unit",
+                        "狀態檔的 revert_unit 不是認得的值；用固定的 "
+                        f"{REVERT_TIMER_UNIT}（不拿它去呼叫 systemctl）")
+        return REVERT_TIMER_UNIT
+    return unit
 
 
 def _stop_new_units(layout, report) -> None:
