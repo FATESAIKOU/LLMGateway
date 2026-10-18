@@ -589,6 +589,17 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertTrue(has_line(out, "tunnel-env", "fail"), out)
         self.assertFalse(os.path.exists(self.box.etc("tunnel.env")))
 
+    def test_prepare_refuses_a_symlinked_old_keysync_env(self):
+        outside = self.box.write(os.path.join(self.box.root, "outside-keysync.env"),
+                                 "LLMGW_KEYS_PASSWORD=stolen-password\n", 0o600)
+        os.unlink(self.box.old_conf("keysync.env"))
+        os.symlink(outside, self.box.old_conf("keysync.env"))
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "keys-pass", "fail"), out)
+        self.assertFalse(os.path.exists(self.box.etc("keys.pass")))
+        self.assertNotIn("stolen-password", out + err)
+
     def test_prepare_replaces_a_broken_symlink_target_without_a_traceback(self):
         """低-1：目標是斷掉的 symlink 時不能 traceback（getsize 會丟）。"""
         os.makedirs(os.path.dirname(self.box.state("keys.env")), exist_ok=True)
@@ -1920,6 +1931,78 @@ class OpenNoFollowTests(unittest.TestCase):
         dst = os.path.join(self.box.root, "dst")
         migrate._copy_into_place(src, dst)
         self.assertLess(abs(os.path.getmtime(dst) - old), 2)
+
+    def test_keys_pass_reads_the_checked_fd_when_swapped_to_symlink(self):
+        """新-中1：舊 keysync.env 在 fd 開啟後被換成 symlink，仍讀原 fd 且密碼不進 log。"""
+        from lgwctl import migrate
+        from lgwctl.layout import Layout
+        from lgwctl.report import Report
+
+        self.box.make_old_layout(password="original-safe-password")
+        old_keysync = self.box.old_conf("keysync.env")
+        secret = self.box.write(os.path.join(self.box.root, "secret.env"),
+                                "LLMGW_KEYS_PASSWORD=stolen-root-secret\n")
+        real_open = migrate._open_regular
+        swapped = []
+
+        def swap_after_open(path):
+            fd = real_open(path)
+            if path == old_keysync and not swapped:
+                swapped.append(path)
+                os.unlink(old_keysync)
+                os.symlink(secret, old_keysync)
+            return fd
+
+        layout = Layout.from_env(self.box.env)
+        os.makedirs(layout.etc_dir, exist_ok=True)
+        old = migrate.OldLayout(layout.service_home)
+        report = Report(out=lambda line: None)
+        with mock.patch.object(migrate, "_open_regular", side_effect=swap_after_open):
+            migrate._step_keys_pass(layout, old, report, force=False)
+
+        self.assertEqual(swapped, [old_keysync])
+        # 讀到的是原 fd 的內容，非換掉後的 symlink 目標
+        self.assertEqual(self.box.read(layout.keys_pass_file),
+                         "LLMGW_KEYS_PASSWORD=original-safe-password\n")
+        # 密碼值不進 log／輸出
+        rendered = "\n".join(report.lines)
+        self.assertNotIn("original-safe-password", rendered)
+        self.assertNotIn("stolen-root-secret", rendered)
+
+    def test_keys_pass_refuses_when_swapped_to_symlink_before_open(self):
+        """新-中1：若在檢查後、開啟前換成 symlink，O_NOFOLLOW 擋下並拒絕。"""
+        from lgwctl import migrate
+        from lgwctl.layout import Layout
+        from lgwctl.report import Report
+
+        self.box.make_old_layout(password="original-safe-password")
+        old_keysync = self.box.old_conf("keysync.env")
+        secret = self.box.write(os.path.join(self.box.root, "secret.env"),
+                                "LLMGW_KEYS_PASSWORD=stolen-root-secret\n")
+        real_regular = migrate._regular_file
+        swapped = []
+
+        def swap_after_check(path):
+            res = real_regular(path)
+            if path == old_keysync and not swapped:
+                swapped.append(path)
+                os.unlink(old_keysync)
+                os.symlink(secret, old_keysync)
+            return res
+
+        layout = Layout.from_env(self.box.env)
+        os.makedirs(layout.etc_dir, exist_ok=True)
+        old = migrate.OldLayout(layout.service_home)
+        report = Report(out=lambda line: None)
+        with mock.patch.object(migrate, "_regular_file", side_effect=swap_after_check):
+            migrate._step_keys_pass(layout, old, report, force=False)
+
+        self.assertEqual(swapped, [old_keysync])
+        self.assertFalse(os.path.exists(layout.keys_pass_file))
+        rendered = "\n".join(report.lines)
+        self.assertIn("fail keys-pass", rendered)
+        self.assertNotIn("stolen-root-secret", rendered)
+        self.assertNotIn("original-safe-password", rendered)
 
 
 class SharedOwnershipTests(unittest.TestCase):
