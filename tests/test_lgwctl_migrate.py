@@ -1726,6 +1726,69 @@ class StateFileTests(MigrationTestCase):
         self.assertNotIn("Traceback", err)
 
 
+class OpenNoFollowTests(unittest.TestCase):
+    """中-9：舊檔在服務帳號可控制的目錄；檢查與讀取必須是同一個 fd。"""
+
+    def setUp(self):
+        self.box = MigrateSandbox()
+        self.addCleanup(self.box.close)
+
+    def test_symlink_is_refused_and_copy_reads_the_checked_fd(self):
+        from lgwctl import migrate
+
+        safe = self.box.write(os.path.join(self.box.root, "safe.env"),
+                              "CLAUDE_PERSONAL_OAUTH_TOKEN=safe\n")
+        secret = self.box.write(os.path.join(self.box.root, "secret.env"),
+                                "CLAUDE_PERSONAL_OAUTH_TOKEN=stolen\n")
+        link = os.path.join(self.box.root, "link.env")
+        os.symlink(secret, link)
+        self.assertEqual(migrate._open_regular(link), -1)
+        self.assertIsNone(migrate._read_regular(link))
+        with self.assertRaises(OSError):
+            migrate._copy_into_place(link, os.path.join(self.box.root, "out.env"))
+
+        # 檢查回傳 fd 之後才把路徑換成 symlink：複製仍要讀原來那個 inode，
+        # 不能跟著新路徑去讀 secret（copy2 會）。
+        dst = os.path.join(self.box.root, "copied.env")
+        real_open = migrate._open_regular
+        swapped = []
+
+        def swap_after_open(path):
+            fd = real_open(path)
+            if path == safe and not swapped:
+                swapped.append(path)
+                os.unlink(safe)
+                os.symlink(secret, safe)
+            return fd
+
+        with mock.patch.object(migrate, "_open_regular", side_effect=swap_after_open):
+            migrate._copy_into_place(safe, dst)
+        self.assertEqual(self.box.read(dst), "CLAUDE_PERSONAL_OAUTH_TOKEN=safe\n")
+        self.assertEqual(swapped, [safe])
+
+    def test_sqlite_source_and_copy_refuse_symlinks(self):
+        from lgwctl import migrate
+
+        outside = os.path.join(self.box.root, "outside.db")
+        self.box.make_db(outside, "outside")
+        link = os.path.join(self.box.root, "link.db")
+        os.symlink(outside, link)
+        self.assertFalse(migrate._db_source_ok(link))
+        with self.assertRaises(OSError):
+            migrate._copy_db_consistent(link, os.path.join(self.box.root, "copy.db"))
+
+    def test_copy_into_place_preserves_mtime(self):
+        """cp -a 語意：回滾要用 mtime 判斷新舊，不能被複製時間蓋掉。"""
+        from lgwctl import migrate
+
+        src = self.box.write(os.path.join(self.box.root, "src"), "x\n")
+        old = time.time() - 3600
+        os.utime(src, (old, old))
+        dst = os.path.join(self.box.root, "dst")
+        migrate._copy_into_place(src, dst)
+        self.assertLess(abs(os.path.getmtime(dst) - old), 2)
+
+
 class SharedOwnershipTests(unittest.TestCase):
     """中-7：keys.pass 與 /etc 設定檔的 owner 規則收在 install 的同一個函式。"""
 
