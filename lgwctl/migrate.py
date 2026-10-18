@@ -629,6 +629,22 @@ def _wait_unit_active(layout, unit: str, seconds: float) -> bool:
         time.sleep(min(1.0, remaining))
 
 
+def _system_unit_busy(layout, unit: str) -> bool:
+    """unit 正在跑或正在起來（active／activating／reloading）；中-9 用。
+
+    ``is-active`` 對 activating 回 3 但 stdout 是 ``activating``：只看結束碼
+    會把「保險正在回舊版」誤判成沒在跑。
+    """
+    try:
+        proc = units.raw(layout, "is-active", unit)
+    except runmod.RunError:
+        return False
+    if proc.returncode == 0:
+        return True
+    text = (proc.stdout or "") + (proc.stderr or "")
+    return any(word in text for word in ("activating", "reloading"))
+
+
 def _outcome(layout, layer: str, *args) -> tuple:
     """``layer="user"`` 走 runuser 包起來的 user manager，其餘走 system 層。"""
     if layer == "user":
@@ -1336,7 +1352,7 @@ def _confirm_locked(layout, report) -> int:
                                   "（不會拿它去呼叫 systemctl）")
         return 1
     # 保險是不是已經開跑（中-9）：停 timer 不會停掉已經觸發的 service；先確認。
-    if units.is_active(layout, REVERT_UNIT + ".service"):
+    if _system_unit_busy(layout, REVERT_UNIT + ".service"):
         report.fail("insurance-running",
                     f"{REVERT_UNIT}.service 已經在跑（保險正在回舊版）；"
                     "先等它跑完，不要 confirm")
