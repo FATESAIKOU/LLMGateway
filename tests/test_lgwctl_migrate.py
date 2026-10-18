@@ -1150,6 +1150,19 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertEqual(self.box.db_backups(self.box.old_state("llm.db")), [])
         self.assertTrue(has_level(out, "db-copy", "skip"), out)
 
+    def test_db_backups_keep_only_the_recent_three(self):
+        """中-6：時間戳備份保留最近 3 份（不會無限長大、也不會只剩一份）。"""
+        from lgwctl import migrate
+
+        base = self.box.old_state("llm.db")
+        self.box.make_db(base, "old-db")
+        for index in range(5):
+            self.box.make_db(f"{base}.bak-2026010100000{index}", f"bak-{index}")
+        migrate._prune_db_backups(base)
+        kept = self.box.db_backups(base)
+        self.assertEqual(len(kept), 3, kept)
+        self.assertIn("llm.db.bak-20260101000004", [os.path.basename(path) for path in kept])
+
     def test_rollback_copies_a_newer_valid_keys_env(self):
         self.box.write(self.box.state("keys.env"), f"OLLAMA_API_KEY={FAKE_KEY_VALUE}\n", 0o600)
         self.box.age(self.box.state("keys.env"), 3600)
