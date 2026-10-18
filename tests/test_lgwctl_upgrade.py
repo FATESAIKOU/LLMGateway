@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
 import unittest
 
@@ -77,6 +78,11 @@ class UpgradeTests(unittest.TestCase):
         self.assertIn("dry-run 通過", out)
         # unit 檔不隨升級換（還在舊版內容；要換 unit 是 install 的事）
         self.assertIn(FAKE_TAG, self.box.read(self.box.unit("llmgateway.service")))
+        # 新版目錄一樣是服務帳號讀得到的權限（Lima 演練的 CHDIR bug）
+        self.assertEqual(stat.S_IMODE(os.stat(self.box.opt(NEW_TAG)).st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.join(self.box.opt(NEW_TAG), "lgwd")).st_mode),
+            0o755)
 
     def test_upgrade_keeps_two_versions_and_removes_others(self):
         self.box.install_state(FAKE_TAG, previous=OLD_TAG)

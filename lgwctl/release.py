@@ -66,6 +66,38 @@ def write_tag_file(tag_dir: str, tag: str) -> None:
         fh.write(tag + "\n")
 
 
+def normalize_tree(layout, root: str) -> None:
+    """版本目錄要讓服務帳號讀得到（Lima 演練抓到的 status=200/CHDIR）。
+
+    ``git clone`` 進 ``tempfile.mkdtemp`` 的目錄是 0700（root 擁有），但服務是
+    ``User=llmgw``、``WorkingDirectory=/opt/llmgateway/current``，進不去就起不來。
+    這裡把整棵設成：目錄 0755、一般檔 0644、原本有執行位的維持 0755；有的話
+    擁有者設 root:root（``LLMGW_PREFIX`` 測試模式不 chown，但照樣 chmod）。
+    ``.git`` 直接移除（發佈目錄不需要；--depth 1 的它也幫不上什麼）。
+
+    symlink 不跟進去、也不改它指到的東西（目前 repo 裡沒有）。
+    """
+    git_dir = os.path.join(root, ".git")
+    if os.path.isdir(git_dir) and not os.path.islink(git_dir):
+        shutil.rmtree(git_dir, ignore_errors=True)
+
+    chown = (not layout.prefix) and layout.euid == 0
+    for base, dirs, files in os.walk(root):
+        os.chmod(base, 0o755)
+        if chown:
+            os.chown(base, 0, 0)
+        dirs[:] = [name for name in dirs
+                   if not os.path.islink(os.path.join(base, name))]
+        for name in files:
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                continue
+            mode = os.stat(path).st_mode
+            os.chmod(path, 0o755 if mode & 0o111 else 0o644)
+            if chown:
+                os.chown(path, 0, 0)
+
+
 def _move_into_place(tmp: str, tag_dir: str) -> None:
     """把驗過的暫存目錄搬進 tag_dir；舊的（不完整的）目錄先移開，失敗搬回去。"""
     stale = None
@@ -88,9 +120,19 @@ def _move_into_place(tmp: str, tag_dir: str) -> None:
 
 
 def fetch(layout, tag: str, repo: str | None, report) -> str | None:
-    """取一版程式；成功回 tag 目錄，失敗回 None（已經記 fail 行）。"""
+    """取一版程式；成功回 tag 目錄，失敗回 None（已經記 fail 行）。
+
+    不論是新抓的還是沿用的，回傳前都會把目錄權限整理成服務讀得到（見
+    ``normalize_tree``）：舊版（這個 bug 修好之前）留下來的 0700 目錄，重跑
+    install／upgrade 也會被修好。
+    """
     tag_dir = layout.tag_dir(tag)
     if installed_complete(layout, tag):
+        try:
+            normalize_tree(layout, tag_dir)
+        except OSError as exc:
+            report.fail("fetch", f"版本目錄權限修不好（{type(exc).__name__}）")
+            return None
         report.ok("fetch", f"{tag} 已存在（沿用）")
         return tag_dir
     repo_url = repo or layout.repo
@@ -118,6 +160,7 @@ def fetch(layout, tag: str, repo: str | None, report) -> str | None:
         return None
     try:
         write_tag_file(tmp, tag)
+        normalize_tree(layout, tmp)
         _move_into_place(tmp, tag_dir)
     except OSError as exc:
         shutil.rmtree(tmp, ignore_errors=True)

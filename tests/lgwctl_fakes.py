@@ -82,6 +82,9 @@ for a in "$@"; do
 done
 mkdir -p "$dest/deploy/units"
 cp -a "${REAL_TEMPLATE:?}/." "$dest/"
+# 真的 git clone 會有 .git；install 應該把它移掉（發佈目錄不需要）。
+mkdir -p "$dest/.git"
+printf 'ref: refs/heads/main\\n' > "$dest/.git/HEAD"
 if [[ "${FAKE_GIT_BAD_POLICY:-0}" == "1" ]]; then
     printf '{"subscriptions": {}}\\n' > "$dest/policy/default.json"
 fi

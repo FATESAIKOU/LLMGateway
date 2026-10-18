@@ -235,6 +235,44 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn(FAKE_PASSWORD, text)
         self.assertNotIn(FAKE_KEY_VALUE, text)
 
+    # -- 版本目錄的權限（Lima 演練抓到的 CHDIR bug）-------------------------
+
+    def test_version_dir_is_readable_by_the_service_user(self):
+        """mkdtemp 的 0700 會讓 User=llmgw 進不去 current（status=200/CHDIR）。"""
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        tag_dir = self.box.opt(FAKE_TAG)
+        self.assertEqual(stat.S_IMODE(os.stat(tag_dir).st_mode), 0o755)
+        for rel in ("lgwd", "ops-scripts", "policy", "deploy", "deploy/units"):
+            path = os.path.join(tag_dir, rel)
+            self.assertTrue(os.path.isdir(path), rel)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755, rel)
+        for rel in ("policy/default.json", "lgwd/__main__.py",
+                    "deploy/units/llmgateway.service", ".lgw-tag"):
+            path = os.path.join(tag_dir, rel)
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            self.assertEqual(mode, 0o644, rel)
+            self.assertEqual(mode & 0o022, 0, rel)  # 沒有 group／other 寫位
+        for rel in ("ops-scripts/key-sync", "ops-scripts/llmgateway-tunnel"):
+            path = os.path.join(tag_dir, rel)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755, rel)
+        # 發佈目錄不需要 .git
+        self.assertFalse(os.path.exists(os.path.join(tag_dir, ".git")))
+
+    def test_reused_version_dir_is_fixed_too(self):
+        """已存在的版本目錄（舊版留下來的 0700）重跑 install 也要修好。"""
+        self.install()
+        tag_dir = self.box.opt(FAKE_TAG)
+        os.chmod(tag_dir, 0o700)
+        os.chmod(os.path.join(tag_dir, "lgwd", "__main__.py"), 0o600)
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("沿用", out)
+        self.assertEqual(stat.S_IMODE(os.stat(tag_dir).st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.join(tag_dir, "lgwd", "__main__.py")).st_mode),
+            0o644)
+
 
 class UnitFileTests(unittest.TestCase):
     """deploy/units/llmgateway.service 的靜態檢查（#35 spec 的固定值）。"""

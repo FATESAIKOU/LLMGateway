@@ -141,6 +141,9 @@ def _step_dirs(layout, report) -> bool:
         for path in (layout.state_dir, ssh_dir):
             os.chmod(path, 0o700)
             _chown(layout, path)
+        # current 的父目錄要讓服務帳號進得去（umask 很嚴的機器也一樣）；
+        # 版本目錄本身由 release.normalize_tree 處理。
+        os.chmod(layout.opt_dir, 0o755)
     except OSError as exc:
         report.fail("dirs", f"目錄或權限沒弄好（{type(exc).__name__}）")
         return False
