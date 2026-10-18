@@ -1469,6 +1469,35 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertEqual(len(kept), 3, kept)
         self.assertIn("llm.db.bak-20260101000004", [os.path.basename(path) for path in kept])
 
+    def test_prune_db_backups_refuses_symlink_backup_and_symlink_dir(self):
+        """低-3：_prune_db_backups 對 symlink 備份檔與包含 symlink 之目錄的拒絕。"""
+        from lgwctl import migrate
+
+        base = self.box.old_state("llm.db")
+        self.box.make_db(base, "old-db")
+        for index in range(1, 5):
+            self.box.make_db(f"{base}.bak-2026010100000{index}", f"bak-{index}")
+        symlink_bak = f"{base}.bak-20260101000000"
+        target_file = os.path.join(self.box.root, "target_secret.db")
+        self.box.make_db(target_file, "secret")
+        os.symlink(target_file, symlink_bak)
+
+        migrate._prune_db_backups(base, base=self.box.service_home)
+        self.assertTrue(os.path.islink(symlink_bak))
+        self.assertTrue(os.path.exists(target_file))
+
+        sym_dir = os.path.join(self.box.service_home, "sym_state")
+        real_dir = os.path.join(self.box.service_home, "real_state")
+        os.makedirs(real_dir, exist_ok=True)
+        os.symlink(real_dir, sym_dir)
+        sym_db = os.path.join(sym_dir, "llm.db")
+        for index in range(5):
+            self.box.make_db(f"{sym_db}.bak-2026010100000{index}", f"bak-{index}")
+
+        migrate._prune_db_backups(sym_db, base=self.box.service_home)
+        sym_backups = glob.glob(f"{sym_db}.bak-*")
+        self.assertEqual(len(sym_backups), 5)
+
     def test_rollback_copies_a_newer_valid_keys_env(self):
         self.box.write(self.box.state("keys.env"), f"OLLAMA_API_KEY={FAKE_KEY_VALUE}\n", 0o600)
         self.box.age(self.box.state("keys.env"), 3600)
@@ -1566,6 +1595,105 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
         self.assertTrue(self.box.active("llmgateway-tunnel.service"))
         self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="user"))
+
+    def test_rollback_rerun_when_both_tunnels_inactive_starts_old_tunnel(self):
+        """中-1：狀態為 reverted 且新舊隧道皆 inactive 時重跑 rollback，舊隧道應被啟動且成功。"""
+        self.box.write_cutover_state(phase="reverted", tag=FAKE_TAG,
+                                     old_home=self.box.service_home)
+        self.box.set_active("llmgateway-tunnel.service", False, layer="system")
+        self.box.set_active("llmgateway-tunnel.service", False, layer="user")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="user"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="system"))
+        self.assertTrue(self.box.cutover_state()["tunnel_ok"])
+        self.assertTrue(has_level(out, "start-old-tunnel", "ok"), out)
+
+    def test_rollback_rerun_after_interrupted_at_stop_new_tunnel(self):
+        """中-1：回滾在 stop 新隧道之後被打斷、再跑一次的情境。"""
+        self.box.set_active("llmgateway.service", False, layer="system")
+        self.box.set_active("llmgateway-tunnel.service", False, layer="system")
+        self.box.set_active("llmgateway-tunnel.service", False, layer="user")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="user"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="system"))
+        self.assertTrue(self.box.cutover_state()["tunnel_ok"])
+
+    def test_switch_to_old_tunnel_takes_restarts_baseline_after_start(self):
+        """低-2：NRestarts 基準要在舊隧道 start 之後才取。"""
+        call_times = []
+        def fake_restarts(layout, unit):
+            call_times.append(len(self.box.actions()))
+            return 0
+
+        with mock.patch("lgwctl.migrate._user_unit_restarts", side_effect=fake_restarts):
+            rc, out, err = self.rollback()
+            self.assertEqual(rc, 0, out + err)
+            user_starts = [i for i, a in enumerate(self.box.actions()) if a == "user start llmgateway-tunnel.service"]
+            self.assertTrue(len(user_starts) > 0)
+            self.assertGreaterEqual(call_times[0], user_starts[0] + 1)
+
+    def test_rollback_when_start_old_tunnel_fails(self):
+        """低-3：start-old-tunnel 失敗分支，應記錄失敗並嘗試復原新隧道。"""
+        self.box.fail_action("start", "llmgateway-tunnel.service", layer="user")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "start-old-tunnel", "fail"), out)
+        self.assertTrue(has_line(out, "recover-new-tunnel", "ok"), out)
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="system"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="user"))
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        self.assertFalse(self.box.cutover_state()["tunnel_ok"])
+
+    def test_rollback_when_wait_old_tunnel_fails_after_start(self):
+        """低-3：_wait_old_tunnel 失敗分支（舊隧道 start 成功但隨後 inactive）。"""
+        with mock.patch("lgwctl.migrate._user_unit_state", return_value="inactive"):
+            rc, out, err = self.rollback()
+            self.assertEqual(rc, 1)
+            self.assertTrue(has_line(out, "start-old-tunnel", "ok"), out)
+            self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
+            self.assertTrue(has_line(out, "recover-new-tunnel", "ok"), out)
+            self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="system"))
+            self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="user"))
+            self.assertFalse(self.box.cutover_state()["tunnel_ok"])
+
+    def test_rollback_when_recover_new_tunnel_fails(self):
+        """低-3：_recover_new_tunnel 自己失敗分支（印「請以 console 登入處理」、rc 非 0、狀態誠實）。"""
+        self.box.fail_action("start", "llmgateway-tunnel.service", layer="user")
+        self.box.fail_action("start", "llmgateway-tunnel.service", layer="system")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertIn("請以 console 登入處理", out)
+        self.assertTrue(has_line(out, "recover-new-tunnel", "fail"), out)
+        self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
+        self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="system"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="user"))
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        self.assertFalse(self.box.cutover_state()["tunnel_ok"])
+
+    def test_has_symlink_component_path_component_and_fail_closed(self):
+        """低-1：_has_symlink_component 路徑元件比對與不在 base 底下時 fail-closed。"""
+        from lgwctl import migrate
+
+        base = "/home/llmgw"
+        # 1. 相同字串 prefix 但不是子目錄（原 startswith 會誤判）
+        self.assertTrue(migrate._has_symlink_component("/home/llmgw2/foo", base))
+        # 2. 完全不在 base 底下（fail-closed 應回傳 True）
+        self.assertTrue(migrate._has_symlink_component("/etc/passwd", base))
+        self.assertTrue(migrate._has_symlink_component("/var/lib/llmgateway/db", base))
+        # 3. 在 base 底下且無 symlink
+        safe_dir = os.path.join(self.box.service_home, "sub", "dir")
+        os.makedirs(safe_dir, exist_ok=True)
+        safe_file = os.path.join(safe_dir, "test.txt")
+        self.box.write(safe_file, "hello\n")
+        self.assertFalse(migrate._has_symlink_component(safe_file, self.box.service_home))
+        # 4. 在 base 底下但中繼目錄為 symlink
+        sym_dir = os.path.join(self.box.service_home, "sub_sym")
+        os.symlink(safe_dir, sym_dir)
+        sym_file = os.path.join(sym_dir, "test.txt")
+        self.assertTrue(migrate._has_symlink_component(sym_file, self.box.service_home))
 
     def test_rollback_keeps_old_keys_env_when_a_key_is_duplicated(self):
         """低-6：重複鍵會被舊 KeyStore 拒收，不能覆蓋舊的。"""
