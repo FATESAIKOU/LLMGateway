@@ -702,6 +702,48 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertNotIn("phase", state)
         self.assertEqual(state["old_home"], self.box.service_home)
 
+    def test_prepare_skipped_keys_pass_still_fixes_owner_and_mode(self):
+        """低-9：keys.pass 已有值時 skip，但 0640／root:<群組> 還是要校正。"""
+        dst = self.box.etc("keys.pass")
+        self.box.write(dst, f"LLMGW_KEYS_PASSWORD={FAKE_PASSWORD}\n", 0o600)
+        calls = []
+
+        def record(layout, path):
+            calls.append(path)
+
+        with mock.patch("lgwctl.install.chown_root_group", side_effect=record):
+            rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_level(out, "keys-pass", "skip"), out)
+        self.assertEqual(stat.S_IMODE(os.stat(dst).st_mode), 0o640)
+        self.assertIn(dst, calls)
+
+    def test_prepare_replaces_broken_symlink_targets(self):
+        """低-10：目標是斷鏈時不能當「已存在」跳過（llm.db／tunnel.env）。"""
+        os.makedirs(self.box.state(), exist_ok=True)
+        os.symlink(os.path.join(self.box.root, "gone-db"), self.box.state("llm.db"))
+        os.makedirs(self.box.etc(), exist_ok=True)
+        os.symlink(os.path.join(self.box.root, "gone-env"), self.box.etc("tunnel.env"))
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(os.path.islink(self.box.state("llm.db")))
+        self.assertFalse(os.path.islink(self.box.etc("tunnel.env")))
+        self.assertEqual(self.box.db_markers(self.box.state("llm.db")), ["old-db"])
+        self.assertIn(f"RENDEZVOUS={OLD_RENDEZVOUS}",
+                      self.box.read(self.box.etc("tunnel.env")))
+
+    def test_prepare_fails_loudly_when_another_run_holds_the_lock(self):
+        """低-4：prepare 與 cutover／rollback／finalize 共用同一把鎖。"""
+        lock_path = self.box.ctl(".cutover.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(os.close, fd)
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "prepare", "fail"), out)
+        self.assertEqual(self.box.log("git.log"), "")
+
     def test_prepare_rejects_bad_tag(self):
         rc, out, err = self.box.run_migrate(["prepare-migration", "--tag", "nope"])
         self.assertEqual(rc, 1)
@@ -1371,6 +1413,30 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertFalse(self.box.active("llmgateway-tunnel.service"))
         self.assertTrue(self.box.cutover_state()["tunnel_ok"], out)
 
+    def test_rollback_keeps_old_keys_env_when_a_key_is_duplicated(self):
+        """低-6：重複鍵會被舊 KeyStore 拒收，不能覆蓋舊的。"""
+        self.box.write(self.box.state("keys.env"),
+                       f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n"
+                       f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n", 0o600)
+        self.box.age(self.box.state("keys.env"), 3600)
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.box.read(self.box.old_state("keys.env")),
+                         f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
+        self.assertTrue(has_line(out, "keys-env", "todo"), out)
+        self.assert_no_values(out, err)
+
+    def test_rollback_without_a_cutover_timestamp_does_not_overwrite_the_db(self):
+        """低-7：沒有 new_service_ts（prepare 後直接回滾）時不比 mtime，安全跳過。"""
+        self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG)
+        self.box.age(self.box.state("llm.db"), 3600)
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.box.db_markers(self.box.old_state("llm.db")), ["old-db"])
+        self.assertEqual(self.box.db_backups(self.box.old_state("llm.db")), [])
+        self.assertTrue(has_level(out, "db-copy", "skip"), out)
+        self.assertIn("切換時間", out)
+
     def test_rollback_fails_when_old_service_does_not_come_back(self):
         self.box.fail_action("start", "llmgateway.service", layer="user")
         rc, out, err = self.rollback()
@@ -1513,6 +1579,17 @@ class FinalizeMigrationTests(MigrationTestCase):
         self.assertTrue(os.path.isdir(self.box.old_conf()))
         self.assertEqual(self.box.cutover_state()["phase"], "confirmed")
 
+    def test_refuses_when_the_full_check_fails_even_if_local_is_200(self):
+        """低-5：隧道／key 拉取／gh 壞掉也是不健康，不能只憑本機 200 就收舊版。"""
+        rc, out, err = self.finalize("--yes", FAKE_GH_API_RC="1")
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "list-local", "ok"), out)
+        self.assertTrue(has_line(out, "check", "fail"), out)
+        self.assertTrue(os.path.isdir(self.box.old_conf()))
+        self.assertEqual(self.box.cutover_state()["phase"], "confirmed")
+        self.assertFalse(any(line.startswith("system stop")
+                             for line in self.box.actions()), self.box.actions())
+
     # -- 收尾 ---------------------------------------------------------------
 
     def test_moves_old_layout_into_the_archive_without_deleting(self):
@@ -1558,6 +1635,18 @@ class FinalizeMigrationTests(MigrationTestCase):
         rc, out, err = self.finalize("--yes")
         self.assertEqual(rc, 1)
         self.assertIn("不是 confirmed", out)
+
+    def test_finalize_fails_loudly_when_another_run_holds_the_lock(self):
+        """低-4：finalize 與切換／回滾共用同一把鎖。"""
+        lock_path = self.box.ctl(".cutover.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(os.close, fd)
+        rc, out, err = self.finalize("--yes")
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "finalize", "fail"), out)
+        self.assertTrue(os.path.isdir(self.box.old_conf()))
 
     def test_linger_failure_is_a_todo_not_a_failure(self):
         rc, out, err = self.finalize("--yes", LGW_FAKE_LOGINCTL_RC="1")
