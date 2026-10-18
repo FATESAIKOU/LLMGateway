@@ -150,6 +150,7 @@ ENV_TUNNEL_WAIT = "LLMGW_TUNNEL_WAIT"
 ENV_REMOTE_TRIES = "LLMGW_REMOTE_TRIES"
 ENV_REMOTE_WAIT = "LLMGW_REMOTE_WAIT"
 ENV_LOCK_WAIT = "LLMGW_LOCK_WAIT"
+ENV_TUNNEL_STABLE = "LLMGW_TUNNEL_STABLE"
 # systemd 給每個 service／transient unit 的環境變數：只有它才證明「這是
 # 分離執行的那一次」，不是人手在 ssh 上直接跑的（低-6）。
 ENV_INVOCATION = "INVOCATION_ID"
@@ -161,6 +162,7 @@ DEFAULT_CUTOVER_WAIT = 60.0
 DEFAULT_KEYSYNC_GRACE = 90.0
 DEFAULT_OBSERVE_DAYS = 3.0
 DEFAULT_TUNNEL_WAIT = 30.0
+DEFAULT_TUNNEL_STABLE = 5.0
 DEFAULT_REMOTE_TRIES = 3
 DEFAULT_REMOTE_WAIT = 10.0
 DEFAULT_LOCK_WAIT = 30.0
@@ -449,6 +451,7 @@ def _sqlite_connect_fd(fd: int):
         conn = None
         try:
             conn = sqlite3.connect(uri, uri=True)
+            conn.execute("PRAGMA trusted_schema = OFF;")
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
         except sqlite3.Error:
             if conn is not None:
@@ -480,6 +483,7 @@ def _copy_fd_to_temp(src_fd: int, directory: str) -> str:
 def _backup_into(src_conn, dst_path: str) -> None:
     dst_conn = sqlite3.connect(dst_path)
     try:
+        dst_conn.execute("PRAGMA trusted_schema = OFF;")
         src_conn.backup(dst_conn)
     finally:
         dst_conn.close()
@@ -500,6 +504,7 @@ def _sqlite_backup_fd(src_fd: int, dst_path: str, directory: str) -> None:
         if src_conn is None:
             tmp_copy = _copy_fd_to_temp(src_fd, directory)
             src_conn = sqlite3.connect(tmp_copy)
+            src_conn.execute("PRAGMA trusted_schema = OFF;")
         _backup_into(src_conn, dst_path)
         return
     except sqlite3.Error:
@@ -509,6 +514,7 @@ def _sqlite_backup_fd(src_fd: int, dst_path: str, directory: str) -> None:
         if tmp_copy is None:
             tmp_copy = _copy_fd_to_temp(src_fd, directory)
         src_conn = sqlite3.connect(tmp_copy)
+        src_conn.execute("PRAGMA trusted_schema = OFF;")
         _backup_into(src_conn, dst_path)
     finally:
         if src_conn is not None:
@@ -524,6 +530,7 @@ def _db_integrity_ok(path: str) -> bool:
     try:
         conn = sqlite3.connect(path)
         try:
+            conn.execute("PRAGMA trusted_schema = OFF;")
             row = conn.execute("PRAGMA integrity_check").fetchone()
         finally:
             conn.close()
@@ -1333,7 +1340,7 @@ def insurance_unit_argv(layout, *, revert_after: str, old_home: str) -> list:
             "--old-home", old_home, "--inner"]
 
 
-def preflight(layout, tag: str) -> list:
+def preflight(layout, tag: str, old: OldLayout | None = None) -> list:
     """切換前的不影響舊服務檢查（中-8）；回問題清單（空＝可以切）。
 
     outer 在排 transient unit **之前**、inner 在排保險之前都跑同一組：缺
@@ -1343,8 +1350,15 @@ def preflight(layout, tag: str) -> list:
     中-6（gh 沒登入）與中-7（policy dry-run）也在這裡：`check` 把 gh 沒登入
     當 todo（rc 2），切完才踩到就會白停一次舊服務；壞 policy 同理（新服務載
     不起 policy → list 非 200 → 停損回舊版）。
+    中-3：檢查 OLD_UNIT_NAMES 四個舊 unit 檔都在且為一般檔（缺則停損回滾會拒絕，切換前拒絕）。
     """
     problems: list[str] = []
+    old_layout = old or OldLayout(layout.service_home)
+    missing_old = [unit for unit in OLD_UNIT_NAMES
+                   if not _regular_file(old_layout.unit_file(unit), old_layout.home)]
+    if missing_old:
+        problems.append(f"舊 unit 檔缺漏或不是一般檔（{old_layout.unit_dir} 的 "
+                        f"{'、'.join(missing_old)}；缺則停損回滾會拒絕，切換前拒絕）")
     if layout.installed_tag() != tag:
         problems.append(f"current 不是 {tag}（先跑 prepare-migration --tag {tag}）")
     tag_dir = layout.tag_dir(tag)
@@ -1406,7 +1420,7 @@ def cutover(layout, *, tag: str, revert_after: str = DEFAULT_REVERT_AFTER,
         report.fail("cutover", f"狀態是 {phase}；不重複切換"
                                 "（要開新一輪先跑 prepare-migration）")
         return 1
-    problems = preflight(layout, tag)
+    problems = preflight(layout, tag, old=old)
     if problems:
         for problem in problems:
             report.fail("preflight", problem)
@@ -1526,7 +1540,7 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
         return 1
     if phase in (PHASE_REVERTED, PHASE_ABORTED):
         _start_new_round(layout, report)
-    problems = preflight(layout, tag)
+    problems = preflight(layout, tag, old=old)
     if problems:
         for problem in problems:
             report.fail("preflight", problem)
@@ -2194,26 +2208,61 @@ def _wait_old_list(layout, report) -> bool:
     return False
 
 
-def _wait_old_tunnel(layout, report) -> bool:
-    """等舊 user 隧道真的 active（高-1：它活了才切斷新的管理連線）。
+def _user_unit_restarts(layout, unit: str) -> int | None:
+    try:
+        proc = units.user_run(layout, "show", unit, "-p", "NRestarts", "--value")
+        if proc.returncode == 0:
+            val = proc.stdout.strip()
+            if val.isdigit():
+                return int(val)
+    except Exception:
+        pass
+    return None
 
-    只看 ``start`` 的結束碼不夠：舊隧道可能因為會合點的埠還被新隧道佔著而起
-    不來（unit 進 failed、等 restart）。那時停掉新隧道的話，API 與管理連線
-    會同時消失，所以這裡先確認。
+
+def _wait_old_tunnel(layout, report) -> bool:
+    """等舊 user 隧道連續穩定 active（高-1、中-4：它活了才切斷新的管理連線）。
+
+    中-4：不能只取樣一次 is-active（crash-loop 會過）。需連續穩定一段時間
+    （active 且 NRestarts 沒增加）才判定為 true。
     """
-    deadline = time.monotonic() + _wait_seconds(layout, ENV_TUNNEL_WAIT,
-                                                DEFAULT_TUNNEL_WAIT)
+    total_wait = _wait_seconds(layout, ENV_TUNNEL_WAIT, DEFAULT_TUNNEL_WAIT)
+    stable_cfg = _wait_seconds(layout, ENV_TUNNEL_STABLE, DEFAULT_TUNNEL_STABLE)
+    stable_required = min(total_wait, stable_cfg) if total_wait > 0 else 0.0
+    deadline = time.monotonic() + total_wait
+
+    initial_restarts = _user_unit_restarts(layout, TUNNEL_SERVICE_NAME)
+    active_since: float | None = None
+    crash_loop_detected = False
+
     while True:
         state = _user_unit_state(layout, TUNNEL_SERVICE_NAME)
-        if state == "active":
-            report.ok("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）已 active")
-            return True
+        current_restarts = _user_unit_restarts(layout, TUNNEL_SERVICE_NAME)
+        restarts_increased = False
+        if initial_restarts is not None and current_restarts is not None:
+            if current_restarts > initial_restarts:
+                restarts_increased = True
+                crash_loop_detected = True
+                initial_restarts = current_restarts
+
+        if state == "active" and not restarts_increased:
+            now = time.monotonic()
+            if active_since is None:
+                active_since = now
+            if (now - active_since) >= stable_required:
+                report.ok("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）已連續穩定 active")
+                return True
+        else:
+            active_since = None
+
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            report.fail("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）不是 active"
-                                      f"（{state}）")
+            detail = f"（{state}）"
+            if crash_loop_detected:
+                detail += "（偵測到重啟崩潰迴圈 crash-loop，NRestarts 曾增加）"
+            report.fail("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）未達連續穩定 active {detail}")
             return False
-        time.sleep(min(1.0, remaining))
+        time.sleep(min(0.2, remaining))
 
 
 # -- finalize-migration ---------------------------------------------------

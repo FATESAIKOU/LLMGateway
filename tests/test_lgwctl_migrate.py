@@ -904,6 +904,18 @@ class CutoverTests(MigrationTestCase):
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
         self.assertFalse(os.path.exists(self.box.ctl(".cutover.state")))
 
+    def test_cutover_refuses_when_old_unit_file_is_missing(self):
+        """中-3：缺任一個舊 unit 檔時，preflight 在停舊之前就拒絕。"""
+        timer_file = self.box.old_units("key-sync.timer")
+        os.unlink(timer_file)
+        rc, out, err = self.outer()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "preflight", "fail"), out)
+        self.assertIn("key-sync.timer", out)
+        # 舊服務完全沒動
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+        self.assertEqual(self.box.order(), [])
+
     def test_inner_archives_a_reverted_state_and_starts_a_new_round(self):
         """中-4：reverted 是終態但可開新一輪——舊狀態檔歸檔後照常切。"""
         self.box.write_cutover_state(phase="reverted", tag=FAKE_TAG)
@@ -1499,6 +1511,20 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="user"))
         self.assertFalse(self.box.active("llmgateway-tunnel.service"))
         self.assertTrue(self.box.cutover_state()["tunnel_ok"], out)
+
+    def test_rollback_keeps_new_tunnel_when_old_tunnel_crash_loops(self):
+        """中-4：舊隧道處於 crash-loop 重啟循環（NRestarts 增加）時不判定穩定，新隧道保留。"""
+        restarts = [0, 1, 2]
+        def fake_restarts(layout, unit):
+            return restarts.pop(0) if restarts else 3
+
+        with mock.patch("lgwctl.migrate._user_unit_restarts", side_effect=fake_restarts):
+            rc, out, err = self.rollback()
+            self.assertEqual(rc, 1)
+            self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
+            self.assertIn("crash-loop", out)
+            # 新隧道依然保持運行，避免管理通道斷線
+            self.assertTrue(self.box.active("llmgateway-tunnel.service"))
 
     def test_rollback_keeps_old_keys_env_when_a_key_is_duplicated(self):
         """低-6：重複鍵會被舊 KeyStore 拒收，不能覆蓋舊的。"""
@@ -2121,6 +2147,20 @@ class SharedOwnershipTests(unittest.TestCase):
         with mock.patch.object(install.pwd, "getpwnam", side_effect=KeyError):
             with self.assertRaises(KeyError):
                 install.chown_root_group(self.layout, "/x")
+
+    def test_sqlite_backup_and_integrity_disable_trusted_schema(self):
+        """低-4：開啟 untrusted SQLite 檔時停用 trusted_schema。"""
+        db_path = os.path.join(self.box.root, "test_trusted_schema.db")
+        self.box.make_db(db_path, "marker")
+        from lgwctl import migrate
+        self.assertTrue(migrate._db_integrity_ok(db_path))
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA trusted_schema = OFF;")
+            val = conn.execute("PRAGMA trusted_schema").fetchone()[0]
+            self.assertEqual(val, 0)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
