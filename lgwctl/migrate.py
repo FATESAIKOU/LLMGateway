@@ -119,8 +119,8 @@ OLD_KEYSYNC_TIMER = "key-sync.timer"
 
 # 停舊 unit 的順序：隧道最後停（它承載管理連線，這樣中斷最短）。
 OLD_STOP_ORDER = (SERVICE_NAME, OLD_KEYSYNC_TIMER, OLD_KEYSYNC_SERVICE, TUNNEL_SERVICE_NAME)
-# 啟動舊 unit 的順序：先服務再隧道（探針要 API 先起來）；key-sync.timer 也要
-# **start**（enable 只建立開機的 wants symlink，不讓它立刻開始計時，中-11）。
+# 啟動舊 unit 的順序：先服務與 timer；隧道等新隧道停止讓出埠後才啟動（中-2）。
+OLD_START_SERVICES = (SERVICE_NAME, OLD_KEYSYNC_TIMER)
 OLD_START_ORDER = (SERVICE_NAME, TUNNEL_SERVICE_NAME, OLD_KEYSYNC_TIMER)
 OLD_UNIT_NAMES = (SERVICE_NAME, TUNNEL_SERVICE_NAME, OLD_KEYSYNC_SERVICE, OLD_KEYSYNC_TIMER)
 
@@ -161,8 +161,8 @@ TRANSIENT_ENV_NAMES = ("LLMGW_PREFIX", "LLMGW_SERVICE_USER", "LLMGW_SERVICE_HOME
 DEFAULT_CUTOVER_WAIT = 60.0
 DEFAULT_KEYSYNC_GRACE = 90.0
 DEFAULT_OBSERVE_DAYS = 3.0
-DEFAULT_TUNNEL_WAIT = 30.0
-DEFAULT_TUNNEL_STABLE = 5.0
+DEFAULT_TUNNEL_WAIT = 45.0
+DEFAULT_TUNNEL_STABLE = 15.0
 DEFAULT_REMOTE_TRIES = 3
 DEFAULT_REMOTE_WAIT = 10.0
 DEFAULT_LOCK_WAIT = 30.0
@@ -1977,16 +1977,17 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
         # 已經回過（人工先回、保險後來才觸發）：再確認一次就好，不動資料——
         # 新的 llm.db 已經複製回去過，再複製一次只會蓋掉舊服務寫的東西。
         # 上一次可能停在「舊服務回來了、但舊隧道起不來，所以新隧道先留著」；
-        # 修好後再跑一次就能補完（舊隧道活了才停新隧道；高-1）。
+        # 修好後再跑一次就能補完（中-2）。
         report.ok("rollback", "狀態已經是 reverted（人工與保險重複觸發也安全）")
         started = _start_old_units(layout, report)
         ok = _wait_old_list(layout, report)
-        tunnel_ok = _wait_old_tunnel(layout, report)
-        if tunnel_ok and units.is_active(layout, TUNNEL_SERVICE_NAME):
-            _stop_new_tunnel(layout, report)
-        elif not tunnel_ok:
-            report.fail("tunnel-old", "舊隧道仍然起不來；新隧道先留著，"
-                                      "管理連線不會斷（修好後再跑一次 rollback-to-user）")
+        if units.is_active(layout, TUNNEL_SERVICE_NAME):
+            tunnel_ok = _switch_to_old_tunnel(layout, report, ok)
+        else:
+            tunnel_ok = _wait_old_tunnel(layout, report)
+            if not tunnel_ok:
+                report.fail("tunnel-old", "舊隧道仍然起不來；新隧道先留著，"
+                                          "管理連線不會斷（修好後再跑一次 rollback-to-user）")
         _cancel_revert(layout, _state_revert_unit(state, report), report)
         try:
             write_state(layout, phase=PHASE_REVERTED,
@@ -1997,21 +1998,14 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
         return 0 if (ok and started and tunnel_ok
                      and not getattr(report, "has_fail", False)) else 1
 
-    # 停新 service（讓出 8480 埠）＋disable；新隧道留到最後（高-1）。
+    # 停新 service（讓出 8480 埠）＋disable；新隧道留到確認舊服務後才停（中-2）。
     _stop_new_service(layout, report)
     _restore_db(layout, old, state, report)
     _restore_keys_env(layout, old, report)
     started = _start_old_units(layout, report)
     ok = _wait_old_list(layout, report)
-    # 舊服務活回來、舊隧道也活了才斷管理連線（高-1：新隧道最後才停）。舊隧道
-    # 起不來時**不**停新隧道——它還能把管理連線與 API 導到 8480（現在是舊
-    # 服務），比什麼都沒有安全；明確 fail，修好後再跑一次。
-    tunnel_ok = _wait_old_tunnel(layout, report)
-    if tunnel_ok:
-        _stop_new_tunnel(layout, report)
-    elif ok:
-        report.fail("tunnel-old", "舊隧道起不來；新隧道先留著（管理連線不會斷），"
-                                  "修好後再跑一次 rollback-to-user")
+    # 中-2：舊服務回來後才停新隧道並起舊隧道，驗證連續穩定與 probe.remote
+    tunnel_ok = _switch_to_old_tunnel(layout, report, ok)
     _cancel_revert(layout, _state_revert_unit(state, report), report)
     try:
         write_state(layout, phase=PHASE_REVERTED, local_ok=bool(ok and started),
@@ -2179,7 +2173,7 @@ def _start_old_units(layout, report) -> bool:
 
     cutover 停舊 unit 時把四個都 disable（高-2，觀察期重開機不得雙跑）；
     回舊版時要全部 enable 回來（含 key-sync.timer，不然舊版的 key 不會再拉），
-    再啟動兩個服務。
+    先啟動舊服務與 key-sync.timer。舊隧道留待新隧道停止讓出會合點埠後才啟動（中-2）。
     """
     ok = True
     for unit in OLD_UNIT_NAMES:
@@ -2194,7 +2188,7 @@ def _start_old_units(layout, report) -> bool:
             report.fail("enable-old", f"{unit} 的 unit 檔不在（enable 算失敗）")
         else:
             report.ok("enable-old", f"{unit}（開機會自動起）")
-    for unit in OLD_START_ORDER:
+    for unit in OLD_START_SERVICES:
         outcome, detail = _user_systemctl_outcome(layout, "start", unit)
         if outcome == "ok":
             report.ok("start-old", f"{unit}（user 層）")
@@ -2226,18 +2220,97 @@ def _user_unit_restarts(layout, unit: str) -> int | None:
     return None
 
 
-def _wait_old_tunnel(layout, report) -> bool:
+def _switch_to_old_tunnel(layout, report, old_service_ok: bool) -> bool:
+    """中-2：回滾時舊隧道與新隧道不能同時持有會合點的 4710/4711 埠。
+
+    順序：
+    1. 舊服務若未回來（list 200 失敗）：不切換隧道，新隧道維持運行（留住管理通道）並報錯。
+    2. 記錄舊隧道 NRestarts。
+    3. 停新隧道（先不 disable，讓出會合點埠，短暫空窗）。
+    4. 啟舊隧道。
+    5. 等舊隧道連續穩定 ≥15～20 秒且 NRestarts 不增。
+    6. probe.remote 經會合點驗證回 200。
+    7. 成功才 disable 新隧道。
+    8. 失敗則將新隧道 start 回來（留住管理通道）並報錯。
+    """
+    unit = TUNNEL_SERVICE_NAME
+    if not old_service_ok:
+        report.fail("tunnel-old", "舊服務未恢復（本機 list 非 200），新隧道維持運行（管理連線未中斷）；修好後請再執行 rollback-to-user")
+        return False
+
+    initial_restarts = _user_unit_restarts(layout, unit)
+
+    # 停新隧道（先不 disable，讓出會合點 4710/4711 埠）
+    outcome, detail = _systemctl_outcome(layout, "stop", unit)
+    _report_outcome(report, "stop-new-tunnel", outcome, detail,
+                    ok=f"{unit}（system 層；短暫切換空窗，讓出會合點埠）已停",
+                    missing=f"{unit}（本來就沒在跑）",
+                    failed=f"停 {unit} 失敗（{detail}）")
+    if outcome == "failed":
+        report.fail("tunnel-old", "新隧道停止失敗；無法切換至舊隧道")
+        return False
+
+    # 啟動舊隧道
+    outcome, detail = _user_systemctl_outcome(layout, "start", unit)
+    if outcome != "ok":
+        report.fail("start-old-tunnel", f"{unit} 起不來（{detail or outcome}）")
+        _recover_new_tunnel(layout, report)
+        return False
+    report.ok("start-old-tunnel", f"{unit}（user 層）")
+
+    # 等舊隧道連續穩定
+    if not _wait_old_tunnel(layout, report, initial_restarts=initial_restarts):
+        _user_systemctl_outcome(layout, "stop", unit)
+        _recover_new_tunnel(layout, report)
+        return False
+
+    # 經會合點探測回 200
+    level, detail = _probe_remote_with_retry(layout)
+    if level not in ("ok",):
+        report.fail("probe-old-tunnel", f"舊隧道遠端探針失敗（{detail}）")
+        _user_systemctl_outcome(layout, "stop", unit)
+        _recover_new_tunnel(layout, report)
+        return False
+
+    report.ok("tunnel-old", f"{unit}（user 層）已連續穩定 active 且遠端探針 200")
+
+    # 成功才 disable 新隧道
+    outcome, detail = _systemctl_outcome(layout, "disable", unit)
+    _report_outcome(report, "disable-new-tunnel", outcome, detail,
+                    ok=f"{unit} 不再開機自動起",
+                    missing=f"{unit}（本來就沒 enable）",
+                    failed=f"disable {unit} 失敗（{detail}）")
+    return True
+
+
+def _recover_new_tunnel(layout, report) -> None:
+    """舊隧道失敗時把新隧道 start 回來，保留管理連線通道（中-2）。"""
+    unit = TUNNEL_SERVICE_NAME
+    outcome, detail = _systemctl_outcome(layout, "start", unit)
+    _report_outcome(report, "recover-new-tunnel", outcome, detail,
+                    ok=f"{unit}（system 層）已重新啟動（保留管理通道）",
+                    missing=f"{unit} 不在",
+                    failed=f"重新啟動 {unit} 失敗（{detail}）；管理通道中斷，請以 console 登入處理")
+    report.fail("tunnel-old", "舊隧道未達連續穩定或探針非 200；已重新啟動新隧道留住管理通道，修好後再跑一次 rollback-to-user")
+
+
+def _wait_old_tunnel(layout, report, initial_restarts: int | None = None) -> bool:
     """等舊 user 隧道連續穩定 active（高-1、中-4：它活了才切斷新的管理連線）。
 
     中-4：不能只取樣一次 is-active（crash-loop 會過）。需連續穩定一段時間
     （active 且 NRestarts 沒增加）才判定為 true。
+    低-1：讀不到 NRestarts 時印一行 todo，預設穩定窗口拉長到 15 秒。
     """
     total_wait = _wait_seconds(layout, ENV_TUNNEL_WAIT, DEFAULT_TUNNEL_WAIT)
     stable_cfg = _wait_seconds(layout, ENV_TUNNEL_STABLE, DEFAULT_TUNNEL_STABLE)
     stable_required = min(total_wait, stable_cfg) if total_wait > 0 else 0.0
     deadline = time.monotonic() + total_wait
 
-    initial_restarts = _user_unit_restarts(layout, TUNNEL_SERVICE_NAME)
+    if initial_restarts is None:
+        initial_restarts = _user_unit_restarts(layout, TUNNEL_SERVICE_NAME)
+    if initial_restarts is None:
+        report.todo("tunnel-restarts", "無法讀取舊隧道 NRestarts，僅以連續 is-active 判定穩定")
+
     active_since: float | None = None
     crash_loop_detected = False
 
@@ -2256,7 +2329,6 @@ def _wait_old_tunnel(layout, report) -> bool:
             if active_since is None:
                 active_since = now
             if (now - active_since) >= stable_required:
-                report.ok("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）已連續穩定 active")
                 return True
         else:
             active_since = None
@@ -2268,7 +2340,7 @@ def _wait_old_tunnel(layout, report) -> bool:
                 detail += "（偵測到重啟崩潰迴圈 crash-loop，NRestarts 曾增加）"
             report.fail("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）未達連續穩定 active {detail}")
             return False
-        time.sleep(min(0.2, remaining))
+        time.sleep(min(0.5, remaining))
 
 
 # -- finalize-migration ---------------------------------------------------

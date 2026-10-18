@@ -99,6 +99,15 @@ case "$verb" in
         exit 0 ;;
     start|restart)
         [[ -f "${fake}/fail/start/${layer}/${unit}" ]] && exit 1
+        if [[ "$unit" == "llmgateway-tunnel.service" ]]; then
+            # 中-2：兩條隧道不能同時持有同一埠；另一層 active 時 start 會立刻 crash
+            other="user"
+            [[ "$layer" == "user" ]] && other="system"
+            if [[ -f "${fake}/active/${other}/${unit}" ]]; then
+                printf 'Failed to start %s: port already in use by %s tunnel\n' "$unit" "$other" >&2
+                exit 1
+            fi
+        fi
         : > "$active"
         # 中-1 的旋鈕：新服務「啟動的當下」寫一份 .keysync.status（模擬新的
         # lgwd 起來 30 秒內就跑第一次 key 拉取）。
@@ -1525,6 +1534,38 @@ class RollbackToUserTests(MigrationTestCase):
             self.assertIn("crash-loop", out)
             # 新隧道依然保持運行，避免管理通道斷線
             self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+
+    def test_fake_systemctl_rejects_simultaneous_tunnels(self):
+        """中-2：假 systemd 確實模擬兩條隧道不能同時持有同一埠。"""
+        from lgwctl import units
+        from lgwctl.layout import Layout
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="system"))
+        proc = units.user_run(Layout.from_env(self.box.env), "start", "llmgateway-tunnel.service")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("already in use", proc.stderr)
+
+    def test_rollback_handles_tunnel_port_handover(self):
+        """中-2：新舊隧道不能同時持有同一埠；回滾時必須先停新隧道再起舊隧道。"""
+        self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        order = self.box.order()
+        tunnel_stop = max(i for i, line in enumerate(order)
+                          if "systemctl stop llmgateway-tunnel.service" in line)
+        old_tunnel_start = max(i for i, line in enumerate(order)
+                               if "start llmgateway-tunnel.service" in line)
+        self.assertLess(tunnel_stop, old_tunnel_start, "新隧道必須在舊隧道啟動前停止以讓出埠")
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="user"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service"))
+
+    def test_rollback_recovers_new_tunnel_when_old_tunnel_probe_fails(self):
+        """中-2：舊隧道雖然起來但遠端探針失敗時，復原新隧道並保留管理連線。"""
+        self.box.probe_codes(["1", "1", "1", "1"])  # 模擬遠端探針全部回非 200
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
+        self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="user"))
 
     def test_rollback_keeps_old_keys_env_when_a_key_is_duplicated(self):
         """低-6：重複鍵會被舊 KeyStore 拒收，不能覆蓋舊的。"""
