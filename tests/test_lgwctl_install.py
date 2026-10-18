@@ -279,6 +279,46 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(has_line(out, "tunnel-key", "todo"), out)
         self.assertIn("systemctl start llmgateway-tunnel.service", out)
 
+    def test_install_refuses_when_old_user_units_are_running(self):
+        """中-10：舊 user 版還在跑時這是遷移，不是安裝；不能先起新服務搶 8480。"""
+        from unittest import mock
+
+        with mock.patch("lgwctl.units.user_unit_state", return_value="active"):
+            rc, out, err = self.install()
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "old-user-units", "fail"), out)
+        self.assertIn("prepare-migration", out)
+        self.assertEqual(self.box.log("git.log"), "")
+        self.assertFalse(os.path.lexists(self.box.current_link))
+        self.assertEqual(self.box.actions(), [])
+
+    def test_start_ok_but_unit_not_active_is_fail(self):
+        """中-10：本機 list 200 可能是舊服務在回答；新 unit 沒 active 就是失敗。"""
+        self.box.set_start_noop("llmgateway.service")
+        rc, out, err = self.install()
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "start", "fail"), out)
+        self.assertIn("is-active", out)
+
+    def test_install_fixes_a_private_etc_dir(self):
+        """低-1：root umask 077 留下的 0700 /etc/llmgateway，llmgw 進不去。"""
+        os.makedirs(self.box.etc(), exist_ok=True)
+        os.chmod(self.box.etc(), 0o700)
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(stat.S_IMODE(os.stat(self.box.etc()).st_mode), 0o755)
+
+    def test_install_rerun_hints_restart_after_keys_pass_is_filled(self):
+        """低-11：LoadCredential 是啟動快照；填完 keys.pass 重跑 install 要提醒 restart。"""
+        self.assertEqual(self.install()[0], 0)
+        self.box.write(self.box.etc("keys.pass"),
+                       f"LLMGW_KEYS_PASSWORD={FAKE_PASSWORD}\n", 0o640)
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "restart", "todo"), out)
+        self.assertIn("快照", out)
+        self.assertEqual(self.box.actions().count("start llmgateway.service"), 1)
+
     def test_install_with_a_different_tag_is_rejected(self):
         """install 換 tag 會造成「跑舊碼、status 說新版」；一律擋下（中-3）。"""
         rc, out, err = self.install()
