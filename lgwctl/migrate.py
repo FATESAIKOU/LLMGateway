@@ -44,11 +44,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import glob
 import json
 import os
 import pwd
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -119,6 +121,10 @@ DEFAULT_KEYSYNC_GRACE = 90.0
 DEFAULT_OBSERVE_DAYS = 3.0
 SECONDS_PER_DAY = 86400.0
 MAX_KEYS_ENV_BYTES = 1 << 20
+# llm.db 一致快照：SQLite backup API 重試次數與保留的備份份數（中-6）。
+DB_COPY_ATTEMPTS = 3
+DB_BACKUP_KEEP = 3
+SQLITE_HEADER = b"SQLite format 3\x00"
 
 # systemctl「這個 unit 根本不在」的訊息（停舊 unit、取消保險時要分得出來）。
 _UNIT_MISSING_MARKERS = ("not loaded", "not found", "No such file", "could not be found")
@@ -239,6 +245,88 @@ def _copy_into_place(src: str, dst: str, mode: int | None = None) -> None:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def _db_source_ok(path: str) -> bool:
+    """是不是一個 SQLite 資料庫（backup API 的來源一定要是）。"""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(SQLITE_HEADER)) == SQLITE_HEADER
+    except OSError:
+        return False
+
+
+def _sqlite_backup(src: str, dst: str) -> None:
+    """用 SQLite 的線上備份 API 從 src 複製到 dst（舊服務還在寫也安全，高-4）。"""
+    src_conn = sqlite3.connect(src)
+    try:
+        dst_conn = sqlite3.connect(dst)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+    finally:
+        src_conn.close()
+
+
+def _db_integrity_ok(path: str) -> bool:
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return bool(row) and row[0] == "ok"
+
+
+def _copy_db_consistent(src: str, dst: str, mode: int = 0o600) -> None:
+    """一致快照到 dst（同目錄暫存 → rename）；驗 integrity_check，失敗重試再放棄。
+
+    不沿用 ``shutil.copy2``：rollback journal 模式的主檔在寫入交易期間是就地
+    修改的，直接複製會拿到新舊頁混合的檔案（高-4）。``Connection.backup`` 對
+    活著的寫入者安全（讀交易看到的是已提交的狀態）。
+    """
+    if not _db_source_ok(src):
+        raise OSError(f"{src} 不是 SQLite 資料庫")
+    directory = os.path.dirname(dst) or "."
+    os.makedirs(directory, exist_ok=True)
+    last: Exception | None = None
+    for _ in range(DB_COPY_ATTEMPTS):
+        fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=directory)
+        os.close(fd)
+        try:
+            _sqlite_backup(src, tmp)
+            if not _db_integrity_ok(tmp):
+                raise sqlite3.DatabaseError("integrity_check 不是 ok")
+            os.chmod(tmp, mode)
+            os.replace(tmp, dst)
+            tmp = None
+            return
+        except (OSError, sqlite3.Error) as exc:
+            last = exc
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    raise OSError(f"一致快照失敗（{type(last).__name__ if last else 'unknown'}）")
+
+
+def _db_backup_paths(dst: str) -> list:
+    """舊 db 的時間戳備份（新到舊排序）。"""
+    return sorted(glob.glob(dst + ".bak-*"), reverse=True)
+
+
+def _prune_db_backups(dst: str) -> None:
+    """只留最近 ``DB_BACKUP_KEEP`` 份時間戳備份（中-6）。"""
+    for path in _db_backup_paths(dst)[DB_BACKUP_KEEP:]:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _has_password(path: str) -> bool:
@@ -560,12 +648,12 @@ def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
         report.todo("state-db", f"舊的 {old.db_file} 不在；新服務會自己建")
         return
     try:
-        _copy_into_place(old.db_file, dst)
+        _copy_db_consistent(old.db_file, dst)
         install._chown_service(layout, dst)
     except OSError as exc:
-        report.fail("state-db", f"複製失敗（{type(exc).__name__}）")
+        report.fail("state-db", f"一致快照失敗（{type(exc).__name__}）")
         return
-    report.ok("state-db", "從舊 state 複製 llm.db")
+    report.ok("state-db", "從舊 state 一致快照 llm.db（舊服務還在寫也安全）")
 
 
 def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
@@ -726,7 +814,8 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
         report.fail("insurance", f"systemd-run rc={proc.returncode}；不切")
         return 1
     try:
-        write_state(layout, phase=PHASE_CUTOVER, tag=tag, revert_unit=REVERT_TIMER_UNIT)
+        write_state(layout, phase=PHASE_CUTOVER, tag=tag, revert_unit=REVERT_TIMER_UNIT,
+                    old_home=old.home, new_service_ts=time.time())
     except OSError as exc:
         _cancel_revert(layout, REVERT_TIMER_UNIT, report)
         report.fail("insurance", f"寫 {cutover_state_path(layout)} 失敗"
@@ -896,7 +985,7 @@ def rollback_to_user(layout, *, old_home: str | None = None,
             return 0 if ok else 1
 
         _stop_new_units(layout, report)
-        _restore_db(layout, old, report)
+        _restore_db(layout, old, state, report)
         _restore_keys_env(layout, old, report)
         started = _start_old_units(layout, report)
         ok = _wait_old_list(layout, report)
@@ -938,26 +1027,70 @@ def _stop_new_units(layout, report) -> None:
                         failed=f"disable {unit} 失敗（{detail}）")
 
 
-def _restore_db(layout, old: OldLayout, report) -> None:
-    """把新 state 的 ``llm.db`` 複製回舊 state；舊的先備份 ``.bak``（只備份一次）。"""
+def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
+    """把新 state 的 ``llm.db`` 複製回舊 state（只在新的真的寫過時，中-6）。
+
+    舊的先備份成帶時間戳的 ``llm.db.bak-YYYYmmddHHMMSS``（保留最近幾份）；
+    複製走 SQLite backup API（回滾時同理，高-4）。
+    """
     src, dst = layout.db_file, old.db_file
     if not os.path.isfile(src):
         report.skip("db-copy", f"{src} 不在（沒得複製）")
         return
-    bak = dst + ".bak"
+    if not _db_source_ok(src):
+        report.skip("db-copy", "新的 llm.db 還不是可用的資料庫（新服務沒寫過）；不覆蓋舊的")
+        return
+    if not _db_has_new_writes(state, src, dst):
+        report.skip("db-copy", "新的 llm.db 沒有比較新（新服務沒寫過），不覆蓋舊的")
+        return
+    if os.path.isfile(dst):
+        try:
+            bak = _backup_old_db(layout, dst)
+        except OSError as exc:
+            report.fail("db-bak", f"舊 llm.db 備份失敗（{type(exc).__name__}）；不覆蓋")
+            return
+    else:
+        bak = None
+        report.skip("db-bak", f"{dst} 不在（沒有舊的可以備份）")
     try:
-        if os.path.isfile(dst) and not _exists(bak):
-            _copy_into_place(dst, bak)
-            install._chown_service(layout, bak)
-            report.ok("db-bak", f"舊 llm.db 先備份成 {bak}")
-        elif _exists(bak):
-            report.skip("db-bak", f"{bak} 已經在（保留第一份）")
-        _copy_into_place(src, dst)
+        _copy_db_consistent(src, dst)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("db-copy", f"複製失敗（{type(exc).__name__}）")
         return
-    report.ok("db-copy", f"新 llm.db → {dst}")
+    where = f"（舊的備份：{os.path.basename(bak)}）" if bak else ""
+    report.ok("db-copy", f"新 llm.db → {dst}{where}")
+
+
+def _db_has_new_writes(state: dict, src: str, dst: str) -> bool:
+    """新的 db 是不是在切換開始之後被寫過（中-6）。
+
+    狀態檔記了 ``new_service_ts``（切換開始）就用它；沒有（舊狀態檔或人工
+    回滾）就退回 mtime 比較（新的大於舊的才算）。
+    """
+    started = state.get("new_service_ts")
+    try:
+        if isinstance(started, (int, float)) and not isinstance(started, bool):
+            return os.path.getmtime(src) > float(started)
+        if os.path.isfile(dst):
+            return os.path.getmtime(src) > os.path.getmtime(dst)
+        return True
+    except OSError:
+        return False
+
+
+def _backup_old_db(layout, dst: str) -> str:
+    """把舊 db 一致快照成帶時間戳的備份；失敗丟 OSError（呼叫方不覆蓋）。"""
+    stamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
+    bak = f"{dst}.bak-{stamp}"
+    index = 1
+    while _exists(bak):
+        bak = f"{dst}.bak-{stamp}-{index}"
+        index += 1
+    _copy_db_consistent(dst, bak)
+    install._chown_service(layout, bak)
+    _prune_db_backups(dst)
+    return bak
 
 
 def _restore_keys_env(layout, old: OldLayout, report) -> None:

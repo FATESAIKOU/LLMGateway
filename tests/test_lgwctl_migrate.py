@@ -17,9 +17,11 @@ finalize-migration）的測試。
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -261,7 +263,7 @@ class MigrateSandbox(Sandbox):
         return os.path.join(self.service_home, ".config", "systemd", "user", *parts)
 
     def make_old_layout(self, *, password: str = FAKE_PASSWORD,
-                        key_value: str = FAKE_KEY_VALUE, db: str = "old-db\n") -> None:
+                        key_value: str = FAKE_KEY_VALUE, db_marker: str = "old-db") -> None:
         """舊機器：設定、state、舊版程式目錄、四個 user unit 與隧道金鑰都在。"""
         home = self.service_home
         self.write(self.old_conf("llmgateway.env"), 'LGW_API_PORT="8480"\n')
@@ -274,7 +276,7 @@ class MigrateSandbox(Sandbox):
                    f"# 只有一行\nLLMGW_KEYS_PASSWORD={password}\n", 0o600)
         self.write(self.old_state("keys.env"),
                    f"CLAUDE_PERSONAL_OAUTH_TOKEN={key_value}\n", 0o600)
-        self.write(self.old_state("llm.db"), db, 0o600)
+        self.make_db(self.old_state("llm.db"), db_marker)
         self.write(self.old_share(OLD_TAG, ".lgw-tag"), OLD_TAG + "\n")
         for name in ("llmgateway.service", "llmgateway-tunnel.service",
                      "key-sync.service", "key-sync.timer"):
@@ -292,10 +294,14 @@ class MigrateSandbox(Sandbox):
                  self.old_state("llm.db"), self.old_share(OLD_TAG, ".lgw-tag"),
                  os.path.join(self.service_home, ".ssh", "id_llmgw_tunnel"),
                  os.path.join(self.service_home, ".ssh", "known_hosts_rendezvous"))
-        snapshot = {path: self.read(path) for path in paths}
+        snapshot = {}
+        for path in paths:
+            with open(path, "rb") as fh:
+                snapshot[path] = fh.read()
         for name in ("llmgateway.service", "llmgateway-tunnel.service",
                      "key-sync.service", "key-sync.timer"):
-            snapshot[self.old_units(name)] = self.read(self.old_units(name))
+            with open(self.old_units(name), "rb") as fh:
+                snapshot[self.old_units(name)] = fh.read()
         return snapshot
 
     # -- 新佈局（prepare 完、還沒 start）-----------------------------------
@@ -330,6 +336,37 @@ class MigrateSandbox(Sandbox):
         """把 mtime 調成 now+seconds（測「新的有沒有比較新」）。"""
         stamp = time.time() + seconds
         os.utime(path, (stamp, stamp))
+
+    # -- 真的 SQLite 檔（高-4：backup API 測不到假檔案）--------------------
+
+    def make_db(self, path: str, marker: str) -> None:
+        """建一個有內容的真 SQLite 資料庫（marker 放進 t 表）。"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS t (v TEXT)")
+            conn.execute("INSERT INTO t VALUES (?)", (marker,))
+            conn.commit()
+        finally:
+            conn.close()
+        os.chmod(path, 0o600)
+
+    def db_markers(self, path: str) -> list:
+        conn = sqlite3.connect(path)
+        try:
+            return [row[0] for row in conn.execute("SELECT v FROM t ORDER BY rowid")]
+        finally:
+            conn.close()
+
+    def db_integrity(self, path: str) -> str:
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            conn.close()
+
+    def db_backups(self, path: str) -> list:
+        return sorted(glob.glob(path + ".bak-*"))
 
 
 class MigrationTestCase(unittest.TestCase):
@@ -389,7 +426,7 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.box.read(self.box.state("keys.env")),
                          f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
-        self.assertEqual(self.box.read(self.box.state("llm.db")), "old-db\n")
+        self.assertEqual(self.box.db_markers(self.box.state("llm.db")), ["old-db"])
         self.assertEqual(self.box.read(self.box.etc("tunnel.env")),
                          self.box.read(self.box.old_conf("tunnel.env")))
         self.assertEqual(self.box.read(self.box.etc("llmgateway.env")),
@@ -454,6 +491,25 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assert_no_values(out, err)
 
     # -- 缺東缺西與拒絕 -----------------------------------------------------
+
+    def test_prepare_snapshots_a_live_database_consistently(self):
+        """舊服務的寫入交易開著時，快照仍是一致的（高-4）。
+
+        rollback journal 模式下主檔是就地修改的：直接 copy 會拿到新舊頁混合
+        的檔案。backup API 只看得到已提交的資料。
+        """
+        db = self.box.old_state("llm.db")
+        conn = sqlite3.connect(db)
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO t VALUES ('committed')")
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO t VALUES ('uncommitted')")   # 故意不 commit
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        new = self.box.state("llm.db")
+        self.assertEqual(self.box.db_integrity(new), "ok")
+        self.assertEqual(self.box.db_markers(new), ["old-db", "committed"])
 
     def test_prepare_without_old_layout_lists_todo_not_fail(self):
         box = MigrateSandbox()          # 舊佈局完全沒有
@@ -735,9 +791,10 @@ class RollbackToUserTests(MigrationTestCase):
         for unit in ("llmgateway.service", "llmgateway-tunnel.service", "key-sync.timer"):
             self.box.set_active(unit, False, layer="user")
         self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,
-                                     revert_unit="lgw-revert.timer")
+                                     revert_unit="lgw-revert.timer",
+                                     new_service_ts=time.time() - 3600)
         # 新版跑了一段時間：資料庫與 keys.env 是它寫的
-        self.box.write(self.box.state("llm.db"), "new-db\n", 0o600)
+        self.box.make_db(self.box.state("llm.db"), "new-db")
         self.box.write(self.box.state("keys.env"),
                        f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n", 0o600)
         # 預設：新的 keys.env 比舊的舊 → 回滾時不覆蓋舊的
@@ -755,9 +812,12 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertIn("system disable llmgateway.service", actions)
         self.assertIn("user start llmgateway.service", actions)
         self.assertIn("user start llmgateway-tunnel.service", actions)
-        # 新的 llm.db 複製回舊 state，舊的先備份
-        self.assertEqual(self.box.read(self.box.old_state("llm.db")), "new-db\n")
-        self.assertEqual(self.box.read(self.box.old_state("llm.db") + ".bak"), "old-db\n")
+        # 新的 llm.db 複製回舊 state，舊的先備份（帶時間戳，中-6）
+        self.assertEqual(self.box.db_markers(self.box.old_state("llm.db")), ["new-db"])
+        baks = self.box.db_backups(self.box.old_state("llm.db"))
+        self.assertEqual(len(baks), 1, baks)
+        self.assertEqual(self.box.db_markers(baks[0]), ["old-db"])
+        self.assertIn("舊的備份", out)
         # keys.env 沒有比較新 → 不覆蓋舊的
         self.assertEqual(self.box.read(self.box.old_state("keys.env")),
                          f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
@@ -784,15 +844,18 @@ class RollbackToUserTests(MigrationTestCase):
 
     def test_rollback_is_idempotent_when_insurance_fires_twice(self):
         self.assertEqual(self.rollback()[0], 0)
-        bak = self.box.old_state("llm.db") + ".bak"
-        before = self.box.read(bak)
+        baks = self.box.db_backups(self.box.old_state("llm.db"))
+        self.assertEqual(len(baks), 1, baks)
+        bak = baks[0]
+        before = self.box.db_markers(bak)
         before_mtime = os.path.getmtime(bak)
         seen = len(self.box.order())
         # 反向保險到時又觸發一次（或人工按了兩次）：不能再動資料
         rc, out, err = self.rollback()
         self.assertEqual(rc, 0, out + err)
         self.assertTrue(has_line(out, "rollback", "ok"), out)
-        self.assertEqual(self.box.read(bak), before)
+        self.assertEqual(self.box.db_backups(self.box.old_state("llm.db")), baks)
+        self.assertEqual(self.box.db_markers(bak), before)
         self.assertEqual(os.path.getmtime(bak), before_mtime)
         second = self.box.order()[seen:]
         self.assertFalse(any("--user stop" in line for line in second), second)
@@ -811,6 +874,18 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertIn("跳過", out)
         self.assertEqual(self.box.order(), [])
         self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
+    def test_rollback_keeps_old_db_when_the_new_one_was_never_written(self):
+        """新服務沒寫過（db 比切換開始舊）：不覆蓋舊的，也不留備份（中-6）。"""
+        self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,
+                                     revert_unit="lgw-revert.timer",
+                                     new_service_ts=time.time())
+        self.box.age(self.box.state("llm.db"), -60)
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.box.db_markers(self.box.old_state("llm.db")), ["old-db"])
+        self.assertEqual(self.box.db_backups(self.box.old_state("llm.db")), [])
+        self.assertTrue(has_level(out, "db-copy", "skip"), out)
 
     def test_rollback_copies_a_newer_valid_keys_env(self):
         self.box.write(self.box.state("keys.env"), f"OTHER_KEY={FAKE_KEY_VALUE}\n", 0o600)
@@ -939,7 +1014,7 @@ class FinalizeMigrationTests(MigrationTestCase):
         moved_state = os.path.join(archive, ".local", "state", "llmgateway")
         self.assertEqual(self.box.read(os.path.join(moved_state, "keys.env")),
                          f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
-        self.assertEqual(self.box.read(os.path.join(moved_state, "llm.db")), "old-db\n")
+        self.assertEqual(self.box.db_markers(os.path.join(moved_state, "llm.db")), ["old-db"])
         moved_share = os.path.join(archive, ".local", "share", "llmgateway")
         self.assertTrue(os.path.isfile(os.path.join(moved_share, OLD_TAG, ".lgw-tag")))
         # 舊 unit 檔也在檔案館裡
