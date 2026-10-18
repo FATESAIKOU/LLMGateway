@@ -4,7 +4,7 @@
 判定只看程式與測試；「原判定」是 `d3f312b` 的狀態，後面是這次補的東西。行號是最終 commit 的。
 
 - 基線測試：480（分支只有 T1／T4，沒有整合分支的 T2／T3 測試）。
-- 本輪結束：`python3 -m unittest discover -s tests` → 見回報（最終數字）。
+- 本輪結束：`python3 -m unittest discover -s tests` → `Ran 507 tests in 495.967s` → `OK (skipped=1)`（skip 是 root-only chown 測試）。
 
 ## 高
 
