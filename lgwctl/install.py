@@ -94,6 +94,20 @@ def _chown_service(layout, path: str) -> None:
     os.chown(path, info.pw_uid, info.pw_gid)
 
 
+def chown_root_group(layout, path: str) -> None:
+    """``/etc`` 的設定檔與 ``keys.pass``：root:<服務帳號群組>（中-7）。
+
+    install 與 migrate 共用同一個規則：檔案由 root 擁有（服務帳號不能改自己
+    的 credential／設定），群組是服務帳號的群組（``User=llmgw`` 的 unit 讀得
+    到）。不是 root 或 prefix 模式就跳過；服務帳號不在時丟 KeyError，由呼叫
+    方決定 fail（不要靜默變成 root:root）。
+    """
+    if layout.prefix or layout.euid != 0:
+        return
+    gid = pwd.getpwnam(layout.service_user).pw_gid
+    os.chown(path, 0, gid)
+
+
 def _chown_keys_pass(layout) -> None:
     """``keys.pass`` 設成 root:<llmgw 群組> 0640（中-4）。
 
@@ -101,10 +115,7 @@ def _chown_keys_pass(layout) -> None:
     （defense-in-depth），這也是規格固定值。重跑 install 也不會把它改成
     llmgw 擁有（每次都是設 root:<gid>）。
     """
-    if layout.prefix or layout.euid != 0:
-        return
-    info = pwd.getpwnam(layout.service_user)
-    os.chown(layout.keys_pass_file, 0, info.pw_gid)
+    chown_root_group(layout, layout.keys_pass_file)
 
 
 def _chmod_quiet(path: str, mode: int) -> None:

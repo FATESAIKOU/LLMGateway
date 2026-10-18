@@ -26,8 +26,10 @@ import stat
 import subprocess
 import sys
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     from .lgwctl_fakes import (
@@ -232,6 +234,16 @@ class MigrateSandbox(Sandbox):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text)
             os.chmod(path, 0o755)
+        # 真的 `git clone` 進 `tempfile.mkdtemp`（0700）的目錄不會改它的 mode
+        # （高-1）；共用假 git 的 `cp -a` 會把 template 的 0755 套上去，正好掩蓋
+        # 這個洞。這裡在複製完把 dest 改回 0700，讓 normalize_tree 真的有被測到。
+        git_path = os.path.join(self.fakebin, "git")
+        with open(git_path, encoding="utf-8") as fh:
+            git_text = fh.read()
+        git_text = git_text.replace('exit 0\n', 'chmod 700 "$dest"\nexit 0\n')
+        with open(git_path, "w", encoding="utf-8") as fh:
+            fh.write(git_text)
+        os.chmod(git_path, 0o755)
         # 版目錄裡的隧道探針換成會寫 order.log 的那支（make_release 從 template 複製）。
         self.write(os.path.join(self.template, "ops-scripts", "llmgateway-tunnel"),
                    FAKE_TUNNEL_PROBE, 0o755)
@@ -522,6 +534,86 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertTrue(has_line(out, "keys-pass", "ok"), out)
         self.assert_no_values(out, err)
 
+    # -- 舊檔不可信（中-5）與斷鏈（低-1）----------------------------------
+
+    def test_prepare_refuses_a_symlinked_old_keys_env(self):
+        outside = self.box.write(os.path.join(self.box.root, "outside.env"),
+                                 "CLAUDE_PERSONAL_OAUTH_TOKEN=stolen-value\n", 0o600)
+        os.unlink(self.box.old_state("keys.env"))
+        os.symlink(outside, self.box.old_state("keys.env"))
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "state-keys-env", "fail"), out)
+        self.assertFalse(os.path.exists(self.box.state("keys.env")))
+        self.assertNotIn("stolen-value", out + err)
+
+    def test_prepare_refuses_a_symlinked_old_db(self):
+        outside = os.path.join(self.box.root, "outside.db")
+        self.box.make_db(outside, "outside-db")
+        os.unlink(self.box.old_state("llm.db"))
+        os.symlink(outside, self.box.old_state("llm.db"))
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "state-db", "fail"), out)
+        self.assertFalse(os.path.exists(self.box.state("llm.db")))
+
+    def test_prepare_refuses_a_symlinked_old_tunnel_env(self):
+        outside = self.box.write(os.path.join(self.box.root, "outside-tunnel.env"),
+                                 f"RENDEZVOUS={OLD_RENDEZVOUS}\n", 0o600)
+        os.unlink(self.box.old_conf("tunnel.env"))
+        os.symlink(outside, self.box.old_conf("tunnel.env"))
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "tunnel-env", "fail"), out)
+        self.assertFalse(os.path.exists(self.box.etc("tunnel.env")))
+
+    def test_prepare_replaces_a_broken_symlink_target_without_a_traceback(self):
+        """低-1：目標是斷掉的 symlink 時不能 traceback（getsize 會丟）。"""
+        os.makedirs(os.path.dirname(self.box.state("keys.env")), exist_ok=True)
+        os.symlink(os.path.join(self.box.root, "gone"), self.box.state("keys.env"))
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("Traceback", err)
+        self.assertFalse(os.path.islink(self.box.state("keys.env")))
+        self.assertEqual(self.box.read(self.box.state("keys.env")),
+                         f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
+
+    # -- owner 規則（中-7）與 .keysync.sha（低-8a）------------------------
+
+    def test_prepare_copies_the_keysync_sha(self):
+        self.box.write(self.box.old_state(".keysync.sha"), "abc123\n", 0o600)
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.box.read(self.box.state(".keysync.sha")), "abc123\n")
+        self.assertTrue(has_line(out, "state-keysync-sha", "ok"), out)
+
+    def test_prepare_uses_the_shared_ownership_helpers(self):
+        """中-7：keys.pass／/etc 設定檔用 install 的同一個規則（root:<群組>）。"""
+        calls = []
+
+        def record(kind):
+            return lambda layout, path: calls.append((kind, path))
+
+        with mock.patch("lgwctl.install.chown_root_group", side_effect=record("root")), \
+                mock.patch("lgwctl.install._chown_service", side_effect=record("service")):
+            rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        root_paths = {path for kind, path in calls if kind == "root"}
+        service_paths = {path for kind, path in calls if kind == "service"}
+        for name in ("keys.pass", "tunnel.env", "llmgateway.env"):
+            self.assertIn(self.box.etc(name), root_paths, name)
+        for name in ("keys.env", "llm.db"):
+            self.assertIn(self.box.state(name), service_paths, name)
+        self.assertIn(f"root:{self.box.service_user}", out)
+
+    def test_prepare_fails_when_the_service_group_is_missing(self):
+        """中-7：拿不到群組要 fail，不能靜默變成 root:root。"""
+        with mock.patch("lgwctl.install.chown_root_group", side_effect=KeyError):
+            rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "keys-pass", "fail"), out)
+        self.assertIn("root:root", out)
+
     # -- 缺東缺西與拒絕 -----------------------------------------------------
 
     def test_prepare_snapshots_a_live_database_consistently(self):
@@ -543,6 +635,22 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertEqual(self.box.db_integrity(new), "ok")
         self.assertEqual(self.box.db_markers(new), ["old-db", "committed"])
 
+    def test_prepare_makes_the_version_dir_traversable_for_the_service(self):
+        """高-1：真的 git clone 進 mkdtemp 是 0700；prepare 後必須 0755。
+
+        假 git 會故意留下 0700，所以這條測得到 release.normalize_tree 真的跑了
+        （不然 User=llmgw 的服務 WorkingDirectory 進不去，切換必定 CHDIR 失敗）。
+        """
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        tag_dir = self.box.opt(FAKE_TAG)
+        mode = stat.S_IMODE(os.stat(tag_dir).st_mode)
+        self.assertEqual(mode, 0o755, oct(mode))
+        self.assertTrue(mode & 0o005, "服務帳號要有 o+rx 才進得去")
+        # 版本目錄裡的檔案也要讓 llmgw 讀得到（unit 以 llmgw 跑）
+        unit_file = os.path.join(tag_dir, "deploy", "units", "llmgateway.service")
+        self.assertTrue(stat.S_IMODE(os.stat(unit_file).st_mode) & 0o004)
+
     def test_prepare_without_old_layout_lists_todo_not_fail(self):
         box = MigrateSandbox()          # 舊佈局完全沒有
         self.addCleanup(box.close)
@@ -550,7 +658,7 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(lines_with_level(out, "fail"), [], out)
         for name in ("state-keys-env", "state-db", "tunnel-env", "llmgateway-env",
-                     "keys-pass"):
+                     "keys-pass", "state-keysync-sha"):
             self.assertTrue(has_line(out, name, "todo"), (name, out))
         # keys.pass／tunnel.env 的範本還是要放（LoadCredential 的來源檔要在）
         self.assertTrue(os.path.isfile(box.etc("keys.pass")))
@@ -1043,13 +1151,24 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertTrue(has_level(out, "db-copy", "skip"), out)
 
     def test_rollback_copies_a_newer_valid_keys_env(self):
-        self.box.write(self.box.state("keys.env"), f"OTHER_KEY={FAKE_KEY_VALUE}\n", 0o600)
+        self.box.write(self.box.state("keys.env"), f"OLLAMA_API_KEY={FAKE_KEY_VALUE}\n", 0o600)
         self.box.age(self.box.state("keys.env"), 3600)
         rc, out, err = self.rollback()
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.box.read(self.box.old_state("keys.env")),
-                         f"OTHER_KEY={FAKE_KEY_VALUE}\n")
+                         f"OLLAMA_API_KEY={FAKE_KEY_VALUE}\n")
         self.assertTrue(has_line(out, "keys-env", "ok"), out)
+        self.assert_no_values(out, err)
+
+    def test_rollback_keeps_old_keys_env_when_a_key_name_is_unknown(self):
+        """低-7：語法合法但鍵名不在白名單，舊服務的 KeyStore 會拒收。"""
+        self.box.write(self.box.state("keys.env"), f"NOT_A_REAL_KEY={FAKE_KEY_VALUE}\n", 0o600)
+        self.box.age(self.box.state("keys.env"), 3600)
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.box.read(self.box.old_state("keys.env")),
+                         f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
+        self.assertTrue(has_line(out, "keys-env", "todo"), out)
         self.assert_no_values(out, err)
 
     def test_rollback_keeps_old_keys_env_when_new_one_is_invalid(self):
@@ -1375,6 +1494,48 @@ class StateFileTests(MigrationTestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "confirm", "fail"), out)
         self.assertNotIn("Traceback", err)
+
+
+class SharedOwnershipTests(unittest.TestCase):
+    """中-7：keys.pass 與 /etc 設定檔的 owner 規則收在 install 的同一個函式。"""
+
+    def setUp(self):
+        from lgwctl.layout import Layout
+
+        self.box = MigrateSandbox()
+        self.addCleanup(self.box.close)
+        env = {name: value for name, value in self.box.env.items()
+               if name != "LLMGW_PREFIX"}
+        self.layout = Layout.from_env(env)
+        self.layout.euid = 0          # 假裝是 root（不真的 chown）
+
+    def test_chown_root_group_uses_root_and_the_service_gid(self):
+        from lgwctl import install
+
+        calls = []
+        fake = types.SimpleNamespace(pw_uid=1001, pw_gid=2002, pw_dir="/home/lgwfake")
+        with mock.patch.object(install.pwd, "getpwnam", return_value=fake), \
+                mock.patch.object(install.os, "chown",
+                                  side_effect=lambda *args: calls.append(args)):
+            install.chown_root_group(self.layout, "/etc/llmgateway/keys.pass")
+        self.assertEqual(calls, [("/etc/llmgateway/keys.pass", 0, 2002)])
+
+    def test_chown_root_group_skips_in_prefix_mode(self):
+        from lgwctl import install
+        from lgwctl.layout import Layout
+
+        calls = []
+        with mock.patch.object(install.os, "chown",
+                               side_effect=lambda *args: calls.append(args)):
+            install.chown_root_group(Layout.from_env(self.box.env), "/x")
+        self.assertEqual(calls, [])
+
+    def test_chown_root_group_raises_when_the_user_is_missing(self):
+        from lgwctl import install
+
+        with mock.patch.object(install.pwd, "getpwnam", side_effect=KeyError):
+            with self.assertRaises(KeyError):
+                install.chown_root_group(self.layout, "/x")
 
 
 if __name__ == "__main__":

@@ -61,6 +61,7 @@ import pwd
 import re
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -69,6 +70,7 @@ from . import atomic, check, install, probe, release, units
 from . import run as runmod
 from .layout import (
     DEFAULT_API_PORT,
+    KEYSYNC_SHA_NAME,
     SERVICE_NAME,
     TAG_PATTERN,
     TAG_RE,
@@ -208,6 +210,10 @@ class OldLayout:
     @property
     def db_file(self) -> str:
         return os.path.join(self.state_dir, "llm.db")
+
+    @property
+    def keysync_sha_file(self) -> str:
+        return os.path.join(self.state_dir, KEYSYNC_SHA_NAME)
 
     def unit_file(self, name: str) -> str:
         return os.path.join(self.unit_dir, name)
@@ -376,7 +382,17 @@ def _has_password(path: str) -> bool:
 
 
 def _keys_env_valid(path: str) -> bool:
-    """新的 ``keys.env`` 「格式驗得過」：KEY=VALUE 的行、至少一個有值、不含 NUL。"""
+    """新的 ``keys.env`` 「格式驗得過」：KEY=VALUE、鍵名在白名單、至少一個有值。
+
+    低-7：語法合法但鍵名錯的檔（人工貼錯）舊服務的 KeyStore 會拒收，正好打在
+    「回舊版」這一步。鍵名白名單用 ``lgwd.keys.KEY_NAMES``（服務真正會載入
+    的那一組）；載不到就當驗不過（不覆蓋舊的）。
+    """
+    try:
+        from lgwd.keys import KEY_NAMES
+    except ImportError:
+        return False
+    allowed = set(KEY_NAMES.values())
     try:
         with open(path, "rb") as fh:
             raw = fh.read(MAX_KEYS_ENV_BYTES)
@@ -394,22 +410,38 @@ def _keys_env_valid(path: str) -> bool:
         if not line or line.startswith("#"):
             continue
         name, sep, value = line.partition("=")
-        if not sep or not _ENV_NAME_RE.match(name.strip()):
+        name = name.strip()
+        if not sep or not _ENV_NAME_RE.match(name) or name not in allowed:
             return False
         if value.strip():
             saw_value = True
     return saw_value
 
 
-def _chown_root_group(layout, path: str) -> None:
-    """``keys.pass``（root:llmgw 0640）：owner 是 root、group 是服務帳號。"""
-    if layout.prefix or layout.euid != 0:
-        return
+def _regular_file(path: str) -> bool:
+    """存在、是一般檔、**不是 symlink**（prepare 讀舊檔前的唯一判準，中-5）。"""
     try:
-        gid = pwd.getpwnam(layout.service_user).pw_gid
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _refuse_symlink(report, name: str, path: str, what: str = "舊的") -> None:
+    report.fail(name, f"{what} {path} 不是一般檔（symlink？）——不跟，請本人確認後再跑")
+
+
+def _chown_keys_pass(layout, report, name: str = "keys-pass") -> bool:
+    """keys.pass → root:<服務群組> 0640；拿不到群組要 fail，不能靜默 root:root。"""
+    try:
+        install.chown_root_group(layout, layout.keys_pass_file)
     except KeyError:
-        gid = 0
-    os.chown(path, 0, gid)
+        report.fail(name, f"找不到服務帳號 {layout.service_user} 的群組；"
+                          "keys.pass 不能留在 root:root（llmgwctl sync 會讀不到）")
+        return False
+    except OSError as exc:
+        report.fail(name, f"chown 失敗（{type(exc).__name__}）")
+        return False
+    return True
 
 
 # -- 狀態檔 ---------------------------------------------------------------
@@ -722,12 +754,21 @@ def _copy_old_files(layout, old: OldLayout, report, *, force: bool) -> None:
                    src=old.env_file, dst=layout.env_file,
                    template=install.LLMGATEWAY_ENV_TEMPLATE.format(port=DEFAULT_API_PORT))
     _step_keys_pass(layout, old, report, force=force)
+    _step_keysync_sha(layout, old, report, force=force)
 
 
 def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
     dst = layout.keys_env
-    if _exists(dst) and not force and os.path.getsize(dst) > 0:
+    try:
+        existing = os.path.isfile(dst) and os.path.getsize(dst) > 0
+    except OSError:            # 斷掉的 symlink：getsize 會丟（低-1）
+        existing = False
+    if existing and not force:
         report.skip("state-keys-env", f"{dst} 已存在（不覆蓋）")
+        return
+    if _exists(old.keys_env) and not _regular_file(old.keys_env):
+        # 中-5：舊檔在服務帳號控制下；symlink 會讓 root 把任意檔交給 llmgw。
+        _refuse_symlink(report, "state-keys-env", old.keys_env)
         return
     if not os.path.isfile(old.keys_env):
         if not _exists(dst):
@@ -754,6 +795,9 @@ def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
     if _exists(dst) and not force:
         report.skip("state-db", f"{dst} 已存在（不覆蓋）")
         return
+    if _exists(old.db_file) and not _regular_file(old.db_file):
+        _refuse_symlink(report, "state-db", old.db_file)
+        return
     if not os.path.isfile(old.db_file):
         report.todo("state-db", f"舊的 {old.db_file} 不在；新服務會自己建")
         return
@@ -771,25 +815,35 @@ def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
     if _exists(dst) and not force:
         report.skip(name, f"{dst} 已存在（不覆蓋）")
         return
+    if _exists(src) and not _regular_file(src):
+        _refuse_symlink(report, name, src)
+        return
     if not os.path.isfile(src):
         try:
-            atomic.write_text(dst, template, 0o644)
-            install._chown_service(layout, dst)
+            atomic.write_text(dst, template, 0o640)
+            install.chown_root_group(layout, dst)
+        except KeyError:
+            report.fail(name, f"找不到服務帳號 {layout.service_user} 的群組；"
+                              "設定檔 owner 沒設好")
+            return
         except OSError as exc:
             report.fail(name, f"寫範本失敗（{type(exc).__name__}）")
             return
         report.todo(name, f"舊的 {src} 不在；放了範本，要本人確認")
         return
     try:
-        # cp -a 語意：權限沿用舊檔（舊 tunnel.env 是 0600），擁有者給服務帳號
-        # （system unit 以 llmgw 跑，要讀得到）。IDENTITY／KNOWN_HOSTS 是絕對
-        # 路徑，原樣照抄、不改寫。
-        _copy_into_place(src, dst)
-        install._chown_service(layout, dst)
+        # 內容原樣照抄（IDENTITY／KNOWN_HOSTS 是絕對路徑、不改寫），但 owner／
+        # mode 是規格值：/etc 的設定檔 root:<llmgw 群組> 0640（中-7）。
+        _copy_into_place(src, dst, 0o640)
+        install.chown_root_group(layout, dst)
+    except KeyError:
+        report.fail(name, f"找不到服務帳號 {layout.service_user} 的群組；"
+                          "設定檔 owner 沒設好")
+        return
     except OSError as exc:
         report.fail(name, f"複製失敗（{type(exc).__name__}）")
         return
-    report.ok(name, f"從舊 {src} 複製（權限沿用）")
+    report.ok(name, f"從舊 {src} 複製（root:{layout.service_user} 0640）")
 
 
 def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
@@ -797,27 +851,56 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
     if not force and _has_password(dst):
         report.skip("keys-pass", f"{dst} 已有值（不覆蓋）")
         return
+    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+        # 中-5：舊 keysync.env 在服務帳號控制下（symlink 到 /proc/… 或外部檔）。
+        _refuse_symlink(report, "keys-pass", old.keysync_env_file)
+        return
     value = parse_env_file(old.keysync_env_file).get(install.KEYS_PASS_VAR, "")
     if not value:
         if not _exists(dst):
             try:
                 atomic.write_text(dst, install.KEYS_PASS_TEMPLATE, 0o640)
-                _chown_root_group(layout, dst)
             except OSError as exc:
                 report.fail("keys-pass", f"建空殼失敗（{type(exc).__name__}）")
                 return
+        if not _chown_keys_pass(layout, report):
+            return
         report.todo("keys-pass",
                     f"舊的 {old.keysync_env_file} 沒有非空的 {install.KEYS_PASS_VAR}；"
                     f"要本人填進 {dst}")
         return
     try:
         atomic.write_text(dst, f"{install.KEYS_PASS_VAR}={value}\n", 0o640)
-        _chown_root_group(layout, dst)
     except OSError as exc:
         report.fail("keys-pass", f"寫失敗（{type(exc).__name__}）")
         return
+    if not _chown_keys_pass(layout, report):
+        return
     report.ok("keys-pass",
-              f"從舊 {OLD_KEYSYNC_ENV_NAME} 複製一行到 {dst}（root:llmgw 0640；值不印出）")
+              f"從舊 {OLD_KEYSYNC_ENV_NAME} 複製一行到 {dst}"
+              f"（root:{layout.service_user} 0640；值不印出）")
+
+
+def _step_keysync_sha(layout, old: OldLayout, report, *, force: bool) -> None:
+    """``.keysync.sha`` 一起複製（低-8a）：省一次 key 的全量重拉。"""
+    src, dst = old.keysync_sha_file, layout.keysync_sha_file
+    if _exists(dst) and not force:
+        report.skip("state-keysync-sha", f"{dst} 已存在（不覆蓋）")
+        return
+    if _exists(src) and not _regular_file(src):
+        _refuse_symlink(report, "state-keysync-sha", src)
+        return
+    if not os.path.isfile(src):
+        report.todo("state-keysync-sha",
+                    f"舊的 {src} 不在；第一次 key 拉取會全量重拉（功能不受影響）")
+        return
+    try:
+        _copy_into_place(src, dst, 0o600)
+        install._chown_service(layout, dst)
+    except OSError as exc:
+        report.fail("state-keysync-sha", f"複製失敗（{type(exc).__name__}）")
+        return
+    report.ok("state-keysync-sha", "從舊 state 複製（省一次全量拉取）")
 
 
 def _step_gh_login(layout, report) -> None:
