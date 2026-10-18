@@ -10,13 +10,16 @@ import os
 import tempfile
 
 
-def write_bytes(path: str, data: bytes, mode: int = 0o644) -> None:
+def write_bytes(path: str, data: bytes, mode: int = 0o644, *,
+                owner: tuple[int, int] | None = None) -> None:
     directory = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", dir=directory)
     try:
+        os.fchmod(fd, mode)
+        if owner is not None:
+            os.fchown(fd, owner[0], owner[1])
         with os.fdopen(fd, "wb") as out:
             out.write(data)
-        os.chmod(tmp, mode)
         os.replace(tmp, path)
         tmp = None
     finally:
@@ -27,5 +30,6 @@ def write_bytes(path: str, data: bytes, mode: int = 0o644) -> None:
                 pass
 
 
-def write_text(path: str, text: str, mode: int = 0o644) -> None:
-    write_bytes(path, text.encode("utf-8"), mode)
+def write_text(path: str, text: str, mode: int = 0o644, *,
+               owner: tuple[int, int] | None = None) -> None:
+    write_bytes(path, text.encode("utf-8"), mode, owner=owner)

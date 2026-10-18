@@ -29,6 +29,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+import shutil
 from unittest import mock
 
 try:
@@ -546,6 +547,21 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertTrue(has_line(out, "keys-pass", "ok"), out)
         self.assert_no_values(out, err)
 
+    def test_prepare_refuses_when_phase_is_open(self):
+        """中-1：階段處於 OPEN_PHASES（如 confirmed）時拒絕 prepare --force 覆蓋正在跑的新資料。"""
+        self.box.install_new_state()
+        self.box.write_cutover_state(phase="confirmed")
+        # 模擬新服務在 confirmed 階段已寫入新資料
+        self.box.write(self.box.state("keys.env"), "NEW_TOKEN=new-token\n")
+        self.box.write(self.box.etc("tunnel.env"), "NEW_TUNNEL=1\n")
+
+        rc, out, err = self.prepare("--force")
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "prepare", "fail"), out)
+        # 確保現有新資料完全未被舊資料覆蓋
+        self.assertEqual(self.box.read(self.box.state("keys.env")), "NEW_TOKEN=new-token\n")
+        self.assertEqual(self.box.read(self.box.etc("tunnel.env")), "NEW_TUNNEL=1\n")
+
     def test_prepare_fills_an_empty_keys_pass_shell(self):
         """install 先放過空殼（只有註解）時，prepare 會把舊的密碼補上。"""
         self.box.write(self.box.etc("keys.pass"), "# 只有註解\n", 0o640)
@@ -599,6 +615,50 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertTrue(has_line(out, "keys-pass", "fail"), out)
         self.assertFalse(os.path.exists(self.box.etc("keys.pass")))
         self.assertNotIn("stolen-password", out + err)
+
+    def test_prepare_refuses_symlinked_ssh_dir(self):
+        """高-1：~svc/.ssh 是 symlink 時 prepare 必須 fail 且目標目錄權限不變。"""
+        target_dir = os.path.join(self.box.root, "target_etc")
+        os.makedirs(target_dir, mode=0o755)
+        os.chmod(target_dir, 0o755)
+        ssh_dir = os.path.join(self.box.service_home, ".ssh")
+        if os.path.islink(ssh_dir):
+            os.unlink(ssh_dir)
+        elif os.path.isdir(ssh_dir):
+            shutil.rmtree(ssh_dir)
+        os.makedirs(self.box.service_home, exist_ok=True)
+        os.symlink(target_dir, ssh_dir)
+
+        rc, out, err = self.prepare()
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(has_line(out, "dirs", "fail"), out)
+        mode = stat.S_IMODE(os.lstat(target_dir).st_mode)
+        self.assertEqual(mode, 0o755)
+
+    def test_prepare_refuses_intermediate_symlink_directory(self):
+        """低-2：舊 state 的上層目錄是 symlink 時拒絕跟隨。"""
+        outside = os.path.join(self.box.root, "outside_state")
+        os.makedirs(os.path.join(outside, "llmgateway"), exist_ok=True)
+        self.box.make_db(os.path.join(outside, "llmgateway", "llm.db"), "outside-db")
+        state_parent = os.path.join(self.box.service_home, ".local", "state")
+        if os.path.exists(state_parent):
+            shutil.rmtree(state_parent)
+        os.makedirs(os.path.dirname(state_parent), exist_ok=True)
+        os.symlink(outside, state_parent)
+
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "state-db", "fail"), out)
+        self.assertFalse(os.path.exists(self.box.state("llm.db")))
+
+    def test_copy_into_place_closes_src_fd_on_mkstemp_error(self):
+        """低-3：mkstemp 失敗時不洩漏已開啟的來源 fd。"""
+        from lgwctl import migrate
+        src = self.box.write(os.path.join(self.box.root, "some.txt"), "hello\n")
+        dst = os.path.join(self.box.root, "dst.txt")
+        with mock.patch("tempfile.mkstemp", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                migrate._copy_into_place(src, dst)
 
     def test_prepare_replaces_a_broken_symlink_target_without_a_traceback(self):
         """低-1：目標是斷掉的 symlink 時不能 traceback（getsize 會丟）。"""
@@ -844,6 +904,18 @@ class CutoverTests(MigrationTestCase):
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
         self.assertFalse(os.path.exists(self.box.ctl(".cutover.state")))
 
+    def test_cutover_refuses_when_old_unit_file_is_missing(self):
+        """中-3：缺任一個舊 unit 檔時，preflight 在停舊之前就拒絕。"""
+        timer_file = self.box.old_units("key-sync.timer")
+        os.unlink(timer_file)
+        rc, out, err = self.outer()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "preflight", "fail"), out)
+        self.assertIn("key-sync.timer", out)
+        # 舊服務完全沒動
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+        self.assertEqual(self.box.order(), [])
+
     def test_inner_archives_a_reverted_state_and_starts_a_new_round(self):
         """中-4：reverted 是終態但可開新一輪——舊狀態檔歸檔後照常切。"""
         self.box.write_cutover_state(phase="reverted", tag=FAKE_TAG)
@@ -871,6 +943,22 @@ class CutoverTests(MigrationTestCase):
                 self.assertTrue(has_line(out, "cutover", "fail"), out)
                 self.assertIn(phase, out)
                 self.assertEqual(box.actions(), [])
+
+    def test_cutover_resnapshots_old_db_and_syncs_newer_keys(self):
+        """中-2：停完舊服務後重新快照舊 llm.db，並同步較新的 keys.env。"""
+        # prepare 之後、cutover 之前，舊服務寫入新的資料
+        self.box.make_db(self.box.old_state("llm.db"), "new-cooldown-writes")
+        # 舊 keys.env 有更新（mtime 比新位置新）
+        time.sleep(0.01)
+        self.box.write(self.box.old_state("keys.env"), "UPDATED_KEY=val\n")
+
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "sync-db", "ok"), out)
+        self.assertTrue(has_line(out, "sync-keys-env", "ok"), out)
+        # 驗證新位置的 db 包含了舊服務在切換前的最新資料
+        self.assertIn("new-cooldown-writes", self.box.db_markers(self.box.state("llm.db")))
+        self.assertEqual(self.box.read(self.box.state("keys.env")), "UPDATED_KEY=val\n")
 
     def test_outer_refuses_when_a_round_is_still_open(self):
         """中-4：confirmed／finalized 等階段在 outer 就拒絕，不排 transient。"""
@@ -1423,6 +1511,20 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="user"))
         self.assertFalse(self.box.active("llmgateway-tunnel.service"))
         self.assertTrue(self.box.cutover_state()["tunnel_ok"], out)
+
+    def test_rollback_keeps_new_tunnel_when_old_tunnel_crash_loops(self):
+        """中-4：舊隧道處於 crash-loop 重啟循環（NRestarts 增加）時不判定穩定，新隧道保留。"""
+        restarts = [0, 1, 2]
+        def fake_restarts(layout, unit):
+            return restarts.pop(0) if restarts else 3
+
+        with mock.patch("lgwctl.migrate._user_unit_restarts", side_effect=fake_restarts):
+            rc, out, err = self.rollback()
+            self.assertEqual(rc, 1)
+            self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
+            self.assertIn("crash-loop", out)
+            # 新隧道依然保持運行，避免管理通道斷線
+            self.assertTrue(self.box.active("llmgateway-tunnel.service"))
 
     def test_rollback_keeps_old_keys_env_when_a_key_is_duplicated(self):
         """低-6：重複鍵會被舊 KeyStore 拒收，不能覆蓋舊的。"""
@@ -2045,6 +2147,20 @@ class SharedOwnershipTests(unittest.TestCase):
         with mock.patch.object(install.pwd, "getpwnam", side_effect=KeyError):
             with self.assertRaises(KeyError):
                 install.chown_root_group(self.layout, "/x")
+
+    def test_sqlite_backup_and_integrity_disable_trusted_schema(self):
+        """低-4：開啟 untrusted SQLite 檔時停用 trusted_schema。"""
+        db_path = os.path.join(self.box.root, "test_trusted_schema.db")
+        self.box.make_db(db_path, "marker")
+        from lgwctl import migrate
+        self.assertTrue(migrate._db_integrity_ok(db_path))
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA trusted_schema = OFF;")
+            val = conn.execute("PRAGMA trusted_schema").fetchone()[0]
+            self.assertEqual(val, 0)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

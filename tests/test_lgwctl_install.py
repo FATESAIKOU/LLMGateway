@@ -7,6 +7,7 @@ keys.env 都是假的。
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import unittest
 
@@ -491,6 +492,25 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(
             stat.S_IMODE(os.stat(os.path.join(tag_dir, "lgwd", "__main__.py")).st_mode),
             0o644)
+
+    def test_install_refuses_symlinked_ssh_dir(self):
+        """高-1：~svc/.ssh 是 symlink 時 install 必須 fail 且目標目錄權限不變。"""
+        target_dir = os.path.join(self.box.root, "target_etc")
+        os.makedirs(target_dir, mode=0o755)
+        os.chmod(target_dir, 0o755)
+        ssh_dir = os.path.join(self.box.service_home, ".ssh")
+        if os.path.islink(ssh_dir):
+            os.unlink(ssh_dir)
+        elif os.path.isdir(ssh_dir):
+            shutil.rmtree(ssh_dir)
+        os.makedirs(self.box.service_home, exist_ok=True)
+        os.symlink(target_dir, ssh_dir)
+
+        rc, out, err = self.install()
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(has_line(out, "dirs", "fail"))
+        mode = stat.S_IMODE(os.lstat(target_dir).st_mode)
+        self.assertEqual(mode, 0o755)
 
 
 class UnitFileTests(unittest.TestCase):

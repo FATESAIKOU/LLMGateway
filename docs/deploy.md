@@ -61,8 +61,8 @@
 在全新建置的機器上安裝 LLMGateway（需要 root 權限）：
 
 ```bash
-# 1. 確保已建立服務帳號 llmgw
-id -u llmgw >/dev/null 2>&1 || useradd -m -s /bin/bash llmgw
+# 1. 確保已建立服務帳號 llmgw（-U 確保建立同名群組）
+id -u llmgw >/dev/null 2>&1 || useradd -m -U -s /bin/bash llmgw
 
 # 2. 本人以服務帳號登入 gh
 sudo -u llmgw -i
@@ -97,7 +97,7 @@ llmgwctl check
      ▼ (2) cutover（排程反向保險 timer）
 [切換窗口中]
      ├─────────────────────────────────┐
-     │ 5 分鐘內探針非 200／check 非 0   │ 10 分鐘內未 confirm
+     │ 停損條件成立（探針失敗／check 非 0）│ 保險到期未 confirm（預設 10m）
      ▼ 或手動 rollback-to-user          ▼
 [自動回滾至舊版 user unit]       [反向保險到期自動回舊版]
      │
@@ -108,7 +108,18 @@ llmgwctl check
 [遷移完成（封裝歸檔、關閉 linger）]
 ```
 
-### 2.2 遷移步驟
+### 2.2 切換前後操作者注意事項
+
+1. **進場備援**：切換前務必確認具備**不經隧道的進場方式**（例如雲端供應商 Web Console、本機終端或區網 SSH）。若隧道為唯一進場通道，一旦遇到雙邊暫時下線的路徑將只能依賴 Console 救援。
+2. **切換前系統檢查**：
+   - 檢查系統無待重啟任務：`ls /var/run/reboot-required` 不存在。
+   - 檢視定時器：`systemctl list-timers`，確認 `unattended-upgrades` 未排程自動重開機。
+   - 確認無殘留單元：`systemctl list-units 'lgw-*'` 確認無過去留存的 transient 單元。
+   - 確認控制狀態：檢視 `/var/lib/llmgateway-ctl/.cutover.state`，確認目前不處於進行中階段（`cutover-started`、`pending-confirm`）。
+   - 暫停同機其他維護排程，並以 `ps -u llmgw` 確認服務帳號行程符合預期。
+3. **窗口內切勿重開機**：自舊版 unit 被 disable 到新版 unit 被 enable 之間（數秒至一分鐘），新舊皆未開機自動啟用，且反向保險為 transient timer；此期間重開機將導致新舊服務均無法自啟。
+
+### 2.3 遷移步驟
 
 所有遷移步驟均由管理帳號以 `sudo` 執行。
 
@@ -118,34 +129,49 @@ llmgwctl check
 
 ```bash
 # 以特定 tag 執行準備
-llmgwctl prepare-migration --tag lgw-vX.Y.Z
+llmgwctl prepare-migration --tag lgw-vX.Y.Z [--old-home <path>] [--force]
 ```
 
 - 若尚未安裝 `/usr/local/bin/llmgwctl`，可先 clone 該 tag 到暫存目錄執行 `python3 -m lgwctl prepare-migration --tag lgw-vX.Y.Z`。
-- **安全性與隔離**：舊版設定檔皆經過 `O_NOFOLLOW` 與檔案描述子（fd）檢驗，防止符號連結（symlink）提權；舊資料庫透過 SQLite backup API 進行一致快照，舊服務仍能正常寫入。
+- **安全性與隔離**：舊版設定檔與上層目錄元件皆經過 `O_NOFOLLOW`、`stat.S_ISLNK` 與檔案描述子（fd）檢驗，防止符號連結（symlink）提權；舊資料庫透過 SQLite backup API 進行一致快照，舊服務仍能正常寫入。
 - **不影響舊版**：此步驟不會修改或停止任何既有的 user unit，舊服務維持對外提供服務。
+- **階段守門**：若切換已進入 `cutover-started`、`pending-confirm`、`confirmed` 或 `finalized` 階段，`prepare-migration`（包含 `--force`）將直接拒絕執行，避免以舊資料覆蓋正在運行之新資料庫或金鑰。
+- **參數說明**：
+  - `--old-home <path>`：指定舊服務帳號的家目錄（預設為服務帳號家目錄）。
+  - `--force`：強制覆蓋既有已複製檔案（若已進入進行中階段則拒絕）。
 
 #### 步驟 2：切換窗口（`cutover`）
 
 ```bash
-llmgwctl cutover --tag lgw-vX.Y.Z [--revert-after 10m]
+llmgwctl cutover --tag lgw-vX.Y.Z [--revert-after 10m] [--no-remote] [--old-home <path>]
 ```
 
-- **分離執行**：`cutover` 會以 `systemd-run` 啟動分離執行的 transient unit（`lgw-cutover`），避免切換過程中斷管理者自己正在通行的 SSH 隧道。
-- **反向保險機制**：啟動時立即排定反向保險定時器 `lgw-revert.timer`（預設等待 10 分鐘，最低限制 5 分鐘）。
-- **原子切換**：
-  1. 停止並停用（disable）舊版四個 user unit：`llmgateway.service`、`llmgateway-tunnel.service`、`key-sync.service`、`key-sync.timer`。
-  2. 啟用並啟動新版兩個 system unit：`llmgateway.service`、`llmgateway-tunnel.service`。
-  3. 執行本機與經由會合點的健康探針（連續驗證 HTTP 200）。
-- **停損條件（自動回舊版）**：
-  - 切換後 5 分鐘內本機或經會合點 list 探針回傳非 200。
-  - 切換後 `check` 結束碼非 0。
-  - 保險時限（預設 10 分鐘）到達前未執行 `confirm`。
-  若觸發上述任一條件，系統自動執行回滾，拉起舊版 user unit 並回復原狀。
+- **分離執行與連線中斷**：人手執行的 `llmgwctl cutover` 指令**只負責排程 transient unit（`lgw-cutover`）並立即返回**。真正的切換工作在 systemd 背景單元內執行。
+  > [!IMPORTANT]
+  > 由於切換會停止舊隧道並啟動新隧道，管理者透過舊隧道連線的 SSH 會在數秒至數分鐘內中斷。請勿慌張或手動重開機。請準備第二終端機，約 3～7 分鐘後（走新隧道）重新連線，並執行 `journalctl -u lgw-cutover -n 100` 檢視切換進度。成功的最後標誌為 `ok confirm-needed`。
+- **Preflight 預檢條件**（任一不符合則在動舊服務前明確拒絕）：
+  1. `/etc/llmgateway/keys.pass` 必須包含非空之密碼。
+  2. `/etc/llmgateway/tunnel.env` 設定就緒。
+  3. `gh` 認證已登入（`gh auth status` 通過）。
+  4. `current` 符號連結指向指定的 tag。
+  5. 新版 policy dry-run 預檢通過。
+  6. 舊版 4 個 unit 檔案（`llmgateway.service`、`llmgateway-tunnel.service`、`key-sync.service`、`key-sync.timer`）皆存在且為一般檔。
+- **反向保險機制**：啟動時立即排定反向保險定時器 `lgw-revert.timer`（預設等待 10 分鐘，最低限制 5 分鐘；由 `--revert-after` 指定）。
+- **停舊、重快照與啟新**：
+  1. 停止並停用（disable）舊版四個 user unit，逐一透過 `is-active` 確認停妥。
+  2. **最新資料同步**：在舊服務停止後、啟動新服務前，再次對舊 `llm.db` 進行一致快照（帶入 prepare 至切換間的最新冷卻與稽核），並同步較新的 `keys.env` 與 `.keysync.sha`。
+  3. 啟用並啟動新版兩個 system unit：`llmgateway.service`、`llmgateway-tunnel.service`。
+- **停損順序與條件（失敗立即自動回舊版）**：
+  1. 本機 list 200 探針（最多等 60 秒）。
+  2. 隧道 active 探針（最多等 30 秒）。
+  3. 經會合點遠端探針（重試 3 次，間隔 10 秒；`--no-remote` 可略過）。
+  4. 等待新版第一次 key 拉取結果寫入（最多等 90 秒）。
+  5. 全量健康檢查 `check` 結束碼須為 0。
+  若上述任一項未達標，或在保險時限內未執行 `confirm`，系統將自動觸發停損回滾，停止新服務並拉回舊版 user unit。
 
 #### 步驟 3：確認切換（`confirm`）
 
-在切換完成並由管理者確認新服務運作無誤後，必須在保險時限內執行確認：
+在切換完成、重新連線並由管理者確認新服務運作無誤後，必須在保險時限內執行確認：
 
 ```bash
 llmgwctl confirm
@@ -159,22 +185,22 @@ llmgwctl confirm
 若在 3 天觀察期內發現不可預期的問題，可手動退回舊版 user unit：
 
 ```bash
-llmgwctl rollback-to-user
+llmgwctl rollback-to-user [--old-home <path>]
 ```
 
 - 同樣以 transient unit（`lgw-rollback`）分離執行，絕不直接中斷當前隧道。
-- 順序：停止新服務讓出埠 → 還原資料庫與 `keys.env`（若新版有較新修改）→ 啟用並啟動舊版四個 user unit → 驗證本機 200 與舊隧道已 active → 確認無誤後才關閉新版隧道。若舊版起不來，新版隧道將保持開啟，確保連線出口安全。
+- 順序：停止新服務讓出 8480 埠 → 還原資料庫（舊 db 先備份為 `.bak-*`）與 `keys.env`（若新版有較新修改）→ 啟用並啟動舊版四個 user unit → 驗證本機 200 與舊隧道連續穩定 active（確認無 crash-loop）→ 確認舊版隧道完全穩定後才停用新隧道。若舊隧道起不來，新隧道將保持開啟，確保管理連線不會中斷。
 
 #### 步驟 5：遷移收尾（`finalize-migration`）
 
 在觀察期滿 3 天、確認系統完全穩定後，執行最後收尾：
 
 ```bash
-llmgwctl finalize-migration --yes
+llmgwctl finalize-migration --yes [--old-home <path>]
 ```
 
 - 自動執行全量健康檢查 `check`。
-- 將舊版 user unit 檔案與目錄搬移歸檔至 `~llmgw/old-user-layout/`（安全封裝、不刪除）。
+- 將舊版 user unit 檔案與目錄搬移歸檔至 `/var/lib/llmgateway/old-user-layout/`（安全封裝、不刪除）。
 - 執行 `loginctl disable-linger llmgw`，停用服務帳號常駐，釋放 user manager 資源。
 - 標記遷移終態為 `finalized`，完成全部遷移工作。
 
@@ -254,7 +280,9 @@ llmgwctl check [--no-remote] [--tag <tag>]
 llmgwctl status
 ```
 
-印出目前 `current` 與 `previous` 的版本 tag、兩個 system unit 的 active 狀態，以及金鑰同步記錄。
+印出目前 `current` 與 `previous` 的版本 tag，以及兩個 system unit（`llmgateway.service`、`llmgateway-tunnel.service`）的 active 狀態。
+- 若需檢視遷移階段狀態，可查看 `/var/lib/llmgateway-ctl/.cutover.state` 或 transient unit 紀錄（`journalctl -u lgw-cutover` / `lgw-rollback`）。
+- 若需檢視詳細金鑰同步狀態，請查看 `/var/lib/llmgateway/.keysync.status` 或執行 `llmgwctl check`。
 
 ### 5.3 版本升級（`upgrade`）
 
@@ -284,6 +312,9 @@ llmgwctl sync
 ```
 
 讀取 `/etc/llmgateway/keys.pass`，以 `llmgw` 身分執行金鑰拉取、解密並更新 `/var/lib/llmgateway/keys.env`，記錄狀態至 `.keysync.status`。
+
+> [!NOTE]
+> 若更新了 `/etc/llmgateway/keys.pass` 的密碼內容，必須執行 `sudo systemctl restart llmgateway`。因為 systemd 的 `LoadCredential` 是在服務啟動時建立憑證快照（snapshot），單純 `llmgwctl sync` 雖能以新密碼解密新檔，但運行中的主服務若需重新載入憑證仍需重啟。
 
 ### 5.6 更新金鑰（上游改動）
 
@@ -328,6 +359,7 @@ cat /var/lib/llmgateway/.keysync.status
 - 檢視 `llmgwctl check` 輸出中之金鑰檢查項目。
 - 以 `llmgw` 身分檢視 `gh auth status`，確認 GitHub CLI 登入憑證是否過期。
 - 檢查 `/etc/llmgateway/keys.pass` 權限是否為 `0640` 且擁有者為 `root:llmgw`。
+- **密碼變更需重啟**：若變更了 `keys.pass`，記得執行 `systemctl restart llmgateway`，以使 systemd 的 `LoadCredential` 快照重新載入。
 - 執行 `llmgwctl sync` 觀察是否有 `failed=decrypt_failed` 或 `failed=gh_auth`。
 
 ### 6.4 隧道持續重開或斷線
