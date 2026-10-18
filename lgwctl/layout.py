@@ -75,6 +75,9 @@ ENV_PYTHON = "LLMGW_PYTHON"
 ENV_REPO = "LLMGW_REPO"
 ENV_KEYSYNC_SCRIPT = "LLMGW_KEYSYNC_SCRIPT"
 ENV_LIST_WAIT = "LLMGW_LIST_WAIT"
+# 解密密碼的變數名：一律不進子行程（child_env 預設移除；只有 sync 的子 shell
+# 會明確放行，且它真正用的值是 keys.pass source 出來的，低-4）。
+ENV_KEYS_PASSWORD = "LLMGW_KEYS_PASSWORD"
 
 # 隧道守護的設定檔路徑（T3 的 ops-scripts/llmgateway-tunnel 讀這個變數；
 # 這裡的探針要讓它讀新位置，而不是舊的 ~/.config/llmgateway/tunnel.env）。
@@ -350,8 +353,15 @@ class Layout:
         return True, ""
 
     def child_env(self, **extra) -> dict:
-        """子行程的環境：這份 env 加 extra（值為 None 表示移除該變數）。"""
+        """子行程的環境：這份 env 加 extra（值為 None 表示移除該變數）。
+
+        **一律先移除 ``LLMGW_KEYS_PASSWORD``**（低-4）：那是解密密碼，只該經
+        keys.pass／LoadCredential 給服務；操作者的 shell 若 export 過它，
+        不該被 git／curl／gh／systemctl 全部繼承。要放行的呼叫方（sync）在
+        extra 裡明確指名。
+        """
         env = dict(self.env)
+        env.pop(ENV_KEYS_PASSWORD, None)
         for name, value in extra.items():
             if value is None:
                 env.pop(name, None)

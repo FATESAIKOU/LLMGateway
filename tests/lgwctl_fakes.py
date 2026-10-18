@@ -141,7 +141,15 @@ exit 0
 
 FAKE_GH = """#!/usr/bin/env bash
 fake="${LGW_FAKE:?}"
-printf 'gh %s\\n' "$*" >> "${fake}/gh.log"
+{
+    printf 'gh %s\\n' "$*"
+    # 這支子行程的環境裡有沒有解密密碼（只記有無，不記值；低-4 的測試用）
+    if [[ -n "${LLMGW_KEYS_PASSWORD:-}" ]]; then
+        printf 'env-password yes\\n'
+    else
+        printf 'env-password no\\n'
+    fi
+} >> "${fake}/gh.log"
 case "${1:-}" in
     auth)
         exit "${FAKE_GH_AUTH_RC:-1}" ;;

@@ -407,6 +407,13 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn(FAKE_PASSWORD, text)
         self.assertNotIn(FAKE_KEY_VALUE, text)
 
+    def test_children_do_not_inherit_the_exported_password(self):
+        """操作者 shell export 的解密密碼不傳給 git／gh 等子行程（低-4）。"""
+        rc, out, err = self.install(LLMGW_KEYS_PASSWORD=FAKE_PASSWORD)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("env-password no", self.box.log("gh.log"))
+        self.assertNotIn(FAKE_PASSWORD, out + err)
+
     # -- 版本目錄的權限（Lima 演練抓到的 CHDIR bug）-------------------------
 
     def test_version_dir_is_readable_by_the_service_user(self):
