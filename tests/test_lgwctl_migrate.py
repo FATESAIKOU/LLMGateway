@@ -69,6 +69,10 @@ for a in "$@"; do
         args+=("$a")
     fi
 done
+if [[ -f "${fake}/busfail/${layer}" ]]; then
+    printf 'Failed to connect to bus: Failed to connect to socket /run/user/0/bus: No such file or directory\\n' >&2
+    exit 1
+fi
 verb="${args[0]:-}"
 unit="${args[1]:-}"
 active="${fake}/active/${layer}/${unit}"
@@ -161,10 +165,22 @@ exit 0
 
 FAKE_TUNNEL_PROBE = """#!/usr/bin/env bash
 # 假隧道探針：記下 LGW_TUNNEL_ENV 指到哪（不含值）與結束碼。
+# 連續結果放 $LGW_FAKE/probe_codes（一次一行；用完就回預設）。
 fake="${LGW_FAKE:?}"
 printf 'probe %s\\n' "$*" >> "${fake}/order.log"
 printf 'probe-env %s\\n' "${LGW_TUNNEL_ENV:-}" >> "${fake}/probe.log"
-exit "${FAKE_PROBE_RC:-0}"
+code="${FAKE_PROBE_RC:-0}"
+codes="${fake}/probe_codes"
+if [[ -s "$codes" ]]; then
+    code="$(head -n 1 "$codes")"
+    if [[ "$(wc -l < "$codes")" -gt 1 ]]; then
+        tail -n +2 "$codes" > "${codes}.next"
+        mv "${codes}.next" "$codes"
+    else
+        : > "$codes"
+    fi
+fi
+exit "$code"
 """
 
 
@@ -200,6 +216,11 @@ class MigrateSandbox(Sandbox):
             # 等待時間調 0：測試不真的等 60／90 秒（只試一次）。
             "LLMGW_CUTOVER_WAIT": "0",
             "LLMGW_KEYSYNC_GRACE": "0",
+            "LLMGW_TUNNEL_WAIT": "0",
+            "LLMGW_REMOTE_WAIT": "0",
+            "LLMGW_LOCK_WAIT": "0",
+            # inner 只接受 transient unit（低-6）：假裝是 systemd 起的。
+            "INVOCATION_ID": "fake-invocation",
         })
 
     def _write_migrate_tools(self) -> None:
@@ -232,6 +253,15 @@ class MigrateSandbox(Sandbox):
 
     def mark_unit_missing(self, unit: str, *, layer: str = "system") -> None:
         self.write(os.path.join(self.fake, "missing", layer, unit), "1\n")
+
+    def set_bus_failure(self, layer: str = "user") -> None:
+        """讓假 systemctl 對這一層印「Failed to connect to bus」並回 1（中-2）。"""
+        self.write(os.path.join(self.fake, "busfail", layer), "1\n")
+
+    def probe_codes(self, codes) -> None:
+        """隧道探針的連續結果（一次一行；像 curl_codes）。"""
+        self.write(os.path.join(self.fake, "probe_codes"),
+                   "".join(f"{code}\n" for code in codes))
 
     def order(self) -> list:
         return self.log_lines("order.log")
@@ -314,6 +344,8 @@ class MigrateSandbox(Sandbox):
                    f"RENDEZVOUS={OLD_RENDEZVOUS}\n"
                    f"IDENTITY={os.path.join(self.service_home, '.ssh', 'id_llmgw_tunnel')}\n"
                    f"KNOWN_HOSTS={os.path.join(self.service_home, '.ssh', 'known_hosts_rendezvous')}\n")
+        self.write(self.etc("keys.pass"),
+                   f"LLMGW_KEYS_PASSWORD={FAKE_PASSWORD}\n", 0o640)
         self.write(self.state("keys.env"),
                    f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n", 0o600)
         self.write(self.state(".keysync.status"),
@@ -594,6 +626,62 @@ class CutoverTests(MigrationTestCase):
         self.assertIn("prepare-migration", out)
         self.assertEqual(self.box.order(), [])
 
+    def test_outer_preflight_refuses_when_keys_pass_is_empty(self):
+        """中-8：缺前置（keys.pass 沒填）在排程前就拒絕，舊服務完全沒動。"""
+        self.box.write(self.box.etc("keys.pass"), "# 只有註解\n", 0o640)
+        rc, out, err = self.outer()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "preflight", "fail"), out)
+        self.assertTrue(has_line(out, "cutover", "fail"), out)
+        self.assertIn("keys.pass", out)
+        self.assertEqual(self.box.order(), [])
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+
+    def test_inner_preflight_refuses_without_touching_old_service(self):
+        """中-8：inner 也跑同一組 pre-flight（detached 之間可能有人改東西）。"""
+        self.box.write(self.box.etc("keys.pass"), "# 只有註解\n", 0o640)
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "preflight", "fail"), out)
+        self.assertEqual(self.box.actions(), [])
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+        self.assertFalse(os.path.exists(self.box.ctl(".cutover.state")))
+
+    def test_inner_refuses_when_state_is_reverted(self):
+        """中-3：狀態已被回滾時，inner 不得再往下切。"""
+        self.box.write_cutover_state(phase="reverted", tag=FAKE_TAG)
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 1)
+        self.assertIn("reverted", out)
+        self.assertEqual(self.box.actions(), [])
+
+    def test_inner_fails_when_another_run_holds_the_lock(self):
+        """中-3：切換與回滾共用一把鎖；拿不到就明確失敗。"""
+        lock_path = self.box.ctl(".cutover.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(os.close, fd)
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "cutover", "fail"), out)
+        self.assertEqual(self.box.actions(), [])
+
+    def test_inner_requires_invocation_id(self):
+        """低-6：--inner 只給 transient unit 用（人手照抄會被拒絕）。"""
+        rc, out, err = self.inner(INVOCATION_ID="")
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "inner", "fail"), out)
+        self.assertEqual(self.box.order(), [])
+
+    def test_revert_after_has_a_floor(self):
+        """低-6／中-3：太短的保險會在切換進行中就開跑。"""
+        rc, out, err = self.box.run_migrate(["cutover", "--tag", FAKE_TAG,
+                                             "--revert-after", "30s"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "revert-after", "fail"), out)
+        self.assertEqual(self.box.order(), [])
+
     # -- 順序 ---------------------------------------------------------------
 
     def test_inner_orders_insurance_then_old_stop_then_new_start(self):
@@ -621,12 +709,20 @@ class CutoverTests(MigrationTestCase):
         self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="user"))
         self.assertTrue(self.box.active("llmgateway.service"))
         self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+        # 停完的舊 unit 也 disable 了（高-2：觀察期內重開機不得雙跑）
+        actions = self.box.actions()
+        for unit in ("llmgateway.service", "llmgateway-tunnel.service", "key-sync.timer"):
+            self.assertIn(f"user disable {unit}", actions)
+        last_disable = max(i for i, line in enumerate(order) if "--user disable" in line)
+        self.assertLess(last_disable, index_of(order, "systemctl enable llmgateway.service"))
         # 狀態與提示
         state = self.box.cutover_state()
         self.assertEqual(state["phase"], "pending-confirm")
         self.assertEqual(state["revert_unit"], "lgw-revert.timer")
         self.assertEqual(state["tag"], FAKE_TAG)
         self.assertIn("執行 llmgwctl confirm 取消自動回舊版", out)
+        # 保險是 transient timer：重開機會消失，輸出要有提醒（高-2）
+        self.assertTrue(has_line(out, "insurance-reboot", "todo"), out)
         self.assertEqual(len(self.box.log_lines("timers.log")), 1)
         self.assert_no_values(out, err)
 
@@ -690,6 +786,30 @@ class CutoverTests(MigrationTestCase):
                              for line in self.box.order()), self.box.order())
         self.assertIn("systemctl stop lgw-revert.timer", self.box.order())
         self.assert_no_values(out, err)
+
+    def test_bus_failure_is_a_failure_not_a_skip(self):
+        """中-2：user bus 連不上不能被當成「舊 unit 本來就沒在跑」。"""
+        self.box.set_bus_failure("user")
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "stop-old", "fail"), out)
+        self.assertEqual(self.box.cutover_state()["phase"], "aborted")
+        # 舊服務沒有被真的停掉（bus 根本連不上）
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+        self.assertFalse(any(line.startswith("system start") for line in self.box.order()),
+                         self.box.order())
+
+    def test_remote_probe_retries_before_declaring_stop_loss(self):
+        """中-4：隧道剛起來時的前兩次探針失敗不該立刻停損。"""
+        self.box.probe_codes([1, 1, 0])
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(lines_with_level(out, "fail"), [], out)
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+        probes = [line for line in self.box.order() if line.startswith("probe ")]
+        # 3 次重試（第 3 次成功）＋ check 自己的 1 次
+        self.assertEqual(len(probes), 4, probes)
+        self.assertIn("第 3/3 次", out)
 
     def test_no_remote_skips_the_probe(self):
         rc, out, err = self.inner("--no-remote")
@@ -810,6 +930,7 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertIn("system stop llmgateway.service", actions)
         self.assertIn("system stop llmgateway-tunnel.service", actions)
         self.assertIn("system disable llmgateway.service", actions)
+        self.assertIn("user enable llmgateway.service", actions)
         self.assertIn("user start llmgateway.service", actions)
         self.assertIn("user start llmgateway-tunnel.service", actions)
         # 新的 llm.db 複製回舊 state，舊的先備份（帶時間戳，中-6）
@@ -863,15 +984,16 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertFalse(any("disable" in line for line in second), second)
         self.assertEqual(self.box.cutover_state()["phase"], "reverted")
 
-    def test_rollback_skips_when_insurance_holds_the_lock(self):
+    def test_rollback_fails_loudly_when_the_lock_stays_held(self):
+        """拿不到鎖不能回 0 假裝回滾了（中-3：保險被吃掉）。"""
         lock_path = self.box.ctl(".cutover.lock")
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.addCleanup(os.close, fd)
         rc, out, err = self.rollback()
-        self.assertEqual(rc, 0, out + err)
-        self.assertIn("跳過", out)
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "rollback", "fail"), out)
         self.assertEqual(self.box.order(), [])
         self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
 
@@ -1110,6 +1232,9 @@ class CutoverUnitArgvTests(unittest.TestCase):
         self.assertEqual(argv[0], self.box.env["LLMGW_SYSTEMD_RUN"])
         self.assertIn("--unit=lgw-cutover", argv)
         self.assertIn("--collect", argv)
+        self.assertIn(f"--setenv=LLMGW_PREFIX={self.box.prefix}", argv)
+        self.assertIn(f"--setenv=LLMGW_SERVICE_USER={self.box.service_user}", argv)
+        self.assertIn(f"--setenv=LLMGW_SERVICE_HOME={self.box.service_home}", argv)
         self.assertIn(f"--working-directory={self.layout.current_link}", argv)
         self.assertEqual(argv[argv.index(sys.executable):],
                          [sys.executable, "-m", "lgwctl", "cutover",
@@ -1125,6 +1250,7 @@ class CutoverUnitArgvTests(unittest.TestCase):
         self.assertIn("--unit=lgw-revert", argv)
         self.assertIn("--on-active=10m", argv)
         self.assertIn("--collect", argv)
+        self.assertIn(f"--setenv=LLMGW_PREFIX={self.box.prefix}", argv)
         self.assertEqual(argv[argv.index(sys.executable):],
                          [sys.executable, "-m", "lgwctl", "rollback-to-user",
                           "--old-home", self.box.service_home])

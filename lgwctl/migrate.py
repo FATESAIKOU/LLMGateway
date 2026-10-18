@@ -13,21 +13,31 @@
 - ``cutover --tag X --revert-after 10m [--old-home D] [--no-remote]``：切換窗口。
   人手下的那一次只做一件事：用 ``systemd-run --unit=lgw-cutover`` 起一個獨立
   的 transient unit（ssh 連線斷了也不中止），自己立刻結束。真正的工作跑在
-  ``--inner``（transient unit 帶的參數，人手不用加）：
+  ``--inner``（transient unit 帶的參數，人手不用加；它要求 systemd 設的
+  ``INVOCATION_ID``）：
   (a) 先排**反向保險** ``systemd-run --unit=lgw-revert --on-active=<revert-after>
-  … rollback-to-user``（單元名記到 ``.cutover.state``）；排不起來就不切；
+  … rollback-to-user``（單元名記到 ``.cutover.state``）；排不起來就不切。
+  ``--revert-after`` 有 5 分鐘下限（切換最壞要幾分鐘，太短會在切換中就回滾）；
   (b) 以 ``runuser -u llmgw --``（自帶 XDG_RUNTIME_DIR／DBUS_SESSION_BUS_ADDRESS）
-  停舊 user 的服務與隧道；
+  停舊 user 的服務與隧道，**接著 disable** 它們（觀察期內重開機不得新舊雙跑），
+  再用 ``is-active`` 逐一確認真的不跑了；
   (c) enable＋start 兩個新 unit；
-  (d) 等最多 60 秒本機 list 200、再經會合點探一次（``--no-remote`` 略過）；
-  (e) 任一不過就立刻 ``rollback-to-user``；全過寫 ``pending-confirm`` 並印
+  (d) 等最多 60 秒本機 list 200、等隧道 unit active，再經會合點探測（預設
+  3 次、間隔 10 秒；``--no-remote`` 略過）；
+  (e) 任一不過就立刻回舊版；全過寫 ``pending-confirm`` 並印
   ``執行 llmgwctl confirm 取消自動回舊版``。
-- ``confirm``：停掉反向保險的 timer、狀態改 ``confirmed``（觀察期從這裡起算）。
+  注意：``lgw-revert.timer`` 是 transient unit，**重開機後不在**。pending-confirm
+  期間重開機時新版會自己起、舊版已 disable（不會雙跑），但保險不會自己回舊版；
+  那時要立刻 ``confirm`` 或 ``rollback-to-user``（cutover 的輸出有這行提醒）。
+- ``confirm``：先確認反向保險沒有已經開跑、此刻在跑的是新版（舊 user unit 不是
+  active），再停掉保險的 timer、狀態改 ``confirmed``（觀察期從這裡起算）。
   狀態不是 ``pending-confirm`` 就拒絕並非零結束。
 - ``rollback-to-user [--old-home D]``：停（並 disable）新 system unit、把新的
-  ``llm.db`` 複製回舊 state（舊的先備份 ``.bak``；``keys.env`` 只在新的比較新且
-  格式驗得過時才覆蓋）、以 llmgw 身分啟動舊 user unit、探本機 list 200、停反向
-  保險、狀態寫 ``reverted``。用 flock 互斥，所以反向保險與人工同時觸發也安全。
+  ``llm.db`` 複製回舊 state（只在新的真的寫過時；舊的先備份成帶時間戳的
+  ``llm.db.bak-*``）、``keys.env`` 只在新的比較新且格式驗得過時才覆蓋、以 llmgw
+  身分 enable＋啟動舊 user unit、探本機 list 200、停反向保險、狀態寫 ``reverted``。
+  用 flock 互斥（與 cutover 的 inner 同一把；拿不到鎖會短暫重試再明確失敗），
+  所以反向保險與人工同時觸發也安全。
 - ``finalize-migration [--old-home D] --yes``：觀察期後收尾（狀態要 ``confirmed``
   且已過 3 天，否則拒絕）。停舊 unit、把舊目錄與舊 unit 檔**搬移**到
   ``<state>/old-user-layout/``（不刪除）、``loginctl disable-linger``。
@@ -115,10 +125,27 @@ ENV_LOGINCTL = "LLMGW_LOGINCTL"
 ENV_CUTOVER_WAIT = "LLMGW_CUTOVER_WAIT"
 ENV_KEYSYNC_GRACE = "LLMGW_KEYSYNC_GRACE"
 ENV_OBSERVE_DAYS = "LLMGW_OBSERVE_DAYS"
+ENV_TUNNEL_WAIT = "LLMGW_TUNNEL_WAIT"
+ENV_REMOTE_TRIES = "LLMGW_REMOTE_TRIES"
+ENV_REMOTE_WAIT = "LLMGW_REMOTE_WAIT"
+ENV_LOCK_WAIT = "LLMGW_LOCK_WAIT"
+# systemd 給每個 service／transient unit 的環境變數：只有它才證明「這是
+# 分離執行的那一次」，不是人手在 ssh 上直接跑的（低-6）。
+ENV_INVOCATION = "INVOCATION_ID"
+
+# transient unit 真的需要的呼叫端變數（其餘不轉送；中-1）。
+TRANSIENT_ENV_NAMES = ("LLMGW_PREFIX", "LLMGW_SERVICE_USER", "LLMGW_SERVICE_HOME")
 
 DEFAULT_CUTOVER_WAIT = 60.0
 DEFAULT_KEYSYNC_GRACE = 90.0
 DEFAULT_OBSERVE_DAYS = 3.0
+DEFAULT_TUNNEL_WAIT = 30.0
+DEFAULT_REMOTE_TRIES = 3
+DEFAULT_REMOTE_WAIT = 10.0
+DEFAULT_LOCK_WAIT = 30.0
+# 切換最壞要 60 秒本機＋90 秒 key 拉取＋遠端探針；保險比這短會在切換中就
+# 開跑（中-3、低-6）。給 5 分鐘當下限。
+MIN_REVERT_AFTER_SECONDS = 300.0
 SECONDS_PER_DAY = 86400.0
 MAX_KEYS_ENV_BYTES = 1 << 20
 # llm.db 一致快照：SQLite backup API 重試次數與保留的備份份數（中-6）。
@@ -126,8 +153,13 @@ DB_COPY_ATTEMPTS = 3
 DB_BACKUP_KEEP = 3
 SQLITE_HEADER = b"SQLite format 3\x00"
 
-# systemctl「這個 unit 根本不在」的訊息（停舊 unit、取消保險時要分得出來）。
-_UNIT_MISSING_MARKERS = ("not loaded", "not found", "No such file", "could not be found")
+# systemctl 的輸出分類（中-2）：先認「根本連不上／指令不在」這種確定失敗，
+# 再認「unit 本來就沒在跑」。'No such file' 這種太寬的字串不能算 missing——
+# `systemctl --user` 連不到 bus 時就是印它。
+_FATAL_MARKERS = ("Failed to connect to bus", "command not found",
+                  "No such file or directory")
+_UNIT_MISSING_MARKERS = ("not loaded", "Loaded not-found", "does not exist",
+                         "could not be found")
 
 # 反向保險的 --on-active 只收 systemd 的時間格式（不猜、不讓它帶著壞值上場）。
 _REVERT_AFTER_RE = re.compile(r"^[0-9]+(\.[0-9]+)?(us|ms|s|sec|m|min|h|hr|d|w)?$")
@@ -443,21 +475,28 @@ class _Lock:
         self.path = path
         self.fd: int | None = None
 
-    def acquire(self) -> bool:
+    def acquire(self, timeout: float = 0.0) -> bool:
+        """拿鎖；``timeout`` 秒內拿不到回 False（中-3：短暫重試，不要靜默跳過）。"""
         directory = os.path.dirname(self.path) or "."
         os.makedirs(directory, exist_ok=True)
         try:
             os.chmod(directory, 0o700)
         except OSError:
             pass
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return False
-        self.fd = fd
-        return True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(0.2, remaining))
+                continue
+            self.fd = fd
+            return True
 
     def release(self) -> None:
         if self.fd is None:
@@ -474,10 +513,12 @@ class _Lock:
 
 
 def _judge(proc) -> tuple:
-    """把一個 systemctl 的結果分成 ok｜missing（unit 不在）｜failed。"""
+    """把一個 systemctl 的結果分成 ok｜missing（unit 不在）｜failed（中-2）。"""
     if proc.returncode == 0:
         return "ok", ""
     text = (proc.stderr or "") + (proc.stdout or "")
+    if any(marker in text for marker in _FATAL_MARKERS):
+        return "failed", f"rc={proc.returncode}"
     if any(marker in text for marker in _UNIT_MISSING_MARKERS):
         return "missing", ""
     return "failed", f"rc={proc.returncode}"
@@ -524,6 +565,38 @@ def _user_systemctl_outcome(layout, *args) -> tuple:
     return _judge(proc)
 
 
+def _user_unit_state(layout, unit: str) -> str:
+    """user manager 眼中的 unit 狀態：active｜inactive｜missing｜unknown（中-2）。
+
+    ``is-active`` 的 0＝active、3＝inactive、4＝unit 檔不存在；bus 連不上是 1，
+    一律 unknown（不能當成「沒在跑」）。
+    """
+    argv = user_systemctl_argv(layout, "is-active", unit)
+    try:
+        proc = runmod.run(argv, env=layout.child_env())
+    except runmod.RunError:
+        return "unknown"
+    if proc.returncode == 0:
+        return "active"
+    if proc.returncode == 3:
+        return "inactive"
+    if proc.returncode == 4:
+        return "missing"
+    return "unknown"
+
+
+def _wait_unit_active(layout, unit: str, seconds: float) -> bool:
+    """等一個 system unit 真的 active（中-4：start 回 0 不等於連上了）。"""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if units.unit_state(layout, unit) == "active":
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(1.0, remaining))
+
+
 def _outcome(layout, layer: str, *args) -> tuple:
     """``layer="user"`` 走 runuser 包起來的 user manager，其餘走 system 層。"""
     if layer == "user":
@@ -548,6 +621,37 @@ def _stop_unit(layout, report, name: str, unit: str, *, layer: str = "system",
     _report_outcome(report, name, outcome, detail, ok=ok, missing=missing,
                     failed=f"停 {unit} 失敗（{detail}）")
     return outcome
+
+
+def _disable_unit(layout, report, name: str, unit: str, *, layer: str = "system") -> str:
+    """disable 一個 unit（開機不再自動起）；回三態。"""
+    outcome, detail = _outcome(layout, layer, "disable", unit)
+    _report_outcome(report, name, outcome, detail,
+                    ok=f"{unit} 不再開機自動起",
+                    missing=f"{unit}（本來就沒 enable）",
+                    failed=f"disable {unit} 失敗（{detail}）")
+    return outcome
+
+
+def _count_value(layout, env_name: str, default: int) -> int:
+    """整數型的旋鈕（次數）；壞值用預設。"""
+    raw = layout.env.get(env_name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(1, int(float(raw)))
+    except ValueError:
+        return default
+
+
+def _revert_after_seconds(value: str) -> float | None:
+    """把 systemd 的時間值換成秒（給下限檢查用）；格式不認得回 None。"""
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)(us|ms|s|sec|m|min|h|hr|d|w)?$", value or "")
+    if not match:
+        return None
+    factor = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "sec": 1.0, "m": 60.0, "min": 60.0,
+              "h": 3600.0, "hr": 3600.0, "d": 86400.0, "w": 604800.0}[match.group(2) or "s"]
+    return float(match.group(1)) * factor
 
 
 # -- prepare-migration ----------------------------------------------------
@@ -733,6 +837,21 @@ def _step_tunnel_config(layout, report) -> None:
 # -- cutover --------------------------------------------------------------
 
 
+def transient_setenv_args(layout) -> list:
+    """把呼叫端的 ``LLMGW_*`` 變數轉送給 transient unit（中-1）。
+
+    ``systemd-run`` 只給服務管理器的預設環境，呼叫端的 ``LLMGW_PREFIX`` 等
+    不會自動過去；不轉送的話，演練（Lima VM＋prefix 隔離）的 detached 單元
+    會打到真實路徑。只轉送真的需要的幾個，不是整個環境。
+    """
+    args = []
+    for name in TRANSIENT_ENV_NAMES:
+        value = layout.env.get(name)
+        if value not in (None, ""):
+            args.append(f"--setenv={name}={value}")
+    return args
+
+
 def cutover_unit_argv(layout, *, tag: str, revert_after: str, old_home: str,
                       no_remote: bool) -> list:
     """分離執行的 transient unit：人手下的 cutover 只跑這一件事。
@@ -745,20 +864,51 @@ def cutover_unit_argv(layout, *, tag: str, revert_after: str, old_home: str,
     if no_remote:
         inner.append("--no-remote")
     return [_tool(layout, ENV_SYSTEMD_RUN, "systemd-run"),
-            f"--unit={CUTOVER_UNIT}", "--collect",
+            f"--unit={CUTOVER_UNIT}", "--collect", *transient_setenv_args(layout),
             f"--working-directory={layout.current_link}", *inner]
 
 
 def insurance_unit_argv(layout, *, revert_after: str, old_home: str) -> list:
     """反向保險：時間到就跑 ``rollback-to-user``（system 層的 transient timer）。
 
-    這是停損的最後一道：沒人 confirm 就自己回舊版。
+    這是停損的最後一道：沒人 confirm 就自己回舊版。注意 transient 的 timer
+    **重開機就沒了**：pending-confirm 期間重開機不會自動回舊版（見 cutover
+    輸出的提醒與模組說明）。
     """
     return [_tool(layout, ENV_SYSTEMD_RUN, "systemd-run"),
             f"--unit={REVERT_UNIT}", f"--on-active={revert_after}", "--collect",
+            *transient_setenv_args(layout),
             f"--working-directory={layout.current_link}",
             layout.python3, "-m", "lgwctl", "rollback-to-user",
             "--old-home", old_home]
+
+
+def preflight(layout, tag: str) -> list:
+    """切換前的不影響舊服務檢查（中-8）；回問題清單（空＝可以切）。
+
+    outer 在排 transient unit **之前**、inner 在排保險之前都跑同一組：缺
+    keys.pass 的值、tunnel.env 沒填、版本目錄服務帳號進不去…這些 prepare 只
+    列 todo，切下去才發現就等於白白停一次舊服務（還要回滾）。
+    """
+    problems: list[str] = []
+    if layout.installed_tag() != tag:
+        problems.append(f"current 不是 {tag}（先跑 prepare-migration --tag {tag}）")
+    tag_dir = layout.tag_dir(tag)
+    try:
+        mode = os.stat(tag_dir).st_mode
+    except OSError:
+        problems.append(f"版本目錄不在：{tag_dir}")
+        mode = None
+    if mode is not None and not (mode & 0o005):
+        problems.append(f"版本目錄服務帳號進不去（mode {oct(mode & 0o777)}；高-1）")
+    if not os.path.isfile(layout.keys_env):
+        problems.append("keys.env 不在（先跑 prepare-migration）")
+    if not install._keys_pass_filled(layout):
+        problems.append(f"keys.pass 沒有非空的 {install.KEYS_PASS_VAR}（要本人填）")
+    ready, missing = layout.tunnel_config_state()
+    if not ready:
+        problems.append(f"tunnel.env 還沒就緒（{missing}）")
+    return problems
 
 
 def cutover(layout, *, tag: str, revert_after: str = DEFAULT_REVERT_AFTER,
@@ -773,12 +923,27 @@ def cutover(layout, *, tag: str, revert_after: str = DEFAULT_REVERT_AFTER,
     if not _REVERT_AFTER_RE.match(revert_after or ""):
         report.fail("revert-after", f"時間格式不認得（例 10m、600s）：{revert_after}")
         return 1
+    seconds = _revert_after_seconds(revert_after)
+    if seconds is None or seconds < MIN_REVERT_AFTER_SECONDS:
+        report.fail("revert-after",
+                    f"太短（{revert_after}）：切換最壞要幾分鐘，保險會在切換進行中"
+                    f"就開跑；至少 {int(MIN_REVERT_AFTER_SECONDS / 60)}m")
+        return 1
     old = OldLayout(old_home or layout.service_home)
     if inner:
+        # --inner 只有 systemd-run 起的 transient unit 會帶（低-6）：人手在 ssh
+        # 上照抄整串指令會讓切換失去分離執行，連線一斷就停在中間。
+        if not layout.env.get(ENV_INVOCATION):
+            report.fail("inner", "--inner 只給 lgw-cutover 的 transient unit 用"
+                                 "（沒有 INVOCATION_ID；人手請直接跑 llmgwctl cutover）")
+            return 1
         return _cutover_inner(layout, old, tag=tag, revert_after=revert_after,
                               no_remote=no_remote, report=report)
-    if layout.installed_tag() != tag:
-        report.fail("cutover", f"current 不是 {tag}；先跑 prepare-migration --tag {tag}")
+    problems = preflight(layout, tag)
+    if problems:
+        for problem in problems:
+            report.fail("preflight", problem)
+        report.fail("cutover", "前置條件沒過；不排程（舊服務完全沒動）")
         return 1
     argv = cutover_unit_argv(layout, tag=tag, revert_after=revert_after,
                              old_home=old.home, no_remote=no_remote)
@@ -797,9 +962,37 @@ def cutover(layout, *, tag: str, revert_after: str = DEFAULT_REVERT_AFTER,
 
 def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
                    no_remote: bool, report: MigrationReport) -> int:
-    """切換窗口真正的工作（跑在 systemd-run 起的 transient unit 裡）。"""
-    if layout.installed_tag() != tag:
-        report.fail("cutover", f"current 不是 {tag}；先跑 prepare-migration --tag {tag}")
+    """切換窗口真正的工作（跑在 systemd-run 起的 transient unit 裡）。
+
+    與 rollback-to-user 共用同一把 flock（中-3）：保險提早到、或切換中有人
+    手動回滾時，兩邊不會同時動 unit 與互相覆寫狀態。
+    """
+    lock = _Lock(cutover_lock_path(layout))
+    try:
+        if not lock.acquire(_wait_seconds(layout, ENV_LOCK_WAIT, DEFAULT_LOCK_WAIT)):
+            report.fail("cutover", "另一個切換／回滾正在跑（等不到鎖）；不切")
+            return 1
+    except OSError as exc:
+        report.fail("cutover", f"拿不到鎖（{type(exc).__name__}）：{lock.path}")
+        return 1
+    try:
+        return _cutover_locked(layout, old, tag=tag, revert_after=revert_after,
+                               no_remote=no_remote, report=report)
+    finally:
+        lock.release()
+
+
+def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
+                    no_remote: bool, report: MigrationReport) -> int:
+    state = read_state(layout)
+    if state.get("phase") == PHASE_REVERTED:
+        report.fail("cutover", "狀態是 reverted（已經回過舊版）；不重複切換")
+        return 1
+    problems = preflight(layout, tag)
+    if problems:
+        for problem in problems:
+            report.fail("preflight", problem)
+        report.fail("cutover", "前置條件沒過；沒動舊服務")
         return 1
 
     # (a) 先排反向保險；排不起來就不切（保險是停損的最後一道）
@@ -823,7 +1016,7 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
         return 1
     report.ok("insurance", f"{REVERT_TIMER_UNIT}（{revert_after} 後沒 confirm 就自動回舊版）")
 
-    # (b) 停舊 user 的服務與隧道（root 代做，runuser 自帶 XDG／DBUS）
+    # (b) 停舊 user 的服務與隧道，並且 disable：觀察期內重開機不得新舊雙跑（高-2）
     stopped: list[str] = []
     for unit in OLD_STOP_ORDER:
         outcome = _stop_unit(layout, report, "stop-old", unit, layer="user",
@@ -840,6 +1033,35 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
                 pass
             report.fail("cutover", "停舊服務失敗，沒切換（已把停掉的叫回來）")
             return 1
+        # 停掉的（含本來就沒在跑但檔案在的）一律 disable：重開機不再自動起。
+        if outcome != "failed":
+            disabled = _disable_unit(layout, report, "disable-old", unit, layer="user")
+            if disabled == "failed":
+                _restore_old_units(layout, stopped, report)
+                _cancel_revert(layout, REVERT_TIMER_UNIT, report)
+                try:
+                    write_state(layout, phase=PHASE_ABORTED, tag=tag, reason="disable-old")
+                except OSError:
+                    pass
+                report.fail("cutover", "舊 unit disable 不掉（重開機會雙跑）；沒切換")
+                return 1
+    if not _confirm_old_units_stopped(layout, report):
+        _restore_old_units(layout, stopped, report)
+        _cancel_revert(layout, REVERT_TIMER_UNIT, report)
+        try:
+            write_state(layout, phase=PHASE_ABORTED, tag=tag, reason="old-still-active")
+        except OSError:
+            pass
+        report.fail("cutover", "舊 unit 沒有真的停（is-active 不是 inactive）；沒切換")
+        return 1
+    report.ok("stopped-check", "舊 unit 都停了（is-active 逐一確認）")
+
+    # 不可逆步驟前再確認一次狀態沒被回滾蓋掉（中-3）。
+    if read_state(layout).get("phase") != PHASE_CUTOVER:
+        _restore_old_units(layout, stopped, report)
+        _cancel_revert(layout, REVERT_TIMER_UNIT, report)
+        report.fail("cutover", "狀態在切換中被改掉（可能已被回滾）；中止")
+        return 1
 
     # (c) 啟新 unit（enable：觀察期內重開機也要起得來）
     for unit in (SERVICE_NAME, TUNNEL_SERVICE_NAME):
@@ -852,7 +1074,7 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
         return _stop_loss(layout, old, [f"{TUNNEL_SERVICE_NAME} 起不來"], report)
     report.ok("start", TUNNEL_SERVICE_NAME)
 
-    # (d) 本機 list 200（最多 60 秒）＋經會合點探一次
+    # (d) 本機 list 200（最多 60 秒）＋隧道真的 active＋經會合點探測（重試）
     problems: list[str] = []
     if probe.wait_local_ok(layout, _wait_seconds(layout, ENV_CUTOVER_WAIT,
                                                  DEFAULT_CUTOVER_WAIT)):
@@ -860,10 +1082,16 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
     else:
         report.fail("list-local", "時間內等不到 200")
         problems.append("本機 list 非 200")
+    if not _wait_unit_active(layout, TUNNEL_SERVICE_NAME,
+                             _wait_seconds(layout, ENV_TUNNEL_WAIT, DEFAULT_TUNNEL_WAIT)):
+        report.fail("tunnel-active", "隧道 unit 時間內沒有 active")
+        problems.append("隧道 unit 沒起來")
+    else:
+        report.ok("tunnel-active", TUNNEL_SERVICE_NAME)
     if no_remote:
         report.skip("list-remote", "--no-remote 略過")
     else:
-        level, detail = probe.remote(layout)
+        level, detail = _probe_remote_with_retry(layout)
         report.add("ok" if level == "ok" else level, "list-remote", detail)
         if level not in ("ok",):
             problems.append("經會合點非 200")
@@ -871,10 +1099,14 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
         return _stop_loss(layout, old, problems, report)
 
     # (e) check；它的 keysync 那項要等第一次拉取有結果才有意義（不然一定 todo）
+    started = time.time()
     if not _wait_file(layout.keysync_status_file,
-                      _wait_seconds(layout, ENV_KEYSYNC_GRACE, DEFAULT_KEYSYNC_GRACE)):
-        report.todo("keysync", "等不到第一次拉取的結果（check 會照實報）")
-    code = check.run(layout, report=report, no_remote=no_remote)
+                      _wait_seconds(layout, ENV_KEYSYNC_GRACE, DEFAULT_KEYSYNC_GRACE),
+                      since=started):
+        report.todo("keysync", "等不到這次切換後第一次拉取的結果（check 會照實報）")
+    # 用 check 自己的 Report：遷移自己的 todo 不能讓 check 的結束碼變成 2
+    # （兩者共用一份報告時，任何 todo 都會被當成「check 非 0」→ 假停損）。
+    code = check.run(layout, no_remote=no_remote)
     if code != 0:
         return _stop_loss(layout, old, [f"check 非 0（rc={code}）"], report)
 
@@ -883,22 +1115,70 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
     except OSError as exc:
         return _stop_loss(layout, old, [f"寫狀態失敗（{type(exc).__name__}）"], report)
     report.ok("confirm-needed", "執行 llmgwctl confirm 取消自動回舊版")
+    report.todo("insurance-reboot",
+                "觀察期內不要重開機：lgw-revert.timer 是 transient，重開機後不會"
+                "回來（新版會自己起、舊版已 disable，不會雙跑）；那時請立刻 "
+                "llmgwctl confirm 或 llmgwctl rollback-to-user")
     return 0
 
 
+def _confirm_old_units_stopped(layout, report) -> bool:
+    """停完舊 unit 後逐一用 user manager 的 is-active 確認（中-2）。"""
+    ok = True
+    for unit in OLD_STOP_ORDER:
+        state = _user_unit_state(layout, unit)
+        if state in ("inactive", "missing"):
+            continue
+        report.fail("stopped-check", f"{unit} 還是 {state}；不切")
+        ok = False
+    return ok
+
+
+def _probe_remote_with_retry(layout) -> tuple:
+    """經會合點的探針：有間隔地重試（中-4），全部失敗才算停損。
+
+    新隧道的 ssh 連線／reverse forward 建立要時間，舊隧道剛停時會合點的
+    4710／4711 也可能還沒釋放；單次探測會把「還沒連上」判成「切換失敗」。
+    """
+    tries = _count_value(layout, ENV_REMOTE_TRIES, DEFAULT_REMOTE_TRIES)
+    interval = _wait_seconds(layout, ENV_REMOTE_WAIT, DEFAULT_REMOTE_WAIT)
+    level, detail = "fail", ""
+    for attempt in range(tries):
+        level, detail = probe.remote(layout)
+        if level == "ok":
+            if tries > 1:
+                detail = f"{detail}（第 {attempt + 1}/{tries} 次）"
+            return level, detail
+        if attempt + 1 < tries:
+            time.sleep(interval)
+    return level, f"探了 {tries} 次，最後一次：{detail}"
+
+
 def _stop_loss(layout, old: OldLayout, problems: list, report: MigrationReport) -> int:
-    """停損成立：立刻回舊版（反向保險那一套邏輯，同一個 rollback-to-user）。"""
+    """停損成立：立刻回舊版（反向保險那一套邏輯，同一個 _rollback_locked）。
+
+    inner 已經持有 flock，直接呼叫不拿鎖的版本（不然會與自己死結）。
+    """
     report.fail("cutover", "停損成立（" + "、".join(problems) + "）；立刻回舊版")
-    rollback_to_user(layout, old_home=old.home, report=report)
+    _rollback_locked(layout, old, report)
     return 1
 
 
-def _wait_file(path: str, seconds: float) -> bool:
-    """等一個檔出現，最多 seconds 秒（0＝只試一次）。"""
+def _wait_file(path: str, seconds: float, *, since: float | None = None) -> bool:
+    """等一個檔出現（或比 ``since`` 新），最多 seconds 秒（0＝只試一次）。
+
+    低-5：切換前留下的舊 ``.keysync.status`` 不能讓 90 秒等待立刻通過。
+    """
     deadline = time.monotonic() + max(0.0, float(seconds))
     while True:
         if os.path.isfile(path):
-            return True
+            if since is None:
+                return True
+            try:
+                if os.path.getmtime(path) >= float(since):
+                    return True
+            except OSError:
+                pass
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -906,8 +1186,11 @@ def _wait_file(path: str, seconds: float) -> bool:
 
 
 def _restore_old_units(layout, units_list: list, report) -> None:
-    """中止切換時，把剛剛停掉的舊 unit 叫回來（best effort）。"""
+    """中止切換時，把剛剛停掉（且 disable 過）的舊 unit 叫回來。"""
     for unit in units_list:
+        outcome, _ = _user_systemctl_outcome(layout, "enable", unit)
+        if outcome == "failed":
+            report.fail("enable-old", f"{unit} enable 不回來（重開機不會自動起）")
         outcome, detail = _user_systemctl_outcome(layout, "start", unit)
         if outcome == "ok":
             report.ok("start-old", f"{unit}（叫回來）")
@@ -967,36 +1250,43 @@ def rollback_to_user(layout, *, old_home: str | None = None,
     old = OldLayout(old_home or layout.service_home)
     lock = _Lock(cutover_lock_path(layout))
     try:
-        if not lock.acquire():
-            report.ok("rollback", "另一個回舊版正在跑（跳過，不會重複動作）")
-            return 0
+        if not lock.acquire(_wait_seconds(layout, ENV_LOCK_WAIT, DEFAULT_LOCK_WAIT)):
+            # 中-3：不能回 0 了事——保險與切換同時發生時，靜默「跳過」等於保險
+            # 被吃掉卻沒有真的回滾。短暫重試後還拿不到就明確失敗。
+            report.fail("rollback", "另一個切換／回滾還在做（等不到鎖）；這次沒有回滾")
+            return 1
     except OSError as exc:
         report.fail("rollback", f"拿不到鎖（{type(exc).__name__}：{lock.path}）")
         return 1
     try:
-        state = read_state(layout)
-        if state.get("phase") == PHASE_REVERTED:
-            # 已經回過（人工先回、保險後來才觸發）：再確認一次就好，不動資料——
-            # 新的 llm.db 已經複製回去過，再複製一次只會蓋掉舊服務寫的東西。
-            report.ok("rollback", "狀態已經是 reverted（人工與保險重複觸發也安全）")
-            _start_old_units(layout, report)
-            ok = _wait_old_list(layout, report)
-            _cancel_revert(layout, _state_revert_unit(state, report), report)
-            return 0 if ok else 1
-
-        _stop_new_units(layout, report)
-        _restore_db(layout, old, state, report)
-        _restore_keys_env(layout, old, report)
-        started = _start_old_units(layout, report)
-        ok = _wait_old_list(layout, report)
-        _cancel_revert(layout, _state_revert_unit(state, report), report)
-        try:
-            write_state(layout, phase=PHASE_REVERTED, local_ok=bool(ok and started))
-        except OSError as exc:
-            report.fail("rollback", f"寫狀態失敗（{type(exc).__name__}）")
-        return 0 if (ok and started) else 1
+        return _rollback_locked(layout, old, report)
     finally:
         lock.release()
+
+
+def _rollback_locked(layout, old: OldLayout, report) -> int:
+    """回舊版的本體（呼叫方已持有 flock；停損時由 inner 直接呼叫）。"""
+    state = read_state(layout)
+    if state.get("phase") == PHASE_REVERTED:
+        # 已經回過（人工先回、保險後來才觸發）：再確認一次就好，不動資料——
+        # 新的 llm.db 已經複製回去過，再複製一次只會蓋掉舊服務寫的東西。
+        report.ok("rollback", "狀態已經是 reverted（人工與保險重複觸發也安全）")
+        _start_old_units(layout, report)
+        ok = _wait_old_list(layout, report)
+        _cancel_revert(layout, _state_revert_unit(state, report), report)
+        return 0 if ok else 1
+
+    _stop_new_units(layout, report)
+    _restore_db(layout, old, state, report)
+    _restore_keys_env(layout, old, report)
+    started = _start_old_units(layout, report)
+    ok = _wait_old_list(layout, report)
+    _cancel_revert(layout, _state_revert_unit(state, report), report)
+    try:
+        write_state(layout, phase=PHASE_REVERTED, local_ok=bool(ok and started))
+    except OSError as exc:
+        report.fail("rollback", f"寫狀態失敗（{type(exc).__name__}）")
+    return 0 if (ok and started) else 1
 
 
 def _state_revert_unit(state: dict, report=None) -> str:
@@ -1120,9 +1410,19 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
 
 
 def _start_old_units(layout, report) -> bool:
-    """以 llmgw 身分啟動舊 user unit（同 cutover 停它們的做法）。"""
+    """以 llmgw 身分（重新 enable 並）啟動舊 user unit。
+
+    cutover 停舊 unit 時順便 disable（高-2，觀察期重開機不得雙跑）；回舊版時
+    要 enable 回來，不然回滾後重開機舊服務不會自己起。
+    """
     ok = True
     for unit in OLD_START_ORDER:
+        outcome, _ = _user_systemctl_outcome(layout, "enable", unit)
+        if outcome == "failed":
+            ok = False
+            report.fail("enable-old", f"{unit} enable 不回來（重開機不會自動起）")
+        else:
+            report.ok("enable-old", f"{unit}（開機會自動起）")
         outcome, detail = _user_systemctl_outcome(layout, "start", unit)
         if outcome == "ok":
             report.ok("start-old", f"{unit}（user 層）")
