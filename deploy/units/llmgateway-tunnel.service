@@ -1,0 +1,17 @@
+[Unit]
+Description=LLMGateway tunnel keeper (ssh reverse tunnel to the rendezvous)
+After=llmgateway.service
+
+[Service]
+Type=simple
+User=llmgw
+# 設定檔在 /etc/llmgateway/tunnel.env（新版面）；LGW_TUNNEL_ENV 是程式的覆寫點。
+Environment=LGW_TUNNEL_ENV=/etc/llmgateway/tunnel.env
+ExecStart=/opt/llmgateway/current/ops-scripts/llmgateway-tunnel
+Restart=always
+RestartSec=10
+# 設定缺一（config_missing）時以 78 結束：不要反覆重開
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=multi-user.target

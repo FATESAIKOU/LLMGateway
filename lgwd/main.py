@@ -6,13 +6,16 @@
 - 每個請求處理前看一次 keys.env 的 mtime（v5.4：key-sync 換檔後由這裡自己偵測，
   不再用 SIGHUP／ExecReload）：變了就重讀，失敗沿用舊的、記 log、不含值。
   policy 只在啟動時讀（換政策要重啟）。
-- SIGTERM 正常關閉。
+- 內建 key 拉取計時（#35 T2，見 lgwd/keysync.py）：背景執行緒每 interval 秒跑一次
+  ops-scripts/key-sync；interval 0 或 script 不可用＝關閉。失敗與逾時不影響 API。
+- SIGTERM 正常關閉（含計時執行緒）。
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import signal
 import sys
@@ -22,6 +25,9 @@ from dataclasses import dataclass
 from .clock import Clock, SystemClock
 from .http import make_api_server
 from .keys import KeyFileError, KeyStore
+from .keysync import DEFAULT_INTERVAL as DEFAULT_KEYSYNC_INTERVAL
+from .keysync import DEFAULT_TIMEOUT as DEFAULT_KEYSYNC_TIMEOUT
+from .keysync import KeySyncTimer, default_script as default_keysync_script
 from .policy import PolicyError, load_policy
 from .registry import RegistryService
 
@@ -41,6 +47,9 @@ ENV_POLICY = "LGWD_POLICY"
 ENV_KEYS = "LGWD_KEYS"
 ENV_API_HOST = "LGWD_API_HOST"
 ENV_API_PORT = "LGWD_API_PORT"
+ENV_KEYSYNC_SCRIPT = "LGW_KEYSYNC_SCRIPT"
+ENV_KEYSYNC_INTERVAL = "LGW_KEYSYNC_INTERVAL"
+ENV_KEYSYNC_TIMEOUT = "LGW_KEYSYNC_TIMEOUT"
 
 
 @dataclass
@@ -50,6 +59,10 @@ class Config:
     keys_path: str = DEFAULT_KEYS_PATH
     api_host: str = DEFAULT_API_HOST
     api_port: int = DEFAULT_API_PORT
+    # 內建 key 拉取（#35 T2）：script None＝用預設路徑；interval 0＝整個關閉。
+    keysync_script: str | None = None
+    keysync_interval: float = DEFAULT_KEYSYNC_INTERVAL
+    keysync_timeout: float = DEFAULT_KEYSYNC_TIMEOUT
 
 
 def _parse_port(text: str) -> int:
@@ -57,6 +70,22 @@ def _parse_port(text: str) -> int:
     if not 0 <= port <= 65535:
         raise ValueError("port out of range")
     return port
+
+
+def _parse_interval(text: str) -> float:
+    """keysync interval：0 或正有限秒數（0＝關閉）。"""
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("keysync interval out of range")
+    return value
+
+
+def _parse_timeout(text: str) -> float:
+    """keysync timeout：正有限秒數。"""
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("keysync timeout out of range")
+    return value
 
 
 def load_config(argv: list[str] | None = None, env=None) -> Config:
@@ -73,6 +102,9 @@ def load_config(argv: list[str] | None = None, env=None) -> Config:
     parser.add_argument("--keys", default=None)
     parser.add_argument("--api-host", dest="api_host", default=None)
     parser.add_argument("--api-port", default=None)
+    parser.add_argument("--keysync-script", default=None)
+    parser.add_argument("--keysync-interval", default=None)
+    parser.add_argument("--keysync-timeout", default=None)
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     api_host = args.api_host or env_of(ENV_API_HOST) or DEFAULT_API_HOST
@@ -86,6 +118,18 @@ def load_config(argv: list[str] | None = None, env=None) -> Config:
             api_port = _parse_port(env_of(ENV_API_PORT))
         else:
             api_port = DEFAULT_API_PORT
+        if args.keysync_interval is not None:
+            keysync_interval = _parse_interval(args.keysync_interval)
+        elif env_of(ENV_KEYSYNC_INTERVAL) is not None:
+            keysync_interval = _parse_interval(env_of(ENV_KEYSYNC_INTERVAL))
+        else:
+            keysync_interval = DEFAULT_KEYSYNC_INTERVAL
+        if args.keysync_timeout is not None:
+            keysync_timeout = _parse_timeout(args.keysync_timeout)
+        elif env_of(ENV_KEYSYNC_TIMEOUT) is not None:
+            keysync_timeout = _parse_timeout(env_of(ENV_KEYSYNC_TIMEOUT))
+        else:
+            keysync_timeout = DEFAULT_KEYSYNC_TIMEOUT
     except (TypeError, ValueError) as exc:
         raise ValueError(f"bad config value: {exc}") from exc
 
@@ -95,7 +139,27 @@ def load_config(argv: list[str] | None = None, env=None) -> Config:
         keys_path=args.keys or env_of(ENV_KEYS) or DEFAULT_KEYS_PATH,
         api_host=api_host,
         api_port=api_port,
+        keysync_script=args.keysync_script or env_of(ENV_KEYSYNC_SCRIPT),
+        keysync_interval=keysync_interval,
+        keysync_timeout=keysync_timeout,
     )
+
+
+def make_keysync(config: Config, env=None) -> KeySyncTimer | None:
+    """依設定建內建 key 拉取計時器；關閉時回 None 並記一行 log。
+
+    關閉＝`interval` 為 0，或 script 沒設又沒有預設路徑可用（不存在／不是執行檔）。
+    """
+    src = os.environ if env is None else env
+    if config.keysync_interval <= 0:
+        _LOG.info("keysync disabled: interval=0")
+        return None
+    script = config.keysync_script or default_keysync_script(src)
+    if not os.path.isfile(script) or not os.access(script, os.X_OK):
+        _LOG.warning("keysync disabled: script not usable: %s", script)
+        return None
+    return KeySyncTimer(script, config.keysync_interval, timeout=config.keysync_timeout,
+                        keys_path=config.keys_path, env=src)
 
 
 class _Current:
@@ -141,6 +205,7 @@ class Gateway:
         self._service = RegistryService(config.db, policy, keys, self._clock)
         self._current = _Current(self, self._service)
         self.api_server = make_api_server(self._current, config.api_host, config.api_port)
+        self.keysync = make_keysync(config)  # 關閉時是 None
         self._thread: threading.Thread | None = None
 
     @property
@@ -162,8 +227,12 @@ class Gateway:
         )
         thread.start()
         self._thread = thread
+        if self.keysync is not None:
+            self.keysync.start()  # 啟動後先跑一次（在 30 秒內），之後照 interval
 
     def stop(self) -> None:
+        if self.keysync is not None:
+            self.keysync.stop()  # 先叫停 key 拉取，再關 API
         try:
             self.api_server.shutdown()
         except Exception:  # 關閉中出錯不擋後面
