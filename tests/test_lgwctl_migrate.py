@@ -873,8 +873,57 @@ class CutoverTests(MigrationTestCase):
         self.assertIn("執行 llmgwctl confirm 取消自動回舊版", out)
         # 保險是 transient timer：重開機會消失，輸出要有提醒（高-2）
         self.assertTrue(has_line(out, "insurance-reboot", "todo"), out)
+        # 中-5：窗口內（舊已 disable、新還沒 enable）重開機會什麼都不起，警告要
+        # 印在停舊之前。
+        self.assertTrue(has_line(out, "reboot-window", "todo"), out)
+        self.assertLess(out.index("reboot-window"), out.index("stop-old"),
+                        out)
         self.assertEqual(len(self.box.log_lines("timers.log")), 1)
         self.assert_no_values(out, err)
+
+    def test_keysync_wait_uses_the_cutover_start_time(self):
+        """中-1：門檻是切換開始（啟動新服務前），不是等待開始。
+
+        新的 lgwd 在啟動當下就寫了第一次拉取的狀態（假 systemctl 模擬）；用
+        「等待開始」當門檻會把那檔案當成太舊，白等滿 grace 並印假 todo。
+        """
+        started = time.monotonic()
+        rc, out, err = self.inner(
+            LLMGW_KEYSYNC_GRACE="5",
+            LGW_FAKE_KEYSYNC_AT_START=self.box.state(".keysync.status"))
+        elapsed = time.monotonic() - started
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(has_line(out, "keysync", "todo"), out)
+        self.assertTrue(has_line(out, "keysync", "ok"), out)
+        self.assertLess(elapsed, 4.0, "正常情況不該等滿 keysync grace")
+
+    def test_insurance_gone_during_cutover_is_reported(self):
+        """中-2：一次性 timer 在切換拖太久時會到點消失，不能宣稱還有保險。"""
+        rc, out, err = self.inner(LGW_FAKE_SYSTEMD_RUN_SKIP_ACTIVE="1")
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "insurance", "fail"), out)
+        self.assertTrue(has_line(out, "no-insurance", "todo"), out)
+        self.assertIn("沒有自動回舊版", out)
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
+    def test_outer_preflight_refuses_when_gh_is_not_logged_in(self):
+        """中-6：gh 沒登入時 check 只會 todo（rc 2）→ 不能先停舊服務再停損。"""
+        rc, out, err = self.outer(FAKE_GH_AUTH_RC="1")
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "preflight", "fail"), out)
+        self.assertIn("gh 沒登入", out)
+        self.assertEqual(self.box.order(), [])
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+
+    def test_outer_preflight_runs_the_policy_dry_run(self):
+        """中-7：壞 policy 要在停舊服務、排保險之前就擋下。"""
+        with mock.patch("lgwctl.upgrade._dry_run_policy", return_value=False):
+            rc, out, err = self.outer()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "preflight", "fail"), out)
+        self.assertIn("policy dry-run", out)
+        self.assertEqual(self.box.order(), [])
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
 
     # -- 停損 ---------------------------------------------------------------
 
@@ -1083,6 +1132,15 @@ class ConfirmTests(MigrationTestCase):
         self.assertTrue(has_line(out, "confirm", "fail"), out)
         self.assertIn("沒有狀態檔", out)
 
+    def test_confirm_refuses_when_the_insurance_service_failed(self):
+        """低-13：保險曾跑到一半失敗（failed 殘留）不能直接 confirm。"""
+        self.box.write(os.path.join(self.box.fake, "failed", "system",
+                                    "lgw-revert.service"), "1\n")
+        rc, out, err = self.box.run_migrate(["confirm"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "insurance-failed", "fail"), out)
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
     def test_confirm_refuses_when_the_timer_cannot_be_stopped(self):
         self.box.fail_action("stop", "lgw-revert.timer")
         rc, out, err = self.box.run_migrate(["confirm"])
@@ -1134,6 +1192,8 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertIn("system disable llmgateway.service", actions)
         self.assertIn("user enable llmgateway.service", actions)
         self.assertIn("user enable key-sync.timer", actions)
+        # 中-11：只 enable 只建開機 symlink；要 start 才會立刻開始計時。
+        self.assertIn("user start key-sync.timer", actions)
         self.assertIn("user start llmgateway.service", actions)
         self.assertIn("user start llmgateway-tunnel.service", actions)
         # 新的 llm.db 複製回舊 state，舊的先備份（帶時間戳，中-6）
