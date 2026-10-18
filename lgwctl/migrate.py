@@ -288,6 +288,20 @@ def _exists(path: str) -> bool:
     return os.path.lexists(path)
 
 
+def _target_exists(path: str) -> bool:
+    """目標是不是「可以用的一般檔」：一般檔、不是 symlink、大小大於 0（低-10）。
+
+    目標可能在 llmgw 可寫的目錄（舊版留下的 state、或人工放錯的 symlink）：
+    ``lexists`` 會把斷鏈當成「已存在」而 skip，切換時 systemd 的
+    ``EnvironmentFile`` 或新服務開 db 才失敗。斷鏈／空檔都當不存在，照常放新的。
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size > 0
+
+
 def _open_regular(path: str) -> int:
     """``O_NOFOLLOW`` 開檔，並用**同一個 fd** 驗證是一般檔；不成立回 -1（中-9）。
 
@@ -905,7 +919,25 @@ def prepare(layout, *, tag: str, old_home: str | None = None, force: bool = Fals
         report.fail("tag", f"格式不符（要 {TAG_PATTERN}）：{tag}")
         return report.exit_code(todo_ok=True)
     old = OldLayout(old_home or layout.service_home)
+    # 低-4：prepare 也會複製 db／keys 並寫狀態檔，要與 cutover／rollback／
+    # finalize 共用同一把 flock（不然回滾與 prepare 會互相覆寫狀態與檔案）。
+    lock = _Lock(cutover_lock_path(layout))
+    try:
+        if not lock.acquire(_wait_seconds(layout, ENV_LOCK_WAIT, DEFAULT_LOCK_WAIT)):
+            report.fail("prepare", "另一個切換／回滾／收尾正在跑（等不到鎖）；稍後再 prepare")
+            return report.exit_code(todo_ok=True)
+    except OSError as exc:
+        report.fail("prepare", f"拿不到鎖（{type(exc).__name__}）：{lock.path}")
+        return report.exit_code(todo_ok=True)
+    try:
+        return _prepare_locked(layout, old, tag=tag, force=force, report=report)
+    finally:
+        lock.release()
 
+
+def _prepare_locked(layout, old: OldLayout, *, tag: str, force: bool,
+                    report) -> int:
+    """prepare 的本體（已持有 flock）。"""
     if not install._step_account(layout, report):
         return report.exit_code(todo_ok=True)
     if not install._step_dirs(layout, report):
@@ -971,11 +1003,7 @@ def _copy_old_files(layout, old: OldLayout, report, *, force: bool) -> None:
 
 def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
     dst = layout.keys_env
-    try:
-        existing = os.path.isfile(dst) and os.path.getsize(dst) > 0
-    except OSError:            # 斷掉的 symlink：getsize 會丟（低-1）
-        existing = False
-    if existing and not force:
+    if _target_exists(dst) and not force:
         report.skip("state-keys-env", f"{dst} 已存在（不覆蓋）")
         return
     if _exists(old.keys_env) and not _regular_file(old.keys_env):
@@ -1004,7 +1032,7 @@ def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
 
 def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
     dst = layout.db_file
-    if _exists(dst) and not force:
+    if _target_exists(dst) and not force:
         report.skip("state-db", f"{dst} 已存在（不覆蓋）")
         return
     if _exists(old.db_file) and not _regular_file(old.db_file):
@@ -1024,7 +1052,7 @@ def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
 
 def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
                    src: str, dst: str, template: str) -> None:
-    if _exists(dst) and not force:
+    if _target_exists(dst) and not force:
         report.skip(name, f"{dst} 已存在（不覆蓋）")
         return
     if _exists(src) and not _regular_file(src):
@@ -1061,7 +1089,16 @@ def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
 def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
     dst = layout.keys_pass_file
     if not force and _has_password(dst):
-        report.skip("keys-pass", f"{dst} 已有值（不覆蓋）")
+        # 低-9：有值就 skip，但權限還是要校正（人工建立／舊版留下的可能是
+        # root:root 0600 或 llmgw:llmgw，llmgwctl sync 會讀不到）；與 install 對齊。
+        try:
+            os.chmod(dst, 0o640)
+        except OSError as exc:
+            report.fail("keys-pass", f"chmod 失敗（{type(exc).__name__}）")
+            return
+        if not _chown_keys_pass(layout, report):
+            return
+        report.skip("keys-pass", f"{dst} 已有值（不覆蓋；owner／mode 已校正）")
         return
     if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
         # 中-5：舊 keysync.env 在服務帳號控制下（symlink 到 /proc/… 或外部檔）。
@@ -1096,7 +1133,7 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
 def _step_keysync_sha(layout, old: OldLayout, report, *, force: bool) -> None:
     """``.keysync.sha`` 一起複製（低-8a）：省一次 key 的全量重拉。"""
     src, dst = old.keysync_sha_file, layout.keysync_sha_file
-    if _exists(dst) and not force:
+    if _target_exists(dst) and not force:
         report.skip("state-keysync-sha", f"{dst} 已存在（不覆蓋）")
         return
     if _exists(src) and not _regular_file(src):
@@ -1836,7 +1873,13 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
     if not _db_source_ok(src):
         report.skip("db-copy", "新的 llm.db 還不是可用的資料庫（新服務沒寫過）；不覆蓋舊的")
         return
-    if not _db_has_new_writes(state, src, dst):
+    started = _new_service_ts(state)
+    if started is None:
+        # 低-7：沒有切換時間就無法判斷新 db 是不是新服務寫的（prepare 快照的
+        # mtime 是建立時間，可能比舊 db 新）。安全的一邊是不覆蓋。
+        report.skip("db-copy", "狀態檔沒有切換時間（沒跑過切換？）；不覆蓋舊的")
+        return
+    if not _db_has_new_writes(started, src):
         report.skip("db-copy", "新的 llm.db 沒有比較新（新服務沒寫過），不覆蓋舊的")
         return
     if os.path.isfile(dst):
@@ -1858,19 +1901,21 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
     report.ok("db-copy", f"新 llm.db → {dst}{where}")
 
 
-def _db_has_new_writes(state: dict, src: str, dst: str) -> bool:
+def _new_service_ts(state: dict) -> float | None:
+    """切換開始時間（狀態檔的 ``new_service_ts``）；沒有／壞值回 ``None``。"""
+    started = state.get("new_service_ts")
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        return float(started)
+    return None
+
+
+def _db_has_new_writes(started: float, src: str) -> bool:
     """新的 db 是不是在切換開始之後被寫過（中-6）。
 
-    狀態檔記了 ``new_service_ts``（切換開始）就用它；沒有（舊狀態檔或人工
-    回滾）就退回 mtime 比較（新的大於舊的才算）。
+    呼叫方要先確認狀態檔有 ``new_service_ts``（低-7：沒有就無從判斷，不覆蓋）。
     """
-    started = state.get("new_service_ts")
     try:
-        if isinstance(started, (int, float)) and not isinstance(started, bool):
-            return os.path.getmtime(src) > float(started)
-        if os.path.isfile(dst):
-            return os.path.getmtime(src) > os.path.getmtime(dst)
-        return True
+        return os.path.getmtime(src) > started
     except OSError:
         return False
 
