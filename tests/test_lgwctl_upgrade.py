@@ -236,6 +236,7 @@ class UpgradeTests(unittest.TestCase):
     def test_rollback_after_upgrade_runs_check(self):
         rc, out, err = self.upgrade()
         self.assertEqual(rc, 0, out + err)
+        self.assertIn(NEW_TAG, self.box.read(self.box.unit("llmgateway.service")))
         rc, out, err = self.box.run_cli(["rollback"])
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.current(), FAKE_TAG)
@@ -244,6 +245,25 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(has_line(out, "keysync", "ok"), out)
         self.assertTrue(has_line(out, "list-local", "ok"), out)
         self.assertEqual(self.box.actions().count("restart llmgateway.service"), 2)
+        # 中-3：unit 檔也要換回舊 tag 的（不然舊程式跑在新 unit 下）。
+        self.assertIn(FAKE_TAG, self.box.read(self.box.unit("llmgateway.service")))
+        self.assertIn(FAKE_TAG, self.box.read(self.box.unit("llmgateway-tunnel.service")))
+        self.assertNotIn(NEW_TAG, self.box.read(self.box.unit("llmgateway.service")))
+        self.assertIn("daemon-reload daemon-reload", self.box.actions())
+
+    def test_rollback_refuses_when_previous_has_no_unit_files(self):
+        """中-3：previous 是舊格式（沒有 deploy/units）就在切 link 之前拒絕。"""
+        import shutil
+
+        self.assertEqual(self.upgrade()[0], 0)
+        shutil.rmtree(os.path.join(self.box.opt(FAKE_TAG), "deploy", "units"))
+        before = self.box.actions().count("restart llmgateway.service")
+        rc, out, err = self.box.run_cli(["rollback"])
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "rollback", "fail"), out)
+        self.assertIn("deploy/units", out)
+        self.assertEqual(self.current(), NEW_TAG)
+        self.assertEqual(self.box.actions().count("restart llmgateway.service"), before)
 
     def test_rollback_returns_check_exit_code(self):
         self.upgrade()
