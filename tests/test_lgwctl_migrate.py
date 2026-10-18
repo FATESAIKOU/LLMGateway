@@ -99,6 +99,15 @@ case "$verb" in
         exit 0 ;;
     start|restart)
         [[ -f "${fake}/fail/start/${layer}/${unit}" ]] && exit 1
+        if [[ "$unit" == "llmgateway-tunnel.service" ]]; then
+            # 中-2：兩條隧道不能同時持有同一埠；另一層 active 時 start 會立刻 crash
+            other="user"
+            [[ "$layer" == "user" ]] && other="system"
+            if [[ -f "${fake}/active/${other}/${unit}" ]]; then
+                printf 'Failed to start %s: port already in use by %s tunnel\n' "$unit" "$other" >&2
+                exit 1
+            fi
+        fi
         : > "$active"
         # 中-1 的旋鈕：新服務「啟動的當下」寫一份 .keysync.status（模擬新的
         # lgwd 起來 30 秒內就跑第一次 key 拉取）。
@@ -1526,6 +1535,38 @@ class RollbackToUserTests(MigrationTestCase):
             # 新隧道依然保持運行，避免管理通道斷線
             self.assertTrue(self.box.active("llmgateway-tunnel.service"))
 
+    def test_fake_systemctl_rejects_simultaneous_tunnels(self):
+        """中-2：假 systemd 確實模擬兩條隧道不能同時持有同一埠。"""
+        from lgwctl import units
+        from lgwctl.layout import Layout
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="system"))
+        proc = units.user_run(Layout.from_env(self.box.env), "start", "llmgateway-tunnel.service")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("already in use", proc.stderr)
+
+    def test_rollback_handles_tunnel_port_handover(self):
+        """中-2：新舊隧道不能同時持有同一埠；回滾時必須先停新隧道再起舊隧道。"""
+        self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        order = self.box.order()
+        tunnel_stop = max(i for i, line in enumerate(order)
+                          if "systemctl stop llmgateway-tunnel.service" in line)
+        old_tunnel_start = max(i for i, line in enumerate(order)
+                               if "start llmgateway-tunnel.service" in line)
+        self.assertLess(tunnel_stop, old_tunnel_start, "新隧道必須在舊隧道啟動前停止以讓出埠")
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="user"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service"))
+
+    def test_rollback_recovers_new_tunnel_when_old_tunnel_probe_fails(self):
+        """中-2：舊隧道雖然起來但遠端探針失敗時，復原新隧道並保留管理連線。"""
+        self.box.probe_codes(["1", "1", "1", "1"])  # 模擬遠端探針全部回非 200
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
+        self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service", layer="user"))
+
     def test_rollback_keeps_old_keys_env_when_a_key_is_duplicated(self):
         """低-6：重複鍵會被舊 KeyStore 拒收，不能覆蓋舊的。"""
         self.box.write(self.box.state("keys.env"),
@@ -1538,6 +1579,25 @@ class RollbackToUserTests(MigrationTestCase):
                          f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
         self.assertTrue(has_line(out, "keys-env", "todo"), out)
         self.assert_no_values(out, err)
+
+    def test_rollback_refuses_when_state_dir_is_symlink_and_dst_missing(self):
+        """中-1：舊 state 目錄是 symlink 且舊檔案不存在時，rollback 不寫入任何檔。"""
+        if os.path.exists(self.box.old_state("llm.db")):
+            os.unlink(self.box.old_state("llm.db"))
+        if os.path.exists(self.box.old_state("keys.env")):
+            os.unlink(self.box.old_state("keys.env"))
+        evil_dir = os.path.join(self.box.root, "evil_target")
+        os.makedirs(evil_dir, exist_ok=True)
+        state_dir = os.path.dirname(self.box.old_state("llm.db"))
+        shutil.rmtree(state_dir)
+        os.symlink(evil_dir, state_dir)
+
+        rc, out, err = self.rollback()
+        self.assertFalse(os.path.exists(os.path.join(evil_dir, "llm.db")))
+        self.assertFalse(os.path.exists(os.path.join(evil_dir, "keys.env")))
+        self.assertEqual(os.listdir(evil_dir), [])
+        self.assertTrue(has_line(out, "db-copy", "fail"))
+        self.assertTrue(has_line(out, "keys-env", "fail"))
 
     def test_rollback_without_a_cutover_timestamp_does_not_overwrite_the_db(self):
         """低-7：沒有 new_service_ts（prepare 後直接回滾）時不比 mtime，安全跳過。"""
@@ -1999,8 +2059,8 @@ class OpenNoFollowTests(unittest.TestCase):
         real_open = migrate._open_regular
         swapped = []
 
-        def swap_after_open(path):
-            fd = real_open(path)
+        def swap_after_open(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
             if path == safe and not swapped:
                 swapped.append(path)
                 os.unlink(safe)
@@ -2047,8 +2107,8 @@ class OpenNoFollowTests(unittest.TestCase):
         real_open = migrate._open_regular
         swapped = []
 
-        def swap_after_open(path):
-            fd = real_open(path)
+        def swap_after_open(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
             if path == old_keysync and not swapped:
                 swapped.append(path)
                 os.unlink(old_keysync)
@@ -2084,8 +2144,8 @@ class OpenNoFollowTests(unittest.TestCase):
         real_regular = migrate._regular_file
         swapped = []
 
-        def swap_after_check(path):
-            res = real_regular(path)
+        def swap_after_check(path, *args, **kwargs):
+            res = real_regular(path, *args, **kwargs)
             if path == old_keysync and not swapped:
                 swapped.append(path)
                 os.unlink(old_keysync)
@@ -2124,19 +2184,45 @@ class SharedOwnershipTests(unittest.TestCase):
         from lgwctl import install
 
         calls = []
+        open_calls = []
+        fake_stat_reg = mock.Mock(st_mode=stat.S_IFREG | 0o640)
         fake = types.SimpleNamespace(pw_uid=1001, pw_gid=2002, pw_dir="/home/lgwfake")
+
+        def fake_open(path, flags, *args):
+            open_calls.append((path, flags))
+            return 99
+
+        def fake_fchown(fd, uid, gid):
+            calls.append((open_calls[-1][0], uid, gid))
+
         with mock.patch.object(install.pwd, "getpwnam", return_value=fake), \
-                mock.patch.object(install.os, "chown",
-                                  side_effect=lambda *args: calls.append(args)):
+                mock.patch.object(install.os, "open", side_effect=fake_open), \
+                mock.patch.object(install.os, "fstat", return_value=fake_stat_reg), \
+                mock.patch.object(install.os, "fchown", side_effect=fake_fchown), \
+                mock.patch.object(install.os, "close", return_value=None):
             install.chown_root_group(self.layout, "/etc/llmgateway/keys.pass")
         self.assertEqual(calls, [("/etc/llmgateway/keys.pass", 0, 2002)])
+
+    def test_chown_service_refuses_fifo_and_non_regular(self):
+        """低-3：_chown_service 與 chown_root_group 拒絕 FIFO 與非一般檔。"""
+        from lgwctl import install
+        fake = types.SimpleNamespace(pw_uid=1001, pw_gid=2002, pw_dir="/home/lgwfake")
+        fake_stat_fifo = mock.Mock(st_mode=stat.S_IFIFO | 0o600)
+        with mock.patch.object(install.pwd, "getpwnam", return_value=fake), \
+                mock.patch.object(install.os, "open", return_value=99), \
+                mock.patch.object(install.os, "fstat", return_value=fake_stat_fifo), \
+                mock.patch.object(install.os, "close", return_value=None):
+            with self.assertRaises(OSError):
+                install._chown_service(self.layout, "/tmp/fake_fifo")
+            with self.assertRaises(OSError):
+                install.chown_root_group(self.layout, "/tmp/fake_fifo")
 
     def test_chown_root_group_skips_in_prefix_mode(self):
         from lgwctl import install
         from lgwctl.layout import Layout
 
         calls = []
-        with mock.patch.object(install.os, "chown",
+        with mock.patch.object(install.os, "fchown",
                                side_effect=lambda *args: calls.append(args)):
             install.chown_root_group(Layout.from_env(self.box.env), "/x")
         self.assertEqual(calls, [])

@@ -92,23 +92,21 @@ def _write_one(layout, path: str, name: str, text: str, mode: int,
 def _chown_service(layout, path: str) -> None:
     """目錄／keys.env 給服務帳號（llmgw:llmgw）；不是 root 或 prefix 模式就跳過。
     高-1：以 O_NOFOLLOW 開啟 fd 再 fchown，拒絕跟隨 symlink。
+    低-3：拿掉路徑式 fallback，加 O_NONBLOCK 與 fstat 驗型別防 FIFO 卡住。
     """
     if layout.prefix or layout.euid != 0:
         return
     if os.path.islink(path):
         raise OSError(f"{path} 是 symlink；拒絕以 root 變更擁有者")
     info = pwd.getpwnam(layout.service_user)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     if os.path.isdir(path):
         flags |= getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        if os.path.islink(path) or getattr(exc, "errno", None) in (errno.ELOOP, errno.EMLINK):
-            raise
-        os.chown(path, info.pw_uid, info.pw_gid)
-        return
-    try:
+        st = os.fstat(fd)
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+            raise OSError(f"{path} 不是一般檔或目錄")
         os.fchown(fd, info.pw_uid, info.pw_gid)
     finally:
         os.close(fd)
@@ -121,21 +119,19 @@ def chown_root_group(layout, path: str) -> None:
     的 credential／設定），群組是服務帳號的群組（``User=llmgw`` 的 unit 讀得
     到）。不是 root 或 prefix 模式就跳過；服務帳號不在時丟 KeyError，由呼叫
     方決定 fail（不要靜默變成 root:root）。高-1：拒絕跟隨 symlink。
+    低-3：拿掉路徑式 fallback，加 O_NONBLOCK 與 fstat 驗型別。
     """
     if layout.prefix or layout.euid != 0:
         return
     if os.path.islink(path):
         raise OSError(f"{path} 是 symlink；拒絕以 root 變更擁有者")
     gid = pwd.getpwnam(layout.service_user).pw_gid
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        if os.path.islink(path) or getattr(exc, "errno", None) in (errno.ELOOP, errno.EMLINK):
-            raise
-        os.chown(path, 0, gid)
-        return
-    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{path} 不是一般檔")
         os.fchown(fd, 0, gid)
     finally:
         os.close(fd)

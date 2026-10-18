@@ -367,6 +367,7 @@ class InstallTests(unittest.TestCase):
 
     def test_keys_pass_chown_targets(self):
         """keys.pass → root:<llmgw gid>、keys.env 與目錄 → llmgw:llmgw（中-4）。"""
+        import stat
         from types import SimpleNamespace
         from unittest import mock
 
@@ -377,11 +378,30 @@ class InstallTests(unittest.TestCase):
         layout.prefix = ""      # 裝成正式模式（prefix 模式一律不 chown）
         layout.euid = 0
         calls = []
+        open_calls = []
+
+        fake_stat_reg = mock.Mock(st_mode=stat.S_IFREG | 0o600)
+        fake_stat_dir = mock.Mock(st_mode=stat.S_IFDIR | 0o700)
+
+        def fake_open(path, flags, *args):
+            open_calls.append((path, flags))
+            return 99
+
+        def fake_fstat(fd):
+            path = open_calls[-1][0]
+            if path == layout.state_dir:
+                return fake_stat_dir
+            return fake_stat_reg
+
+        def fake_fchown(fd, uid, gid):
+            calls.append((open_calls[-1][0], uid, gid))
+
         with mock.patch.object(installmod.pwd, "getpwnam",
                                return_value=SimpleNamespace(pw_uid=111, pw_gid=222)), \
-                mock.patch.object(installmod.os, "chown",
-                                  side_effect=lambda path, uid, gid:
-                                      calls.append((path, uid, gid))):
+                mock.patch.object(installmod.os, "open", side_effect=fake_open), \
+                mock.patch.object(installmod.os, "fstat", side_effect=fake_fstat), \
+                mock.patch.object(installmod.os, "fchown", side_effect=fake_fchown), \
+                mock.patch.object(installmod.os, "close", return_value=None):
             installmod._chown_keys_pass(layout)
             installmod._chown_service(layout, layout.keys_env)
             installmod._chown_service(layout, layout.state_dir)

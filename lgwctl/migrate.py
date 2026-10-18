@@ -119,8 +119,8 @@ OLD_KEYSYNC_TIMER = "key-sync.timer"
 
 # 停舊 unit 的順序：隧道最後停（它承載管理連線，這樣中斷最短）。
 OLD_STOP_ORDER = (SERVICE_NAME, OLD_KEYSYNC_TIMER, OLD_KEYSYNC_SERVICE, TUNNEL_SERVICE_NAME)
-# 啟動舊 unit 的順序：先服務再隧道（探針要 API 先起來）；key-sync.timer 也要
-# **start**（enable 只建立開機的 wants symlink，不讓它立刻開始計時，中-11）。
+# 啟動舊 unit 的順序：先服務與 timer；隧道等新隧道停止讓出埠後才啟動（中-2）。
+OLD_START_SERVICES = (SERVICE_NAME, OLD_KEYSYNC_TIMER)
 OLD_START_ORDER = (SERVICE_NAME, TUNNEL_SERVICE_NAME, OLD_KEYSYNC_TIMER)
 OLD_UNIT_NAMES = (SERVICE_NAME, TUNNEL_SERVICE_NAME, OLD_KEYSYNC_SERVICE, OLD_KEYSYNC_TIMER)
 
@@ -161,8 +161,8 @@ TRANSIENT_ENV_NAMES = ("LLMGW_PREFIX", "LLMGW_SERVICE_USER", "LLMGW_SERVICE_HOME
 DEFAULT_CUTOVER_WAIT = 60.0
 DEFAULT_KEYSYNC_GRACE = 90.0
 DEFAULT_OBSERVE_DAYS = 3.0
-DEFAULT_TUNNEL_WAIT = 30.0
-DEFAULT_TUNNEL_STABLE = 5.0
+DEFAULT_TUNNEL_WAIT = 45.0
+DEFAULT_TUNNEL_STABLE = 15.0
 DEFAULT_REMOTE_TRIES = 3
 DEFAULT_REMOTE_WAIT = 10.0
 DEFAULT_LOCK_WAIT = 30.0
@@ -393,20 +393,24 @@ def _lseek0(fd: int) -> None:
 
 def _copy_into_place(src: str, dst: str, mode: int | None = None, *,
                      owner: tuple[int, int] | None = None,
-                     base: str | None = None) -> None:
+                     base: str | None = None,
+                     dst_base: str | None = None) -> None:
     """同目錄暫存 → rename（原子）；不給 mode 就沿用來源權限（cp -a 語意）。
 
     內容從 ``O_NOFOLLOW`` 驗過的 fd 讀（中-9）：不再用 ``shutil.copy2(src, …)``
     （它會跟著路徑走，檢查與複製之間可被換成 symlink）。mtime 也照抄（cp -a）：
     回滾要用「新 keys.env 是不是比較新」判斷，時間戳不能被複製時間蓋掉。
     高-1／低-3：fchmod／fchown 在 rename 之前對 fd 操作，且 mkstemp 失敗時妥善關閉 src_fd。
+    中-1：寫入側上層目錄若為 symlink 亦在 makedirs 前直接拒絕。
     """
     directory = os.path.dirname(dst) or "."
+    if dst_base is not None:
+        if _has_symlink_component(directory, dst_base):
+            raise OSError(f"{directory} 上層目錄包含 symlink")
+        if os.path.lexists(dst) and _has_symlink_component(dst, dst_base):
+            raise OSError(f"{dst} 或其上層目錄包含 symlink")
     os.makedirs(directory, exist_ok=True)
-    if base is not None:
-        src_fd = _open_regular(src, base=base)
-    else:
-        src_fd = _open_regular(src)
+    src_fd = _open_regular(src, base=base)
     if src_fd < 0:
         raise OSError(f"{src} 不是一般檔")
     out_fd = -1
@@ -556,7 +560,8 @@ def _verify_not_swapped(path: str, fd: int) -> None:
 
 def _copy_db_consistent(src: str, dst: str, mode: int = 0o600, *,
                         owner: tuple[int, int] | None = None,
-                        base: str | None = None) -> None:
+                        base: str | None = None,
+                        dst_base: str | None = None) -> None:
     """一致快照到 dst（同目錄暫存 → rename）；驗 integrity_check，失敗重試再放棄。
 
     不沿用 ``shutil.copy2``：rollback journal 模式的主檔在寫入交易期間是就地
@@ -564,10 +569,16 @@ def _copy_db_consistent(src: str, dst: str, mode: int = 0o600, *,
     活著的寫入者安全（讀交易看到的是已提交的狀態）；來源一律從驗過的 fd 讀
     （中-9），暫存檔在 rename 前再驗一次 inode 沒被換掉。
     高-1／低-3：fchmod／fchown 在 rename 前對 fd 操作，且 mkstemp 失敗時妥善關閉 src_fd。
+    中-1：寫入側上層目錄若為 symlink 亦在 makedirs 前直接拒絕。
     """
     if not _db_source_ok(src, base=base):
         raise OSError(f"{src} 不是 SQLite 資料庫")
     directory = os.path.dirname(dst) or "."
+    if dst_base is not None:
+        if _has_symlink_component(directory, dst_base):
+            raise OSError(f"{directory} 上層目錄包含 symlink")
+        if os.path.lexists(dst) and _has_symlink_component(dst, dst_base):
+            raise OSError(f"{dst} 或其上層目錄包含 symlink")
     os.makedirs(directory, exist_ok=True)
     last: Exception | None = None
     for _ in range(DB_COPY_ATTEMPTS):
@@ -608,9 +619,18 @@ def _db_backup_paths(dst: str) -> list:
     return sorted(glob.glob(dst + ".bak-*"), reverse=True)
 
 
-def _prune_db_backups(dst: str) -> None:
-    """只留最近 ``DB_BACKUP_KEEP`` 份時間戳備份（中-6）。"""
+def _prune_db_backups(dst: str, base: str | None = None) -> None:
+    """只留最近 ``DB_BACKUP_KEEP`` 份時間戳備份（中-6）。
+
+    中-1：若上層目錄為 symlink 或備份檔本身為 symlink 則拒絕刪除。
+    """
+    if base and _has_symlink_component(os.path.dirname(dst), base):
+        return
     for path in _db_backup_paths(dst)[DB_BACKUP_KEEP:]:
+        if os.path.islink(path):
+            continue
+        if base and _has_symlink_component(path, base):
+            continue
         try:
             os.unlink(path)
         except OSError:
@@ -1068,8 +1088,6 @@ def _prepare_locked(layout, old: OldLayout, *, tag: str, force: bool,
     _step_gh_login(layout, report)
     _step_tunnel_config(layout, report)
     # 把正規化後的 old_home 綁進狀態檔（低-3）：finalize 不收命令列打錯的目錄。
-    # 上一輪若是終態（reverted／aborted），先把舊狀態檔歸檔再開新一輪（中-4）。
-    _start_new_round(layout, report)
     try:
         if not read_state(layout).get("old_home"):
             write_state(layout, old_home=old.home)
@@ -1120,7 +1138,8 @@ def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
                     f"舊的 {old.keys_env} 不在；新版啟動後由 key 拉取補（或本人確認）")
         return
     try:
-        _copy_into_place(old.keys_env, dst, 0o600, owner=_service_owner_ids(layout))
+        _copy_into_place(old.keys_env, dst, 0o600, owner=_service_owner_ids(layout),
+                         base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-keys-env", f"複製失敗（{type(exc).__name__}）")
@@ -1140,7 +1159,8 @@ def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
         report.todo("state-db", f"舊的 {old.db_file} 不在；新服務會自己建")
         return
     try:
-        _copy_db_consistent(old.db_file, dst, owner=_service_owner_ids(layout))
+        _copy_db_consistent(old.db_file, dst, owner=_service_owner_ids(layout),
+                            base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-db", f"一致快照失敗（{type(exc).__name__}）")
@@ -1209,13 +1229,13 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
             return
         report.skip("keys-pass", f"{dst} 已有值（不覆蓋；owner／mode 已校正）")
         return
-    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
         # 中-5：舊 keysync.env 在服務帳號控制下（symlink 到 /proc/… 或外部檔）。
         _refuse_symlink(report, "keys-pass", old.keysync_env_file)
         return
-    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1)
+    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1, base=old.home)
     if raw is None:
-        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
             _refuse_symlink(report, "keys-pass", old.keysync_env_file)
             return
         value = ""
@@ -1977,16 +1997,17 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
         # 已經回過（人工先回、保險後來才觸發）：再確認一次就好，不動資料——
         # 新的 llm.db 已經複製回去過，再複製一次只會蓋掉舊服務寫的東西。
         # 上一次可能停在「舊服務回來了、但舊隧道起不來，所以新隧道先留著」；
-        # 修好後再跑一次就能補完（舊隧道活了才停新隧道；高-1）。
+        # 修好後再跑一次就能補完（中-2）。
         report.ok("rollback", "狀態已經是 reverted（人工與保險重複觸發也安全）")
         started = _start_old_units(layout, report)
         ok = _wait_old_list(layout, report)
-        tunnel_ok = _wait_old_tunnel(layout, report)
-        if tunnel_ok and units.is_active(layout, TUNNEL_SERVICE_NAME):
-            _stop_new_tunnel(layout, report)
-        elif not tunnel_ok:
-            report.fail("tunnel-old", "舊隧道仍然起不來；新隧道先留著，"
-                                      "管理連線不會斷（修好後再跑一次 rollback-to-user）")
+        if units.is_active(layout, TUNNEL_SERVICE_NAME):
+            tunnel_ok = _switch_to_old_tunnel(layout, report, ok)
+        else:
+            tunnel_ok = _wait_old_tunnel(layout, report)
+            if not tunnel_ok:
+                report.fail("tunnel-old", "舊隧道仍然起不來；新隧道先留著，"
+                                          "管理連線不會斷（修好後再跑一次 rollback-to-user）")
         _cancel_revert(layout, _state_revert_unit(state, report), report)
         try:
             write_state(layout, phase=PHASE_REVERTED,
@@ -1997,21 +2018,14 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
         return 0 if (ok and started and tunnel_ok
                      and not getattr(report, "has_fail", False)) else 1
 
-    # 停新 service（讓出 8480 埠）＋disable；新隧道留到最後（高-1）。
+    # 停新 service（讓出 8480 埠）＋disable；新隧道留到確認舊服務後才停（中-2）。
     _stop_new_service(layout, report)
     _restore_db(layout, old, state, report)
     _restore_keys_env(layout, old, report)
     started = _start_old_units(layout, report)
     ok = _wait_old_list(layout, report)
-    # 舊服務活回來、舊隧道也活了才斷管理連線（高-1：新隧道最後才停）。舊隧道
-    # 起不來時**不**停新隧道——它還能把管理連線與 API 導到 8480（現在是舊
-    # 服務），比什麼都沒有安全；明確 fail，修好後再跑一次。
-    tunnel_ok = _wait_old_tunnel(layout, report)
-    if tunnel_ok:
-        _stop_new_tunnel(layout, report)
-    elif ok:
-        report.fail("tunnel-old", "舊隧道起不來；新隧道先留著（管理連線不會斷），"
-                                  "修好後再跑一次 rollback-to-user")
+    # 中-2：舊服務回來後才停新隧道並起舊隧道，驗證連續穩定與 probe.remote
+    tunnel_ok = _switch_to_old_tunnel(layout, report, ok)
     _cancel_revert(layout, _state_revert_unit(state, report), report)
     try:
         write_state(layout, phase=PHASE_REVERTED, local_ok=bool(ok and started),
@@ -2090,7 +2104,8 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
     if not _db_has_new_writes(started, src):
         report.skip("db-copy", "新的 llm.db 沒有比較新（新服務沒寫過），不覆蓋舊的")
         return
-    if os.path.isfile(dst) and not _regular_file(dst, old.home):
+    dst_dir = os.path.dirname(dst)
+    if _has_symlink_component(dst_dir, old.home) or (os.path.lexists(dst) and _has_symlink_component(dst, old.home)):
         report.fail("db-copy", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
         return
     if os.path.isfile(dst):
@@ -2103,7 +2118,7 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
         bak = None
         report.skip("db-bak", f"{dst} 不在（沒有舊的可以備份）")
     try:
-        _copy_db_consistent(src, dst, owner=_service_owner_ids(layout))
+        _copy_db_consistent(src, dst, owner=_service_owner_ids(layout), dst_base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("db-copy", f"複製失敗（{type(exc).__name__}）")
@@ -2139,9 +2154,10 @@ def _backup_old_db(layout, dst: str, old_home: str | None = None) -> str:
     while _exists(bak):
         bak = f"{dst}.bak-{stamp}-{index}"
         index += 1
-    _copy_db_consistent(dst, bak, owner=_service_owner_ids(layout), base=old_home)
+    _copy_db_consistent(dst, bak, owner=_service_owner_ids(layout), base=old_home,
+                        dst_base=old_home)
     install._chown_service(layout, bak)
-    _prune_db_backups(dst)
+    _prune_db_backups(dst, base=old_home)
     return bak
 
 
@@ -2151,10 +2167,11 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
     if not os.path.isfile(src):
         report.skip("keys-env", f"{src} 不在（不覆蓋舊的）")
         return
+    dst_dir = os.path.dirname(dst)
+    if _has_symlink_component(dst_dir, old.home) or (os.path.lexists(dst) and _has_symlink_component(dst, old.home)):
+        report.fail("keys-env", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
+        return
     if os.path.isfile(dst):
-        if not _regular_file(dst, old.home):
-            report.fail("keys-env", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
-            return
         try:
             newer = os.path.getmtime(src) > os.path.getmtime(dst)
         except OSError:
@@ -2166,7 +2183,8 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
             report.todo("keys-env", "新的 keys.env 格式驗不過，不覆蓋舊的；請本人確認")
             return
     try:
-        _copy_into_place(src, dst, 0o600, owner=_service_owner_ids(layout))
+        _copy_into_place(src, dst, 0o600, owner=_service_owner_ids(layout),
+                         dst_base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("keys-env", f"複製失敗（{type(exc).__name__}）")
@@ -2179,7 +2197,7 @@ def _start_old_units(layout, report) -> bool:
 
     cutover 停舊 unit 時把四個都 disable（高-2，觀察期重開機不得雙跑）；
     回舊版時要全部 enable 回來（含 key-sync.timer，不然舊版的 key 不會再拉），
-    再啟動兩個服務。
+    先啟動舊服務與 key-sync.timer。舊隧道留待新隧道停止讓出會合點埠後才啟動（中-2）。
     """
     ok = True
     for unit in OLD_UNIT_NAMES:
@@ -2194,7 +2212,7 @@ def _start_old_units(layout, report) -> bool:
             report.fail("enable-old", f"{unit} 的 unit 檔不在（enable 算失敗）")
         else:
             report.ok("enable-old", f"{unit}（開機會自動起）")
-    for unit in OLD_START_ORDER:
+    for unit in OLD_START_SERVICES:
         outcome, detail = _user_systemctl_outcome(layout, "start", unit)
         if outcome == "ok":
             report.ok("start-old", f"{unit}（user 層）")
@@ -2226,18 +2244,97 @@ def _user_unit_restarts(layout, unit: str) -> int | None:
     return None
 
 
-def _wait_old_tunnel(layout, report) -> bool:
+def _switch_to_old_tunnel(layout, report, old_service_ok: bool) -> bool:
+    """中-2：回滾時舊隧道與新隧道不能同時持有會合點的 4710/4711 埠。
+
+    順序：
+    1. 舊服務若未回來（list 200 失敗）：不切換隧道，新隧道維持運行（留住管理通道）並報錯。
+    2. 記錄舊隧道 NRestarts。
+    3. 停新隧道（先不 disable，讓出會合點埠，短暫空窗）。
+    4. 啟舊隧道。
+    5. 等舊隧道連續穩定 ≥15～20 秒且 NRestarts 不增。
+    6. probe.remote 經會合點驗證回 200。
+    7. 成功才 disable 新隧道。
+    8. 失敗則將新隧道 start 回來（留住管理通道）並報錯。
+    """
+    unit = TUNNEL_SERVICE_NAME
+    if not old_service_ok:
+        report.fail("tunnel-old", "舊服務未恢復（本機 list 非 200），新隧道維持運行（管理連線未中斷）；修好後請再執行 rollback-to-user")
+        return False
+
+    initial_restarts = _user_unit_restarts(layout, unit)
+
+    # 停新隧道（先不 disable，讓出會合點 4710/4711 埠）
+    outcome, detail = _systemctl_outcome(layout, "stop", unit)
+    _report_outcome(report, "stop-new-tunnel", outcome, detail,
+                    ok=f"{unit}（system 層；短暫切換空窗，讓出會合點埠）已停",
+                    missing=f"{unit}（本來就沒在跑）",
+                    failed=f"停 {unit} 失敗（{detail}）")
+    if outcome == "failed":
+        report.fail("tunnel-old", "新隧道停止失敗；無法切換至舊隧道")
+        return False
+
+    # 啟動舊隧道
+    outcome, detail = _user_systemctl_outcome(layout, "start", unit)
+    if outcome != "ok":
+        report.fail("start-old-tunnel", f"{unit} 起不來（{detail or outcome}）")
+        _recover_new_tunnel(layout, report)
+        return False
+    report.ok("start-old-tunnel", f"{unit}（user 層）")
+
+    # 等舊隧道連續穩定
+    if not _wait_old_tunnel(layout, report, initial_restarts=initial_restarts):
+        _user_systemctl_outcome(layout, "stop", unit)
+        _recover_new_tunnel(layout, report)
+        return False
+
+    # 經會合點探測回 200
+    level, detail = _probe_remote_with_retry(layout)
+    if level not in ("ok",):
+        report.fail("probe-old-tunnel", f"舊隧道遠端探針失敗（{detail}）")
+        _user_systemctl_outcome(layout, "stop", unit)
+        _recover_new_tunnel(layout, report)
+        return False
+
+    report.ok("tunnel-old", f"{unit}（user 層）已連續穩定 active 且遠端探針 200")
+
+    # 成功才 disable 新隧道
+    outcome, detail = _systemctl_outcome(layout, "disable", unit)
+    _report_outcome(report, "disable-new-tunnel", outcome, detail,
+                    ok=f"{unit} 不再開機自動起",
+                    missing=f"{unit}（本來就沒 enable）",
+                    failed=f"disable {unit} 失敗（{detail}）")
+    return True
+
+
+def _recover_new_tunnel(layout, report) -> None:
+    """舊隧道失敗時把新隧道 start 回來，保留管理連線通道（中-2）。"""
+    unit = TUNNEL_SERVICE_NAME
+    outcome, detail = _systemctl_outcome(layout, "start", unit)
+    _report_outcome(report, "recover-new-tunnel", outcome, detail,
+                    ok=f"{unit}（system 層）已重新啟動（保留管理通道）",
+                    missing=f"{unit} 不在",
+                    failed=f"重新啟動 {unit} 失敗（{detail}）；管理通道中斷，請以 console 登入處理")
+    report.fail("tunnel-old", "舊隧道未達連續穩定或探針非 200；已重新啟動新隧道留住管理通道，修好後再跑一次 rollback-to-user")
+
+
+def _wait_old_tunnel(layout, report, initial_restarts: int | None = None) -> bool:
     """等舊 user 隧道連續穩定 active（高-1、中-4：它活了才切斷新的管理連線）。
 
     中-4：不能只取樣一次 is-active（crash-loop 會過）。需連續穩定一段時間
     （active 且 NRestarts 沒增加）才判定為 true。
+    低-1：讀不到 NRestarts 時印一行 todo，預設穩定窗口拉長到 15 秒。
     """
     total_wait = _wait_seconds(layout, ENV_TUNNEL_WAIT, DEFAULT_TUNNEL_WAIT)
     stable_cfg = _wait_seconds(layout, ENV_TUNNEL_STABLE, DEFAULT_TUNNEL_STABLE)
     stable_required = min(total_wait, stable_cfg) if total_wait > 0 else 0.0
     deadline = time.monotonic() + total_wait
 
-    initial_restarts = _user_unit_restarts(layout, TUNNEL_SERVICE_NAME)
+    if initial_restarts is None:
+        initial_restarts = _user_unit_restarts(layout, TUNNEL_SERVICE_NAME)
+    if initial_restarts is None:
+        report.todo("tunnel-restarts", "無法讀取舊隧道 NRestarts，僅以連續 is-active 判定穩定")
+
     active_since: float | None = None
     crash_loop_detected = False
 
@@ -2256,7 +2353,6 @@ def _wait_old_tunnel(layout, report) -> bool:
             if active_since is None:
                 active_since = now
             if (now - active_since) >= stable_required:
-                report.ok("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）已連續穩定 active")
                 return True
         else:
             active_since = None
@@ -2268,7 +2364,7 @@ def _wait_old_tunnel(layout, report) -> bool:
                 detail += "（偵測到重啟崩潰迴圈 crash-loop，NRestarts 曾增加）"
             report.fail("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）未達連續穩定 active {detail}")
             return False
-        time.sleep(min(0.2, remaining))
+        time.sleep(min(0.5, remaining))
 
 
 # -- finalize-migration ---------------------------------------------------
