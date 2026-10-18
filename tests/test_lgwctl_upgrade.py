@@ -172,8 +172,10 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(os.readlink(self.box.previous_link), self.box.opt(OLD_TAG))
 
     def test_upgrade_waits_and_succeeds_after_a_slow_start(self):
+        # 2 秒是「容負載」用的：0.3 秒在測試機忙碌時會來不及第二次重試
+        # （第一次 curl 就超過 deadline），不是要模擬 2 秒的啟動時間。
         self.box.curl_codes(["503", "200"])
-        rc, out, err = self.upgrade(LLMGW_LIST_WAIT="0.3")
+        rc, out, err = self.upgrade(LLMGW_LIST_WAIT="2")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.current(), NEW_TAG)
         self.assertEqual(self.box.actions().count("restart llmgateway.service"), 1)

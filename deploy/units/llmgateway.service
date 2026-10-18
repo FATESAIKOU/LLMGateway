@@ -7,8 +7,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Type 不寫：有 LoadCredential= 時 systemd 用 exec 語意（啟動失敗會反映在
-# systemctl 的結束碼上）。
+# Type=exec：等 exec 成功才算啟動中（systemd 250+；比預設的 simple 準——simple
+# 是 fork 完就算在跑）。exec 成功不等於 app 起得來，install 另外用本機 list 確認。
+Type=exec
 User=llmgw
 Group=llmgw
 WorkingDirectory=/opt/llmgateway/current

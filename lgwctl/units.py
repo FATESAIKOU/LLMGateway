@@ -7,9 +7,8 @@ unit 一律從當版目錄的 ``deploy/units/`` 裝到 ``<prefix>/etc/systemd/sy
 from __future__ import annotations
 
 import os
-import shutil
-import tempfile
 
+from . import atomic
 from .layout import UNIT_NAMES
 from .run import RunError, run
 
@@ -17,21 +16,9 @@ UNITS_REL_DIR = os.path.join("deploy", "units")
 
 
 def copy_file(src: str, dst: str, mode: int = 0o644) -> None:
-    """同目錄暫存 → chmod → rename（原子，不留暫存）。"""
-    directory = os.path.dirname(dst) or "."
-    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=directory)
-    try:
-        with os.fdopen(fd, "wb") as out, open(src, "rb") as fh:
-            shutil.copyfileobj(fh, out)
-        os.chmod(tmp, mode)
-        os.replace(tmp, dst)
-        tmp = None
-    finally:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+    """把版本裡的 unit 檔複製到 unit 目錄（原子；內容不經改寫）。"""
+    with open(src, "rb") as fh:
+        atomic.write_bytes(dst, fh.read(), mode)
 
 
 def unit_source(tag_dir: str, name: str) -> str:

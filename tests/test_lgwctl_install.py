@@ -15,6 +15,7 @@ try:
         FAKE_KEY_VALUE,
         FAKE_PASSWORD,
         FAKE_TAG,
+        NEW_TAG,
         OLD_TAG,
         Sandbox,
         current_user,
@@ -26,6 +27,7 @@ except ImportError:  # python3 -m unittest discover -s tests
         FAKE_KEY_VALUE,
         FAKE_PASSWORD,
         FAKE_TAG,
+        NEW_TAG,
         OLD_TAG,
         Sandbox,
         current_user,
@@ -42,10 +44,18 @@ class InstallTests(unittest.TestCase):
 
     # -- 共用的小工具 -------------------------------------------------------
 
-    def install(self, tag=FAKE_TAG, **extra_env):
+    def install(self, tag=FAKE_TAG, repo=None, **extra_env):
         env = dict(self.box.env)
         env.update(extra_env)
-        return self.box.run_cli(["install", "--tag", tag, "--repo", self.repo], env=env)
+        argv = ["install", "--tag", tag]
+        if repo is None:
+            argv += ["--repo", self.repo]
+        elif repo.startswith("-"):
+            # argparse 認 --opt=值，值本身可以 - 開頭（中-6 的注入面就從這來）
+            argv += [f"--repo={repo}"]
+        else:
+            argv += ["--repo", repo]
+        return self.box.run_cli(argv, env=env)
 
     def fill_tunnel_config(self):
         """把隧道設定填好（假的金鑰檔），讓 install 會去 start 隧道單位。"""
@@ -86,6 +96,8 @@ class InstallTests(unittest.TestCase):
         self.assertIn("IDENTITY=" + os.path.join(self.box.service_home, ".ssh",
                                                  "id_llmgw_tunnel"), tunnel_env)
         self.assertIn("RENDEZVOUS=", tunnel_env)
+        # LOCAL_API 要跟上面的 LGW_API_PORT 一致（低-1；這裡是預設 8480）
+        self.assertIn("LOCAL_API=8480", tunnel_env)
         # keys.pass 是空殼（只有註解）、keys.env 是空的 0600
         keys_pass = self.box.etc("keys.pass")
         self.assertNotIn(FAKE_PASSWORD, self.box.read(keys_pass))
@@ -199,6 +211,123 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "start", "fail"), out)
 
+    def test_start_ok_but_list_not_200_is_fail(self):
+        """systemctl start 回 0 不代表 app 起得來；list 不是 200 就是 fail（中-7）。"""
+        self.box.set_start_noop("llmgateway.service")   # start 回 0 但 app 沒起來
+        rc, out, err = self.install(FAKE_CURL_CODE="500")
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "start", "fail"), out)
+        self.assertIn("list 不是 200", out)
+
+    def test_tunnel_start_is_confirmed_with_is_active(self):
+        """隧道 start 之後再 is-active 確認一次；沒跑起來是 todo 不是假 ok（中-7）。"""
+        self.box.write(self.box.etc("tunnel.env"), "")
+        self.fill_tunnel_config()
+        self.box.set_start_noop("llmgateway-tunnel.service")
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)   # 隧道是本人動作，todo 不算失敗
+        self.assertTrue(has_line(out, "tunnel-run", "todo"), out)
+        self.assertIn("沒確認成功", out)
+
+    def test_tunnel_todo_tells_the_next_step(self):
+        """設定未填的 todo 要寫明下一步（低-2）。"""
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "tunnel-key", "todo"), out)
+        self.assertIn("systemctl start llmgateway-tunnel.service", out)
+
+    def test_install_with_a_different_tag_is_rejected(self):
+        """install 換 tag 會造成「跑舊碼、status 說新版」；一律擋下（中-3）。"""
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        rc, out, err = self.install(tag=NEW_TAG)
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "tag", "fail"), out)
+        self.assertIn("upgrade", out)
+        self.assertEqual(os.readlink(self.box.current_link), self.box.opt(FAKE_TAG))
+        self.assertEqual(len(self.box.log_lines("git.log")), 1)  # 沒有偷抓新版
+
+    def test_install_with_the_same_tag_stays_idempotent(self):
+        """同 tag 重跑仍然要照跑（冪等，中-3 的另一半）。"""
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        rc, out, err = self.install(tag=FAKE_TAG)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(os.readlink(self.box.current_link), self.box.opt(FAKE_TAG))
+
+    def test_tunnel_env_port_follows_llmgateway_env(self):
+        """tunnel.env 的 LOCAL_API 要跟 llmgateway.env 的 LGW_API_PORT 一致（低-1）。"""
+        self.box.write(self.box.etc("llmgateway.env"), 'LGW_API_PORT="9999"\n')
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("LOCAL_API=9999", self.box.read(self.box.etc("tunnel.env")))
+
+    # -- 帳號與權限（中-4／低-9）--------------------------------------------
+
+    def test_useradd_creates_the_group(self):
+        """unit 的 Group= 要有同名群組，useradd 要帶 -U（低-9）。"""
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("-U", self.box.log("useradd.log"))
+
+    def test_missing_group_is_a_fail(self):
+        """群組不在（-U 沒建出來）是 fail，不能裝完才發現服務起不來（低-9）。"""
+        from unittest import mock
+        from lgwctl import install as installmod
+
+        with mock.patch.object(installmod, "_group_exists", return_value=False):
+            rc, out, err = self.install()
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "account", "fail"), out)
+        self.assertIn("群組", out)
+
+    def test_keys_pass_chown_targets(self):
+        """keys.pass → root:<llmgw gid>、keys.env 與目錄 → llmgw:llmgw（中-4）。"""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from lgwctl import install as installmod
+        from lgwctl.layout import Layout
+
+        layout = Layout.from_env(self.box.env)
+        layout.prefix = ""      # 裝成正式模式（prefix 模式一律不 chown）
+        layout.euid = 0
+        calls = []
+        with mock.patch.object(installmod.pwd, "getpwnam",
+                               return_value=SimpleNamespace(pw_uid=111, pw_gid=222)), \
+                mock.patch.object(installmod.os, "chown",
+                                  side_effect=lambda path, uid, gid:
+                                      calls.append((path, uid, gid))):
+            installmod._chown_keys_pass(layout)
+            installmod._chown_service(layout, layout.keys_env)
+            installmod._chown_service(layout, layout.state_dir)
+        self.assertEqual(calls, [
+            (layout.keys_pass_file, 0, 222),
+            (layout.keys_env, 111, 222),
+            (layout.state_dir, 111, 222),
+        ])
+
+    @unittest.skipIf(os.geteuid() != 0, "只有 root 會真的 chown")
+    def test_keys_pass_is_root_owned_with_service_group(self):
+        """真的 root 跑一次：keys.pass root:<gid> 0640、keys.env llmgw:llmgw；重跑不變。"""
+        import pwd as pwdmod
+
+        box = Sandbox(service_user=current_user())
+        self.addCleanup(box.close)
+        rc, out, err = box.run_cli(["install", "--tag", FAKE_TAG])
+        self.assertEqual(rc, 0, out + err)
+        info = pwdmod.getpwnam(box.service_user)
+        st = os.stat(box.etc("keys.pass"))
+        self.assertEqual((st.st_uid, st.st_gid), (0, info.pw_gid))
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o640)
+        env_st = os.stat(box.state("keys.env"))
+        self.assertEqual((env_st.st_uid, env_st.st_gid), (info.pw_uid, info.pw_gid))
+        # 重跑不得把 keys.pass 改成服務帳號擁有
+        rc, out, err = box.run_cli(["install", "--tag", FAKE_TAG])
+        self.assertEqual(rc, 0, out + err)
+        st = os.stat(box.etc("keys.pass"))
+        self.assertEqual((st.st_uid, st.st_gid), (0, info.pw_gid))
+
     def test_gh_logged_in_is_not_a_todo(self):
         rc, out, err = self.install(FAKE_GH_AUTH_RC="0")
         self.assertEqual(rc, 0, out + err)
@@ -286,6 +415,8 @@ class UnitFileTests(unittest.TestCase):
     def test_required_settings(self):
         for needle in (
             "User=llmgw",
+            # 中-7：exec 成功才算啟動中（預設 simple 是 fork 完就算）。
+            "Type=exec",
             "Restart=on-failure",
             "WantedBy=multi-user.target",
             "LoadCredential=keys.pass:/etc/llmgateway/keys.pass",
@@ -309,6 +440,10 @@ class UnitFileTests(unittest.TestCase):
     def test_not_user_layer(self):
         for needle in ("WantedBy=default.target", "--user", "%h"):
             self.assertNotIn(needle, self.text, needle)
+
+    def test_old_wrong_type_comment_is_gone(self):
+        # 之前寫「有 LoadCredential= 時 systemd 用 exec 語意」是錯的（中-7）。
+        self.assertNotIn("systemd 用 exec 語意", self.text)
 
 
 if __name__ == "__main__":
