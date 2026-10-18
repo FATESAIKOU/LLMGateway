@@ -61,7 +61,11 @@ def _systemctl(layout, *args):
 
 
 def unit_state(layout, unit: str) -> str:
-    """``active``｜``inactive``｜``unknown``（systemctl 不能用時 unknown）。"""
+    """``active``｜``inactive``｜``missing``｜``unknown``（systemctl 不能用）。
+
+    systemd 的 ``is-active``：0＝active、3＝inactive、**4＝unit 檔不存在**
+    （原始碼的 not_found 分支）。4 是「確定沒裝」，不是「無法確認」（中-1）。
+    """
     try:
         proc = _systemctl(layout, "is-active", unit)
     except RunError:
@@ -70,6 +74,8 @@ def unit_state(layout, unit: str) -> str:
         return "active"
     if proc.returncode == 3:
         return "inactive"
+    if proc.returncode == 4:
+        return "missing"
     return "unknown"
 
 

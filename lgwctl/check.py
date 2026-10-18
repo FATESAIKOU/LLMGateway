@@ -3,8 +3,8 @@
 項目與判法：
 
 - ``llmgateway.service``／``llmgateway-tunnel.service``：``systemctl is-active``
-  （system 層，不需要任何環境變數）；隧道那條在「設定還沒填」時算 todo
-  （本人才要動），填了就照實 fail。
+  （system 層，不需要任何環境變數）；unit 檔不存在（rc 4）一律 ``fail``（沒裝）；
+  隧道那條在「設定還沒填」且還裝著時算 todo（本人才要動），裝了沒跑就照實 fail。
 - ``tag``（只有 ``--tag`` 時）：裝的版本是不是指定的那個。
 - ``list-local``：本機 ``GET /v1/subscriptions`` 要 200。
 - ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``）；
@@ -58,6 +58,10 @@ def _check_units(layout, report) -> None:
         state = units.unit_state(layout, unit)
         if state == "active":
             report.ok(unit)
+        elif state == "missing":
+            # unit 檔不在＝確定沒裝（含隧道：install 本來就該放兩個 unit），
+            # 不能當 todo／unknown，否則「沒裝」會被誤當「無法確認」（中-1）。
+            report.fail(unit, "unit 不在（沒裝）")
         elif state == "unknown":
             report.todo(unit, f"{layout.systemctl} 不能用，無法確認")
         elif unit == TUNNEL_SERVICE_NAME and not tunnel_ready:

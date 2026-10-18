@@ -40,10 +40,16 @@ printf '%s\\n' "$*" >> "${fake}/systemctl.log"
 unit="${!#}"
 case "$1" in
     is-active)
+        # rc 4＝systemd 的 not_found（unit 檔不存在），不是 3。
+        [[ -f "${fake}/missing/${unit}" ]] && exit 4
         [[ -f "${fake}/active/${unit}" ]] && exit 0 || exit 3 ;;
     is-failed)
         [[ -f "${fake}/failed/${unit}" ]] && exit 0 || exit 1 ;;
-    daemon-reload|enable)
+    daemon-reload)
+        printf '%s %s\\n' "$1" "$unit" >> "${fake}/actions.log"
+        [[ -f "${fake}/reload_fail" ]] && exit 1
+        exit 0 ;;
+    enable)
         printf '%s %s\\n' "$1" "$unit" >> "${fake}/actions.log"
         exit 0 ;;
     start|restart|stop)
@@ -51,7 +57,10 @@ case "$1" in
         if [[ -f "${fake}/start_fail/${unit}" ]]; then
             exit 1
         fi
-        : > "${fake}/active/${unit}"
+        # start_noop：回 0 但不標 active（模擬 simple 型 unit、exec 前就回 0）。
+        if [[ ! -f "${fake}/start_noop/${unit}" ]]; then
+            : > "${fake}/active/${unit}"
+        fi
         exit 0 ;;
     *)
         exit 0 ;;
@@ -338,8 +347,23 @@ class Sandbox:
         elif os.path.exists(path):
             os.unlink(path)
 
+    def set_missing(self, unit: str, missing: bool = True) -> None:
+        """讓假 systemctl 對這個 unit 回 rc 4（systemd 的「unit 檔不存在」）。"""
+        path = os.path.join(self.fake, "missing", unit)
+        if missing:
+            self.write(path, "1\n")
+        elif os.path.exists(path):
+            os.unlink(path)
+
     def set_start_fail(self, unit: str) -> None:
         self.write(os.path.join(self.fake, "start_fail", unit), "1\n")
+
+    def set_start_noop(self, unit: str) -> None:
+        """start 回 0 但不把 unit 標成 active（systemd 的 simple：fork 完就回 0）。"""
+        self.write(os.path.join(self.fake, "start_noop", unit), "1\n")
+
+    def set_daemon_reload_fail(self) -> None:
+        self.write(os.path.join(self.fake, "reload_fail"), "1\n")
 
     def set_failed(self, unit: str) -> None:
         self.write(os.path.join(self.fake, "failed", unit), "1\n")
