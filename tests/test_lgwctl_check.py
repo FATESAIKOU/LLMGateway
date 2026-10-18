@@ -123,6 +123,24 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(has_line(out, "llmgateway.service", "todo"), out)
         self.assertEqual(rc, 2, out + err)
 
+    def test_missing_units_are_fail(self):
+        """systemctl is-active rc 4＝unit 檔不存在：確定沒裝，是 fail 不是 todo。"""
+        self.box.set_missing("llmgateway.service")
+        self.box.set_missing("llmgateway-tunnel.service")
+        rc, out, err = self.check()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "llmgateway.service", "fail"), out)
+        self.assertTrue(has_line(out, "llmgateway-tunnel.service", "fail"), out)
+        self.assertIn("沒裝", out)
+        self.assertNotIn("不能用", out)   # 不是「systemctl 不能用」的那種 todo
+
+    def test_missing_tunnel_unit_is_fail_even_without_config(self):
+        """隧道 unit 不在＝沒裝（install 本來就該放兩個），「設定未填」特例不適用。"""
+        self.box.set_missing("llmgateway-tunnel.service")
+        rc, out, err = self.check()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "llmgateway-tunnel.service", "fail"), out)
+
     # -- list ---------------------------------------------------------------
 
     def test_list_local_not_200_is_fail(self):
@@ -293,6 +311,15 @@ class StatusTests(unittest.TestCase):
                              "LLMGW_SYSTEMCTL": os.path.join(self.box.root, "no-systemctl")})
         self.assertEqual(rc, 0, out + err)
         self.assertIn("unknown", out)
+
+    def test_status_shows_missing(self):
+        """unit 檔不在（is-active rc 4）時 status 要顯示 missing，不是 unknown。"""
+        self.box.install_state(FAKE_TAG)
+        self.box.set_missing("llmgateway.service")
+        rc, out, err = self.box.run_cli(["status"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("missing", out)
+        self.assertNotIn("unknown", out)
 
     def test_check_on_an_empty_machine_does_not_crash(self):
         """什麼都還沒裝時 check 要照樣給三態行（policy 一定是 fail），不要 traceback。"""

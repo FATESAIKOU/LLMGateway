@@ -1,6 +1,7 @@
 """取碼、切 current／previous、清舊版（install 與 upgrade 共用）。
 
-- 取碼：``git clone --depth 1 --branch <tag>`` 到同層暫存目錄，驗必要檔案都在
+- 取碼：``git clone --depth 1 --branch <tag> -- <repo>`` 到同層暫存目錄（``--``
+  後一律當路徑，repo 再過一次 ``bad_repo``），驗必要檔案都在
   才寫 ``.lgw-tag`` 並原子搬進 ``<prefix>/opt/llmgateway/<tag>``；已裝完整就沿用。
 - 切版：``current`` 指新 tag，舊的記到 ``previous``（原子換 symlink）。
 - 清舊版：只留 current 與 previous 兩版，其他 tag 目錄刪掉。
@@ -16,15 +17,31 @@ from .layout import KEYSYNC_BIN_NAME, OPS_DIR_NAME, TAG_RE, TUNNEL_BIN_NAME
 from .run import CLONE_TIMEOUT, RunError, run
 
 # 一版取回來至少要有的檔案；缺一個就不算完整（不切 current）。
+# lgwd/policy.py 額外重要：升級的 policy dry-run 會在版本目錄裡 import 它
+# （低-5）；lgwctl/__main__.py 與 lgwd/main.py、lgwd/keys.py 是服務與
+# 指令實際跑起來要用的（低-8）。
 REQUIRED_FILES = (
     "policy/default.json",
     os.path.join("lgwd", "__main__.py"),
+    os.path.join("lgwd", "main.py"),
+    os.path.join("lgwd", "policy.py"),
+    os.path.join("lgwd", "keys.py"),
+    os.path.join("lgwctl", "__main__.py"),
     os.path.join(OPS_DIR_NAME, KEYSYNC_BIN_NAME),
     os.path.join(OPS_DIR_NAME, TUNNEL_BIN_NAME),
     os.path.join("deploy", "units", "llmgateway.service"),
     os.path.join("deploy", "units", "llmgateway-tunnel.service"),
 )
 TAG_FILE_NAME = ".lgw-tag"
+
+
+def bad_repo(repo: str) -> bool:
+    """repo 位址不可用：以 ``-`` 開頭（git 會當選項解，例：``--upload-pack=``），
+    或含 NUL（argv 的界線，非法）。
+
+    ``--repo`` 與 ``LLMGW_REPO`` 都要過這關（中-6）；緊接著的 ``--`` 是第二層。
+    """
+    return repo.startswith("-") or "\0" in repo
 
 
 def missing_files(tag_dir: str) -> list[str]:
@@ -66,6 +83,38 @@ def write_tag_file(tag_dir: str, tag: str) -> None:
         fh.write(tag + "\n")
 
 
+def normalize_tree(layout, root: str) -> None:
+    """版本目錄要讓服務帳號讀得到（Lima 演練抓到的 status=200/CHDIR）。
+
+    ``git clone`` 進 ``tempfile.mkdtemp`` 的目錄是 0700（root 擁有），但服務是
+    ``User=llmgw``、``WorkingDirectory=/opt/llmgateway/current``，進不去就起不來。
+    這裡把整棵設成：目錄 0755、一般檔 0644、原本有執行位的維持 0755；有的話
+    擁有者設 root:root（``LLMGW_PREFIX`` 測試模式不 chown，但照樣 chmod）。
+    ``.git`` 直接移除（發佈目錄不需要；--depth 1 的它也幫不上什麼）。
+
+    symlink 不跟進去、也不改它指到的東西（目前 repo 裡沒有）。
+    """
+    git_dir = os.path.join(root, ".git")
+    if os.path.isdir(git_dir) and not os.path.islink(git_dir):
+        shutil.rmtree(git_dir, ignore_errors=True)
+
+    chown = (not layout.prefix) and layout.euid == 0
+    for base, dirs, files in os.walk(root):
+        os.chmod(base, 0o755)
+        if chown:
+            os.chown(base, 0, 0)
+        dirs[:] = [name for name in dirs
+                   if not os.path.islink(os.path.join(base, name))]
+        for name in files:
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                continue
+            mode = os.stat(path).st_mode
+            os.chmod(path, 0o755 if mode & 0o111 else 0o644)
+            if chown:
+                os.chown(path, 0, 0)
+
+
 def _move_into_place(tmp: str, tag_dir: str) -> None:
     """把驗過的暫存目錄搬進 tag_dir；舊的（不完整的）目錄先移開，失敗搬回去。"""
     stale = None
@@ -88,12 +137,26 @@ def _move_into_place(tmp: str, tag_dir: str) -> None:
 
 
 def fetch(layout, tag: str, repo: str | None, report) -> str | None:
-    """取一版程式；成功回 tag 目錄，失敗回 None（已經記 fail 行）。"""
+    """取一版程式；成功回 tag 目錄，失敗回 None（已經記 fail 行）。
+
+    不論是新抓的還是沿用的，回傳前都會把目錄權限整理成服務讀得到（見
+    ``normalize_tree``）：舊版（這個 bug 修好之前）留下來的 0700 目錄，重跑
+    install／upgrade 也會被修好。
+    """
     tag_dir = layout.tag_dir(tag)
     if installed_complete(layout, tag):
+        try:
+            normalize_tree(layout, tag_dir)
+        except OSError as exc:
+            report.fail("fetch", f"版本目錄權限修不好（{type(exc).__name__}）")
+            return None
         report.ok("fetch", f"{tag} 已存在（沿用）")
         return tag_dir
     repo_url = repo or layout.repo
+    if bad_repo(repo_url):
+        # 不回顯 repo 的值（可能帶參數），只說為什麼不行。
+        report.fail("fetch", "repo 位址不可用（不能以 - 開頭、不能含 NUL）")
+        return None
     try:
         os.makedirs(layout.opt_dir, exist_ok=True)
         tmp = tempfile.mkdtemp(prefix=f".{tag}.", dir=layout.opt_dir)
@@ -101,7 +164,9 @@ def fetch(layout, tag: str, repo: str | None, report) -> str | None:
         report.fail("fetch", f"建暫存目錄失敗（{type(exc).__name__}：{layout.opt_dir}）")
         return None
     try:
-        proc = run([layout.git, "clone", "--depth", "1", "--branch", tag, repo_url, tmp],
+        # ``--`` 之後一律當路徑（第一層防護；bad_repo 是第二層，中-6）。
+        proc = run([layout.git, "clone", "--depth", "1", "--branch", tag,
+                    "--", repo_url, tmp],
                    env=layout.child_env(), timeout=CLONE_TIMEOUT)
     except RunError as exc:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -118,6 +183,7 @@ def fetch(layout, tag: str, repo: str | None, report) -> str | None:
         return None
     try:
         write_tag_file(tmp, tag)
+        normalize_tree(layout, tmp)
         _move_into_place(tmp, tag_dir)
     except OSError as exc:
         shutil.rmtree(tmp, ignore_errors=True)

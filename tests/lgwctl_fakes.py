@@ -40,10 +40,16 @@ printf '%s\\n' "$*" >> "${fake}/systemctl.log"
 unit="${!#}"
 case "$1" in
     is-active)
+        # rc 4＝systemd 的 not_found（unit 檔不存在），不是 3。
+        [[ -f "${fake}/missing/${unit}" ]] && exit 4
         [[ -f "${fake}/active/${unit}" ]] && exit 0 || exit 3 ;;
     is-failed)
         [[ -f "${fake}/failed/${unit}" ]] && exit 0 || exit 1 ;;
-    daemon-reload|enable)
+    daemon-reload)
+        printf '%s %s\\n' "$1" "$unit" >> "${fake}/actions.log"
+        [[ -f "${fake}/reload_fail" ]] && exit 1
+        exit 0 ;;
+    enable)
         printf '%s %s\\n' "$1" "$unit" >> "${fake}/actions.log"
         exit 0 ;;
     start|restart|stop)
@@ -51,7 +57,10 @@ case "$1" in
         if [[ -f "${fake}/start_fail/${unit}" ]]; then
             exit 1
         fi
-        : > "${fake}/active/${unit}"
+        # start_noop：回 0 但不標 active（模擬 simple 型 unit、exec 前就回 0）。
+        if [[ ! -f "${fake}/start_noop/${unit}" ]]; then
+            : > "${fake}/active/${unit}"
+        fi
         exit 0 ;;
     *)
         exit 0 ;;
@@ -59,7 +68,7 @@ esac
 """
 
 FAKE_GIT = """#!/usr/bin/env bash
-# 假 git：只支援 clone --depth 1 --branch <tag> <repo> <dest>；用 REAL_TEMPLATE
+# 假 git：只支援 clone --depth 1 --branch <tag> -- <repo> <dest>；用 REAL_TEMPLATE
 # 造出一版的內容，unit 檔寫上 tag（好分辨裝的是哪一版）。
 fake="${LGW_FAKE:?}"
 printf 'git %s\\n' "$*" >> "${fake}/git.log"
@@ -82,13 +91,28 @@ for a in "$@"; do
 done
 mkdir -p "$dest/deploy/units"
 cp -a "${REAL_TEMPLATE:?}/." "$dest/"
+# 真的 git clone 會有 .git；install 應該把它移掉（發佈目錄不需要）。
+mkdir -p "$dest/.git"
+printf 'ref: refs/heads/main\\n' > "$dest/.git/HEAD"
 if [[ "${FAKE_GIT_BAD_POLICY:-0}" == "1" ]]; then
     printf '{"subscriptions": {}}\\n' > "$dest/policy/default.json"
 fi
+if [[ "${FAKE_GIT_BAD_LOADER:-0}" == "1" ]]; then
+    # 這版的 lgwd.policy 永遠拒收（低-5：dry-run 必須用新 tag 的 loader）
+    cat > "$dest/lgwd/policy.py" <<'PY'
+class PolicyError(ValueError):
+    pass
+
+
+def load_policy(path):
+    raise PolicyError("fake loader always refuses")
+PY
+fi
 printf '[Unit]\\n# llmgateway %s\\n' "$tag" > "$dest/deploy/units/llmgateway.service"
 printf '[Unit]\\n# tunnel %s\\n' "$tag" > "$dest/deploy/units/llmgateway-tunnel.service"
-if [[ "${FAKE_GIT_SKIP:-}" == "tunnel-unit" ]]; then
-    rm -f "$dest/deploy/units/llmgateway-tunnel.service"
+if [[ -n "${FAKE_GIT_SKIP:-}" ]]; then
+    # 拿掉相對路徑（低-8：驗必備檔）
+    rm -rf "$dest/${FAKE_GIT_SKIP}"
 fi
 exit 0
 """
@@ -117,7 +141,15 @@ exit 0
 
 FAKE_GH = """#!/usr/bin/env bash
 fake="${LGW_FAKE:?}"
-printf 'gh %s\\n' "$*" >> "${fake}/gh.log"
+{
+    printf 'gh %s\\n' "$*"
+    # 這支子行程的環境裡有沒有解密密碼（只記有無，不記值；低-4 的測試用）
+    if [[ -n "${LLMGW_KEYS_PASSWORD:-}" ]]; then
+        printf 'env-password yes\\n'
+    else
+        printf 'env-password no\\n'
+    fi
+} >> "${fake}/gh.log"
 case "${1:-}" in
     auth)
         exit "${FAKE_GH_AUTH_RC:-1}" ;;
@@ -267,6 +299,16 @@ class Sandbox:
                    Path(REAL_POLICY).read_text(encoding="utf-8"), 0o644)
         self.write(os.path.join(self.template, "lgwd", "__main__.py"),
                    '"""假 lgwd（測試不執行它）。"""\n', 0o644)
+        # lgwd.policy 放真的規則檔：升級的 policy dry-run 會真的在版本目錄裡
+        # import 它（低-5）；main／keys 與 lgwctl 只要求檔案在（低-8 的必備檔）。
+        self.write(os.path.join(self.template, "lgwd", "policy.py"),
+                   (REPO_ROOT / "lgwd" / "policy.py").read_text(encoding="utf-8"), 0o644)
+        self.write(os.path.join(self.template, "lgwd", "main.py"),
+                   '"""假 lgwd.main（必備檔，測試不執行）。"""\n', 0o644)
+        self.write(os.path.join(self.template, "lgwd", "keys.py"),
+                   '"""假 lgwd.keys（必備檔，測試不執行）。"""\n', 0o644)
+        self.write(os.path.join(self.template, "lgwctl", "__main__.py"),
+                   '"""假 lgwctl（必備檔，測試不執行）。"""\n', 0o644)
         self.write(os.path.join(self.template, "ops-scripts", "key-sync"),
                    FAKE_KEY_SYNC, 0o755)
         self.write(os.path.join(self.template, "ops-scripts", "llmgateway-tunnel"),
@@ -335,8 +377,23 @@ class Sandbox:
         elif os.path.exists(path):
             os.unlink(path)
 
+    def set_missing(self, unit: str, missing: bool = True) -> None:
+        """讓假 systemctl 對這個 unit 回 rc 4（systemd 的「unit 檔不存在」）。"""
+        path = os.path.join(self.fake, "missing", unit)
+        if missing:
+            self.write(path, "1\n")
+        elif os.path.exists(path):
+            os.unlink(path)
+
     def set_start_fail(self, unit: str) -> None:
         self.write(os.path.join(self.fake, "start_fail", unit), "1\n")
+
+    def set_start_noop(self, unit: str) -> None:
+        """start 回 0 但不把 unit 標成 active（systemd 的 simple：fork 完就回 0）。"""
+        self.write(os.path.join(self.fake, "start_noop", unit), "1\n")
+
+    def set_daemon_reload_fail(self) -> None:
+        self.write(os.path.join(self.fake, "reload_fail"), "1\n")
 
     def set_failed(self, unit: str) -> None:
         self.write(os.path.join(self.fake, "failed", unit), "1\n")

@@ -5,16 +5,19 @@
 from __future__ import annotations
 
 import importlib.machinery
+import json
 import os
 import stat
 import subprocess
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
 
 try:
     from .lgwctl_fakes import (
+        FAKE_KEY_VALUE,
         FAKE_PASSWORD,
         FAKE_TAG,
         Sandbox,
@@ -23,6 +26,7 @@ try:
     )
 except ImportError:  # python3 -m unittest discover -s tests
     from lgwctl_fakes import (
+        FAKE_KEY_VALUE,
         FAKE_PASSWORD,
         FAKE_TAG,
         Sandbox,
@@ -104,6 +108,59 @@ class SyncTests(unittest.TestCase):
         rc, out, err = self.box.run_cli(["sync"])
         self.assertEqual(rc, 0, out + err)
         self.assertIn("password-env no", self.box.log("keysync.log"))
+
+    # -- 狀態檔與 restart 提示（中-5）---------------------------------------
+
+    def test_sync_success_writes_status_and_hints_restart(self):
+        """成功後補寫 T2 格式的 .keysync.status，並提醒要 restart（中-5）。"""
+        self.write_password()
+        self.box.write(self.box.state("keys.env"), f"KEY={FAKE_KEY_VALUE}\n", 0o600)
+        rc, out, err = self.box.run_cli(["sync"])
+        self.assertEqual(rc, 0, out + err)
+        text = self.box.read(self.box.state(".keysync.status"))
+        status = json.loads(text)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["reason"], "ok")
+        self.assertLess(abs(status["ts"] - time.time()), 300)
+        # 檔裡只有 ts／ok／reason：不含任何值
+        self.assertNotIn(FAKE_PASSWORD, text)
+        self.assertNotIn(FAKE_KEY_VALUE, text)
+        # 提示：LoadCredential 是啟動時的快照，要 restart 才換
+        self.assertTrue(has_line(out, "restart", "todo"), out)
+        self.assertIn("LoadCredential", out)
+        # check 看得到手動拉取的結果
+        rc2, out2, err2 = self.box.run_cli(["check", "--no-remote"])
+        self.assertTrue(has_line(out2, "keysync", "ok"), out2)
+
+    def test_sync_failure_writes_failed_status(self):
+        """失敗要寫 ok:false（不能假成功、也不能讓 check 說好）（中-5）。"""
+        self.write_password()
+        self.box.write(self.box.state("keys.env"), "", 0o600)
+        rc, out, err = self.box.run_cli(["sync"],
+                                        env={**self.box.env, "FAKE_KEYSYNC_RC": "9"})
+        self.assertEqual(rc, 9, out + err)
+        status = json.loads(self.box.read(self.box.state(".keysync.status")))
+        self.assertFalse(status["ok"])
+        self.assertIn("rc=9", status["reason"])
+        rc2, out2, err2 = self.box.run_cli(["check", "--no-remote"])
+        self.assertTrue(has_line(out2, "keysync", "fail"), out2)
+
+    def test_sync_early_failure_keeps_old_status(self):
+        """沒跑到 key-sync（keys.pass 不在）就不動狀態檔（不要假成功，中-5）。"""
+        old = json.dumps({"ts": 1, "ok": False, "reason": "old"})
+        self.box.write(self.box.state(".keysync.status"), old, 0o644)
+        rc, out, err = self.box.run_cli(["sync"])
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(self.box.read(self.box.state(".keysync.status")), old)
+
+    def test_sync_is_the_only_child_allowed_to_see_the_password(self):
+        """child_env 預設移除密碼；sync 明確放行（低-4）。"""
+        self.box.write(self.box.etc("keys.pass"), "# 只有註解\n", 0o640)
+        env = {**self.box.env, "LLMGW_KEYS_PASSWORD": FAKE_PASSWORD}
+        rc, out, err = self.box.run_cli(["sync"], env=env)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("password-env yes", self.box.log("keysync.log"))
+        self.assertNotIn(FAKE_PASSWORD, out + err)
 
     @unittest.skipIf(os.geteuid() == 0, "root 身分下沒有 prefix 會動真機，略過")
     def test_sync_needs_root_without_prefix(self):

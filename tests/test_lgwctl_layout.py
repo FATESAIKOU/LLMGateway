@@ -184,6 +184,15 @@ class EnvFileTests(unittest.TestCase):
         self.assertEqual(child["HOME"], "/h")
         self.assertNotIn("LGW_TUNNEL_ENV", child)
 
+    def test_child_env_drops_keys_password(self):
+        """解密密碼一律不進子行程，除非明確指名（低-4）。"""
+        layout = Layout.from_env({"LLMGW_PREFIX": self.tmp.name,
+                                  "FOO": "1",
+                                  "LLMGW_KEYS_PASSWORD": "ExportedFakePassword"})
+        self.assertNotIn("LLMGW_KEYS_PASSWORD", layout.child_env())
+        self.assertEqual(layout.child_env(LLMGW_KEYS_PASSWORD="x")["LLMGW_KEYS_PASSWORD"],
+                         "x")
+
 
 class ReportTests(unittest.TestCase):
     def test_lines_and_details(self):
