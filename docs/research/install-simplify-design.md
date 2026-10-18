@@ -1,6 +1,6 @@
-# #35 安裝簡單化：設計草案（待本人與 PMO 看過）
+# #35 安裝簡單化：設計（本人已決定方向 A）
 
-狀態：草案，只有文件，沒有動程式、沒有動真機。公開 repo，不寫機器名、位址、key 值。
+狀態：本人 2026-10-18 已決定（見 §7 與 [#35 的決定留言](https://github.com/FATESAIKOU/LLMGateway/issues/35#issuecomment-6242655225)）；實作在後續 PR。公開 repo，不寫機器名、位址、key 值。
 
 ## 1. 現在的安裝有哪些步驟、哪裡麻煩
 
@@ -78,7 +78,7 @@ unit 加固：`NoNewPrivileges`、`ProtectSystem=strict`、`ReadWritePaths=/var/
 前提：真機動作照新規則——計畫（含停損）由 PMO 問本人、本人授權那一次，由我自己跑；我先把腳本與演練證據備齊。目前真機是 user unit 版（v0.1.4）。
 
 階段：
-1. **演練（不碰真機）**：在一台一次性的 Linux（例如 MyLinuxPool 的 worker，假 key、假 repo 內容）把整套 `install → check → upgrade → rollback → 自動回滾` 跑過；腳本邏輯另有假 systemctl 的單元測試。需要 PMO 借一台機器。
+1. **演練（不碰真機）**：worker 的 PID 1 不是 systemd，不能用。第一輪在 Mac 的 Lima 一次性 Ubuntu VM 跑過（已跑）；因 Mac 負載，重演練搬到 fh-l 的一次性 systemd 容器（假 key、假會合點、跑完刪除）。整套 `install → check → upgrade → rollback → 自動回滾` 與遷移（含反向保險、停損）都要跑過；腳本邏輯另有假 systemctl 的單元測試。
 2. **準備（真機，不影響服務）**：只放新程式與設定到 `/opt`、`/etc`、`/var/lib`（複製 `keys.env`、`llm.db`、`tunnel.env`、密碼；用 `cp -a`，值不印出）；新 unit 先不 enable。舊 user unit 全程不動。
 3. **切換窗口（約 5 分鐘，有停損）**：切換由一支「分離執行」的腳本做（`systemd-run` 起，不隨 ssh 連線斷掉而中止）：先排一個**反向保險** `systemd-run --on-active=10min revert.sh`（停新 unit、啟動舊 user unit）；停舊 user 的服務與隧道；啟新 unit；本機與經會合點 list 各探一次。通過就 `llmgwctl confirm` 取消保險；沒人 confirm，10 分鐘後自動回到舊版。
 4. **觀察期（建議 3 天）**：舊 user unit 與舊目錄保留但停用。期間如有問題，`llmgwctl rollback-to-user`（停新啟舊）一個指令回去。
@@ -98,7 +98,7 @@ unit 加固：`NoNewPrivileges`、`ProtectSystem=strict`、`ReadWritePaths=/var/
 ## 7. 已決定（本人 2026-10-18，經 PMO）
 
 1. 方向 A（system 層 unit＋`lgwd` 內建拉 key＋`llmgwctl`）；B、C 不做。照 §8 拆 T1〜T4。
-2. 演練機：worker 不能用（PID 1 不是 systemd）。改在 Mac 上用 Lima 開一台一次性 Ubuntu VM（有 systemd），假 key、假會合點，把 install→check→upgrade→rollback→自動回滾→反向保險（不 confirm 時 10 分鐘自動回舊版）都跑過，跑完刪 VM。演練紀錄寫進 #35。
+2. 演練機：worker 不能用（PID 1 不是 systemd）。第一輪在 Mac 上用 Lima 開一台一次性 Ubuntu VM（有 systemd，已跑）；之後因 Mac 負載，重演練搬到 fh-l 的一次性 systemd 容器。都用假 key、假會合點，把 install→check→upgrade→rollback→自動回滾→反向保險（不 confirm 時 10 分鐘自動回舊版）都跑過，跑完刪 VM。演練紀錄寫進 #35。
 3. 隧道金鑰維持原位（`~llmgw/.ssh`），不搬 `/etc`。
 4. 真機授權：本人已授權，條件是「演練通過＋非作者審查過且高、中都修完」；之後由 PM 自己挑時間切，不用再問。停損照 §5（5 分鐘內本機或經會合點 list 非 200、`check` 非 0、10 分鐘沒 confirm → 自動回舊版）；觀察期 3 天，期內 `rollback-to-user` 一個指令回去，過了才拆舊 unit 與 linger。切換前在 #35 留一行「要切了」，切完把結果（含 `check` 輸出，不含值）留在 #35。
 
