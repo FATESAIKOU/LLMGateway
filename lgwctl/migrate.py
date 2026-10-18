@@ -89,7 +89,6 @@ from .layout import (
     TAG_RE,
     TUNNEL_SERVICE_NAME,
     Layout,
-    parse_env_file,
     parse_env_text,
 )
 from .report import Report
@@ -1104,7 +1103,20 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
         # 中-5：舊 keysync.env 在服務帳號控制下（symlink 到 /proc/… 或外部檔）。
         _refuse_symlink(report, "keys-pass", old.keysync_env_file)
         return
-    value = parse_env_file(old.keysync_env_file).get(install.KEYS_PASS_VAR, "")
+    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1)
+    if raw is None:
+        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+            _refuse_symlink(report, "keys-pass", old.keysync_env_file)
+            return
+        value = ""
+    elif len(raw) > MAX_KEYS_ENV_BYTES:
+        value = ""
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="replace")
+        value = parse_env_text(text).get(install.KEYS_PASS_VAR, "")
     if not value:
         if not _exists(dst):
             try:
