@@ -133,6 +133,10 @@ PHASE_REVERTED = "reverted"
 PHASE_FINALIZED = "finalized"
 PHASE_ABORTED = "aborted"
 
+# 進行中／不可重來的階段：不能直接再切（中-4）。終態 reverted／aborted 可以開
+# 新一輪（先把舊狀態檔歸檔）。
+OPEN_PHASES = (PHASE_PENDING, PHASE_CONFIRMED, PHASE_FINALIZED, PHASE_CUTOVER)
+
 # 狀態檔裡的 unit 名是不可信輸入（服務帳號以前寫得到那個檔）：只接受保險
 # 自己的兩個固定值，其他一律不當 systemctl 的參數（高-3）。
 STATE_UNIT_NAMES = (REVERT_TIMER_UNIT, REVERT_UNIT + ".service")
@@ -1247,6 +1251,12 @@ def cutover(layout, *, tag: str, revert_after: str = DEFAULT_REVERT_AFTER,
             return 1
         return _cutover_inner(layout, old, tag=tag, revert_after=revert_after,
                               no_remote=no_remote, report=report)
+    # 中-4：進行中的階段在 outer 就拒絕（不要先排 transient，inner 才失敗）。
+    phase = read_state(layout).get("phase")
+    if phase in OPEN_PHASES:
+        report.fail("cutover", f"狀態是 {phase}；不重複切換"
+                                "（要開新一輪先跑 prepare-migration）")
+        return 1
     problems = preflight(layout, tag)
     if problems:
         for problem in problems:
@@ -1296,7 +1306,7 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
     phase = state.get("phase")
     # 中-4：進行中／不可重來的階段一律拒絕；終態（reverted／aborted）歸檔後
     # 可以開新一輪（prepare 也會歸檔，這裡是沒重跑 prepare 的直切）。
-    if phase in (PHASE_PENDING, PHASE_CONFIRMED, PHASE_FINALIZED, PHASE_CUTOVER):
+    if phase in OPEN_PHASES:
         report.fail("cutover", f"狀態是 {phase}；不重複切換"
                                 "（要開新一輪先跑 prepare-migration）")
         return 1

@@ -688,6 +688,20 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertEqual(stat.S_IMODE(os.stat(box.etc("keys.pass")).st_mode), 0o640)
         self.assertNotIn(FAKE_PASSWORD, out + err)
 
+    def test_prepare_archives_a_reverted_state_and_starts_a_new_round(self):
+        """中-4：reverted 是終態，但 prepare 要把舊狀態檔歸檔才能再切。"""
+        self.box.write_cutover_state(phase="reverted", tag=OLD_TAG,
+                                     old_home=self.box.service_home)
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "state-archive", "ok"), out)
+        archived = glob.glob(self.box.ctl(".cutover.state.*"))
+        self.assertEqual(len(archived), 1, archived)
+        self.assertEqual(json.loads(self.box.read(archived[0]))["phase"], "reverted")
+        state = self.box.cutover_state()
+        self.assertNotIn("phase", state)
+        self.assertEqual(state["old_home"], self.box.service_home)
+
     def test_prepare_rejects_bad_tag(self):
         rc, out, err = self.box.run_migrate(["prepare-migration", "--tag", "nope"])
         self.assertEqual(rc, 1)
@@ -804,6 +818,22 @@ class CutoverTests(MigrationTestCase):
                 self.assertTrue(has_line(out, "cutover", "fail"), out)
                 self.assertIn(phase, out)
                 self.assertEqual(box.actions(), [])
+
+    def test_outer_refuses_when_a_round_is_still_open(self):
+        """中-4：confirmed／finalized 等階段在 outer 就拒絕，不排 transient。"""
+        for phase in ("pending-confirm", "confirmed", "finalized", "cutover-started"):
+            with self.subTest(phase=phase):
+                box = MigrateSandbox()
+                self.addCleanup(box.close)
+                box.make_old_layout()
+                box.install_new_state(FAKE_TAG)
+                box.write_cutover_state(phase=phase, tag=FAKE_TAG)
+                rc, out, err = box.run_migrate(
+                    ["cutover", "--tag", FAKE_TAG, "--revert-after", "10m"])
+                self.assertEqual(rc, 1, out + err)
+                self.assertTrue(has_line(out, "cutover", "fail"), out)
+                self.assertIn(phase, out)
+                self.assertEqual(box.order(), [])
 
     def test_inner_fails_when_another_run_holds_the_lock(self):
         """中-3：切換與回滾共用一把鎖；拿不到就明確失敗。"""
@@ -1363,6 +1393,28 @@ class RollbackToUserTests(MigrationTestCase):
         # 資料與舊服務還是照常回去了（fail 只是不隱藏）
         self.assertEqual(self.box.cutover_state()["phase"], "reverted")
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+
+    def test_rollback_refuses_after_finalize_without_stopping_new_units(self):
+        """中-4：finalize 後舊版已收走；rollback 必須在停新 unit 之前就拒絕。"""
+        self.box.write_cutover_state(phase="finalized", tag=FAKE_TAG,
+                                     old_home=self.box.service_home)
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "rollback", "fail"), out)
+        self.assertIn("finalized", out)
+        self.assertEqual(self.box.order(), [])
+        self.assertTrue(self.box.active("llmgateway.service"))
+        self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+
+    def test_rollback_refuses_when_an_old_unit_file_is_missing(self):
+        """低-2：舊 unit 檔不在時先拒絕——停掉新版只會讓機器沒有服務。"""
+        os.unlink(self.box.old_units("key-sync.service"))
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "rollback", "fail"), out)
+        self.assertIn("key-sync.service", out)
+        self.assertEqual(self.box.order(), [])
+        self.assertTrue(self.box.active("llmgateway.service"))
 
     def test_rollback_without_any_state_is_still_safe(self):
         os.unlink(self.box.ctl(".cutover.state"))
