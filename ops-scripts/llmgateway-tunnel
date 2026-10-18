@@ -5,7 +5,8 @@
 # 只有 HTTP 200 算健康）。連線斷掉、公開失敗或連續探針失敗就結束，由
 # systemd 重開（llmgateway-tunnel.service）。
 #
-# 設定：~/.config/llmgateway/tunnel.env（KEY=VALUE）
+# 設定：~/.config/llmgateway/tunnel.env（KEY=VALUE；可用環境變數 LGW_TUNNEL_ENV
+# 改成別的絕對路徑——新的 system unit 讀 /etc/llmgateway/tunnel.env）
 #   RENDEZVOUS=user@host:port（必填）、IDENTITY（必填）、KNOWN_HOSTS（必填）、
 #   REMOTE_API=4710、REMOTE_SSH=4711、LOCAL_API=8480、
 #   PROBE_INTERVAL=60、PROBE_FAILS=3、SSH_PATH=ssh。
@@ -30,6 +31,7 @@ import sys
 import threading
 
 CONFIG_REL = os.path.join(".config", "llmgateway", "tunnel.env")
+ENV_CONFIG = "LGW_TUNNEL_ENV"
 REQUIRED_KEYS = ("RENDEZVOUS", "IDENTITY", "KNOWN_HOSTS")
 DEFAULTS = {
     "REMOTE_API": "4710",
@@ -133,6 +135,10 @@ def load_config(path):
 
 
 def config_path():
+    """設定檔路徑：LGW_TUNNEL_ENV 優先（給 system unit 用），否則 ~/.config/...。"""
+    override = (os.environ.get(ENV_CONFIG) or "").strip()
+    if override:
+        return override
     home = os.environ.get("HOME")
     if not home:
         return None

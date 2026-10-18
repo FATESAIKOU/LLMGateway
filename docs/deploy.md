@@ -1,591 +1,396 @@
-# LLMGateway 部署與維運手冊（v5）
+# LLMGateway 部署與維運手冊
 
-給本人（或本人授權的人）做「放服務的那台」的一次性設定、GitHub 的設定、日常維運與排錯。設計見 `openspec/changes/gateway-v0/`（design 決定 2、3、4、5a、5b、6，以及 v5 增補），v5 的做法見 `docs/research/v5-plan.md`。
+給本人（或本人授權的人）做「放服務的那台」的安裝設定、舊版遷移、日常維運與排錯。
 
-v5（2026-10-12）跟 v4 的差別，一句話：**key 改由服務自己用 `gh` 從 private repo 拉**（不再有部署 workflow、部署公鑰與部署連線 secret），**客戶端自備通道**（LLMGateway 不再提供連線程式），**升級改手動**，隧道守護與 key-sync 放 `ops-scripts/`。
+本手冊全面改以 `llmgwctl`（system 層 unit 架構）新流程為主。舊版以 user unit 運作的手動與 bootstrap 流程已移至文末附錄。
 
-這是 public repo，本手冊：
-- 不寫實際的機器名、IP、key 的值；位址一律用 `<跳板機>`、`<埠>` 這類佔位；
-- 機器一律稱為「放服務的那台」；
+這是 public repo，本手冊寫作遵循以下原則：
+- 不寫實際的機器名、IP、key 的值、真實密碼；位址一律用 `<跳板機>`、`<埠>` 這類佔位符號。
+- 機器一律稱為「放服務的那台」。
 - 「會合點」指池跳板機上現有的 `sshproxy` 帳號（本人指定）。
+- 命令一律使用實際存在的 `llmgwctl`（或 `python3 -m lgwctl`）子指令與參數。
 
-## 0. 全貌
+---
 
-服務只做三件事：list、get、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。**不做應用層認證**，存取控制只靠 SSH：
+## 0. 全貌與架構
+
+服務只做三件事：list、get、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
 
 - `lgwd` 只綁放服務那台的 `127.0.0.1:<API 埠>`（預設 8480），不綁任何對外或容器網路的介面。
 - 隧道守護 `llmgateway-tunnel.service` 用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：
   - `127.0.0.1:4710` → `lgwd` 的 API；
-  - `127.0.0.1:4711` → 放服務那台的 sshd（管理用：手動升級、維修）。
-- 客戶端（Mac、worker 的 sidecar、手機）**自備通道**：把會合點的 4710 轉發到自己機器的 loopback（本機埠預設 4710），再直接打 `http://127.0.0.1:<本機埠>`。LLMGateway 不提供連線程式（3.1–3.3）。
-- key 的正本是 private repo `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`（加密檔）。放服務那台的 `key-sync`（systemd timer，約每 10 分鐘）用 `gh` 拉下來、解密、驗證後原子換掉 `keys.env`；`lgwd` 自己發現檔案換了會重讀。使用前提：以 `llmgw` 身分登入過 `gh`（1.9）。
-- 服務程式的升級：管理帳號用手動 `ssh` 上去跑 `install.sh --tag`（4.2）。兩個部署 workflow 與 `remote-deploy.sh` 在 v5 整組拿掉了。
+  - `127.0.0.1:4711` → 放服務那台的 sshd（管理用：手動升級、維護）。
+- 客戶端（Mac、worker 的 sidecar、手機）**自備通道**：把會合點的 4710 轉發到自己機器的 loopback（本機埠預設 4710），再直接打 `http://127.0.0.1:<本機埠>`。LLMGateway 不提供連線程式（見第 4 節）。
+- key 的正本是 private repo `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`（加密檔）。放服務那台以 `llmgw` 身分使用 `gh` 拉取、解密、驗證後原子換掉 `keys.env`；`lgwd` 發現檔案變更後自動重讀。使用前提：以 `llmgw` 身分登入過 `gh`。
+- 管理指令全面統一為 `llmgwctl`（封裝於 `/usr/local/bin/llmgwctl`，或在當版目錄執行 `python3 -m lgwctl`）。
 
-放服務的那台上，帳號 `llmgw` 底下有：
+---
 
-| 東西 | 位置 |
-|---|---|
-| 服務 `lgwd` | `~/.config/systemd/user/llmgateway.service`，執行 `~/.local/bin/llmgateway-run` |
-| 隧道守護 | `~/.config/systemd/user/llmgateway-tunnel.service`，執行 `~/.local/bin/llmgateway-tunnel` |
-| key 拉取 | `~/.config/systemd/user/key-sync.timer`（約每 10 分鐘）＋ `key-sync.service`，執行 `~/.local/bin/key-sync` |
-| 程式 | `~/.local/share/llmgateway/<tag>/`，`current` 指著用中的版本 |
-| 服務設定 | `~/.config/llmgateway/llmgateway.env`（`LGW_API_PORT`） |
-| 隧道設定 | `~/.config/llmgateway/tunnel.env` |
-| 解密密碼 | `~/.config/llmgateway/keysync.env`（**0600**，只有一行 `LLMGW_KEYS_PASSWORD=…`） |
-| 五把 key | `~/.local/state/llmgateway/keys.env`（0600，由 key-sync 換） |
-| 拉取版本記錄 | `~/.local/state/llmgateway/.keysync.sha`（純文字，上次套用的 blob `sha`） |
-| 冷卻與稽核 | `~/.local/state/llmgateway/llm.db`（SQLite，只有 `cooldowns` 與 `audit`，不含 key） |
+## 1. 部署前提與版面配置
 
-維運工具（隧道守護與 key-sync）在 repo 的 `ops-scripts/`；`install.sh` 與 `bootstrap.sh` 仍在 `deploy/`。
+### 1.1 系統前提
 
-## 1. 一次性開機設定（放服務的那台）
+- 作業系統：Linux，具備 systemd（system 層管理）。
+- 工具需求：`python3`（3.10 以上，僅使用標準函式庫）、`git`、`curl`、`ssh`、`ssh-keygen`、`openssl`，以及金鑰同步所需的 `gh`（GitHub CLI）。
+- 獨立服務帳號：`llmgw`（不能加入 `docker` 群組，確保隔離性）。
+- `gh` 登入：由本人親自以 `llmgw` 身分登入（`sudo -u llmgw -i` 後執行 `gh auth login`，使用瀏覽器登入，不放 token 檔）。
+- 隧道金鑰：維持在 `~llmgw/.ssh/`（私鑰 `~llmgw/.ssh/id_llmgw_tunnel`、known_hosts 檔 `~llmgw/.ssh/known_hosts_rendezvous`）。私鑰絕不離開該台機器。
 
-依 tasks 3.3，由本人或本人授權的人（PMO）做。**主要做法是 `deploy/bootstrap.sh`（1.A）**：用一個有 sudo 權限的一般帳號（下稱管理帳號）登入放服務的那台執行，一個指令做完建帳號到安裝、隧道金鑰、解密密碼。1.1–1.10 是同一批動作的手動版：腳本做了什麼、腳本出 `todo` 或 `fail` 時怎麼手動補，以及沒辦法用腳本時的備援。
+### 1.2 檔案系統版面配置（Layout）
 
-`gh` 登入（1.9）**bootstrap 不做**，本人自己來。
+新版架構將程式、設定、狀態與控制檔分層獨立，嚴格限制權限：
 
-### 1.A 用 `bootstrap.sh`（主要做法）
-
-#### 1.A.1 前提
-
-- 登入放服務的那台，用的是有 sudo 權限的管理帳號（不是 `llmgw`，也不要直接用 root）。
-- 那台是 Linux、有 systemd，並且有 `python3`（3.10 以上）、`git`、`curl`、`ssh`、`ssh-keygen`；缺了腳本第一步就 `fail`。
-- 要裝的版本已經打好 tag `lgw-vX.Y.Z` 並 push（腳本在 release tag 裡，見 1.A.2）。
-- 那台連得到 GitHub（`git clone`；key-sync 另外要連得到 `gh` 的 API）。
-- 管理帳號的 sudo 密碼：互動輸入，或放進一個只有你讀得到的密碼檔（`<密碼檔>`，權限 0600，建在你的家目錄底下）。用完就刪。密碼只用來驗證 sudo，不會出現在命令列、輸出或 log 裡；**不要把密碼檔的內容或路徑貼到工單、對話或 repo**。
-- 解密密碼：本人自己產生的 32 字元隨機英數（1.9）。可以放進一個 0600 的單行檔案（`<解密密碼檔>`）給 `--decrypt-pass-file`，或在接得到終端機時互動輸入。**這個值不進 repo、不進 secret、不貼給人**。
-- 會合點資訊：`sshproxy@<跳板機>:<埠>`，和一個含跳板機 host key 的 known_hosts 檔（`<檔>`，格式見 1.7，**不要用 `ssh-keyscan` 現掃**）。這些由 MyLinuxPool 提供；第一次執行可以先不給。
-
-#### 1.A.2 取得腳本
-
-腳本在 release tag 裡，所以先把那個 tag clone 到管理帳號家目錄底下的暫存目錄（不要放 `/tmp`）：
-
-```bash
-git clone --depth 1 --branch lgw-vX.Y.Z https://github.com/FATESAIKOU/LLMGateway.git ~/lgw-boot
-```
-
-`lgw-vX.Y.Z` 是 annotated tag（指向 tag 物件，不是 commit 本身）。clone 時 git 可能印一行 `warning: refs/tags/lgw-vX.Y.Z … is not a commit!`：**這是正常的警告**，工作目錄拿到的就是那個 tag 標記的 commit，照樣跑 1.A.3 即可。
-
-#### 1.A.3 執行
-
-```bash
-bash ~/lgw-boot/deploy/bootstrap.sh \
-  --tag lgw-vX.Y.Z \
-  --sudo-pass-file <密碼檔> \
-  [--decrypt-pass-file <解密密碼檔>] \
-  [--rendezvous sshproxy@<跳板機>:<埠> --rendezvous-known-hosts <檔>]
-```
-
-- `--tag`：要裝的版本，格式 `lgw-vX.Y.Z`；不是 `--check` 時必填。
-- `--sudo-pass-file`：選填；沒給就用一般互動的 `sudo`（會問一次密碼）。
-- `--decrypt-pass-file`：選填；給了就會把解密密碼寫進 `~/.config/llmgateway/keysync.env`（0600）。沒給時，如果接得到終端機（stdin 是 tty）會問一次（不回顯；直接 Enter 跳過），否則那一步記 `todo`。
-- `--rendezvous` 與 `--rendezvous-known-hosts`：選填，**要一起給**；給了才會填 `tunnel.env`（1.8）並重啟隧道守護。
-- `--check`：只檢查、不改任何東西，印出每一步的狀態。
-- `--reinstall`：已經是同一個 tag 也重跑 `install.sh`。
-- 路徑請用絕對路徑。
-
-**可以重複執行**：每一步先看現狀，已經是目標狀態就印 `ok` 不動它。絕不刪除或覆蓋既有的隧道金鑰、`keys.env`、`keysync.env`、資料庫。所以中途失敗、補了條件之後，同樣的指令再跑一次就好。
-
-#### 1.A.4 建議的執行順序
-
-隧道金鑰要先產生，才能拿去給 MyLinuxPool 登記；MyLinuxPool 登記完才能接通。所以分兩次跑，`gh` 登入與解密密碼放好之後再 `--check`：
-
-1. **第一次：不帶會合點。**
-
-   ```bash
-   bash ~/lgw-boot/deploy/bootstrap.sh --tag lgw-vX.Y.Z --sudo-pass-file <密碼檔> \
-     --decrypt-pass-file <解密密碼檔>
-   ```
-
-   做完建帳號、linger、檢查 sshd、第一次安裝（含 key-sync 的 timer）、產隧道金鑰、寫解密密碼。結尾摘要會印兩樣東西，各自交給對的人：
-   - **隧道公鑰**（一行 `ssh-ed25519 … llmgateway-tunnel`）：經 PMO 交給 mylinuxpool-pm，登記到 MyLinuxPool 的 `TUNNEL_EXTRA_PUBKEYS`（MyLinuxPool#77）。v5 不用登記部署公鑰。
-   - **那台的 ed25519 host 公鑰**：給本人自己，之後手動 ssh 進去（4.2）時比對指紋用。
-
-   第一次一定會有 `todo`（還沒給會合點、還沒登入 `gh`），結束碼是 3，這是預期的；`gh` 登入完照第 3 步重跑一次即可。
-2. **等 MyLinuxPool 登記好隧道公鑰後，第二次：補上會合點。**
-
-   ```bash
-   bash ~/lgw-boot/deploy/bootstrap.sh --tag lgw-vX.Y.Z --sudo-pass-file <密碼檔> \
-     --decrypt-pass-file <解密密碼檔> \
-     --rendezvous sshproxy@<跳板機>:<埠> --rendezvous-known-hosts <檔>
-   ```
-
-   這次會複製 known_hosts、填 `tunnel.env`，然後重啟 `llmgateway-tunnel.service`。
-3. **`gh` 登入（本人做；bootstrap 只看狀態、不代做）**：
-
-   bootstrap 有一步 `gh-auth`，以 `llmgw` 身分問 `gh auth status`：
-
-   | 狀態 | 意思 |
-   |---|---|
-   | `ok` | `llmgw` 已登入 `gh` |
-   | `todo` | 還沒登入。**結束碼 3**，後面的步驟照跑、摘要照印；照下面登入後重跑本腳本即可 |
-   | `fail` | 找不到 `gh`（該身分要裝 `gh` 才拉得到金鑰）。腳本停在這裡，結束碼 1 |
-
-   本人照這段登入（v5 選 (B)：用瀏覽器登入，不放 token 檔）：
-
-   ```bash
-   sudo -u llmgw -i
-   gh auth login
-   ```
-
-   登入完重跑第一次那條 `bootstrap.sh`，這次 `gh-auth` 會是 `ok`。
-4. **第一次拉取**（登入完可以立刻拉，不必等 10 分鐘）：
-
-   ```bash
-   sudo -u llmgw -i
-   systemctl --user start key-sync.service
-   journalctl --user -u key-sync -n 5
-   ```
-
-   log 看到 `ok 已換 keys.env` 就是拉下首版；`failed=gh_auth` 表示 `gh` 沒登入或 token 失效（5.1）。
-5. **`--check` 確認**：帶和第二次一樣的參數再加 `--check`（沒帶的參數，對應的那一步會被當成 `todo`）。
-
-   ```bash
-   bash ~/lgw-boot/deploy/bootstrap.sh --tag lgw-vX.Y.Z --sudo-pass-file <密碼檔> \
-     --decrypt-pass-file <解密密碼檔> \
-     --rendezvous sshproxy@<跳板機>:<埠> --rendezvous-known-hosts <檔> --check
-   ```
-
-   全部 `ok`、結束碼 0，再照 1.10 驗證，並從 Mac 照 3.1 連一次。確認完把 `~/lgw-boot`、`<密碼檔>`、`<解密密碼檔>` 刪掉。
-
-#### 1.A.5 看懂輸出
-
-每一步印一行 `[步驟] 狀態 說明`。步驟依序是 `prereq`（前提）、`user`（帳號）、`gh-auth`（`llmgw` 的 `gh` 登入狀態）、`linger`、`sshd`、`install`（安裝）、`tunnel-key`（隧道金鑰）、`keysync`（解密密碼）、`rendezvous`（會合點）、`check`（`install.sh --check`）。
-
-| 狀態 | 意思 |
-|---|---|
-| `ok` | 已經是目標狀態，沒動它 |
-| `changed` | 這次改了東西 |
-| `todo` | 需要人做（或缺參數）；腳本不會擅自處理，結尾摘要會再列一次 |
-| `fail` | 這一步失敗，腳本停在這裡，說明裡有原因 |
-
-結束碼：
-
-| 碼 | 意思 | 怎麼辦 |
+| 路徑 | 擁有者與權限 | 用途說明 |
 |---|---|---|
-| 0 | 全部完成，沒有 `todo` | 沒事了 |
-| 1 | 某一步 `fail` | 看那一行的說明，排除後重跑 |
-| 2 | 參數錯 | 看錯誤訊息（例如 `--rendezvous` 與 `--rendezvous-known-hosts` 沒有一起給、檔案不存在、tag 格式不對） |
-| 3 | 完成了，但還有 `todo` | 照 1.A.6 處理後重跑 |
+| `/opt/llmgateway/<tag>/` | `root:root` 0755 | 各版本程式目錄（從 git tag 抓取） |
+| `/opt/llmgateway/current` | `root:root` symlink | 指向目前生效版本的符號連結 |
+| `/opt/llmgateway/previous` | `root:root` symlink | 指向上一版版本的符號連結（供 rollback 使用） |
+| `/etc/llmgateway/llmgateway.env` | `root:llmgw` 0640 | 服務設定檔（例如 `LGW_API_PORT=8480`） |
+| `/etc/llmgateway/tunnel.env` | `root:llmgw` 0640 | 隧道設定檔（`RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS` 等） |
+| `/etc/llmgateway/keys.pass` | `root:llmgw` 0640 | 單行解密密碼（`LLMGW_KEYS_PASSWORD=...`，透過 systemd `LoadCredential` 傳遞） |
+| `/var/lib/llmgateway/keys.env` | `llmgw:llmgw` 0600 | 解密後的五把金鑰環境變數檔 |
+| `/var/lib/llmgateway/llm.db` | `llmgw:llmgw` 0600 | SQLite 資料庫（冷卻紀錄與稽核） |
+| `/var/lib/llmgateway/.keysync.sha` | `llmgw:llmgw` 0600 | 上次套用的金鑰 blob sha 記錄 |
+| `/var/lib/llmgateway/.keysync.status`| `llmgw:llmgw` 0644 | 金鑰同步狀態檔（時間戳與成敗原因，不含值） |
+| `/var/lib/llmgateway-ctl/` | `root:root` 0700 | 遷移與控制狀態目錄（`.cutover.state`、`.cutover.lock`） |
+| `/etc/systemd/system/` | `root:root` 0644 | 系統層 unit：`llmgateway.service`、`llmgateway-tunnel.service` |
+| `/usr/local/bin/llmgwctl` | `root:root` 0755 | 管理指令 wrapper 腳本（自動切進 current 執行） |
 
-第二次起，條件沒變時 `changed` 應該是 0。
+### 1.3 全新機器安裝（非遷移情境）
 
-#### 1.A.6 每種 `todo`、`fail` 怎麼辦
-
-| 步驟 | 訊息 | 怎麼辦 |
-|---|---|---|
-| `sshd` | `todo`：未啟用 `PubkeyAuthentication`、`AllowUsers`／`DenyUsers` 擋了 `llmgw`、沒在 `127.0.0.1:22` 聽 | 腳本**只檢查、不改 `sshd_config`**。照 1.3 自己改 `/etc/ssh/sshd_config` 或 `sshd_config.d/*.conf`，`sshd -t` 通過後 reload，再重跑腳本。 |
-| `user` | `todo`（`--check` 時）：帳號不存在，或在 `docker` 群組 | 不加 `--check` 重跑，腳本會建帳號或把 `llmgw` 移出 `docker` 群組（1.1）。 |
-| `linger` | `fail`：等 `/run/user/<uid>` 逾時 | `loginctl show-user llmgw -p Linger` 看是否 `yes`；等一下再重跑。 |
-| `install` | `fail` | 多半是 clone 不到 tag（tag 沒 push、網路）或 `install.sh` 出錯；看輸出裡 `ERROR` 那行，排除後重跑；已經裝好卻想重裝加 `--reinstall`。 |
-| `gh-auth` | `todo`：`llmgw` 的 `gh` 尚未登入 | 本人 `sudo -u llmgw -i` 後 `gh auth login`（用瀏覽器登入，不放 token 檔），再重跑本腳本。腳本不代做登入、也不碰 token 值。 |
-| `gh-auth` | `fail`：找不到 `gh` | 該身分要裝 `gh` 才拉得到金鑰；裝好再重跑（這一步失敗腳本會停在這裡，後面的步驟不跑）。 |
-| `keysync` | `todo`：未提供解密密碼 | 給 `--decrypt-pass-file`（單行、0600），或接在終端機上重跑讓它問一次。已經有 `keysync.env` 時這一步是 `ok`，不會覆蓋。 |
-| `keysync` | `fail`：解密密碼檔格式無效 | 檔案只能有一行、值不含空白（1.9）。修正後重跑；既有 `keysync.env` 不會被動到。 |
-| `rendezvous` | `todo`：未給會合點 | 等 MyLinuxPool 登記好隧道公鑰，第二次帶上 `--rendezvous` 與 `--rendezvous-known-hosts`。 |
-| `check` | `fail`：`install.sh --check` 不是 0 | 看 4.4 的三態（含經會合點的探針與 key-sync 的判斷）。隧道還沒設定、或 `gh` 還沒登入／解密密碼還沒放時不通過是預期的；全部做完後仍不通過，照 5.1–5.3 排錯。 |
-
-摘要最後有一份剩餘 `todo` 清單，照著一條條做完再跑一次即可。
-
-#### 1.A.7 腳本沒做的事
-
-- 不改 `sshd_config`（只檢查）。
-- 不做 `gh` 登入（本人以 `llmgw` 身分自己做，1.9）；不碰 `keys.env` 的內容（key 由 key-sync 拉，4.1）。
-- 不登記 MyLinuxPool 的 `TUNNEL_EXTRA_PUBKEYS`、不設 GitHub secret（2.2）：這些由本人或 mylinuxpool-pm 做。
-
-### 手動步驟（備援與說明）
-
-以下 1.1–1.10 是 `bootstrap.sh` 自動化的動作，需要 root。腳本壞掉、或腳本回報 `todo`／`fail` 需要手動補時照這裡做。
-
-### 1.1 建帳號 `llmgw`（不加 docker 群組）
+在全新建置的機器上安裝 LLMGateway（需要 root 權限）：
 
 ```bash
-useradd -m -s /bin/bash llmgw
-```
+# 1. 確保已建立服務帳號 llmgw（-U 確保建立同名群組）
+id -u llmgw >/dev/null 2>&1 || useradd -m -U -s /bin/bash llmgw
 
-- 獨立帳號，key 檔只有它讀得到，和池的管理帳號分開。
-- **不要加進 `docker` 群組**：能用 docker socket 就等於 root，隔離就沒了。
-
-### 1.2 開 linger
-
-```bash
-loginctl enable-linger llmgw
-```
-
-三個服務都是 `llmgw` 的 systemd user unit。開了 linger，開機就會起 user manager，沒人登入也常駐。
-
-### 1.3 sshd 允許 `llmgw` 從 loopback 用公鑰登入
-
-管理連線經隧道進來，在那台看起來是**從 127.0.0.1 連到 127.0.0.1:22**。檢查 `/etc/ssh/sshd_config` 與 `sshd_config.d/*.conf`：
-
-1. sshd 有在 `127.0.0.1:22` 聽（`ListenAddress` 有設時要包含它）；
-2. `AllowUsers`／`AllowGroups` 有設時要放行 `llmgw`；`DenyUsers` 不能擋它；
-3. `PubkeyAuthentication yes`；
-4. 有改就 `systemctl reload sshd`（有的發行版叫 `ssh`）。
-
-### 1.4 確認工具
-
-`python3 --version` 要 3.10 以上（程式只用標準函式庫）；另外要有 `git`、`curl`、`ssh`，以及 key-sync 用的 **`gh`** 與 **`openssl`**。`gh` 裝好、登入是 1.9 的事。
-
-### 1.5 第一次安裝（以 `llmgw` 身分）
-
-```bash
+# 2. 本人以服務帳號登入 gh
 sudo -u llmgw -i
-mkdir -p ~/.local/share/llmgateway
-git clone --depth 1 --branch <tag> https://github.com/FATESAIKOU/LLMGateway.git ~/lgw-bootstrap
-~/lgw-bootstrap/deploy/install.sh --tag <tag>
-rm -rf ~/lgw-bootstrap
+gh auth login        # 選瀏覽器登入
+exit
+
+# 3. 準備臨時原始碼並執行第一次安裝（以 release tag）
+git clone --depth 1 --branch lgw-vX.Y.Z https://github.com/FATESAIKOU/LLMGateway.git /tmp/lgw-setup
+cd /tmp/lgw-setup
+python3 -m lgwctl install --tag lgw-vX.Y.Z
+rm -rf /tmp/lgw-setup
+
+# 4. 補齊設定檔（依提示填寫 /etc/llmgateway/ 下的設定與 keys.pass）
+# 填寫完成後執行檢查：
+llmgwctl check
 ```
 
-`install.sh` 會自己再抓一次固定 tag 放進 `~/.local/share/llmgateway/<tag>/`，然後：
+---
 
-1. 建 `~/.local/state/llmgateway/`（0700）、空的 `keys.env`（0600）；
-2. 沒有設定檔時建範本：`llmgateway.env`、`tunnel.env`（值留空，不含任何位址）；
-3. 原子切換 `current`、裝 `llmgateway-run`、`llmgateway.service`，以及 `ops-scripts/` 來的 `llmgateway-tunnel`＋unit、`key-sync`＋unit／timer；
-4. `daemon-reload`；`llmgateway.service` 在跑就重啟、沒跑就啟用並啟動；`llmgateway-tunnel.service` 只 `enable`，沒在跑才 `start`，**不會當場重啟它**（管理連線本身走這條隧道，見 4.2 第 4 點）；`key-sync.timer` 只 `enable`，沒在跑才 `start`（已在跑就不打斷它的排程）。
+## 2. 舊版遷移（從 v0.1.x user unit 升級至新版）
 
-這時 key 還沒拉（`keys.env` 是空的），list 裡每一把的 `available` 都是 false；`tunnel.env` 的必填三項（`RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS`）還是空的，隧道守護起來後在 log 寫一行 `config_missing` 就以結束碼 78 結束。unit 有 `RestartPreventExitStatus=78`，78 不會觸發自動重開，所以不會在設定填好前反覆重啟，`systemctl --user status llmgateway-tunnel` 會看到它停在 failed。這是預期的，1.8 填好設定後手動重啟即可。（`bootstrap.sh` 帶 `--rendezvous` 時會代做 1.8 的填設定與重啟，見 1.A.4。）
+若目標機器目前正在以舊版 user unit（`~/.config/systemd/user/` 下的 `llmgateway.service` 等）運作，請遵循標準五部曲遷移流程。
 
-### 1.6 產生隧道金鑰（私鑰不離開那台）
+### 2.1 遷移全貌與狀態機
 
-以 `llmgw` 身分：
+```
+[舊版運作中]
+     │
+     ▼ (1) prepare-migration
+[準備完成（新舊並存，舊版未動）]
+     │
+     ▼ (2) cutover（排程反向保險 timer）
+[切換窗口中]
+     ├─────────────────────────────────┐
+     │ 停損條件成立（探針失敗／check 非 0）│ 保險到期未 confirm（預設 10m）
+     ▼ 或手動 rollback-to-user          ▼
+[自動回滾至舊版 user unit]       [反向保險到期自動回舊版]
+     │
+     ▼ (3) confirm
+[觀察期（3 天，仍可用 rollback-to-user）]
+     │
+     ▼ (4) finalize-migration
+[遷移完成（封裝歸檔、關閉 linger）]
+```
+
+### 2.2 切換前後操作者注意事項
+
+1. **進場備援**：切換前務必確認具備**不經隧道的進場方式**（例如雲端供應商 Web Console、本機終端或區網 SSH）。若隧道為唯一進場通道，一旦遇到雙邊暫時下線的路徑將只能依賴 Console 救援。
+2. **切換前系統檢查**：
+   - 檢查系統無待重啟任務：`ls /var/run/reboot-required` 不存在。
+   - 檢視定時器：`systemctl list-timers`，確認 `unattended-upgrades` 未排程自動重開機。
+   - 確認無殘留單元：`systemctl list-units 'lgw-*'` 確認無過去留存的 transient 單元。
+   - 確認控制狀態：檢視 `/var/lib/llmgateway-ctl/.cutover.state`，確認目前不處於進行中階段（`cutover-started`、`pending-confirm`）。
+   - 暫停同機其他維護排程，並以 `ps -u llmgw` 確認服務帳號行程符合預期。
+3. **窗口內切勿重開機**：自舊版 unit 被 disable 到新版 unit 被 enable 之間（數秒至一分鐘），新舊皆未開機自動啟用，且反向保險為 transient timer；此期間重開機將導致新舊服務均無法自啟。
+4. **切換中斷與狀態防護**：執行 `cutover` 後狀態即進入 `cutover-started`，若切換過程發生未預期中斷或卡住，此階段受到防護，系統會拒絕重新執行 `prepare-migration` 或再次 `cutover`；操作者必須執行 `llmgwctl rollback-to-user` 進行回滾，待回到終態（`reverted`）後方可重新準備與切換。
+5. **隧道交接短暫空窗**：因會合點的 4710/4711 埠無法由兩條隧道同時綁定，回滾時在舊服務 list 200 確認正常後，會先停止新隧道讓出該埠（暫不 disable），隨後啟動舊隧道進行連續穩定（≥15～20 秒且 NRestarts 不增）與遠端 `probe.remote` 探針驗證（成功才 disable 新隧道；失敗則立刻重新啟動新隧道保留管理通道）。此交接過程存在數十秒的隧道中斷短暫空窗。
+
+### 2.3 遷移步驟
+
+所有遷移步驟均由管理帳號以 `sudo` 執行。
+
+#### 步驟 1：真機準備（`prepare-migration`）
+
+此步驟會抓取新版本程式、建立 `/opt`、`/etc`、`/var/lib` 版面、安裝新版 system unit（但不 enable、不 start），並自舊版安全複製 key 檔、資料庫一致快照與設定檔：
 
 ```bash
-ssh-keygen -t ed25519 -N '' -C llmgateway-tunnel -f ~/.ssh/id_llmgw_tunnel
-cat ~/.ssh/id_llmgw_tunnel.pub
+# 以特定 tag 執行準備
+llmgwctl prepare-migration --tag lgw-vX.Y.Z [--old-home <path>] [--force]
 ```
 
-- 私鑰只放在這台，**不是** GitHub secret（照 MyLinuxPool 的原則）。
-- 把 `.pub` 那一行交給 mylinuxpool-pm（經 PMO），登記到 MyLinuxPool 的 `TUNNEL_EXTRA_PUBKEYS`（MyLinuxPool#77）；由本人或 PMO 設 var 並 dispatch `refresh-authorized-keys`。公鑰本身不是秘密，但註解只寫 `llmgateway-tunnel`，不要帶機器名。
-- v5 不產生、不登記部署公鑰。
+- 若尚未安裝 `/usr/local/bin/llmgwctl`，可先 clone 該 tag 到暫存目錄執行 `python3 -m lgwctl prepare-migration --tag lgw-vX.Y.Z`。
+- **安全性與隔離**：舊版設定檔與上層目錄元件皆經過 `O_NOFOLLOW`、`stat.S_ISLNK` 與檔案描述子（fd）檢驗，防止符號連結（symlink）提權；舊資料庫透過 SQLite backup API 進行一致快照，舊服務仍能正常寫入。
+- **不影響舊版**：此步驟不會修改或停止任何既有的 user unit，舊服務維持對外提供服務。
+- **階段守門**：若切換已進入 `cutover-started`、`pending-confirm`、`confirmed` 或 `finalized` 階段，`prepare-migration`（包含 `--force`）將直接拒絕執行，避免以舊資料覆蓋正在運行之新資料庫或金鑰。
+- **參數說明**：
+  - `--old-home <path>`：指定舊服務帳號的家目錄（預設為服務帳號家目錄）。
+  - `--force`：強制覆蓋既有已複製檔案（若已進入進行中階段則拒絕）。
 
-### 1.7 準備會合點的 known_hosts
-
-用 MyLinuxPool 提供的跳板機 host key 建 `~/.ssh/known_hosts_rendezvous`，一行的格式：
-
-```text
-[<跳板機>]:<埠> ssh-ed25519 <跳板機的 host key>
-```
-
-- 埠不是 22 時主機寫成 `[host]:port`；**埠是 22 時只寫 `host`**（OpenSSH 對預設埠不加括號，寫成 `[host]:22` 對不上）。
-- **不要用 `ssh-keyscan` 現掃、不要用 `accept-new`**；隧道守護是 `StrictHostKeyChecking=yes`，對不上就不連。
-
-### 1.8 填 `tunnel.env`，啟動隧道守護
-
-編輯 `~/.config/llmgateway/tunnel.env`：
-
-```sh
-RENDEZVOUS=sshproxy@<跳板機>:<埠>
-IDENTITY=/home/llmgw/.ssh/id_llmgw_tunnel
-KNOWN_HOSTS=/home/llmgw/.ssh/known_hosts_rendezvous
-REMOTE_API=4710
-REMOTE_SSH=4711
-LOCAL_API=8480
-PROBE_INTERVAL=60
-PROBE_FAILS=3
-```
-
-- 必填只有 `RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS` 三項；其餘留空（`install.sh` 的範本就是空值）就用預設值（4710、4711、8480、60、3）。
-- 任何一項缺、`RENDEZVOUS` 不是 `user@host:port`、埠不在 1–65535、`PROBE_*` 不是正數，都算設定不能用，一樣是 `config_missing`、結束碼 78。
-- `LOCAL_API` 要和 `llmgateway.env` 的 `LGW_API_PORT` 一樣。
-- 4710、4711 是 MyLinuxPool 在會合點上替 LLMGateway 保留的埠（`NODE_GATEWAY.ports.llmgateway`），避開 2220–2499 與 3000–3999。
-
-填好後重啟（78 不會自動重開，一定要手動做這一步；沒有 `config_missing` 的情況下也可以用同一個指令）：
+#### 步驟 2：切換窗口（`cutover`）
 
 ```bash
-systemctl --user restart llmgateway-tunnel.service
-journalctl --user -u llmgateway-tunnel -n 20
+llmgwctl cutover --tag lgw-vX.Y.Z [--revert-after 10m] [--no-remote] [--old-home <path>]
 ```
 
-看到 `tunnel_up`、之後沒有 `probe_fail` 就是通了。守護程式的行為：
-- 隧道用 `ExitOnForwardFailure=yes`：遠端埠公開不了，ssh 直接結束，systemd 10 秒後重開；
-- 每 `PROBE_INTERVAL` 秒經會合點 `ssh -W 127.0.0.1:4710` 打一次 `GET /v1/subscriptions`，**只有 HTTP 200 算健康**；
-- 連續 `PROBE_FAILS` 次不健康，就殺掉隧道、以非零結束，讓 systemd 重建。
+- **分離執行與連線中斷**：人手執行的 `llmgwctl cutover` 指令**只負責排程 transient unit（`lgw-cutover`）並立即返回**。真正的切換工作在 systemd 背景單元內執行。
+  > [!IMPORTANT]
+  > 由於切換會停止舊隧道並啟動新隧道，管理者透過舊隧道連線的 SSH 會在數秒至數分鐘內中斷。請勿慌張或手動重開機。請準備第二終端機，約 3～7 分鐘後（走新隧道）重新連線，並執行 `journalctl -u lgw-cutover -n 100` 檢視切換進度。成功的最後標誌為 `ok confirm-needed`。
+- **Preflight 預檢條件**（任一不符合則在動舊服務前明確拒絕）：
+  1. `/etc/llmgateway/keys.pass` 必須包含非空之密碼。
+  2. `/etc/llmgateway/tunnel.env` 設定就緒。
+  3. `gh` 認證已登入（`gh auth status` 通過）。
+  4. `current` 符號連結指向指定的 tag。
+  5. 新版 policy dry-run 預檢通過。
+  6. 舊版 4 個 unit 檔案（`llmgateway.service`、`llmgateway-tunnel.service`、`key-sync.service`、`key-sync.timer`）皆存在且為一般檔。
+- **反向保險機制**：啟動時立即排定反向保險定時器 `lgw-revert.timer`（預設等待 10 分鐘，最低限制 5 分鐘；由 `--revert-after` 指定）。
+- **停舊、重快照與啟新**：
+  1. 停止並停用（disable）舊版四個 user unit，逐一透過 `is-active` 確認停妥。
+  2. **最新資料同步**：在舊服務停止後、啟動新服務前，再次對舊 `llm.db` 進行一致快照（帶入 prepare 至切換間的最新冷卻與稽核），並同步較新的 `keys.env` 與 `.keysync.sha`。
+  3. 啟用並啟動新版兩個 system unit：`llmgateway.service`、`llmgateway-tunnel.service`。
+- **停損順序與條件（失敗立即自動回舊版）**：
+  1. 本機 list 200 探針（最多等 60 秒）。
+  2. 隧道 active 探針（最多等 30 秒）。
+  3. 經會合點遠端探針（重試 3 次，間隔 10 秒；`--no-remote` 可略過）。
+  4. 等待新版第一次 key 拉取結果寫入（最多等 90 秒）。
+  5. 全量健康檢查 `check` 結束碼須為 0。
+  若上述任一項未達標，或在保險時限內未執行 `confirm`，系統將自動觸發停損回滾，停止新服務並拉回舊版 user unit。
 
-### 1.9 `gh` 登入、放解密密碼、第一次拉取（v5 的核心）
+#### 步驟 3：確認切換（`confirm`）
 
-**`gh` 登入（本人，以 `llmgw` 身分）**：`gh` 的登入跟著 Unix 使用者走，key-sync 以 `llmgw` 跑，所以：
+在切換完成、重新連線並由管理者確認新服務運作無誤後，必須在保險時限內執行確認：
 
 ```bash
-sudo -u llmgw -i
-gh auth login        # 選 (B)：用瀏覽器登入，不放 token 檔
+llmgwctl confirm
 ```
 
-v5 的 `gh` 認證**本人已選 (B)**（2026-10-12）：`llmgw` 自己用瀏覽器 `gh auth login` 登入，不用 `--with-token` 的 token 檔。token 存在 `~llmgw/.config/gh/`（0600），由 `gh` 自己管，LLMGateway 不碰、不複製、不轉發它的值。
+- 此命令會取消 `lgw-revert.timer` 反向保險排程。
+- 將遷移狀態切換為 `confirmed`，正式進入為期 **3 天的觀察期**。
 
-- 風險（**本人已知並接受**）：`gh` 的登入狀態拿到的是本人帳號的一般權限，拿著這台 `llmgw` 的登入狀態的人可能讀寫本人其他 repo；也因此這台不能當成完全隔離的機器來放。
-- 因此 `install.sh --check` 除了問「登入了沒」，還會實際問一次**讀不讀得到** `FATESAIKOU/LLMGateway-keys`（只問 repo 本身，不讀檔案內容），讀不到就是不能用（4.4）。
-- **不用 deploy key**：免登記公鑰、免管 ssh host key；代價是登入狀態失效時 key 凍在舊版（4.1）。
-- 確認登入好了：
+#### 步驟 4：觀察期應急回滾（`rollback-to-user`）
 
-  ```bash
-  sudo -u llmgw -i
-  gh auth status
-  gh api repos/FATESAIKOU/LLMGateway-keys --jq .full_name
-  ```
-
-**解密密碼**：`bootstrap.sh --decrypt-pass-file` 或互動輸入會寫進 `~/.config/llmgateway/keysync.env`（0600、擁有者 `llmgw`），內容只有一行：
-
-```sh
-LLMGW_KEYS_PASSWORD=<32 字元隨機英數，與加密時用的同一個>
-```
-
-`key-sync.service` 用 `EnvironmentFile=` 讀它，再以 `-pass env:LLMGW_KEYS_PASSWORD` 調 openssl。密碼不進 repo、不進 log、不上命令列。密碼遺失＝加密檔打不開＝換不了 key：重設新密碼、整檔重加密後 push（3.3 的流程），所以密碼另有一份在 GitHub secret 備份（2.2）。
-
-**第一次拉取**（不必等 timer）：
+若在 3 天觀察期內發現不可預期的問題，可手動退回舊版 user unit：
 
 ```bash
-systemctl --user start key-sync.service
-journalctl --user -u key-sync -n 5
+llmgwctl rollback-to-user [--old-home <path>]
 ```
 
-看到 `ok 已換 keys.env` 就好了；`failed=gh_auth` 是 `gh` 沒登入／token 失效，`failed=password_missing` 是密碼沒放，`failed=format_failed`／`decrypt_failed` 見 5.1。失敗不會動舊 key，下一次 timer（約 10 分鐘）再試。
+- 同樣以 transient unit（`lgw-rollback`）分離執行，避免操作者連線中斷影響回滾。
+- 順序：停止新服務讓出 8480 埠 → 還原資料庫（舊 db 先備份為 `.bak-*`）與 `keys.env`（若新版有較新修改）→ 啟用舊版 user unit 並啟動舊版服務與 `key-sync.timer` → 驗證本機 list 200 → 記錄舊隧道重啟次數（`NRestarts`）→ **停止新隧道（暫不 disable，讓出會合點 4710/4711 埠；此時有數十秒之短暫交接空窗）** → 啟動舊隧道 → 等待舊隧道連續穩定 active（≥15～20 秒且 `NRestarts` 不增）並以 `probe.remote` 經會合點驗證回 200 → 成功才 disable 新隧道。若舊隧道起不來或探針失敗，程式會立即重新啟動（`start`）新隧道以保留管理連線通道，並清楚報錯供排查。
 
-### 1.10 驗證
+#### 步驟 5：遷移收尾（`finalize-migration`）
 
-在放服務的那台：
+在觀察期滿 3 天、確認系統完全穩定後，執行最後收尾：
 
 ```bash
-~/.local/share/llmgateway/current/deploy/install.sh --check; echo $?
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8480/v1/subscriptions
-journalctl --user -u key-sync -n 5
+llmgwctl finalize-migration --yes [--old-home <path>]
 ```
 
-`--check` 回 0（兩個 unit active、本機與經會合點的探針都回 200、`gh` 能用、解密密碼放了、上次拉取沒失敗）、`curl` 印 200、key-sync 的 log 沒有 `failed=`。接著從 Mac 照 3.1 連一次。
+- 自動執行全量健康檢查 `check`。
+- 將舊版 user unit 檔案與目錄搬移歸檔至 `/var/lib/llmgateway/old-user-layout/`（安全封裝、不刪除）。
+- 執行 `loginctl disable-linger llmgw`，停用服務帳號常駐，釋放 user manager 資源。
+- 標記遷移終態為 `finalized`，完成全部遷移工作。
 
-## 2. 本人在 GitHub 的設定
+---
 
-### 2.1 Environment `llmgateway-deploy`
+## 3. 本人在 GitHub 的設定
 
-Settings → Environments → New environment，名稱 `llmgateway-deploy`，勾 **Required reviewers** 並加本人。v5 只剩解密密碼的備份 secret 用它。
+### 3.1 Environment 與 Secret 備份
 
-### 2.2 Secrets（放在 `llmgateway-deploy` environment）
+在 GitHub repo 的 Settings → Environments 建立 `llmgateway-deploy`，並設定 Required reviewers 為本人。
 
-命名照本人的規則 `<存取方>__<被存取方>__<動作>`。值由本人設，AI 不經手。
-
-| Secret | 內容 | 用途 |
+| Secret 名稱 | 內容 | 用途 |
 |---|---|---|
-| `GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT` | 解密密碼備份（一行） | 密碼遺失時重建用；不參與服務運作 |
+| `GH_LLMGATEWAY__LLMGATEWAY_KEYS__DECRYPT` | 32 字元隨機英數密碼 | 解密密碼之離線備份，遺失時供本人重建 |
 
-**收掉的**（v5 乙）：五把 key 的 secret（`POOL_LLMGATEWAY__*__LLM`）與部署連線 4 個（`GH_LLMGATEWAY__POOL_SSH__DEPLOY`、`…_DEPLOY_KNOWN_HOSTS`、`…_DEPLOY_JUMP`、`…_DEPLOY_TARGET`）。順帶請 mylinuxpool-pm 拿掉 MyLinuxPool `TUNNEL_EXTRA_PUBKEYS` 裡的**部署**公鑰（隧道公鑰照留）。
+*註：五把金鑰明文與部署連線用的公私鑰 secret 已全數廢除，不儲存於 GitHub Actions。*
 
-### 2.3 Private repo `FATESAIKOU/LLMGateway-keys`
+### 3.2 Private repo `FATESAIKOU/LLMGateway-keys`
 
-key 的正本：private repo（只有本人用）根目錄的 `keys.env.enc`。
+金鑰正本存放於 private repo 根目錄的 `keys.env.enc`：
+- 加密指令：`openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt`。
+- 明文格式為五行 `KEY=VALUE`。機器僅依 `gh api` 取得之 blob `sha` 比對版本。
 
-- 加密格式：`openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt`，密碼經 `-pass env:` 傳；解密後的內容是五行 `KEY=VALUE`（`CLAUDE_PERSONAL_OAUTH_TOKEN`、`CLAUDE_COMPANY_OAUTH_TOKEN`、`OPENROUTER_API_KEY`、`OPENCODE_ZEN_API_KEY`、`OLLAMA_API_KEY`），外加一行人類看的版本註解（例 `# version: 2026-10-12-01`；機器不靠它判斷）。
-- 版本判斷：機器只認 `gh api` 回傳的 blob `sha`（加上解密後內容的 sha256 比對，避免 mtime 空轉）。
-- 沒有那把 key 就不寫那一行（或寫空值）＝沒部署：list 的 `available` 為 false，get 回 409 `not_deployed`。
+---
 
-## 3. 客戶端（自備通道）
+## 4. 客戶端設定（自備通道）
 
-LLMGateway 不提供客戶端連線程式，也不管通道怎麼建；它對通道只提一個需求：**客戶端所在機器本機 loopback 的某個 port 是會合點 API 埠（4710）的 HTTP 轉發**。本機 port 預設 **4710**（與會合點上的 4710 同號純屬巧合，不同機器），建通道的一方可以改；改了 sidecar 的 base URL 就跟著改。
+LLMGateway 僅規範通訊協定，不提供額外的客戶端連線程式。客戶端環境（Mac、worker sidecar、手機）需自行將會合點的 4710 埠轉發至本機 loopback：
 
-客端程式用 `lgw.client`（base URL 由呼叫方給）：
-
-```python
-from lgw import client
-
-c = client.Client("http://127.0.0.1:4710")
-c.list()                                    # 不含 key
-c.get("claude-personal", "claude-code")     # 含 key；agent 必填
-c.cooldown("claude-personal", "2026-10-12T15:00:00Z")   # 登錄 until（RFC 3339 UTC）
-```
-
-`Client` 回 `Result`（`ok`、`status`、`data`、`error`、`unreachable`），連不上或逾時回 `unreachable=True`、**不丟例外**；`Result` 的 repr 不印 `data`（get 的 `data` 裡有 key），不要 log 整個 `Result`。
-
-### 3.1 Mac
-
-用自己已經能登入 sshproxy 的金鑰，把會合點的 4710 轉發到本機：
+### 4.1 Mac 客戶端
 
 ```bash
 ssh -N -i ~/.ssh/<能登入 sshproxy 的金鑰> -o StrictHostKeyChecking=yes \
   -o UserKnownHostsFile=~/.ssh/known_hosts_rendezvous \
   -p <埠> -L 127.0.0.1:4710:127.0.0.1:4710 sshproxy@<跳板機>
+```
+
+測試連線：
+```bash
 curl -s http://127.0.0.1:4710/v1/subscriptions
 ```
 
-- host key 用 MyLinuxPool 提供的，寫進自己的 known_hosts（埠不是 22 時 `[host]:port`）；不要 `accept-new`。
-- 要經過別的跳板時自己加 `-J`。
-- 也可以直接用 `mlp`（MyLinuxPool 的工具）開同一條轉發。
+### 4.2 Python 客戶端程式庫（`lgw.client`）
 
-### 3.2 worker
+```python
+from lgw import client
 
-worker 的 sidecar 自己打本機 loopback 的 port（預設 4710）：
+c = client.Client("http://127.0.0.1:4710")
+c.list()                                              # 取得可用訂閱（不含 key）
+c.get("claude-personal", "claude-code")               # 取得 key 明文（需指定 agent）
+c.cooldown("claude-personal", "2026-10-18T15:00:00Z") # 登錄冷卻
+```
 
-- 通道由 **MyLinuxPool 的 LLMGateway capability** 附的小 script 建立（那是 MyLinuxPool 的工作；LLMGateway 只說「本機 loopback 某 port 即 HTTP API」）。
-- sidecar 用 pool-tunnel 既有的 sshproxy 金鑰，不讀 MyLinuxPool 的設定檔；通道斷了 sidecar 照舊回報「無法確認」，等一下再試。
-- 這部分在 MyLinuxPool 與 sidecar（MyAiStorage）那一側，LLMGateway 不需要知道有新 worker。
+---
 
-### 3.3 手機
+## 5. 日常維運與管理指令
 
-手機自行用 `ssh -J` 等方式把會合點的 4710 轉發到手機的 loopback，再打那個 port。LLMGateway 不提供程式（MyAiEntry#147 已關掉）。
+日常維運一律使用 `/usr/local/bin/llmgwctl`：
 
-## 4. 日常維運
-
-### 4.1 換 key（在 private repo 改加密檔）
-
-本人自己（AI 不經手值）：
+### 5.1 檢查服務狀態（`check`）
 
 ```bash
-export LLMGW_KEYS_PASSWORD='...'   # 與 keysync.env 裡同一個；用完就 unset
-# 寫明文 keys.env（五行 KEY=VALUE）
+llmgwctl check [--no-remote] [--tag <tag>]
+```
+
+輸出以三態呈現（`ok`、`todo`、`fail`），結束碼定義：
+- `0`：全部正常通過。
+- `1`：確定失敗（unit 未運行、探針非 200、gh 認證失效等）。
+- `2`：存在需人工介入處理之 `todo`。
+參數 `--no-remote` 可略過跨會合點之遠端探針。
+
+### 5.2 檢視版本與運行狀態（`status`）
+
+本指令不需要 root 權限：
+
+```bash
+llmgwctl status
+```
+
+印出目前 `current` 與 `previous` 的版本 tag，以及兩個 system unit（`llmgateway.service`、`llmgateway-tunnel.service`）的 active 狀態。
+- 若需檢視遷移階段狀態，可查看 `/var/lib/llmgateway-ctl/.cutover.state` 或 transient unit 紀錄（`journalctl -u lgw-cutover` / `lgw-rollback`）。
+- 若需檢視詳細金鑰同步狀態，請查看 `/var/lib/llmgateway/.keysync.status` 或執行 `llmgwctl check`。
+
+### 5.3 版本升級（`upgrade`）
+
+```bash
+llmgwctl upgrade --tag lgw-vX.Y.Z [--repo <repo>]
+```
+
+1. 自動自 GitHub 抓取新版本 tag 至 `/opt/llmgateway/<tag>/`。
+2. 自動對新版之政策檔執行 dry-run 預檢。
+3. 備份目前 unit 設定，原子切換 `/opt/llmgateway/current` 連結。
+4. 安裝新 unit 檔並執行 `systemctl daemon-reload`。
+5. 重啟 `llmgateway.service`。
+6. **失敗自動回滾**：升級過程中任何步驟失敗，立即自動回復至上一版本（`previous`）。
+
+### 5.4 手動版本回滾（`rollback`）
+
+```bash
+llmgwctl rollback
+```
+
+切回 `/opt/llmgateway/previous` 指向的版本，還原 unit 檔案、重載 daemon 並重啟服務，最後自動執行 `check` 驗證。
+
+### 5.5 手動觸發金鑰同步（`sync`）
+
+```bash
+llmgwctl sync
+```
+
+讀取 `/etc/llmgateway/keys.pass`，以 `llmgw` 身分執行金鑰拉取、解密並更新 `/var/lib/llmgateway/keys.env`，記錄狀態至 `.keysync.status`。
+
+> [!NOTE]
+> 若更新了 `/etc/llmgateway/keys.pass` 的密碼內容，必須執行 `sudo systemctl restart llmgateway`。因為 systemd 的 `LoadCredential` 是在服務啟動時建立憑證快照（snapshot），單純 `llmgwctl sync` 雖能以新密碼解密新檔，但運行中的主服務若需重新載入憑證仍需重啟。
+
+### 5.6 更新金鑰（上游改動）
+
+由本人在本地端處理（AI 不碰明文值）：
+
+```bash
+export LLMGW_KEYS_PASSWORD='<解密密碼>'
 openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -a -salt \
   -pass env:LLMGW_KEYS_PASSWORD -in keys.env -out keys.env.enc
 unset LLMGW_KEYS_PASSWORD
-shred -u keys.env                  # 刪明文
+shred -u keys.env
 git add keys.env.enc && git commit -m 'update keys' && git push
 ```
 
-之後：
+推送後，放服務的機器會在排程（或手動執行 `llmgwctl sync`）時自動同步。
 
-1. 等一次拉取（≤ 約 10 分鐘）；趕時間就上服務那台手動觸發：`sudo -u llmgw -i` 後 `systemctl --user start key-sync.service`。
-2. 驗證：`curl` 經本機通道打 list（`available` 回來了）或等 sidecar 換把成功；log 只看 key-sync 的成敗行（`journalctl --user -u key-sync`）。
+---
 
-key-sync 的流程是：`gh api` 取 base64 內容與 blob `sha` → 與 `.keysync.sha` 相同就不動 → base64 解碼 → openssl 解密（密碼只經環境變數）→ 用 `lgwd/keys.py` 的規則驗證 → 0600 暫存檔 rename 成 `keys.env` → 記新 `sha`。**任何一步失敗都保留舊 key**、不寫 `sha`，只記一行不含值的 log；`lgwd` 自己發現 `keys.env` 換了（mtime／inode）就重讀，失敗沿用舊的。值不上命令列、不進 log。客戶端不持有 key，換 key 後不用改任何客戶端設定。
+## 6. 故障排除
 
-### 4.2 升級（手動）
+### 6.1 不需要設定 `XDG_RUNTIME_DIR` 或 `DBUS`
 
-1. 打 tag `lgw-vX.Y.Z` 並 push。
-2. 用管理帳號 ssh 上去（例如經會合點的 4711：`ssh -J sshproxy@<跳板機>:<埠> -p 4711 <管理帳號>@127.0.0.1`；host key 自己比對）。
-3. 跑：
+在新版架構中，所有服務已全面遷移至 systemd 系統層管理：
+- **切勿**也不需要再執行 `export XDG_RUNTIME_DIR=/run/user/...` 或 `DBUS_SESSION_BUS_ADDRESS=...`。
+- 所有管理指令均直接透過標準系統界面溝通，無需依賴任何 user manager bus。
 
-   ```bash
-   ~/.local/share/llmgateway/current/deploy/install.sh --check
-   ~/.local/share/llmgateway/current/deploy/install.sh --tag lgw-vX.Y.Z
-   ~/.local/share/llmgateway/current/deploy/install.sh --check
-   ```
-
-   已有完整的 tag 目錄就重用、沒有就抓到暫存再搬；原子切換 `current`；重裝 unit 與執行檔（含 `ops-scripts/` 來的隧道與 key-sync）；重啟 `lgwd`；`key-sync.timer` 已在跑就不動它。
-4. 隧道守護有變更時，`install.sh` 不當場重啟它（管理連線本身就走這條隧道，當場重啟會切斷連線），而是用 `systemd-run --user --on-active=60` 排一個約 60 秒後的重啟（只有隧道執行檔或 unit 與已裝的不同時才排；隧道沒在跑就直接 start）。已經有 `llmgateway-tunnel-restart` 排程時就跳過不重排；排程失敗只記警告，不會讓安裝失敗。所以升級後約一分鐘隧道會重連，這段時間 list／get 會斷一下，客戶端重連即可。
-
-政策檔跟著 tag 一起換：`lgwd` 讀的是 `~/.local/share/llmgateway/current/policy/default.json`（`--policy` 指向 `current`），所以升級就是把那一版的 `policy/default.json` 換上，不用（也不該）手動搬舊政策檔。`lgwd` 只在啟動時讀政策（v5 沒有熱重載），`install.sh` 升級時會重啟 `lgwd`，所以新版政策升級後就生效；反過來說，單獨手改政策檔要重啟 `lgwd` 才生效。
-
-政策檔是 **fail-closed** 的，被拒的是**缺欄位**：v4 的政策檔沒有 `until_max_ahead_seconds`，所以會被拒（`lgwd` 起不來，`--check` 不會過）。要自己改過政策檔（跨版沿用同一份），得補上這個新欄位；舊欄位（`cooldown_buffer_seconds`、`resets_at_max_ahead_seconds`）**留著無妨**，loader 會忽略多出來的欄位。所以：不要想著「把舊欄位清掉就好」，要補的是新欄位。另外，非 null 的 `models.default` 必須被同一筆的 `models.allow` 涵蓋（載入時檢查），蓋不進的政策檔一樣拒收。
-
-### 4.3 看狀態
-
-- 誰能不能用：在那台 `curl -s http://127.0.0.1:8480/v1/subscriptions`，或從 Mac 照 3.1。每一筆有 `cooldown`（`{"until": …}` 或 null）與 `available`。
-- 誰在何時 get 過哪一把、誰登錄過冷卻：`llm.db` 的 `audit` 表（不分客戶端，因為不做認證）。
-- 「誰正在用哪一把」：看各 sidecar 的 status，LLMGateway 不追蹤。
-- log：`journalctl --user -u llmgateway -u llmgateway-tunnel`，以及 key 拉取 `journalctl --user -u key-sync`。log 裡不會有 key 的值，也不會有主機名。
-- 上一次套用的版本：`cat ~/.local/state/llmgateway/.keysync.sha`（blob sha，本人讀得到）。
-
-### 4.4 `install.sh --check`（三態）
-
-`--check` 依序檢查：兩個 unit 都 active（有給 `--tag` 時版本要與 `current` 一致）→ 本機 `GET /v1/subscriptions` 回 200 → 經會合點的同一個 list 探針回 200 → key-sync 能不能用（以服務帳號問 `gh` 有沒有登入、讀不讀得到 `FATESAIKOU/LLMGateway-keys`、`keysync.env` 有沒有非空的解密密碼、`key-sync.service` 上次有沒有失敗）。每一項分開印。
-
-| 結果 | 意思 |
-|---|---|
-| 0 | 兩個 unit 都 active、版本一致（有給 `--tag` 時）、本機與經會合點 list 探針都回 200、key 拉取那條路可用 |
-| 1 | 確定不正常：unit 沒在跑或 failed、版本不對、探針不是 200、`gh` 沒登入／讀不到金鑰 repo、解密密碼沒放、上次拉取失敗 |
-| 2 | 無法確認：連不上 user bus、本機 curl 逾時、經會合點探針無法執行、**`gh` 不存在或查詢逾時** |
-
-- 經會合點那一步是 `~/.local/bin/llmgateway-tunnel --probe-once`：讀 `tunnel.env`，用與隧道守護同一套 ssh 參數跑一次 `ssh -W 127.0.0.1:<REMOTE_API>`；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。
-- 本機不是 200 時不會跑經會合點那一步；本機 200 但經會合點不是 200 表示隧道斷了或會合點的 4710 探不到，照 5.3 查。兩段探針都只證明 `GET /v1/subscriptions` 回 200。
-- key-sync 那一段（v5.4）以**服務帳號**（`llmgw`）的身分問 `gh`——`gh` 的登入跟著 Unix 使用者走，用管理帳號問沒意義（`--check` 是服務帳號跑的話直接問，否則 `sudo -n -u llmgw` 過去）：
-  - 沒登入／token 失效、或讀不到 `FATESAIKOU/LLMGateway-keys`（用 `gh api repos/… --jq .full_name` 問 repo 本身，**不讀任何檔案內容**）→ 回 1，印出是哪一項（照 5.1 補）。
-  - 找不到 `gh`，或 `gh` 查詢逾時（`timeout`，可經 `LGW_GH_TIMEOUT` 調，預設 30 秒）→ 回 2（無法確認，不是確定壞掉）。
-  - `keysync.env` 沒放、沒有非空的值、**或讀不到該檔**（權限壞掉）→ 回 1，三種分別印不同的訊息。
-  - `key-sync.service` 上次失敗 → 回 1。
-- 用 `sudo -u llmgw -i` 的身分跑 `--check` 前，先 `export XDG_RUNTIME_DIR=/run/user/$(id -u)` 與 `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`：`sudo -u` 進去的 shell 不會自己帶這兩個，沒帶就連不上 user bus，`--check` 回 2（無法確認，不是確定壞掉）。
-
-### 4.5 外洩時
-
-- **key 外洩**（或懷疑）：在上游作廢並換新 → 照 4.1 更新加密檔並等一次拉取。本人已接受「能登入 sshproxy 的金鑰都讀得到全部 key」（design 決定 5a），換 key 是這種情況的標準處理。
-- **客戶端裝置遺失**（例如手機）：服務沒有應用層認證，任何能登入會合點並開得了轉發的金鑰都能讀全部 key，所以裝置上有 sshproxy 的金鑰就要當成 key 已外洩。依序：
-  1. 請 MyLinuxPool（mylinuxpool-pm，經 PMO）把那把金鑰從 sshproxy 撤掉；
-  2. 在上游作廢並換新五把 key，照 4.1 更新加密檔等一次拉取。
-
-  客戶端不持有 key，不用改任何客戶端設定。步驟 1 做完之前，那把金鑰仍然讀得到。
-- **解密密碼外洩**：重設新密碼、整檔重加密後 push（4.1 的流程，密碼換新的），再更新 2.2 的備份 secret；服務那台的 `keysync.env` 也要換成新密碼（本人以 `llmgw` 身分改）。
-- **隧道私鑰外洩**：請 mylinuxpool-pm 從 `TUNNEL_EXTRA_PUBKEYS` 拿掉舊公鑰，照 1.6 重產並登記新的，改 `tunnel.env` 後 `systemctl --user restart llmgateway-tunnel`。
-- **`gh` 登入狀態外洩**：請本人以 `llmgw` 身分重新 `gh auth login`（登入狀態在 `~llmgw/.config/gh/`，LLMGateway 不碰它的值）；必要的話在上游撤掉舊的憑證。
-
-### 4.6 退回前一版
-
-在那台以 `llmgw` 身分：
+### 6.2 服務紀錄查看
 
 ```bash
-~/.local/share/llmgateway/current/deploy/install.sh --tag <前一個 tag>
-~/.local/share/llmgateway/current/deploy/install.sh --check; echo $?
+# 查看 LLMGateway 服務紀錄
+journalctl -u llmgateway -n 50 -f
+
+# 查看隧道守護紀錄
+journalctl -u llmgateway-tunnel -n 50 -f
+
+# 查看手動同步狀態
+cat /var/lib/llmgateway/.keysync.status
 ```
 
-前一版還在 `~/.local/share/llmgateway/<tag>/`，`install.sh` 會直接重用，不用連網；執行檔與 unit 也會換回那一版的。隧道守護有變更時一樣排約 60 秒後重啟（見 4.2 第 4 點）。`keys.env`、`keysync.env` 與 `tunnel.env` 不隨版本，退回不會動它們。
+### 6.3 金鑰同步未更新
 
-## 5. 排錯
+- 檢視 `llmgwctl check` 輸出中之金鑰檢查項目。
+- 以 `llmgw` 身分檢視 `gh auth status`，確認 GitHub CLI 登入憑證是否過期。
+- 檢查 `/etc/llmgateway/keys.pass` 權限是否為 `0640` 且擁有者為 `root:llmgw`。
+- **密碼變更需重啟**：若變更了 `keys.pass`，記得執行 `systemctl restart llmgateway`，以使 systemd 的 `LoadCredential` 快照重新載入。
+- 執行 `llmgwctl sync` 觀察是否有 `failed=decrypt_failed` 或 `failed=gh_auth`。
 
-### 5.1 key 沒有換（key-sync 的 log）
+### 6.4 隧道持續重開或斷線
 
-看 `journalctl --user -u key-sync -n 20`，每一行是 `ok …`、`failed=<種類> …`或 `bad_config …`（都不含值）。對照：
+- 檢查 `/etc/llmgateway/tunnel.env` 設定值是否正確。
+- 檢查 `~llmgw/.ssh/id_llmgw_tunnel` 是否存在且權限為 `0600`。
+- 檢查 `~llmgw/.ssh/known_hosts_rendezvous` 是否包含正確之會合點主機金鑰。
+- 確認會合點上的 4710 或 4711 埠是否殘留舊連線佔用。
 
-| log | 意思 | 怎麼辦 |
-|---|---|---|
-| `ok sha 未變，不動作` | 加密檔沒換（blob `sha` 與 `.keysync.sha` 相同） | 沒事；本人還沒 push，或已經套用過 |
-| `ok 已換 keys.env`／`ok 內容沒變，不換檔` | 這次拉到新版 | 沒事 |
-| `failed=gh_auth` | `gh` 沒登入或 token 失效（可能帶 `（HTTP 401）`） | 以 `llmgw` 身分重新 `gh auth login`（1.9）；`install.sh --check` 也看得出來 |
-| `failed=gh_missing` | 找不到 `gh` | 裝 `gh`（1.4） |
-| `failed=gh_failed`／`gh_timeout` | `gh` 執行失敗或逾時（可能是網路） | 手動跑一次 `gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc >/dev/null` 看網路；下一次 timer 再試 |
-| `failed=gh_not_found` | repo 或檔案路徑不對（HTTP 404） | 確認 private repo 名稱與檔名（2.3）。**登入了但讀不到那個 repo**：以 `llmgw` 身分跑 `gh api repos/FATESAIKOU/LLMGateway-keys --jq .full_name`（只問 repo、不讀檔案內容）；404 或沒讀權限就是登入的帳號看不到這個 private repo，請本人確認 repo 名稱與帳號權限 |
-| `failed=password_missing` | `keysync.env` 沒放或沒讀到 | 照 1.9 放解密密碼 |
-| `failed=decrypt_failed` | 解不開（密碼錯或檔壞） | 確認 `keysync.env` 的密碼與加密時一致（1.9）；重加密後再 push（4.1） |
-| `failed=format_failed` | 解密出來不是合法的 key 檔（訊息只有行號與種類） | 檢查 `keys.env.enc` 的明文格式（2.3）；重新加密後再 push |
-| `failed=bad_response`／`decode_failed` | `gh api` 的回覆不是預期的 JSON／base64 | 手動跑一次同一條 `gh api` 指令看回什麼；檔案太大（> 1 MB）也會這樣 |
-| `failed=write_failed` | 寫 `keys.env` 失敗 | 看 `~/.local/state/llmgateway/` 的權限與磁碟空間 |
-| `failed=openssl_missing`／`code_missing`／`unexpected` | 環境缺東西（找不到 `openssl`、載不到 `lgwd` 套件）或未預期錯誤 | 照訊息補環境（1.4、1.5）；`unexpected` 要看訊息裡的例外種類再判斷 |
-| `bad_config …`（結束碼 3） | 設定錯（例如 `LGWSYNC_TIMEOUT` 非法：不是數字、非有限或 ≤0），不是同步失敗 | 修正環境變數（或 CLI `--timeout` 覆蓋）；舊 key 不動，下一次 timer 再試 |
+---
 
-key-sync 失敗**不會**動舊 key：服務照用舊版。連續失敗才需要人看（看 log，不看 key）。要立刻套用：`systemctl --user start key-sync.service`。
+## 附錄：舊版（v0.1.x，遷移完成後不再使用）
 
-### 5.2 升級／手動 ssh 進不去
+> [!WARNING]
+> 本節為舊版 user unit 時代（v0.1.x）之遺留記錄。當目標機器已成功執行 `llmgwctl finalize-migration --yes` 並完成 3 天觀察後，本附錄內容即可完全刪除。
 
-- `ssh -J sshproxy@<跳板機>:<埠> -p 4711 …` 的跳板那一段 `Permission denied`：管理帳號的金鑰還沒登記到 sshproxy（請 mylinuxpool-pm 加）。
-- 跳板過了但 `Connection refused`：會合點的 4711 沒人在聽，表示隧道斷了，看 5.3。這時 ssh 也進不去，要另外登入那台處理。
-- `Host key verification failed`：自己的 known_hosts 少了 `[<跳板機>]:<埠>` 或（換機後）那台的 host key 變了；用 1.A.4 摘要印出的 host 公鑰比對。
-- 目標那一段 `Permission denied`：sshd 擋了 `llmgw`／管理帳號（1.3），或帳號沒有該做的事的權限。
-- 跳板機（會合點）端的 sshd：那台的 sshd unit 名稱不是 `ssh`／`sshd`，查 log 時用全量的 `journalctl` 再 grep（例如 `journalctl | grep -i ssh`），不要只 `journalctl -u sshd`。
+舊版架構將所有服務執行於 `llmgw` 帳號之 user unit：
+- 服務位置：`~/.config/systemd/user/llmgateway.service`
+- 隧道守護：`~/.config/systemd/user/llmgateway-tunnel.service`
+- 金鑰拉取：`~/.config/systemd/user/key-sync.service` 與 `key-sync.timer`
+- 安裝路徑：`~/.local/share/llmgateway/<tag>/`
+- 設定與狀態：`~/.config/llmgateway/` 與 `~/.local/state/llmgateway/`
 
-### 5.3 隧道守護一直重開
-
-`journalctl --user -u llmgateway-tunnel` 看事件：
-
-- `config_missing`（結束碼 78）：`tunnel.env` 的必填三項沒填，或值不能用（1.8）。這種情況**不會**自動重開，unit 停在 failed；改好 `~/.config/llmgateway/tunnel.env` 後執行 `systemctl --user restart llmgateway-tunnel.service`。（log 只寫事件種類，不會說是哪一項。）
-- 一起來就結束、反覆重開：多半是遠端埠被佔住（會合點上還留著舊的隧道連線），`ExitOnForwardFailure` 讓 ssh 直接結束。舊連線在 ServerAlive 逾時（約 90 秒）後會被會合點清掉，之後自動恢復；一直不恢復就請 mylinuxpool-pm 看會合點上 4710／4711 是誰在聽。
-- `probe_fail` 連續出現後重開：隧道在，但端對端打不通 `lgwd`。先看 `systemctl --user status llmgateway`，以及 `tunnel.env` 的 `LOCAL_API` 是否等於 `LGW_API_PORT`；`lgwd` 起不來時看 `journalctl --user -u llmgateway`（`keys.env` 格式壞會起不來，但 key-sync 驗過才換檔，正常不會發生）。
-- 認證或 host key 失敗：隧道公鑰還沒登記（1.6），或 `KNOWN_HOSTS` 不對（1.7）。
-
-### 5.4 自備通道打不通
-
-依序檢查（客戶端那台）：
-
-1. 本機有沒有在聽那個 port：`curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4710/v1/subscriptions`；連不上＝轉發沒建起來。
-2. 轉發那條 ssh 是否還活著（通常就是一個前景／背景的 `ssh -N -L …`）；斷了就重開。
-3. 手動 ssh 到會合點本身能不能過（金鑰、帳號、埠、host key）。
-4. 會合點的 4710 是否是 LLMGateway（不是別的服務）＋隧道是否活著：在會合點上 `ss -ltn | grep 4710`，或照 5.3。
-5. 程式端拿到的 base URL 是否指到那個本機 port（預設 4710；改過就要跟著改）。
-
-`lgw.client` 連不上或逾時回 `unreachable=True`（不丟例外），呼叫方當成「無法確認」，等一下再試。
-
-### 5.5 API 回的錯誤碼
-
-回覆是 `{"error": "<碼>"}`，完整表在 spec `subscription-registry`（design 決定 6 的 v5 版）。
-
-| 狀態 | 碼 | 怎麼辦 |
-|---|---|---|
-| 400 | `bad_request` | JSON 壞掉、body 不是物件或缺必填（看回覆的 `missing`；get 少了 `?agent=`、冷卻少了 `until` 都是這個）。檢查呼叫方送的內容。 |
-| 400 | `invalid_until` | `until` 要是 RFC 3339 UTC 字串（例如 `2026-10-18T00:00:00Z`）。 |
-| 400 | `until_out_of_range` | `until` 在過去或超過 8 天以後。多半是客戶端判讀錯或時鐘不準；查呼叫方，不是服務的問題。 |
-| 403 | `agent_not_allowed` | 見下。 |
-| 404 | `not_found` | id 不存在或路徑錯（路徑對但方法錯也是 404）。id 見 `policy/default.json`。 |
-| 409 | `not_deployed` | 見 5.6。 |
-| 413 | `body_too_large` | body 超過 1 MB。 |
-| 500 | `internal` | 服務內部錯誤，只有例外種類在 log，看 `journalctl --user -u llmgateway`。 |
-
-客戶端側（`lgw.client` 的 `Result.error`）另有兩個自己判讀的值：`unreachable`（連不上或逾時，先看 5.4 與 5.3）與 `bad_response`（回覆不是 JSON 物件，通常是連到不是 `lgwd` 的東西，查會合點上 4710 是誰在聽）。
-
-**403 `agent_not_allowed`**：`agent` 不在那一把的 `agents` 裡。Claude 的兩把只給 `claude-code`（Claude 條款的守門），opencode 拿 Claude 訂閱一定是 403；openrouter 只給 `opencode`（Claude Code 只用 Claude 訂閱與 Ollama，免費模型只經過 opencode 使用），claude-code 拿 OpenRouter 也是 403。這些都是預期的。其他組合要改 `policy/default.json` 並發新版。
-
-### 5.6 `available` 為 false，或 get 回 409 `not_deployed`
-
-- `cooldown` 有值：在冷卻中，到 `until` 自動解除，不用做任何事。冷卻中仍然 get 得到，要不要用由 sidecar 決定。
-- `cooldown` 是 null：那把的 key 沒部署（`keys.env` 裡是空值或沒那行）。有 key 的話照 4.1 更新加密檔，等一次拉取；拉取失敗看 5.1。
+舊版管理特性（新版已廢棄）：
+1. 必須以 `loginctl enable-linger llmgw` 維持 user manager 常駐。
+2. 以 `sudo -u llmgw -i` 操作時，必須手動設定環境變數：
+   ```bash
+   export XDG_RUNTIME_DIR=/run/user/$(id -u)
+   export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
+   ```
+3. 舊版升級依賴 `deploy/install.sh --tag <tag>`，無自動 policy dry-run 與 rollback 機制。
+4. 解密密碼存放於 `~/.config/llmgateway/keysync.env`（0600，llmgw 自有）。
