@@ -1721,11 +1721,26 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
     if phase == PHASE_REVERTED:
         # 已經回過（人工先回、保險後來才觸發）：再確認一次就好，不動資料——
         # 新的 llm.db 已經複製回去過，再複製一次只會蓋掉舊服務寫的東西。
+        # 上一次可能停在「舊服務回來了、但舊隧道起不來，所以新隧道先留著」；
+        # 修好後再跑一次就能補完（舊隧道活了才停新隧道；高-1）。
         report.ok("rollback", "狀態已經是 reverted（人工與保險重複觸發也安全）")
         _start_old_units(layout, report)
         ok = _wait_old_list(layout, report)
+        tunnel_ok = _wait_old_tunnel(layout, report)
+        if tunnel_ok and units.is_active(layout, TUNNEL_SERVICE_NAME):
+            _stop_new_tunnel(layout, report)
+        elif not tunnel_ok:
+            report.fail("tunnel-old", "舊隧道仍然起不來；新隧道先留著，"
+                                      "管理連線不會斷（修好後再跑一次 rollback-to-user）")
         _cancel_revert(layout, _state_revert_unit(state, report), report)
-        return 0 if (ok and not getattr(report, "has_fail", False)) else 1
+        try:
+            write_state(layout, phase=PHASE_REVERTED,
+                        local_ok=bool(ok and not getattr(report, "has_fail", False)),
+                        tunnel_ok=bool(tunnel_ok))
+        except OSError as exc:
+            report.fail("rollback", f"寫狀態失敗（{type(exc).__name__}）")
+        return 0 if (ok and tunnel_ok
+                     and not getattr(report, "has_fail", False)) else 1
 
     # 停新 service（讓出 8480 埠）＋disable；新隧道留到最後（高-1）。
     _stop_new_service(layout, report)
@@ -1733,16 +1748,24 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
     _restore_keys_env(layout, old, report)
     started = _start_old_units(layout, report)
     ok = _wait_old_list(layout, report)
-    # 舊服務活回來了才斷管理連線（高-1：新隧道最後才停）。
-    _stop_new_tunnel(layout, report)
+    # 舊服務活回來、舊隧道也活了才斷管理連線（高-1：新隧道最後才停）。舊隧道
+    # 起不來時**不**停新隧道——它還能把管理連線與 API 導到 8480（現在是舊
+    # 服務），比什麼都沒有安全；明確 fail，修好後再跑一次。
+    tunnel_ok = _wait_old_tunnel(layout, report)
+    if tunnel_ok:
+        _stop_new_tunnel(layout, report)
+    elif ok:
+        report.fail("tunnel-old", "舊隧道起不來；新隧道先留著（管理連線不會斷），"
+                                  "修好後再跑一次 rollback-to-user")
     _cancel_revert(layout, _state_revert_unit(state, report), report)
     try:
-        write_state(layout, phase=PHASE_REVERTED, local_ok=bool(ok and started))
+        write_state(layout, phase=PHASE_REVERTED, local_ok=bool(ok and started),
+                    tunnel_ok=bool(tunnel_ok and ok))
     except OSError as exc:
         report.fail("rollback", f"寫狀態失敗（{type(exc).__name__}）")
     # 低-3：資料回復有 fail（db 備份失敗等）也要反映在結束碼。
     failed = getattr(report, "has_fail", False)
-    return 0 if (ok and started and not failed) else 1
+    return 0 if (ok and started and tunnel_ok and not failed) else 1
 
 
 def _state_revert_unit(state: dict, report=None) -> str:
@@ -1920,6 +1943,28 @@ def _wait_old_list(layout, report) -> bool:
         return True
     report.fail("list-local", "舊服務時間內沒回來（本機 list 不是 200）")
     return False
+
+
+def _wait_old_tunnel(layout, report) -> bool:
+    """等舊 user 隧道真的 active（高-1：它活了才切斷新的管理連線）。
+
+    只看 ``start`` 的結束碼不夠：舊隧道可能因為會合點的埠還被新隧道佔著而起
+    不來（unit 進 failed、等 restart）。那時停掉新隧道的話，API 與管理連線
+    會同時消失，所以這裡先確認。
+    """
+    deadline = time.monotonic() + _wait_seconds(layout, ENV_TUNNEL_WAIT,
+                                                DEFAULT_TUNNEL_WAIT)
+    while True:
+        state = _user_unit_state(layout, TUNNEL_SERVICE_NAME)
+        if state == "active":
+            report.ok("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）已 active")
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            report.fail("tunnel-old", f"{TUNNEL_SERVICE_NAME}（user 層）不是 active"
+                                      f"（{state}）")
+            return False
+        time.sleep(min(1.0, remaining))
 
 
 # -- finalize-migration ---------------------------------------------------

@@ -1146,13 +1146,17 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertEqual(self.box.read(self.box.old_state("keys.env")),
                          f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
         self.assertTrue(has_level(out, "keys-env", "skip"), out)
-        # 順序：停新 → 起舊 → 探本機 → 取消保險
+        # 順序：停新 service → 起舊 → 探本機 200 → **舊隧道活了** → 最後才停新隧道
+        # → 取消保險（高-1：管理連線不能比舊服務先斷）。
         order = self.box.order()
         self.assertLess(index_of(order, "systemctl stop llmgateway.service"),
                         index_of(order, "runuser "))
         self.assertLess(index_of(order, "runuser "), index_of(order, "curl "))
-        self.assertLess(index_of(order, "curl "),
-                        index_of(order, "systemctl stop lgw-revert.timer"))
+        curl_at = index_of(order, "curl ")
+        tunnel_stop = max(i for i, line in enumerate(order)
+                          if "systemctl stop llmgateway-tunnel.service" in line)
+        self.assertGreater(tunnel_stop, curl_at, order)
+        self.assertLess(tunnel_stop, index_of(order, "systemctl stop lgw-revert.timer"))
         # 身分與環境變數（root 代做，不要求操作者 export）
         runuser = next(line for line in order if line.startswith("runuser "))
         self.assertIn("-u lgwfake", runuser)
@@ -1255,6 +1259,27 @@ class RollbackToUserTests(MigrationTestCase):
                          f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n")
         self.assertTrue(has_line(out, "keys-env", "todo"), out)
         self.assert_no_values(out, err)
+
+    def test_rollback_keeps_the_new_tunnel_when_the_old_one_cannot_start(self):
+        """高-1：舊隧道起不來時不能切斷新的管理連線；修好後再跑一次補完。"""
+        self.box.fail_action("start", "llmgateway-tunnel.service", layer="user")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "tunnel-old", "fail"), out)
+        # 舊服務回來了、新 service 停了，但新隧道還活著（管理連線／8480 導向舊服務）
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+        self.assertFalse(self.box.active("llmgateway.service"))
+        self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        self.assertFalse(self.box.cutover_state()["tunnel_ok"])
+        # 修好舊隧道後再跑一次：舊隧道活了才停新隧道，這次回 0
+        os.unlink(os.path.join(self.box.fake, "fail", "start", "user",
+                              "llmgateway-tunnel.service"))
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(self.box.active("llmgateway-tunnel.service", layer="user"))
+        self.assertFalse(self.box.active("llmgateway-tunnel.service"))
+        self.assertTrue(self.box.cutover_state()["tunnel_ok"], out)
 
     def test_rollback_fails_when_old_service_does_not_come_back(self):
         self.box.fail_action("start", "llmgateway.service", layer="user")
