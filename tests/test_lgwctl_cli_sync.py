@@ -42,6 +42,9 @@ class SyncTests(unittest.TestCase):
         self.box = Sandbox()
         self.addCleanup(self.box.close)
         self.box.install_state(FAKE_TAG)
+        # 真機 install 一定會建 state 目錄；sync 跑完要補寫 .keysync.status
+        # （低-12：寫不進去＝失敗），沙箱也要有。
+        os.makedirs(self.box.state(""), exist_ok=True)
 
     def write_password(self, value=FAKE_PASSWORD):
         path = self.box.etc("keys.pass")
@@ -52,6 +55,7 @@ class SyncTests(unittest.TestCase):
         box = Sandbox(service_user=current_user())   # 已經是服務帳號，不用 sudo
         self.addCleanup(box.close)
         box.install_state(FAKE_TAG)
+        os.makedirs(box.state(""), exist_ok=True)
         box.write(box.etc("keys.pass"), f"LLMGW_KEYS_PASSWORD={FAKE_PASSWORD}\n", 0o640)
         rc, out, err = box.run_cli(["sync"])
         self.assertEqual(rc, 0, out + err)
@@ -152,6 +156,17 @@ class SyncTests(unittest.TestCase):
         rc, out, err = self.box.run_cli(["sync"])
         self.assertEqual(rc, 1, out + err)
         self.assertEqual(self.box.read(self.box.state(".keysync.status")), old)
+
+    def test_sync_status_write_failure_is_rc_1(self):
+        """key 拉到了但狀態檔寫不進去也是失敗：automation 只看結束碼會以為
+        sync 完整成功，check 之後仍看到舊狀態（低-12）。"""
+        self.write_password()
+        # 讓 .keysync.status 變成目錄：atomic write 的 rename 會 OSError
+        os.makedirs(self.box.state(".keysync.status"))
+        rc, out, err = self.box.run_cli(["sync"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "sync", "ok"), out)
+        self.assertTrue(has_line(out, "status", "fail"), out)
 
     def test_sync_is_the_only_child_allowed_to_see_the_password(self):
         """child_env 預設移除密碼；sync 明確放行（低-4）。"""

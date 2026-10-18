@@ -24,12 +24,27 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 from . import probe, units
 from . import run as runmod
 from .layout import KEYS_REPO, TUNNEL_SERVICE_NAME, UNIT_NAMES
 from .report import Report
+
+# .keysync.status 的 reason 白名單（低-8）：writer（lgwd/keysync.py、sync.py）
+# 只會寫這些形狀；檔案在 llmgw 可寫目錄，被改過的內容不能原樣印到 root 的
+# 終端／log（ANSI escape、控制字元、或把已知 key 值混進來）。
+_REASON_LITERALS = ("ok", "timeout", "spawn_failed", "unknown")
+_REASON_RE = re.compile(r"^(exit_[0-9]{1,10}|signal_[0-9]{1,10}|manual_sync rc=[0-9]{1,10})$")
+
+
+def _safe_reason(value) -> str:
+    """``reason`` 過白名單；不認得一律顯示 ``unknown``（內容不印出）。"""
+    text = str(value or "")
+    if text in _REASON_LITERALS or _REASON_RE.match(text):
+        return text
+    return "unknown"
 
 
 def _age_text(seconds: float) -> str:
@@ -119,7 +134,7 @@ def _check_keysync(layout, report) -> None:
     tail = "（" + "、".join(details) + "）" if details else ""
 
     if data.get("ok") is not True:
-        reason = str(data.get("reason") or "unknown")
+        reason = _safe_reason(data.get("reason"))
         report.fail("keysync", f"最後一次失敗：{reason}{tail}")
         return
     if ts_known is None:

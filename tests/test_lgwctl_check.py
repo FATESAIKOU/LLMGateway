@@ -179,11 +179,24 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(has_line(out, "keysync", "todo"), out)
 
     def test_keysync_status_not_ok_is_fail(self):
-        self.write_status(ok=False, ts=time.time(), reason="gh_auth")
+        self.write_status(ok=False, ts=time.time(), reason="manual_sync rc=9")
         rc, out, err = self.check()
         self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "keysync", "fail"), out)
-        self.assertIn("gh_auth", out)
+        self.assertIn("manual_sync rc=9", out)
+
+    def test_keysync_reason_is_whitelisted(self):
+        """低-8：狀態檔在 llmgw 可寫目錄；不在白名單的 reason（控制字元、
+        任意字串）不能原樣印到 root 的終端，一律顯示 unknown。"""
+        self.write_status(ok=False, ts=time.time(),
+                          reason=chr(27) + "[31mEVIL " + FAKE_KEY_VALUE)
+        rc, out, err = self.check()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "keysync", "fail"), out)
+        self.assertIn("unknown", out)
+        self.assertNotIn("EVIL", out)
+        self.assertNotIn(chr(27), out)
+        self.assertNotIn(FAKE_KEY_VALUE, out + err)
 
     def test_keysync_status_stale_is_fail(self):
         self.write_status(ok=True, ts=time.time() - 3600, reason="ok")

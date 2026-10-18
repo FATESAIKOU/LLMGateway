@@ -81,6 +81,8 @@ active="${fake}/active/${layer}/${unit}"
 case "$verb" in
     is-active)
         [[ -f "$active" ]] && exit 0 || exit 3 ;;
+    is-failed)
+        [[ -f "${fake}/failed/${layer}/${unit}" ]] && exit 0 || exit 1 ;;
     *)
         if [[ -n "$unit" ]]; then
             printf '%s %s %s\\n' "$layer" "$verb" "$unit" >> "${fake}/actions.log"
@@ -97,6 +99,12 @@ case "$verb" in
     start|restart)
         [[ -f "${fake}/fail/start/${layer}/${unit}" ]] && exit 1
         : > "$active"
+        # 中-1 的旋鈕：新服務「啟動的當下」寫一份 .keysync.status（模擬新的
+        # lgwd 起來 30 秒內就跑第一次 key 拉取）。
+        if [[ -n "${LGW_FAKE_KEYSYNC_AT_START:-}" ]]; then
+            printf '{"ts": %s, "ok": true, "reason": "ok"}\\n' "$(date +%s)" \\
+                > "${LGW_FAKE_KEYSYNC_AT_START}"
+        fi
         exit 0 ;;
     stop)
         if [[ -f "${fake}/fail/stop/${layer}/${unit}" ]]; then
@@ -115,14 +123,26 @@ esac
 """
 
 FAKE_SYSTEMD_RUN = """#!/usr/bin/env bash
-# 假 systemd-run：只記下要跑的指令（不真的排程、不執行）。
+# 假 systemd-run：只記下要跑的指令（不真的排程、不執行），但把 --unit= 的
+# 單元標成 active（中-2：cutover 寫 pending 前會確認 lgw-revert.timer 還在）。
 fake="${LGW_FAKE:?}"
 printf 'systemd-run %s\\n' "$*" >> "${fake}/order.log"
+unit=""
 for a in "$@"; do
     case "$a" in
         --on-active=*) printf 'on-active %s\\n' "${a#--on-active=}" >> "${fake}/timers.log" ;;
+        --unit=*) unit="${a#--unit=}" ;;
     esac
 done
+if [[ -n "$unit" && -z "${LGW_FAKE_SYSTEMD_RUN_SKIP_ACTIVE:-}" ]]; then
+    mkdir -p "${fake}/active/system"
+    if [[ "$*" == *--on-active=* ]]; then
+        # systemd-run --unit=X --on-active=… 建的是 X.timer（不是 X.service）。
+        : > "${fake}/active/system/${unit}.timer"
+    else
+        : > "${fake}/active/system/${unit}"
+    fi
+fi
 exit "${LGW_FAKE_SYSTEMD_RUN_RC:-0}"
 """
 
@@ -223,6 +243,8 @@ class MigrateSandbox(Sandbox):
             "LLMGW_LOCK_WAIT": "0",
             # inner 只接受 transient unit（低-6）：假裝是 systemd 起的。
             "INVOCATION_ID": "fake-invocation",
+            # preflight 的 gh 檢查（中-6）：預設登入，單一測試再設 1 擋掉。
+            "FAKE_GH_AUTH_RC": "0",
         })
 
     def _write_migrate_tools(self) -> None:
@@ -755,13 +777,33 @@ class CutoverTests(MigrationTestCase):
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
         self.assertFalse(os.path.exists(self.box.ctl(".cutover.state")))
 
-    def test_inner_refuses_when_state_is_reverted(self):
-        """中-3：狀態已被回滾時，inner 不得再往下切。"""
+    def test_inner_archives_a_reverted_state_and_starts_a_new_round(self):
+        """中-4：reverted 是終態但可開新一輪——舊狀態檔歸檔後照常切。"""
         self.box.write_cutover_state(phase="reverted", tag=FAKE_TAG)
         rc, out, err = self.inner()
-        self.assertEqual(rc, 1)
-        self.assertIn("reverted", out)
-        self.assertEqual(self.box.actions(), [])
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "state-archive", "ok"), out)
+        archived = glob.glob(self.box.ctl(".cutover.state.*"))
+        self.assertEqual(len(archived), 1, archived)
+        self.assertEqual(json.loads(self.box.read(archived[0]))["phase"], "reverted")
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
+    def test_inner_refuses_when_a_round_is_still_open(self):
+        """中-4：pending-confirm／confirmed／finalized 不得重複切換。"""
+        for phase in ("pending-confirm", "confirmed", "finalized", "cutover-started"):
+            with self.subTest(phase=phase):
+                box = MigrateSandbox()
+                self.addCleanup(box.close)
+                box.make_old_layout()
+                box.install_new_state(FAKE_TAG)
+                box.set_active("llmgateway.service")
+                box.write_cutover_state(phase=phase, tag=FAKE_TAG)
+                rc, out, err = box.run_migrate(
+                    ["cutover", "--tag", FAKE_TAG, "--revert-after", "10m", "--inner"])
+                self.assertEqual(rc, 1, out + err)
+                self.assertTrue(has_line(out, "cutover", "fail"), out)
+                self.assertIn(phase, out)
+                self.assertEqual(box.actions(), [])
 
     def test_inner_fails_when_another_run_holds_the_lock(self):
         """中-3：切換與回滾共用一把鎖；拿不到就明確失敗。"""
@@ -926,8 +968,8 @@ class CutoverTests(MigrationTestCase):
         self.assertEqual(lines_with_level(out, "fail"), [], out)
         self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
         probes = [line for line in self.box.order() if line.startswith("probe ")]
-        # 3 次重試（第 3 次成功）＋ check 自己的 1 次
-        self.assertEqual(len(probes), 4, probes)
+        # 3 次重試（第 3 次成功）；中-8：check 不再單探遠端（用 no_remote=True）
+        self.assertEqual(len(probes), 3, probes)
         self.assertIn("第 3/3 次", out)
 
     def test_no_remote_skips_the_probe(self):
@@ -962,10 +1004,16 @@ class ConfirmTests(MigrationTestCase):
         rc, out, err = self.box.run_migrate(["confirm"])
         self.assertEqual(rc, 0, out + err)
         order = self.box.order()
-        self.assertEqual(order[-1], "systemctl stop lgw-revert.timer")
-        # 先確認保險沒開跑、新版在跑，才停 timer（中-9）
-        self.assertIn("systemctl is-active lgw-revert.service", order)
+        # 先確認保險沒開跑、新版在跑，才停 timer（中-9）；停完再驗一次（低-13）
+        busy = index_of(order, "systemctl is-active lgw-revert.service")
         self.assertIn("systemctl is-active llmgateway.service", order)
+        stop = index_of(order, "systemctl stop lgw-revert.timer")
+        self.assertLess(busy, stop)                     # 第一次 busy 檢查在停之前
+        busy_positions = [i for i, line in enumerate(order)
+                          if "is-active lgw-revert.service" in line]
+        self.assertGreaterEqual(len(busy_positions), 2, order)
+        self.assertGreater(busy_positions[-1], stop)    # 停完又驗一次（低-13）
+        self.assertIn("is-failed lgw-revert.service", order[-1])
         state = self.box.cutover_state()
         self.assertEqual(state["phase"], "confirmed")
         self.assertIsInstance(state["confirmed_ts"], float)
@@ -1073,7 +1121,9 @@ class RollbackToUserTests(MigrationTestCase):
         self.box.age(self.box.state("keys.env"), -3600)
 
     def rollback(self, **env_extra):
-        return self.box.run_migrate(["rollback-to-user"], **env_extra)
+        # 真正的工作在 --inner（人手下的 rollback-to-user 現在只排 lgw-rollback，
+        # 高-1）；沙箱已設 INVOCATION_ID，等同 systemd 起的 transient unit。
+        return self.box.run_migrate(["rollback-to-user", "--inner"], **env_extra)
 
     def test_rollback_stops_new_starts_old_and_restores_db(self):
         rc, out, err = self.rollback()
@@ -1220,10 +1270,14 @@ class RollbackToUserTests(MigrationTestCase):
         self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,
                                      revert_unit="sshd.service")
         rc, out, err = self.rollback()
-        self.assertEqual(rc, 0, out + err)
+        # 低-3：報告裡有 fail 行（revert-unit）就不能回 0（自動化只看結束碼）。
+        self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "revert-unit", "fail"), out)
         self.assertFalse(any("sshd" in line for line in self.box.order()), self.box.order())
         self.assertIn("systemctl stop lgw-revert.timer", self.box.order())
+        # 資料與舊服務還是照常回去了（fail 只是不隱藏）
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
 
     def test_rollback_without_any_state_is_still_safe(self):
         os.unlink(self.box.ctl(".cutover.state"))
@@ -1457,9 +1511,23 @@ class CutoverUnitArgvTests(unittest.TestCase):
         self.assertIn("--on-active=10m", argv)
         self.assertIn("--collect", argv)
         self.assertIn(f"--setenv=LLMGW_PREFIX={self.box.prefix}", argv)
+        # 保險跑的是 rollback 的 --inner（高-1：與人工路徑同一套；要求
+        # INVOCATION_ID，transient unit 一定有）。
         self.assertEqual(argv[argv.index(sys.executable):],
                          [sys.executable, "-m", "lgwctl", "rollback-to-user",
-                          "--old-home", self.box.service_home])
+                          "--old-home", self.box.service_home, "--inner"])
+
+    def test_rollback_unit_argv_is_detached(self):
+        """高-1：人手 rollback 一律分離執行到 lgw-rollback（不跑在 ssh session 裡）。"""
+        from lgwctl import migrate
+
+        argv = migrate.rollback_unit_argv(self.layout, old_home=self.box.service_home)
+        self.assertIn("--unit=lgw-rollback", argv)
+        self.assertIn("--collect", argv)
+        self.assertIn(f"--working-directory={self.layout.current_link}", argv)
+        self.assertEqual(argv[argv.index(sys.executable):],
+                         [sys.executable, "-m", "lgwctl", "rollback-to-user",
+                          "--old-home", self.box.service_home, "--inner"])
 
     def test_bad_revert_after_is_rejected(self):
         rc, out, err = self.box.run_migrate(["cutover", "--tag", FAKE_TAG,

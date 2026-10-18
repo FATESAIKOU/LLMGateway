@@ -87,4 +87,6 @@ def run(layout, *, report: Report | None = None, out=None, err=None) -> int:
         report.fail("sync", f"key-sync rc={proc.returncode}（看上面的訊息）")
     if problem:
         report.fail("status", problem)
-    return proc.returncode
+    # 低-12：狀態檔寫不進去也是失敗（automation 只看結束碼會以為 sync 完整成功；
+    # check 之後仍看到舊狀態）。
+    return proc.returncode if not problem else 1

@@ -147,7 +147,12 @@ def upgrade(layout, *, tag: str, repo: str | None = None,
 
 
 def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -> int:
-    """切回 previous、restart、跑 check；回 check 的結束碼。"""
+    """切回 previous、換回它的 unit 檔＋daemon-reload、restart、跑 check（中-3）。
+
+    unit 是版本的一部分：upgrade 換了新 tag 的 unit，rollback 也要把 previous
+    的裝回來——不然舊程式跑在新 unit 的 ExecStart／sandbox 下，可能起不來。
+    previous 沒有 ``deploy/units``（舊版格式）就**在切 link 之前**拒絕。
+    """
     report = report or Report()
     if not runmod.require_root(layout, report):
         return report.exit_code(todo_ok=True)
@@ -156,10 +161,21 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
     if previous is None:
         report.fail("rollback", "沒有 previous 可回")
         return 1
-    if not os.path.isdir(layout.tag_dir(previous)):
+    previous_dir = layout.tag_dir(previous)
+    if not os.path.isdir(previous_dir):
         report.fail("rollback", f"previous 的目錄不在（{previous}）")
         return 1
+    # 中-3：先確認 previous 有 unit 檔（沒有就在切 link 之前停手）。
+    missing = [name for name in units.UNIT_NAMES
+               if not os.path.isfile(units.unit_source(previous_dir, name))]
+    if missing:
+        report.fail("rollback", f"{previous} 沒有 deploy/units 的 "
+                                f"{'、'.join(missing)}；這一版無法用 rollback"
+                                "（請手動處理或裝別的版）")
+        return 1
 
+    saved_units = units.snapshot_units(layout)
+    # 失敗回復要用「切換前」的兩個 link（previous 是換之前的 previous）。
     try:
         release.write_link(layout, layout.current_link, layout.tag_dir(previous))
         if old_current:
@@ -169,7 +185,16 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
         return 1
     report.ok("current", f"{old_current or '（沒有）'} → {previous}")
 
+    if not units.install_unit_files(layout, previous_dir, report):
+        return _rollback_after_switch(layout, saved_units, old_current, previous,
+                                      restart=False, report=report)
+    if not units.daemon_reload(layout):
+        report.fail("daemon-reload", f"{layout.systemctl} daemon-reload 失敗")
+        return _rollback_after_switch(layout, saved_units, old_current, previous,
+                                      restart=False, report=report)
+
     if not _restart_service(layout, report):
-        return report.exit_code(todo_ok=True)
+        return _rollback_after_switch(layout, saved_units, old_current, previous,
+                                      restart=True, report=report)
     probe.wait_local_ok(layout, layout.list_wait)
     return check.run(layout, report=report, no_remote=no_remote)

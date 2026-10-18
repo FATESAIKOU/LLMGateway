@@ -24,6 +24,7 @@ from .layout import (
     ENV_FILE_NAME,
     KEYS_ENV_NAME,
     KEYS_PASS_NAME,
+    OLD_USER_UNIT_NAMES,
     SERVICE_NAME,
     TAG_PATTERN,
     TAG_RE,
@@ -191,6 +192,10 @@ def _step_dirs(layout, report) -> bool:
         # current 的父目錄要讓服務帳號進得去（umask 很嚴的機器也一樣）；
         # 版本目錄本身由 release.normalize_tree 處理。
         os.chmod(layout.opt_dir, 0o755)
+        # etc_dir 也要群組／其他人可穿過（低-1）：keys.pass 是 root:<llmgw> 0640，
+        # 但 llmgwctl sync 要以 llmgw 身分 `. keys.pass`，root umask 077 時
+        # makedirs 出來的 /etc/llmgateway 會是 0700，llmgw 進不去。
+        os.chmod(layout.etc_dir, 0o755)
     except OSError as exc:
         report.fail("dirs", f"目錄或權限沒弄好（{type(exc).__name__}）")
         return False
@@ -272,6 +277,12 @@ def _step_enable(layout, report) -> bool:
 def _step_service(layout, report) -> bool:
     if units.is_active(layout, SERVICE_NAME):
         report.ok("start", f"{SERVICE_NAME} 已在跑（不動它）")
+        # 低-11：LoadCredential 是啟動時的快照；keys.pass 填／改完要 restart
+        # 才會生效（不然 key 拉取一直用沒有密碼的舊快照）。
+        if _keys_pass_filled(layout):
+            report.todo("restart",
+                        f"keys.pass 是啟動時的快照：填／改完要 "
+                        f"systemctl restart {SERVICE_NAME}（或 llmgwctl sync）")
         return True
     if not units.start(layout, SERVICE_NAME):
         report.fail("start",
@@ -285,7 +296,33 @@ def _step_service(layout, report) -> bool:
                     f"{SERVICE_NAME} 起了但本機 list 不是 200"
                     f"（{layout.journalctl} -u {SERVICE_NAME}）")
         return False
+    # 中-10 (3)：本機 list 也可能是**舊 user 版**在 8480 回答（它比新服務先起）；
+    # 用 unit 自己的 is-active 確認真的是新 unit 在跑。
+    if not units.is_active(layout, SERVICE_NAME):
+        report.fail("start",
+                    f"{SERVICE_NAME} 的 is-active 不是 active（crash-loop？"
+                    f"{layout.journalctl} -u {SERVICE_NAME}）")
+        return False
     report.ok("start", f"{SERVICE_NAME}（本機 list 200）")
+    return True
+
+
+def _step_refuse_migration(layout, report) -> bool:
+    """中-10：舊 user 版還在跑時拒絕 install——那台機器要用 prepare-migration。
+
+    舊 user ``lgwd`` 佔著 8480：新服務 start 會 bind 失敗（或 crash-loop），
+    本機 list 的 200 是**舊服務**在回答（install 假成功）；而且新服務先建了
+    空的 ``llm.db``，之後 prepare 看到 db 已存在就 skip，舊 audit／cooldown
+    不會被複製（資料遺失）。四個舊 unit 任一 active 就擋。
+    """
+    running = [unit for unit in OLD_USER_UNIT_NAMES
+               if units.user_unit_state(layout, unit) == "active"]
+    if running:
+        report.fail("old-user-units",
+                    "舊（user 版）unit 還在跑：" + "、".join(running) +
+                    "；這是遷移不是安裝——請用 llmgwctl prepare-migration "
+                    "＋llmgwctl cutover（install 會與舊服務搶 8480 埠）")
+        return False
     return True
 
 
@@ -366,6 +403,10 @@ def run(layout, *, tag: str, repo: str | None = None, report: Report | None = No
     installed = layout.current_tag()
     if installed is not None and installed != tag:
         report.fail("tag", f"已經裝了 {installed}；換版請用 upgrade")
+        return report.exit_code(todo_ok=True)
+
+    # 中-10：舊 user 版還在跑就不要碰（這台是遷移，不是安裝）。
+    if not _step_refuse_migration(layout, report):
         return report.exit_code(todo_ok=True)
 
     if not _step_account(layout, report):

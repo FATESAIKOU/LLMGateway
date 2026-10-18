@@ -44,6 +44,14 @@ DB_NAME = "llm.db"
 KEYSYNC_STATUS_NAME = ".keysync.status"
 KEYSYNC_SHA_NAME = ".keysync.sha"
 
+# 舊（v0.1.4；user 層）unit 檔的位置：**相對服務帳號的 HOME**。
+# install 判斷「機器上還有沒有舊 user 版」（中-10）與遷移搬移舊 unit 都用它，
+# 只有這一份定義（layout.py 是版面固定值的地方）。
+OLD_USER_UNIT_REL = (".config", "systemd", "user")
+# 舊 user 版的四個 unit（中-10：任一 active 就不給 install）。
+OLD_USER_UNIT_NAMES = (SERVICE_NAME, TUNNEL_SERVICE_NAME,
+                       "key-sync.service", "key-sync.timer")
+
 OPS_DIR_NAME = "ops-scripts"
 KEYSYNC_BIN_NAME = "key-sync"
 TUNNEL_BIN_NAME = "llmgateway-tunnel"
@@ -71,6 +79,8 @@ ENV_GH = "LLMGW_GH"
 ENV_SUDO = "LLMGW_SUDO"
 ENV_SH = "LLMGW_SH"
 ENV_USERADD = "LLMGW_USERADD"
+# 以服務帳號身分下 user manager 的指令（install 確認舊版、遷移停／啟舊 unit 共用）。
+ENV_RUNUSER = "LLMGW_RUNUSER"
 ENV_PYTHON = "LLMGW_PYTHON"
 ENV_REPO = "LLMGW_REPO"
 ENV_KEYSYNC_SCRIPT = "LLMGW_KEYSYNC_SCRIPT"
@@ -89,19 +99,14 @@ ENV_KEYSYNC_STALE = "LLMGW_KEYSYNC_STALE"
 DEFAULT_KEYSYNC_STALE = 1800.0
 
 
-def parse_env_file(path: str) -> dict:
-    """讀 KEY=VALUE 的設定檔（llmgateway.env／tunnel.env）；讀不到回空字典。
+def parse_env_text(text: str) -> dict:
+    """``KEY=VALUE`` 文字的解析（``parse_env_file`` 讀到的內容走同一套規則）。
 
-    與 ops-scripts/llmgateway-tunnel 的 parse_env_file 同一套規則：略過空行與
-    ``#`` 註解、去掉 ``export `` 前綴、值兩側的單／雙引號。
+    中-9：服務帳號控制下的設定檔要「從驗過的 fd 讀進來的文字」直接解析，
+    不再用路徑重開（路徑在讀之前可能被換成 symlink）。
     """
     values: dict[str, str] = {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return values
-    for line in lines:
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -117,6 +122,20 @@ def parse_env_file(path: str) -> dict:
         if name:
             values[name] = value
     return values
+
+
+def parse_env_file(path: str) -> dict:
+    """讀 KEY=VALUE 的設定檔（llmgateway.env／tunnel.env）；讀不到回空字典。
+
+    與 ops-scripts/llmgateway-tunnel 的 parse_env_file 同一套規則：略過空行與
+    ``#`` 註解、去掉 ``export `` 前綴、值兩側的單／雙引號。
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return {}
+    return parse_env_text(text)
 
 
 class Layout:
@@ -268,6 +287,10 @@ class Layout:
 
     def unit_file(self, name: str) -> str:
         return os.path.join(self.unit_dir, name)
+
+    def old_user_unit_file(self, name: str) -> str:
+        """舊（user 層）unit 檔的位置：install 判斷「機器上還有沒有舊版」（中-10）。"""
+        return os.path.join(self.service_home, *OLD_USER_UNIT_REL, name)
 
     @property
     def bin_dir(self) -> str:

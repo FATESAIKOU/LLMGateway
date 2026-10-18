@@ -9,9 +9,10 @@ unit 一律從當版目錄的 ``deploy/units/`` 裝到 ``<prefix>/etc/systemd/sy
 from __future__ import annotations
 
 import os
+import pwd
 
 from . import atomic
-from .layout import UNIT_NAMES
+from .layout import ENV_RUNUSER, UNIT_NAMES
 from .run import RunError, run
 
 UNITS_REL_DIR = os.path.join("deploy", "units")
@@ -139,3 +140,52 @@ def restart(layout, unit: str) -> bool:
         return _systemctl(layout, "restart", unit).returncode == 0
     except RunError:
         return False
+
+
+# -- systemctl（user 層：舊版的 unit 由服務帳號的 manager 管）----------------
+
+
+def user_uid(layout) -> int:
+    try:
+        return pwd.getpwnam(layout.service_user).pw_uid
+    except KeyError:
+        return os.geteuid()
+
+
+def user_systemctl_argv(layout, *args) -> list:
+    """以服務帳號身分對它的 user manager 下指令（停／啟動／確認舊 unit）。
+
+    root 代做時用 ``runuser -u llmgw -- env XDG_RUNTIME_DIR=… DBUS…`` 自帶
+    user manager 需要的環境（#35 設計 §1 的痛點：不要求操作者自己 export）。
+    systemctl 路徑沿用 ``layout.systemctl``，測試換成假指令。
+    """
+    uid = user_uid(layout)
+    tool = layout.env.get(ENV_RUNUSER) or "runuser"
+    return [tool, "-u", layout.service_user, "--", "env",
+            f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+            layout.systemctl, "--user", *args]
+
+
+def user_run(layout, *args):
+    """跑上面那串（回 CompletedProcess）；跑不起來丟 ``RunError``。"""
+    return run(user_systemctl_argv(layout, *args), env=layout.child_env())
+
+
+def user_unit_state(layout, unit: str) -> str:
+    """user manager 眼中的 unit 狀態：active｜inactive｜missing｜unknown。
+
+    ``is-active``：0＝active、3＝inactive、4＝unit 檔不存在；bus 連不上是 1，
+    一律 unknown——不能當成「沒在跑」（中-2 與中-10 用同一個判準）。
+    """
+    try:
+        proc = user_run(layout, "is-active", unit)
+    except RunError:
+        return "unknown"
+    if proc.returncode == 0:
+        return "active"
+    if proc.returncode == 3:
+        return "inactive"
+    if proc.returncode == 4:
+        return "missing"
+    return "unknown"
