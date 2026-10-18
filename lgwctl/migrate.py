@@ -53,7 +53,7 @@ import sys
 import tempfile
 import time
 
-from . import check, install, probe, release, units
+from . import atomic, check, install, probe, release, units
 from . import run as runmod
 from .layout import (
     DEFAULT_API_PORT,
@@ -312,7 +312,7 @@ def write_state(layout, **fields) -> dict:
     data.update(fields)
     data["ts"] = time.time()
     os.makedirs(layout.state_dir, exist_ok=True)
-    install._write_text(cutover_state_path(layout), json.dumps(data, sort_keys=True) + "\n",
+    atomic.write_text(cutover_state_path(layout), json.dumps(data, sort_keys=True) + "\n",
                         0o644)
     return data
 
@@ -498,8 +498,8 @@ def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
     if not os.path.isfile(old.keys_env):
         if not _exists(dst):
             try:
-                install._write_text(dst, "", 0o600)
-                install._chown(layout, dst)
+                atomic.write_text(dst, "", 0o600)
+                install._chown_service(layout, dst)
             except OSError as exc:
                 report.fail("state-keys-env", f"建空檔失敗（{type(exc).__name__}）")
                 return
@@ -508,7 +508,7 @@ def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
         return
     try:
         _copy_into_place(old.keys_env, dst, 0o600)
-        install._chown(layout, dst)
+        install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-keys-env", f"複製失敗（{type(exc).__name__}）")
         return
@@ -525,7 +525,7 @@ def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
         return
     try:
         _copy_into_place(old.db_file, dst)
-        install._chown(layout, dst)
+        install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-db", f"複製失敗（{type(exc).__name__}）")
         return
@@ -539,8 +539,8 @@ def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
         return
     if not os.path.isfile(src):
         try:
-            install._write_text(dst, template, 0o644)
-            install._chown(layout, dst)
+            atomic.write_text(dst, template, 0o644)
+            install._chown_service(layout, dst)
         except OSError as exc:
             report.fail(name, f"寫範本失敗（{type(exc).__name__}）")
             return
@@ -551,7 +551,7 @@ def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
         # （system unit 以 llmgw 跑，要讀得到）。IDENTITY／KNOWN_HOSTS 是絕對
         # 路徑，原樣照抄、不改寫。
         _copy_into_place(src, dst)
-        install._chown(layout, dst)
+        install._chown_service(layout, dst)
     except OSError as exc:
         report.fail(name, f"複製失敗（{type(exc).__name__}）")
         return
@@ -567,7 +567,7 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
     if not value:
         if not _exists(dst):
             try:
-                install._write_text(dst, install.KEYS_PASS_TEMPLATE, 0o640)
+                atomic.write_text(dst, install.KEYS_PASS_TEMPLATE, 0o640)
                 _chown_root_group(layout, dst)
             except OSError as exc:
                 report.fail("keys-pass", f"建空殼失敗（{type(exc).__name__}）")
@@ -577,7 +577,7 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
                     f"要本人填進 {dst}")
         return
     try:
-        install._write_text(dst, f"{install.KEYS_PASS_VAR}={value}\n", 0o640)
+        atomic.write_text(dst, f"{install.KEYS_PASS_VAR}={value}\n", 0o640)
         _chown_root_group(layout, dst)
     except OSError as exc:
         report.fail("keys-pass", f"寫失敗（{type(exc).__name__}）")
@@ -900,12 +900,12 @@ def _restore_db(layout, old: OldLayout, report) -> None:
     try:
         if os.path.isfile(dst) and not _exists(bak):
             _copy_into_place(dst, bak)
-            install._chown(layout, bak)
+            install._chown_service(layout, bak)
             report.ok("db-bak", f"舊 llm.db 先備份成 {bak}")
         elif _exists(bak):
             report.skip("db-bak", f"{bak} 已經在（保留第一份）")
         _copy_into_place(src, dst)
-        install._chown(layout, dst)
+        install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("db-copy", f"複製失敗（{type(exc).__name__}）")
         return
@@ -931,7 +931,7 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
             return
     try:
         _copy_into_place(src, dst)
-        install._chown(layout, dst)
+        install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("keys-env", f"複製失敗（{type(exc).__name__}）")
         return
