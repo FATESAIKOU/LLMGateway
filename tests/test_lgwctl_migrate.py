@@ -1446,6 +1446,16 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertEqual(state["phase"], "reverted")
         self.assertFalse(state["local_ok"])
 
+    def test_second_rollback_still_fails_when_the_old_service_never_started(self):
+        """reverted 後再跑一次也要看舊服務有沒有真的起來（不能回 0）。"""
+        self.box.fail_action("start", "llmgateway.service", layer="user")
+        self.assertEqual(self.rollback()[0], 1)
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "start-old", "fail"), out)
+        self.assertFalse(self.box.cutover_state()["local_ok"])
+
     def test_rollback_never_calls_a_unit_from_the_state_file(self):
         """狀態檔塞別的 unit（高-3）：回滾只用固定的 lgw-revert.timer。"""
         self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,

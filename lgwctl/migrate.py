@@ -1771,7 +1771,7 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
         # 上一次可能停在「舊服務回來了、但舊隧道起不來，所以新隧道先留著」；
         # 修好後再跑一次就能補完（舊隧道活了才停新隧道；高-1）。
         report.ok("rollback", "狀態已經是 reverted（人工與保險重複觸發也安全）")
-        _start_old_units(layout, report)
+        started = _start_old_units(layout, report)
         ok = _wait_old_list(layout, report)
         tunnel_ok = _wait_old_tunnel(layout, report)
         if tunnel_ok and units.is_active(layout, TUNNEL_SERVICE_NAME):
@@ -1782,11 +1782,11 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
         _cancel_revert(layout, _state_revert_unit(state, report), report)
         try:
             write_state(layout, phase=PHASE_REVERTED,
-                        local_ok=bool(ok and not getattr(report, "has_fail", False)),
-                        tunnel_ok=bool(tunnel_ok))
+                        local_ok=bool(ok and started),
+                        tunnel_ok=bool(tunnel_ok and started))
         except OSError as exc:
             report.fail("rollback", f"寫狀態失敗（{type(exc).__name__}）")
-        return 0 if (ok and tunnel_ok
+        return 0 if (ok and started and tunnel_ok
                      and not getattr(report, "has_fail", False)) else 1
 
     # 停新 service（讓出 8480 埠）＋disable；新隧道留到最後（高-1）。
