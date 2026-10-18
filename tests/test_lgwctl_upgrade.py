@@ -46,7 +46,7 @@ class UpgradeTests(unittest.TestCase):
                        json.dumps({"ts": time.time(), "ok": True, "reason": "ok"}), 0o644)
         self.box.set_active("llmgateway.service")
         self.box.set_active("llmgateway-tunnel.service")
-        # 沙箱先有「install 裝好的 unit 檔」（升級不換它）。
+        # 沙箱先有「install 裝好的 unit 檔」（升級會把它們換成新 tag 的，中-2）。
         self.box.write(self.box.unit("llmgateway.service"),
                        f"[Unit]\n# llmgateway {FAKE_TAG}\n")
         self.box.write(self.box.unit("llmgateway-tunnel.service"),
@@ -76,8 +76,11 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(has_line(out, "policy", "ok"), out)
         self.assertTrue(has_line(out, "list", "ok"), out)
         self.assertIn("dry-run 通過", out)
-        # unit 檔不隨升級換（還在舊版內容；要換 unit 是 install 的事）
-        self.assertIn(FAKE_TAG, self.box.read(self.box.unit("llmgateway.service")))
+        # unit 檔換成新 tag 的，且 daemon-reload 過（中-2）
+        self.assertTrue(has_line(out, "units", "ok"), out)
+        self.assertIn(NEW_TAG, self.box.read(self.box.unit("llmgateway.service")))
+        self.assertIn(NEW_TAG, self.box.read(self.box.unit("llmgateway-tunnel.service")))
+        self.assertIn("daemon-reload daemon-reload", actions)
         # 新版目錄一樣是服務帳號讀得到的權限（Lima 演練的 CHDIR bug）
         self.assertEqual(stat.S_IMODE(os.stat(self.box.opt(NEW_TAG)).st_mode), 0o755)
         self.assertEqual(
@@ -146,6 +149,54 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(has_line(out, "restart", "fail"), out)
         self.assertEqual(self.current(), FAKE_TAG)
         self.assertFalse(os.path.lexists(self.box.previous_link))
+        # unit 檔也要回到切換前的（中-2：失敗要連 unit 一起回復）
+        self.assertIn(FAKE_TAG, self.box.read(self.box.unit("llmgateway.service")))
+
+    def test_unit_install_failure_restores_links_and_units(self):
+        """unit 寫不進去：link 與 unit 檔都回到切換前、服務不動（中-2）。"""
+        unit_dir = os.path.dirname(self.box.unit("llmgateway.service"))
+        os.chmod(unit_dir, 0o555)
+        self.addCleanup(os.chmod, unit_dir, 0o755)
+        rc, out, err = self.upgrade()
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "units", "fail"), out)
+        self.assertEqual(self.current(), FAKE_TAG)
+        self.assertFalse(os.path.lexists(self.box.previous_link))
+        self.assertIn(FAKE_TAG, self.box.read(self.box.unit("llmgateway.service")))
+        # unit 還沒換成就停手：服務不該被動到
+        self.assertNotIn("restart llmgateway.service", self.box.actions())
+
+    def test_daemon_reload_failure_rolls_back(self):
+        """daemon-reload 失敗也要回復（新 unit 沒被讀進去就停，中-2）。"""
+        self.box.set_daemon_reload_fail()
+        rc, out, err = self.upgrade()
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "daemon-reload", "fail"), out)
+        self.assertEqual(self.current(), FAKE_TAG)
+        self.assertIn(FAKE_TAG, self.box.read(self.box.unit("llmgateway.service")))
+        self.assertNotIn("restart llmgateway.service", self.box.actions())
+
+    def test_policy_dry_run_uses_the_new_tag_loader(self):
+        """dry-run 要跑新 tag 目錄裡的 lgwd.policy，不是跑 llmgwctl 的這份（低-5）。"""
+        rc, out, err = self.upgrade(FAKE_GIT_BAD_LOADER="1")
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "policy", "fail"), out)
+        self.assertIn("fake loader always refuses", out)
+        self.assertEqual(self.current(), FAKE_TAG)
+        self.assertNotIn("restart llmgateway.service", self.box.actions())
+
+    def test_restore_links_failure_is_a_line_not_a_traceback(self):
+        """回復時連 restore_links 都壞（低-6）：只記一行 fail，不炸 traceback。"""
+        from unittest import mock
+
+        from lgwctl import release
+
+        self.box.curl_codes(["500"])
+        with mock.patch.object(release, "restore_links", side_effect=OSError("boom")):
+            rc, out, err = self.upgrade()
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "rollback", "fail"), out)
+        self.assertNotIn("Traceback", out + err)
 
     # -- 自動回滾 -----------------------------------------------------------
 
