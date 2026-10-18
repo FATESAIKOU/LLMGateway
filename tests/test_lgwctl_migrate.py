@@ -547,6 +547,21 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertTrue(has_line(out, "keys-pass", "ok"), out)
         self.assert_no_values(out, err)
 
+    def test_prepare_refuses_when_phase_is_open(self):
+        """中-1：階段處於 OPEN_PHASES（如 confirmed）時拒絕 prepare --force 覆蓋正在跑的新資料。"""
+        self.box.install_new_state()
+        self.box.write_cutover_state(phase="confirmed")
+        # 模擬新服務在 confirmed 階段已寫入新資料
+        self.box.write(self.box.state("keys.env"), "NEW_TOKEN=new-token\n")
+        self.box.write(self.box.etc("tunnel.env"), "NEW_TUNNEL=1\n")
+
+        rc, out, err = self.prepare("--force")
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "prepare", "fail"), out)
+        # 確保現有新資料完全未被舊資料覆蓋
+        self.assertEqual(self.box.read(self.box.state("keys.env")), "NEW_TOKEN=new-token\n")
+        self.assertEqual(self.box.read(self.box.etc("tunnel.env")), "NEW_TUNNEL=1\n")
+
     def test_prepare_fills_an_empty_keys_pass_shell(self):
         """install 先放過空殼（只有註解）時，prepare 會把舊的密碼補上。"""
         self.box.write(self.box.etc("keys.pass"), "# 只有註解\n", 0o640)
@@ -916,6 +931,22 @@ class CutoverTests(MigrationTestCase):
                 self.assertTrue(has_line(out, "cutover", "fail"), out)
                 self.assertIn(phase, out)
                 self.assertEqual(box.actions(), [])
+
+    def test_cutover_resnapshots_old_db_and_syncs_newer_keys(self):
+        """中-2：停完舊服務後重新快照舊 llm.db，並同步較新的 keys.env。"""
+        # prepare 之後、cutover 之前，舊服務寫入新的資料
+        self.box.make_db(self.box.old_state("llm.db"), "new-cooldown-writes")
+        # 舊 keys.env 有更新（mtime 比新位置新）
+        time.sleep(0.01)
+        self.box.write(self.box.old_state("keys.env"), "UPDATED_KEY=val\n")
+
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "sync-db", "ok"), out)
+        self.assertTrue(has_line(out, "sync-keys-env", "ok"), out)
+        # 驗證新位置的 db 包含了舊服務在切換前的最新資料
+        self.assertIn("new-cooldown-writes", self.box.db_markers(self.box.state("llm.db")))
+        self.assertEqual(self.box.read(self.box.state("keys.env")), "UPDATED_KEY=val\n")
 
     def test_outer_refuses_when_a_round_is_still_open(self):
         """中-4：confirmed／finalized 等階段在 outer 就拒絕，不排 transient。"""

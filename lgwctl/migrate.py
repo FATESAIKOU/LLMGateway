@@ -307,8 +307,14 @@ def _has_symlink_component(path: str, base: str | None = None) -> bool:
         cur = os.path.normpath(path)
         base_norm = os.path.normpath(base) if base else None
         while cur and cur != "/":
-            if base_norm and (cur == base_norm or not cur.startswith(base_norm)):
-                break
+            if base_norm:
+                if cur == base_norm or not cur.startswith(base_norm):
+                    break
+            else:
+                try:
+                    return stat.S_ISLNK(os.lstat(cur).st_mode)
+                except OSError:
+                    return False
             try:
                 st = os.lstat(cur)
                 if stat.S_ISLNK(st.st_mode):
@@ -426,9 +432,9 @@ def _copy_into_place(src: str, dst: str, mode: int | None = None, *,
                 pass
 
 
-def _db_source_ok(path: str) -> bool:
+def _db_source_ok(path: str, base: str | None = None) -> bool:
     """是不是一個 SQLite 資料庫（backup API 的來源一定要是）；從驗過的 fd 讀。"""
-    raw = _read_regular(path, len(SQLITE_HEADER) + 1)
+    raw = _read_regular(path, len(SQLITE_HEADER) + 1, base=base)
     return bool(raw) and raw[:len(SQLITE_HEADER)] == SQLITE_HEADER
 
 
@@ -546,7 +552,7 @@ def _copy_db_consistent(src: str, dst: str, mode: int = 0o600, *,
     （中-9），暫存檔在 rename 前再驗一次 inode 沒被換掉。
     高-1／低-3：fchmod／fchown 在 rename 前對 fd 操作，且 mkstemp 失敗時妥善關閉 src_fd。
     """
-    if not _db_source_ok(src):
+    if not _db_source_ok(src, base=base):
         raise OSError(f"{src} 不是 SQLite 資料庫")
     directory = os.path.dirname(dst) or "."
     os.makedirs(directory, exist_ok=True)
@@ -1008,6 +1014,15 @@ def prepare(layout, *, tag: str, old_home: str | None = None, force: bool = Fals
 def _prepare_locked(layout, old: OldLayout, *, tag: str, force: bool,
                     report) -> int:
     """prepare 的本體（已持有 flock）。"""
+    state = read_state(layout)
+    phase = state.get("phase")
+    # 中-1：切換已進行或已完成時拒絕重新準備（避免 --force 或換 tag 覆蓋跑中的新資料）。
+    if phase in OPEN_PHASES:
+        report.fail("prepare", f"狀態是 {phase}；切換已進行或已完成，拒絕重新準備"
+                               "（若需開新一輪請先以 rollback-to-user 回滾）")
+        return report.exit_code(todo_ok=True)
+    if phase in (PHASE_REVERTED, PHASE_ABORTED):
+        _start_new_round(layout, report)
     if not install._step_account(layout, report):
         return report.exit_code(todo_ok=True)
     if not install._step_dirs(layout, report):
@@ -1434,6 +1449,71 @@ def _cutover_inner(layout, old: OldLayout, *, tag: str, revert_after: str,
         lock.release()
 
 
+def _sync_final_cutover_data(layout, old: OldLayout, report) -> bool:
+    """中-2：停完舊服務後、啟動新服務前，重新快照舊 llm.db 並同步更新的 keys.env / .keysync.sha。
+    此時舊服務已停，沒有併發寫入者，可將 prepare 至 cutover 期間的冷卻與稽核資料完整帶過來。
+    """
+    # 1. 舊 llm.db 重新快照
+    if os.path.isfile(old.db_file):
+        if not _regular_file(old.db_file, old.home):
+            _refuse_symlink(report, "sync-db", old.db_file)
+            return False
+        try:
+            _copy_db_consistent(old.db_file, layout.db_file,
+                                owner=_service_owner_ids(layout),
+                                base=old.home)
+            install._chown_service(layout, layout.db_file)
+            report.ok("sync-db", "舊服務停止後重新快照 llm.db（包含最新冷卻與稽核）")
+        except OSError as exc:
+            report.fail("sync-db", f"重新快照 llm.db 失敗（{type(exc).__name__}）")
+            return False
+
+    # 2. 舊 keys.env 若較新則複製
+    if os.path.isfile(old.keys_env):
+        if not _regular_file(old.keys_env, old.home):
+            _refuse_symlink(report, "sync-keys-env", old.keys_env)
+            return False
+        newer = True
+        if os.path.isfile(layout.keys_env):
+            try:
+                newer = os.path.getmtime(old.keys_env) > os.path.getmtime(layout.keys_env)
+            except OSError:
+                newer = False
+        if newer:
+            try:
+                _copy_into_place(old.keys_env, layout.keys_env, 0o600,
+                                 owner=_service_owner_ids(layout),
+                                 base=old.home)
+                install._chown_service(layout, layout.keys_env)
+                report.ok("sync-keys-env", "同步最新 keys.env")
+            except OSError as exc:
+                report.fail("sync-keys-env", f"同步 keys.env 失敗（{type(exc).__name__}）")
+                return False
+
+    # 3. 舊 .keysync.sha 若較新則複製
+    if os.path.isfile(old.keysync_sha_file):
+        if not _regular_file(old.keysync_sha_file, old.home):
+            _refuse_symlink(report, "sync-keysync-sha", old.keysync_sha_file)
+            return False
+        newer = True
+        if os.path.isfile(layout.keysync_sha_file):
+            try:
+                newer = os.path.getmtime(old.keysync_sha_file) > os.path.getmtime(layout.keysync_sha_file)
+            except OSError:
+                newer = False
+        if newer:
+            try:
+                _copy_into_place(old.keysync_sha_file, layout.keysync_sha_file, 0o600,
+                                 owner=_service_owner_ids(layout),
+                                 base=old.home)
+                install._chown_service(layout, layout.keysync_sha_file)
+                report.ok("sync-keysync-sha", "同步最新 .keysync.sha")
+            except OSError as exc:
+                report.fail("sync-keysync-sha", f"同步 .keysync.sha 失敗（{type(exc).__name__}）")
+                return False
+    return True
+
+
 def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
                     no_remote: bool, report: MigrationReport) -> int:
     state = read_state(layout)
@@ -1527,6 +1607,17 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
         _restore_old_units(layout, disabled, stopped, report)
         _cancel_revert(layout, REVERT_TIMER_UNIT, report)
         report.fail("cutover", "狀態在切換中被改掉（可能已被回滾）；中止")
+        return 1
+
+    # 中-2：停完舊服務後、啟動新服務前，重新快照舊 llm.db 並同步更新的 keys.env / .keysync.sha
+    if not _sync_final_cutover_data(layout, old, report):
+        _restore_old_units(layout, disabled, stopped, report)
+        _cancel_revert(layout, REVERT_TIMER_UNIT, report)
+        try:
+            write_state(layout, phase=PHASE_ABORTED, tag=tag, reason="sync-data-failed")
+        except OSError:
+            pass
+        report.fail("cutover", "同步舊服務最新資料失敗；中止切換並復原舊服務")
         return 1
 
     # (c) 啟新 unit（enable：觀察期內重開機也要起得來）
