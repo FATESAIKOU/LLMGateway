@@ -190,11 +190,54 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.box.unit("llmgateway.service")))
 
     def test_tag_without_tunnel_unit_is_rejected(self):
-        rc, out, err = self.install(FAKE_GIT_SKIP="tunnel-unit")
+        rc, out, err = self.install(
+            FAKE_GIT_SKIP="deploy/units/llmgateway-tunnel.service")
         self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "fetch", "fail"), out)
         self.assertIn("deploy/units/llmgateway-tunnel.service", out)
         self.assertFalse(os.path.lexists(self.box.current_link))
+
+    # -- 取碼的 repo 與必備檔（中-6／低-8）-----------------------------------
+
+    def test_repo_starting_with_dash_is_rejected(self):
+        """git 會把 - 開頭的 repo 當選項解（--upload-pack=…）；一律擋（中-6）。"""
+        rc, out, err = self.install(repo="--upload-pack=/bin/evil")
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "fetch", "fail"), out)
+        self.assertIn("repo 位址不可用", out)
+        self.assertEqual(self.box.log("git.log"), "")   # 根本沒跑 git
+
+    def test_env_repo_starting_with_dash_is_rejected(self):
+        """LLMGW_REPO 走同一關（--repo 有檢查不等於環境變數沒事，中-6）。"""
+        rc, out, err = self.box.run_cli(
+            ["install", "--tag", FAKE_TAG],
+            env={**self.box.env, "LLMGW_REPO": "--upload-pack=/bin/evil"})
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "fetch", "fail"), out)
+        self.assertEqual(self.box.log("git.log"), "")
+
+    def test_git_clone_puts_double_dash_before_repo(self):
+        """clone 的 repo 前面要有 --（選項與路徑分開，中-6）。"""
+        rc, out, err = self.install()
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(f"-- {self.repo} ", self.box.log("git.log"))
+
+    def test_release_files_must_all_be_present(self):
+        """必備檔缺一個就不算完整（低-8）：lgwd/keys.py 也要在。"""
+        rc, out, err = self.install(FAKE_GIT_SKIP="lgwd/keys.py")
+        self.assertEqual(rc, 1, out + err)
+        self.assertTrue(has_line(out, "fetch", "fail"), out)
+        self.assertIn("lgwd/keys.py", out)
+        self.assertFalse(os.path.lexists(self.box.current_link))
+
+    def test_bad_repo_helper(self):
+        from lgwctl import release
+
+        self.assertTrue(release.bad_repo("--upload-pack=/bin/sh"))
+        self.assertTrue(release.bad_repo("-e.pwn"))
+        self.assertTrue(release.bad_repo("a\0b"))
+        self.assertFalse(release.bad_repo("https://example.com/repo.git"))
+        self.assertFalse(release.bad_repo("/fake/repo"))
 
     def test_tunnel_ready_starts_tunnel_unit(self):
         self.box.write(self.box.etc("tunnel.env"), "")

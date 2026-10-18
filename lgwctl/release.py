@@ -1,6 +1,7 @@
 """取碼、切 current／previous、清舊版（install 與 upgrade 共用）。
 
-- 取碼：``git clone --depth 1 --branch <tag>`` 到同層暫存目錄，驗必要檔案都在
+- 取碼：``git clone --depth 1 --branch <tag> -- <repo>`` 到同層暫存目錄（``--``
+  後一律當路徑，repo 再過一次 ``bad_repo``），驗必要檔案都在
   才寫 ``.lgw-tag`` 並原子搬進 ``<prefix>/opt/llmgateway/<tag>``；已裝完整就沿用。
 - 切版：``current`` 指新 tag，舊的記到 ``previous``（原子換 symlink）。
 - 清舊版：只留 current 與 previous 兩版，其他 tag 目錄刪掉。
@@ -16,15 +17,31 @@ from .layout import KEYSYNC_BIN_NAME, OPS_DIR_NAME, TAG_RE, TUNNEL_BIN_NAME
 from .run import CLONE_TIMEOUT, RunError, run
 
 # 一版取回來至少要有的檔案；缺一個就不算完整（不切 current）。
+# lgwd/policy.py 額外重要：升級的 policy dry-run 會在版本目錄裡 import 它
+# （低-5）；lgwctl/__main__.py 與 lgwd/main.py、lgwd/keys.py 是服務與
+# 指令實際跑起來要用的（低-8）。
 REQUIRED_FILES = (
     "policy/default.json",
     os.path.join("lgwd", "__main__.py"),
+    os.path.join("lgwd", "main.py"),
+    os.path.join("lgwd", "policy.py"),
+    os.path.join("lgwd", "keys.py"),
+    os.path.join("lgwctl", "__main__.py"),
     os.path.join(OPS_DIR_NAME, KEYSYNC_BIN_NAME),
     os.path.join(OPS_DIR_NAME, TUNNEL_BIN_NAME),
     os.path.join("deploy", "units", "llmgateway.service"),
     os.path.join("deploy", "units", "llmgateway-tunnel.service"),
 )
 TAG_FILE_NAME = ".lgw-tag"
+
+
+def bad_repo(repo: str) -> bool:
+    """repo 位址不可用：以 ``-`` 開頭（git 會當選項解，例：``--upload-pack=``），
+    或含 NUL（argv 的界線，非法）。
+
+    ``--repo`` 與 ``LLMGW_REPO`` 都要過這關（中-6）；緊接著的 ``--`` 是第二層。
+    """
+    return repo.startswith("-") or "\0" in repo
 
 
 def missing_files(tag_dir: str) -> list[str]:
@@ -136,6 +153,10 @@ def fetch(layout, tag: str, repo: str | None, report) -> str | None:
         report.ok("fetch", f"{tag} 已存在（沿用）")
         return tag_dir
     repo_url = repo or layout.repo
+    if bad_repo(repo_url):
+        # 不回顯 repo 的值（可能帶參數），只說為什麼不行。
+        report.fail("fetch", "repo 位址不可用（不能以 - 開頭、不能含 NUL）")
+        return None
     try:
         os.makedirs(layout.opt_dir, exist_ok=True)
         tmp = tempfile.mkdtemp(prefix=f".{tag}.", dir=layout.opt_dir)
@@ -143,7 +164,9 @@ def fetch(layout, tag: str, repo: str | None, report) -> str | None:
         report.fail("fetch", f"建暫存目錄失敗（{type(exc).__name__}：{layout.opt_dir}）")
         return None
     try:
-        proc = run([layout.git, "clone", "--depth", "1", "--branch", tag, repo_url, tmp],
+        # ``--`` 之後一律當路徑（第一層防護；bad_repo 是第二層，中-6）。
+        proc = run([layout.git, "clone", "--depth", "1", "--branch", tag,
+                    "--", repo_url, tmp],
                    env=layout.child_env(), timeout=CLONE_TIMEOUT)
     except RunError as exc:
         shutil.rmtree(tmp, ignore_errors=True)

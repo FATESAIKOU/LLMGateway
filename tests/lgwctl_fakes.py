@@ -68,7 +68,7 @@ esac
 """
 
 FAKE_GIT = """#!/usr/bin/env bash
-# 假 git：只支援 clone --depth 1 --branch <tag> <repo> <dest>；用 REAL_TEMPLATE
+# 假 git：只支援 clone --depth 1 --branch <tag> -- <repo> <dest>；用 REAL_TEMPLATE
 # 造出一版的內容，unit 檔寫上 tag（好分辨裝的是哪一版）。
 fake="${LGW_FAKE:?}"
 printf 'git %s\\n' "$*" >> "${fake}/git.log"
@@ -97,10 +97,22 @@ printf 'ref: refs/heads/main\\n' > "$dest/.git/HEAD"
 if [[ "${FAKE_GIT_BAD_POLICY:-0}" == "1" ]]; then
     printf '{"subscriptions": {}}\\n' > "$dest/policy/default.json"
 fi
+if [[ "${FAKE_GIT_BAD_LOADER:-0}" == "1" ]]; then
+    # 這版的 lgwd.policy 永遠拒收（低-5：dry-run 必須用新 tag 的 loader）
+    cat > "$dest/lgwd/policy.py" <<'PY'
+class PolicyError(ValueError):
+    pass
+
+
+def load_policy(path):
+    raise PolicyError("fake loader always refuses")
+PY
+fi
 printf '[Unit]\\n# llmgateway %s\\n' "$tag" > "$dest/deploy/units/llmgateway.service"
 printf '[Unit]\\n# tunnel %s\\n' "$tag" > "$dest/deploy/units/llmgateway-tunnel.service"
-if [[ "${FAKE_GIT_SKIP:-}" == "tunnel-unit" ]]; then
-    rm -f "$dest/deploy/units/llmgateway-tunnel.service"
+if [[ -n "${FAKE_GIT_SKIP:-}" ]]; then
+    # 拿掉相對路徑（低-8：驗必備檔）
+    rm -rf "$dest/${FAKE_GIT_SKIP}"
 fi
 exit 0
 """
@@ -279,6 +291,16 @@ class Sandbox:
                    Path(REAL_POLICY).read_text(encoding="utf-8"), 0o644)
         self.write(os.path.join(self.template, "lgwd", "__main__.py"),
                    '"""假 lgwd（測試不執行它）。"""\n', 0o644)
+        # lgwd.policy 放真的規則檔：升級的 policy dry-run 會真的在版本目錄裡
+        # import 它（低-5）；main／keys 與 lgwctl 只要求檔案在（低-8 的必備檔）。
+        self.write(os.path.join(self.template, "lgwd", "policy.py"),
+                   (REPO_ROOT / "lgwd" / "policy.py").read_text(encoding="utf-8"), 0o644)
+        self.write(os.path.join(self.template, "lgwd", "main.py"),
+                   '"""假 lgwd.main（必備檔，測試不執行）。"""\n', 0o644)
+        self.write(os.path.join(self.template, "lgwd", "keys.py"),
+                   '"""假 lgwd.keys（必備檔，測試不執行）。"""\n', 0o644)
+        self.write(os.path.join(self.template, "lgwctl", "__main__.py"),
+                   '"""假 lgwctl（必備檔，測試不執行）。"""\n', 0o644)
         self.write(os.path.join(self.template, "ops-scripts", "key-sync"),
                    FAKE_KEY_SYNC, 0o755)
         self.write(os.path.join(self.template, "ops-scripts", "llmgateway-tunnel"),
