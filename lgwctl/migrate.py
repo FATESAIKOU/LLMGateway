@@ -695,6 +695,12 @@ def prepare(layout, *, tag: str, old_home: str | None = None, force: bool = Fals
     _copy_old_files(layout, old, report, force=force)
     _step_gh_login(layout, report)
     _step_tunnel_config(layout, report)
+    # 把正規化後的 old_home 綁進狀態檔（低-3）：finalize 不收命令列打錯的目錄。
+    try:
+        if not read_state(layout).get("old_home"):
+            write_state(layout, old_home=old.home)
+    except OSError as exc:
+        report.fail("state", f"寫 {cutover_state_path(layout)} 失敗（{type(exc).__name__}）")
     report.ok("old-untouched", f"舊 user unit 與舊目錄都沒動（{old.home}）")
     return report.exit_code(todo_ok=True)
 
@@ -1215,6 +1221,22 @@ def confirm(layout, *, report: MigrationReport | None = None) -> int:
     report = report or MigrationReport()
     if not runmod.require_root(layout, report):
         return 1
+    lock = _Lock(cutover_lock_path(layout))
+    try:
+        if not lock.acquire(_wait_seconds(layout, ENV_LOCK_WAIT, DEFAULT_LOCK_WAIT)):
+            report.fail("confirm", "另一個切換／回滾正在跑（等不到鎖）；稍後再 confirm")
+            return 1
+    except OSError as exc:
+        report.fail("confirm", f"拿不到鎖（{type(exc).__name__}）：{lock.path}")
+        return 1
+    try:
+        return _confirm_locked(layout, report)
+    finally:
+        lock.release()
+
+
+def _confirm_locked(layout, report) -> int:
+    """confirm 的本體（已持有 flock）。"""
     state = read_state(layout)
     phase = state.get("phase")
     if phase != PHASE_PENDING:
@@ -1225,6 +1247,19 @@ def confirm(layout, *, report: MigrationReport | None = None) -> int:
     if unit is None:
         report.fail("revert-unit", "狀態檔的 revert_unit 不是認得的值；拒絕"
                                   "（不會拿它去呼叫 systemctl）")
+        return 1
+    # 保險是不是已經開跑（中-9）：停 timer 不會停掉已經觸發的 service；先確認。
+    if units.is_active(layout, REVERT_UNIT + ".service"):
+        report.fail("insurance-running",
+                    f"{REVERT_UNIT}.service 已經在跑（保險正在回舊版）；"
+                    "先等它跑完，不要 confirm")
+        return 1
+    # 此刻在跑的必須是新版、舊的不能還在跑（中-9）。
+    if not units.is_active(layout, SERVICE_NAME):
+        report.fail("confirm", f"{SERVICE_NAME} 不是 active（現在跑的不是新版？）；拒絕")
+        return 1
+    if _user_unit_state(layout, SERVICE_NAME) == "active":
+        report.fail("confirm", f"舊 user 的 {SERVICE_NAME} 還在跑（新舊同時？）；拒絕")
         return 1
     if not _cancel_revert(layout, unit, report):
         report.fail("confirm", f"{unit} 停不掉；保險還在，先人工處理再 confirm")
@@ -1469,7 +1504,29 @@ def finalize(layout, *, old_home: str | None = None, yes: bool = False,
         report.fail("finalize", f"觀察期還沒過（還要 {_duration_text(observe - age)}）；拒絕")
         return 1
 
-    old = OldLayout(old_home or layout.service_home)
+    # 收尾的目標目錄要和切換時綁定（低-3）：命令列打錯不能搬錯或什麼都沒搬。
+    recorded_home = state.get("old_home")
+    if old_home:
+        if isinstance(recorded_home, str) and recorded_home \
+                and os.path.realpath(old_home) != os.path.realpath(recorded_home):
+            report.fail("old-home",
+                        f"--old-home {old_home} 與切換時記錄的 {recorded_home} 不一致；拒絕")
+            return 1
+        home = old_home
+    elif isinstance(recorded_home, str) and recorded_home:
+        home = recorded_home
+    else:
+        home = layout.service_home
+    old = OldLayout(home)
+    # 新版此刻要健康才收舊版（低-3）：壞掉時該做的是 rollback-to-user，不是
+    # 把舊目錄搬走。
+    if not probe.wait_local_ok(layout, _wait_seconds(layout, ENV_CUTOVER_WAIT,
+                                                     DEFAULT_CUTOVER_WAIT)):
+        report.fail("list-local", "不是 200")
+        report.fail("finalize", "新版本機 list 不是 200；先別收舊版"
+                                "（要回舊版就跑 llmgwctl rollback-to-user）")
+        return 1
+    report.ok("list-local", "200（新版健康，才收舊版）")
     # 舊的收掉：先停再 disable（拿不到 user manager 只記 todo，檔案照樣搬——
     # 狀態是 confirmed 代表新版才是活的那一套）
     for unit in OLD_STOP_ORDER:

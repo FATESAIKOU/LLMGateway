@@ -836,11 +836,17 @@ class ConfirmTests(MigrationTestCase):
         self.box.install_new_state(FAKE_TAG)
         self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,
                                      revert_unit="lgw-revert.timer")
+        # 此刻：新版在跑、舊 user unit 不在跑（confirm 的健康條件）
+        self.box.set_active("llmgateway.service")
 
     def test_confirm_cancels_insurance_and_enters_observation(self):
         rc, out, err = self.box.run_migrate(["confirm"])
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(self.box.order(), ["systemctl stop lgw-revert.timer"])
+        order = self.box.order()
+        self.assertEqual(order[-1], "systemctl stop lgw-revert.timer")
+        # 先確認保險沒開跑、新版在跑，才停 timer（中-9）
+        self.assertIn("systemctl is-active lgw-revert.service", order)
+        self.assertIn("systemctl is-active llmgateway.service", order)
         state = self.box.cutover_state()
         self.assertEqual(state["phase"], "confirmed")
         self.assertIsInstance(state["confirmed_ts"], float)
@@ -849,6 +855,33 @@ class ConfirmTests(MigrationTestCase):
         self.assertTrue(has_line(out, "confirm", "ok"), out)
         self.assertIn("觀察期", out)
         self.assert_no_values(out, err)
+
+    def test_confirm_refuses_when_the_insurance_already_fired(self):
+        """中-9：保險的 service 已經在跑時不能 confirm（會被 rollback 蓋掉）。"""
+        self.box.set_active("lgw-revert.service")
+        rc, out, err = self.box.run_migrate(["confirm"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "insurance-running", "fail"), out)
+        self.assertNotIn("systemctl stop lgw-revert.timer", self.box.order())
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
+    def test_confirm_refuses_when_the_new_service_is_not_active(self):
+        self.box.set_active("llmgateway.service", False)
+        rc, out, err = self.box.run_migrate(["confirm"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "confirm", "fail"), out)
+        self.assertIn("不是 active", out)
+        self.assertNotIn("systemctl stop lgw-revert.timer", self.box.order())
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
+    def test_confirm_refuses_when_the_old_user_unit_is_still_active(self):
+        self.box.set_active("llmgateway.service", True, layer="user")
+        rc, out, err = self.box.run_migrate(["confirm"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "confirm", "fail"), out)
+        self.assertIn("還在跑", out)
+        self.assertNotIn("systemctl stop lgw-revert.timer", self.box.order())
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
 
     def test_confirm_treats_a_missing_timer_as_cancelled(self):
         self.box.mark_unit_missing("lgw-revert.timer")
@@ -1077,7 +1110,8 @@ class FinalizeMigrationTests(MigrationTestCase):
         # 三天前就 confirm 了
         self.box.write_cutover_state(phase="confirmed", tag=FAKE_TAG,
                                      confirmed_ts=time.time() - 4 * 86400,
-                                     revert_unit="lgw-revert.timer")
+                                     revert_unit="lgw-revert.timer",
+                                     old_home=self.box.service_home)
 
     def finalize(self, *extra, **env_extra):
         return self.box.run_migrate(["finalize-migration", *extra], **env_extra)
@@ -1115,6 +1149,34 @@ class FinalizeMigrationTests(MigrationTestCase):
         rc, out, err = self.finalize("--yes")
         self.assertEqual(rc, 1)
         self.assertIn("觀察期起始時間", out)
+
+    def test_refuses_when_old_home_differs_from_the_state(self):
+        """低-3：--old-home 打錯不能搬錯（或什麼都沒搬卻寫 finalized）。"""
+        rc, out, err = self.finalize("--yes", "--old-home", "/home/llmgwe")
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "old-home", "fail"), out)
+        self.assertIn("不一致", out)
+        self.assertTrue(os.path.isdir(self.box.old_conf()))
+        self.assertEqual(self.box.order(), [])
+
+    def test_uses_the_old_home_recorded_at_cutover(self):
+        """低-3：沒給 --old-home 就用切換時記下的那一個。"""
+        rc, out, err = self.finalize("--yes")
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(os.path.exists(self.box.old_conf()))
+        self.assertTrue(os.path.isdir(os.path.join(self.box.state("old-user-layout"),
+                                                   ".config", "llmgateway")))
+
+    def test_refuses_when_the_new_service_is_not_healthy(self):
+        """低-3：新版壞掉時該回舊版，不是把舊的收走。"""
+        self.box.curl_codes(["500"])
+        rc, out, err = self.finalize("--yes")
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "list-local", "fail"), out)
+        self.assertTrue(has_line(out, "finalize", "fail"), out)
+        self.assertIn("rollback-to-user", out)
+        self.assertTrue(os.path.isdir(self.box.old_conf()))
+        self.assertEqual(self.box.cutover_state()["phase"], "confirmed")
 
     # -- 收尾 ---------------------------------------------------------------
 
