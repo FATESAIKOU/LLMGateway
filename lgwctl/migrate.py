@@ -393,20 +393,24 @@ def _lseek0(fd: int) -> None:
 
 def _copy_into_place(src: str, dst: str, mode: int | None = None, *,
                      owner: tuple[int, int] | None = None,
-                     base: str | None = None) -> None:
+                     base: str | None = None,
+                     dst_base: str | None = None) -> None:
     """同目錄暫存 → rename（原子）；不給 mode 就沿用來源權限（cp -a 語意）。
 
     內容從 ``O_NOFOLLOW`` 驗過的 fd 讀（中-9）：不再用 ``shutil.copy2(src, …)``
     （它會跟著路徑走，檢查與複製之間可被換成 symlink）。mtime 也照抄（cp -a）：
     回滾要用「新 keys.env 是不是比較新」判斷，時間戳不能被複製時間蓋掉。
     高-1／低-3：fchmod／fchown 在 rename 之前對 fd 操作，且 mkstemp 失敗時妥善關閉 src_fd。
+    中-1：寫入側上層目錄若為 symlink 亦在 makedirs 前直接拒絕。
     """
     directory = os.path.dirname(dst) or "."
+    if dst_base is not None:
+        if _has_symlink_component(directory, dst_base):
+            raise OSError(f"{directory} 上層目錄包含 symlink")
+        if os.path.lexists(dst) and _has_symlink_component(dst, dst_base):
+            raise OSError(f"{dst} 或其上層目錄包含 symlink")
     os.makedirs(directory, exist_ok=True)
-    if base is not None:
-        src_fd = _open_regular(src, base=base)
-    else:
-        src_fd = _open_regular(src)
+    src_fd = _open_regular(src, base=base)
     if src_fd < 0:
         raise OSError(f"{src} 不是一般檔")
     out_fd = -1
@@ -556,7 +560,8 @@ def _verify_not_swapped(path: str, fd: int) -> None:
 
 def _copy_db_consistent(src: str, dst: str, mode: int = 0o600, *,
                         owner: tuple[int, int] | None = None,
-                        base: str | None = None) -> None:
+                        base: str | None = None,
+                        dst_base: str | None = None) -> None:
     """一致快照到 dst（同目錄暫存 → rename）；驗 integrity_check，失敗重試再放棄。
 
     不沿用 ``shutil.copy2``：rollback journal 模式的主檔在寫入交易期間是就地
@@ -564,10 +569,16 @@ def _copy_db_consistent(src: str, dst: str, mode: int = 0o600, *,
     活著的寫入者安全（讀交易看到的是已提交的狀態）；來源一律從驗過的 fd 讀
     （中-9），暫存檔在 rename 前再驗一次 inode 沒被換掉。
     高-1／低-3：fchmod／fchown 在 rename 前對 fd 操作，且 mkstemp 失敗時妥善關閉 src_fd。
+    中-1：寫入側上層目錄若為 symlink 亦在 makedirs 前直接拒絕。
     """
     if not _db_source_ok(src, base=base):
         raise OSError(f"{src} 不是 SQLite 資料庫")
     directory = os.path.dirname(dst) or "."
+    if dst_base is not None:
+        if _has_symlink_component(directory, dst_base):
+            raise OSError(f"{directory} 上層目錄包含 symlink")
+        if os.path.lexists(dst) and _has_symlink_component(dst, dst_base):
+            raise OSError(f"{dst} 或其上層目錄包含 symlink")
     os.makedirs(directory, exist_ok=True)
     last: Exception | None = None
     for _ in range(DB_COPY_ATTEMPTS):
@@ -608,9 +619,18 @@ def _db_backup_paths(dst: str) -> list:
     return sorted(glob.glob(dst + ".bak-*"), reverse=True)
 
 
-def _prune_db_backups(dst: str) -> None:
-    """只留最近 ``DB_BACKUP_KEEP`` 份時間戳備份（中-6）。"""
+def _prune_db_backups(dst: str, base: str | None = None) -> None:
+    """只留最近 ``DB_BACKUP_KEEP`` 份時間戳備份（中-6）。
+
+    中-1：若上層目錄為 symlink 或備份檔本身為 symlink 則拒絕刪除。
+    """
+    if base and _has_symlink_component(os.path.dirname(dst), base):
+        return
     for path in _db_backup_paths(dst)[DB_BACKUP_KEEP:]:
+        if os.path.islink(path):
+            continue
+        if base and _has_symlink_component(path, base):
+            continue
         try:
             os.unlink(path)
         except OSError:
@@ -1120,7 +1140,8 @@ def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
                     f"舊的 {old.keys_env} 不在；新版啟動後由 key 拉取補（或本人確認）")
         return
     try:
-        _copy_into_place(old.keys_env, dst, 0o600, owner=_service_owner_ids(layout))
+        _copy_into_place(old.keys_env, dst, 0o600, owner=_service_owner_ids(layout),
+                         base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-keys-env", f"複製失敗（{type(exc).__name__}）")
@@ -1140,7 +1161,8 @@ def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
         report.todo("state-db", f"舊的 {old.db_file} 不在；新服務會自己建")
         return
     try:
-        _copy_db_consistent(old.db_file, dst, owner=_service_owner_ids(layout))
+        _copy_db_consistent(old.db_file, dst, owner=_service_owner_ids(layout),
+                            base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-db", f"一致快照失敗（{type(exc).__name__}）")
@@ -1209,13 +1231,13 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
             return
         report.skip("keys-pass", f"{dst} 已有值（不覆蓋；owner／mode 已校正）")
         return
-    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
         # 中-5：舊 keysync.env 在服務帳號控制下（symlink 到 /proc/… 或外部檔）。
         _refuse_symlink(report, "keys-pass", old.keysync_env_file)
         return
-    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1)
+    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1, base=old.home)
     if raw is None:
-        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
             _refuse_symlink(report, "keys-pass", old.keysync_env_file)
             return
         value = ""
@@ -2084,7 +2106,8 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
     if not _db_has_new_writes(started, src):
         report.skip("db-copy", "新的 llm.db 沒有比較新（新服務沒寫過），不覆蓋舊的")
         return
-    if os.path.isfile(dst) and not _regular_file(dst, old.home):
+    dst_dir = os.path.dirname(dst)
+    if _has_symlink_component(dst_dir, old.home) or (os.path.lexists(dst) and _has_symlink_component(dst, old.home)):
         report.fail("db-copy", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
         return
     if os.path.isfile(dst):
@@ -2097,7 +2120,7 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
         bak = None
         report.skip("db-bak", f"{dst} 不在（沒有舊的可以備份）")
     try:
-        _copy_db_consistent(src, dst, owner=_service_owner_ids(layout))
+        _copy_db_consistent(src, dst, owner=_service_owner_ids(layout), dst_base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("db-copy", f"複製失敗（{type(exc).__name__}）")
@@ -2133,9 +2156,10 @@ def _backup_old_db(layout, dst: str, old_home: str | None = None) -> str:
     while _exists(bak):
         bak = f"{dst}.bak-{stamp}-{index}"
         index += 1
-    _copy_db_consistent(dst, bak, owner=_service_owner_ids(layout), base=old_home)
+    _copy_db_consistent(dst, bak, owner=_service_owner_ids(layout), base=old_home,
+                        dst_base=old_home)
     install._chown_service(layout, bak)
-    _prune_db_backups(dst)
+    _prune_db_backups(dst, base=old_home)
     return bak
 
 
@@ -2145,10 +2169,11 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
     if not os.path.isfile(src):
         report.skip("keys-env", f"{src} 不在（不覆蓋舊的）")
         return
+    dst_dir = os.path.dirname(dst)
+    if _has_symlink_component(dst_dir, old.home) or (os.path.lexists(dst) and _has_symlink_component(dst, old.home)):
+        report.fail("keys-env", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
+        return
     if os.path.isfile(dst):
-        if not _regular_file(dst, old.home):
-            report.fail("keys-env", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
-            return
         try:
             newer = os.path.getmtime(src) > os.path.getmtime(dst)
         except OSError:
@@ -2160,7 +2185,8 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
             report.todo("keys-env", "新的 keys.env 格式驗不過，不覆蓋舊的；請本人確認")
             return
     try:
-        _copy_into_place(src, dst, 0o600, owner=_service_owner_ids(layout))
+        _copy_into_place(src, dst, 0o600, owner=_service_owner_ids(layout),
+                         dst_base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("keys-env", f"複製失敗（{type(exc).__name__}）")

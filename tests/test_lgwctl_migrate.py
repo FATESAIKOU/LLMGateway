@@ -1580,6 +1580,25 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertTrue(has_line(out, "keys-env", "todo"), out)
         self.assert_no_values(out, err)
 
+    def test_rollback_refuses_when_state_dir_is_symlink_and_dst_missing(self):
+        """中-1：舊 state 目錄是 symlink 且舊檔案不存在時，rollback 不寫入任何檔。"""
+        if os.path.exists(self.box.old_state("llm.db")):
+            os.unlink(self.box.old_state("llm.db"))
+        if os.path.exists(self.box.old_state("keys.env")):
+            os.unlink(self.box.old_state("keys.env"))
+        evil_dir = os.path.join(self.box.root, "evil_target")
+        os.makedirs(evil_dir, exist_ok=True)
+        state_dir = os.path.dirname(self.box.old_state("llm.db"))
+        shutil.rmtree(state_dir)
+        os.symlink(evil_dir, state_dir)
+
+        rc, out, err = self.rollback()
+        self.assertFalse(os.path.exists(os.path.join(evil_dir, "llm.db")))
+        self.assertFalse(os.path.exists(os.path.join(evil_dir, "keys.env")))
+        self.assertEqual(os.listdir(evil_dir), [])
+        self.assertTrue(has_line(out, "db-copy", "fail"))
+        self.assertTrue(has_line(out, "keys-env", "fail"))
+
     def test_rollback_without_a_cutover_timestamp_does_not_overwrite_the_db(self):
         """低-7：沒有 new_service_ts（prepare 後直接回滾）時不比 mtime，安全跳過。"""
         self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG)
@@ -2040,8 +2059,8 @@ class OpenNoFollowTests(unittest.TestCase):
         real_open = migrate._open_regular
         swapped = []
 
-        def swap_after_open(path):
-            fd = real_open(path)
+        def swap_after_open(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
             if path == safe and not swapped:
                 swapped.append(path)
                 os.unlink(safe)
@@ -2088,8 +2107,8 @@ class OpenNoFollowTests(unittest.TestCase):
         real_open = migrate._open_regular
         swapped = []
 
-        def swap_after_open(path):
-            fd = real_open(path)
+        def swap_after_open(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
             if path == old_keysync and not swapped:
                 swapped.append(path)
                 os.unlink(old_keysync)
@@ -2125,8 +2144,8 @@ class OpenNoFollowTests(unittest.TestCase):
         real_regular = migrate._regular_file
         swapped = []
 
-        def swap_after_check(path):
-            res = real_regular(path)
+        def swap_after_check(path, *args, **kwargs):
+            res = real_regular(path, *args, **kwargs)
             if path == old_keysync and not swapped:
                 swapped.append(path)
                 os.unlink(old_keysync)
