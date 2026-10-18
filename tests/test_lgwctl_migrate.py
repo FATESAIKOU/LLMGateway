@@ -29,6 +29,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+import shutil
 from unittest import mock
 
 try:
@@ -599,6 +600,50 @@ class PrepareMigrationTests(MigrationTestCase):
         self.assertTrue(has_line(out, "keys-pass", "fail"), out)
         self.assertFalse(os.path.exists(self.box.etc("keys.pass")))
         self.assertNotIn("stolen-password", out + err)
+
+    def test_prepare_refuses_symlinked_ssh_dir(self):
+        """高-1：~svc/.ssh 是 symlink 時 prepare 必須 fail 且目標目錄權限不變。"""
+        target_dir = os.path.join(self.box.root, "target_etc")
+        os.makedirs(target_dir, mode=0o755)
+        os.chmod(target_dir, 0o755)
+        ssh_dir = os.path.join(self.box.service_home, ".ssh")
+        if os.path.islink(ssh_dir):
+            os.unlink(ssh_dir)
+        elif os.path.isdir(ssh_dir):
+            shutil.rmtree(ssh_dir)
+        os.makedirs(self.box.service_home, exist_ok=True)
+        os.symlink(target_dir, ssh_dir)
+
+        rc, out, err = self.prepare()
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(has_line(out, "dirs", "fail"), out)
+        mode = stat.S_IMODE(os.lstat(target_dir).st_mode)
+        self.assertEqual(mode, 0o755)
+
+    def test_prepare_refuses_intermediate_symlink_directory(self):
+        """低-2：舊 state 的上層目錄是 symlink 時拒絕跟隨。"""
+        outside = os.path.join(self.box.root, "outside_state")
+        os.makedirs(os.path.join(outside, "llmgateway"), exist_ok=True)
+        self.box.make_db(os.path.join(outside, "llmgateway", "llm.db"), "outside-db")
+        state_parent = os.path.join(self.box.service_home, ".local", "state")
+        if os.path.exists(state_parent):
+            shutil.rmtree(state_parent)
+        os.makedirs(os.path.dirname(state_parent), exist_ok=True)
+        os.symlink(outside, state_parent)
+
+        rc, out, err = self.prepare()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "state-db", "fail"), out)
+        self.assertFalse(os.path.exists(self.box.state("llm.db")))
+
+    def test_copy_into_place_closes_src_fd_on_mkstemp_error(self):
+        """低-3：mkstemp 失敗時不洩漏已開啟的來源 fd。"""
+        from lgwctl import migrate
+        src = self.box.write(os.path.join(self.box.root, "some.txt"), "hello\n")
+        dst = os.path.join(self.box.root, "dst.txt")
+        with mock.patch("tempfile.mkstemp", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                migrate._copy_into_place(src, dst)
 
     def test_prepare_replaces_a_broken_symlink_target_without_a_traceback(self):
         """低-1：目標是斷掉的 symlink 時不能 traceback（getsize 會丟）。"""

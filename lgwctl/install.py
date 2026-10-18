@@ -16,6 +16,7 @@ from __future__ import annotations
 import grp
 import os
 import pwd
+import stat
 
 from . import atomic, probe, release, units
 from . import run as runmod
@@ -88,11 +89,26 @@ def _write_one(layout, path: str, name: str, text: str, mode: int,
 
 
 def _chown_service(layout, path: str) -> None:
-    """目錄／keys.env 給服務帳號（llmgw:llmgw）；不是 root 或 prefix 模式就跳過。"""
+    """目錄／keys.env 給服務帳號（llmgw:llmgw）；不是 root 或 prefix 模式就跳過。
+    高-1：以 O_NOFOLLOW 開啟 fd 再 fchown，拒絕跟隨 symlink。
+    """
     if layout.prefix or layout.euid != 0:
         return
+    if os.path.islink(path):
+        raise OSError(f"{path} 是 symlink；拒絕以 root 變更擁有者")
     info = pwd.getpwnam(layout.service_user)
-    os.chown(path, info.pw_uid, info.pw_gid)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if os.path.isdir(path):
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        os.chown(path, info.pw_uid, info.pw_gid, follow_symlinks=False)
+        return
+    try:
+        os.fchown(fd, info.pw_uid, info.pw_gid)
+    finally:
+        os.close(fd)
 
 
 def chown_root_group(layout, path: str) -> None:
@@ -101,12 +117,23 @@ def chown_root_group(layout, path: str) -> None:
     install 與 migrate 共用同一個規則：檔案由 root 擁有（服務帳號不能改自己
     的 credential／設定），群組是服務帳號的群組（``User=llmgw`` 的 unit 讀得
     到）。不是 root 或 prefix 模式就跳過；服務帳號不在時丟 KeyError，由呼叫
-    方決定 fail（不要靜默變成 root:root）。
+    方決定 fail（不要靜默變成 root:root）。高-1：拒絕跟隨 symlink。
     """
     if layout.prefix or layout.euid != 0:
         return
+    if os.path.islink(path):
+        raise OSError(f"{path} 是 symlink；拒絕以 root 變更擁有者")
     gid = pwd.getpwnam(layout.service_user).pw_gid
-    os.chown(path, 0, gid)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        os.chown(path, 0, gid, follow_symlinks=False)
+        return
+    try:
+        os.fchown(fd, 0, gid)
+    finally:
+        os.close(fd)
 
 
 def _chown_keys_pass(layout) -> None:
@@ -121,7 +148,14 @@ def _chown_keys_pass(layout) -> None:
 
 def _chmod_quiet(path: str, mode: int) -> None:
     try:
-        os.chmod(path, mode)
+        if os.path.islink(path):
+            return
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
     except OSError:
         pass
 
@@ -182,20 +216,39 @@ def _step_dirs(layout, report) -> bool:
     ssh_dir = os.path.join(layout.service_home, ".ssh")
     dirs = (layout.opt_dir, layout.etc_dir, layout.state_dir, layout.unit_dir,
             layout.bin_dir, layout.service_home, ssh_dir)
+    # 高-1: 先拒絕 symlink 目錄，防止提權
+    for path in dirs:
+        try:
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                report.fail("dirs", f"{path} 是 symlink；拒絕以 root 變更權限")
+                return False
+        except OSError:
+            pass
     try:
         for path in dirs:
             os.makedirs(path, exist_ok=True)
-        # 安全相關的兩個目錄權限一律校正（其他沿用系統預設／既有設定）。
+        # 安全相關的兩個目錄權限一律校正（O_DIRECTORY|O_NOFOLLOW ＋ fchmod）。
         for path in (layout.state_dir, ssh_dir):
-            os.chmod(path, 0o700)
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                os.fchmod(fd, 0o700)
+            finally:
+                os.close(fd)
             _chown_service(layout, path)
-        # current 的父目錄要讓服務帳號進得去（umask 很嚴的機器也一樣）；
-        # 版本目錄本身由 release.normalize_tree 處理。
-        os.chmod(layout.opt_dir, 0o755)
-        # etc_dir 也要群組／其他人可穿過（低-1）：keys.pass 是 root:<llmgw> 0640，
-        # 但 llmgwctl sync 要以 llmgw 身分 `. keys.pass`，root umask 077 時
-        # makedirs 出來的 /etc/llmgateway 會是 0700，llmgw 進不去。
-        os.chmod(layout.etc_dir, 0o755)
+        # current 的父目錄要讓服務帳號進得去
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(layout.opt_dir, flags)
+        try:
+            os.fchmod(fd, 0o755)
+        finally:
+            os.close(fd)
+        fd = os.open(layout.etc_dir, flags)
+        try:
+            os.fchmod(fd, 0o755)
+        finally:
+            os.close(fd)
     except OSError as exc:
         report.fail("dirs", f"目錄或權限沒弄好（{type(exc).__name__}）")
         return False

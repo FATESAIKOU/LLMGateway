@@ -301,18 +301,40 @@ def _target_exists(path: str) -> bool:
     return stat.S_ISREG(info.st_mode) and info.st_size > 0
 
 
-def _open_regular(path: str) -> int:
-    """``O_NOFOLLOW`` 開檔，並用**同一個 fd** 驗證是一般檔；不成立回 -1（中-9）。
+def _has_symlink_component(path: str, base: str | None = None) -> bool:
+    """低-2：檢查路徑或其相對於 base 的父目錄是否有任何一層是 symlink。"""
+    try:
+        cur = os.path.normpath(path)
+        base_norm = os.path.normpath(base) if base else None
+        while cur and cur != "/":
+            if base_norm and (cur == base_norm or not cur.startswith(base_norm)):
+                break
+            try:
+                st = os.lstat(cur)
+                if stat.S_ISLNK(st.st_mode):
+                    return True
+            except OSError:
+                pass
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    except Exception:
+        pass
+    return False
+
+
+def _open_regular(path: str, base: str | None = None) -> int:
+    """``O_NOFOLLOW`` 開檔，並用**同一個 fd** 驗證是一般檔；不成立回 -1（中-9、低-2）。
 
     舊檔在 ``~llmgw``（服務帳號可控制）：「先 lstat 檢查、再用路徑重開
     （``copy2``／``sqlite3.connect``／``open``）」的中間，服務帳號可以把路徑換成
     指向 root 可讀檔的 symlink，root 就會把那個檔的內容交給服務帳號。所以這裡
     規定：**開了 fd 之後只信 fd**，之後路徑被換掉也不影響讀到的內容。
-
-    限制（要一起看）：這擋的是「路徑被換成 symlink／別的檔」；「同名一般檔的
-    內容被覆寫」擋不住（那是同一個 inode，不是跟著連結走）；fd 對應的路徑
-    ``/proc/self/fd/N``（Linux）／``/dev/fd/N``（macOS）只在 Unix 上有。
+    低-2：若上層路徑元件包含 symlink 亦直接拒絕。
     """
+    if _has_symlink_component(path, base):
+        return -1
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -328,10 +350,10 @@ def _open_regular(path: str) -> int:
     return fd
 
 
-def _read_regular(path: str, limit: int | None = None) -> bytes | None:
+def _read_regular(path: str, limit: int | None = None, base: str | None = None) -> bytes | None:
     """從驗過的 fd 讀整個檔（``limit`` 給時最多讀那麼多 bytes；上限用
     ``limit`` 的呼叫端自己再看 size，中-9）。不是一般檔、讀不到回 ``None``。"""
-    fd = _open_regular(path)
+    fd = _open_regular(path, base=base)
     if fd < 0:
         return None
     try:
@@ -358,27 +380,38 @@ def _lseek0(fd: int) -> None:
         pass
 
 
-def _copy_into_place(src: str, dst: str, mode: int | None = None) -> None:
+def _copy_into_place(src: str, dst: str, mode: int | None = None, *,
+                     owner: tuple[int, int] | None = None,
+                     base: str | None = None) -> None:
     """同目錄暫存 → rename（原子）；不給 mode 就沿用來源權限（cp -a 語意）。
 
     內容從 ``O_NOFOLLOW`` 驗過的 fd 讀（中-9）：不再用 ``shutil.copy2(src, …)``
     （它會跟著路徑走，檢查與複製之間可被換成 symlink）。mtime 也照抄（cp -a）：
     回滾要用「新 keys.env 是不是比較新」判斷，時間戳不能被複製時間蓋掉。
+    高-1／低-3：fchmod／fchown 在 rename 之前對 fd 操作，且 mkstemp 失敗時妥善關閉 src_fd。
     """
     directory = os.path.dirname(dst) or "."
     os.makedirs(directory, exist_ok=True)
-    src_fd = _open_regular(src)
+    src_fd = _open_regular(src, base=base)
     if src_fd < 0:
         raise OSError(f"{src} 不是一般檔")
-    out_fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=directory)
+    out_fd = -1
+    tmp = None
     try:
+        out_fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=directory)
         st = os.fstat(src_fd)
+        file_mode = mode if mode is not None else stat.S_IMODE(st.st_mode)
+        os.fchmod(out_fd, file_mode)
+        if owner is not None:
+            os.fchown(out_fd, owner[0], owner[1])
         with os.fdopen(out_fd, "wb") as out, os.fdopen(src_fd, "rb") as src_fh:
             out_fd = -1
             src_fd = -1
             shutil.copyfileobj(src_fh, out, 1 << 16)
-        os.chmod(tmp, mode if mode is not None else stat.S_IMODE(st.st_mode))
-        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        try:
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
         os.replace(tmp, dst)
         tmp = None
     finally:
@@ -424,9 +457,9 @@ def _copy_fd_to_temp(src_fd: int, directory: str) -> str:
     _lseek0(src_fd)
     fd, tmp = tempfile.mkstemp(prefix=".lgw-db-src.", dir=directory)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as out, os.fdopen(os.dup(src_fd), "rb") as src_fh:
             shutil.copyfileobj(src_fh, out, 1 << 16)
-        os.chmod(tmp, 0o600)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -502,13 +535,16 @@ def _verify_not_swapped(path: str, fd: int) -> None:
         raise OSError("暫存檔在過程中被換掉了")
 
 
-def _copy_db_consistent(src: str, dst: str, mode: int = 0o600) -> None:
+def _copy_db_consistent(src: str, dst: str, mode: int = 0o600, *,
+                        owner: tuple[int, int] | None = None,
+                        base: str | None = None) -> None:
     """一致快照到 dst（同目錄暫存 → rename）；驗 integrity_check，失敗重試再放棄。
 
     不沿用 ``shutil.copy2``：rollback journal 模式的主檔在寫入交易期間是就地
     修改的，直接複製會拿到新舊頁混合的檔案（高-4）。``Connection.backup`` 對
     活著的寫入者安全（讀交易看到的是已提交的狀態）；來源一律從驗過的 fd 讀
     （中-9），暫存檔在 rename 前再驗一次 inode 沒被換掉。
+    高-1／低-3：fchmod／fchown 在 rename 前對 fd 操作，且 mkstemp 失敗時妥善關閉 src_fd。
     """
     if not _db_source_ok(src):
         raise OSError(f"{src} 不是 SQLite 資料庫")
@@ -516,24 +552,30 @@ def _copy_db_consistent(src: str, dst: str, mode: int = 0o600) -> None:
     os.makedirs(directory, exist_ok=True)
     last: Exception | None = None
     for _ in range(DB_COPY_ATTEMPTS):
-        src_fd = _open_regular(src)
+        src_fd = _open_regular(src, base=base)
         if src_fd < 0:
             raise OSError(f"{src} 不是一般檔")
-        dst_fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=directory)
+        dst_fd = -1
+        tmp = None
         try:
+            dst_fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=directory)
             _sqlite_backup_fd(src_fd, tmp, directory)
             if not _db_integrity_ok(tmp):
                 raise sqlite3.DatabaseError("integrity_check 不是 ok")
             _verify_not_swapped(tmp, dst_fd)
             os.fchmod(dst_fd, mode)
+            if owner is not None:
+                os.fchown(dst_fd, owner[0], owner[1])
             os.replace(tmp, dst)
             tmp = None
             return
         except (OSError, sqlite3.Error) as exc:
             last = exc
         finally:
-            os.close(dst_fd)
-            os.close(src_fd)
+            if dst_fd >= 0:
+                os.close(dst_fd)
+            if src_fd >= 0:
+                os.close(src_fd)
             if tmp is not None:
                 try:
                     os.unlink(tmp)
@@ -606,16 +648,40 @@ def _keys_env_valid(path: str) -> bool:
     return saw_value
 
 
-def _regular_file(path: str) -> bool:
-    """存在、是一般檔、**不是 symlink**（prepare 讀舊檔前的唯一判準，中-5）。"""
+def _service_owner_ids(layout) -> tuple[int, int] | None:
+    if layout.prefix or layout.euid != 0:
+        return None
     try:
+        import pwd
+        info = pwd.getpwnam(layout.service_user)
+        return (info.pw_uid, info.pw_gid)
+    except KeyError:
+        return None
+
+
+def _root_group_owner_ids(layout) -> tuple[int, int] | None:
+    if layout.prefix or layout.euid != 0:
+        return None
+    try:
+        import pwd
+        info = pwd.getpwnam(layout.service_user)
+        return (0, info.pw_gid)
+    except KeyError:
+        return None
+
+
+def _regular_file(path: str, base: str | None = None) -> bool:
+    """存在、是一般檔、**自身與其上層目錄都不是 symlink**（中-5、低-2）。"""
+    try:
+        if _has_symlink_component(path, base):
+            return False
         return stat.S_ISREG(os.lstat(path).st_mode)
     except OSError:
         return False
 
 
 def _refuse_symlink(report, name: str, path: str, what: str = "舊的") -> None:
-    report.fail(name, f"{what} {path} 不是一般檔（symlink？）——不跟，請本人確認後再跑")
+    report.fail(name, f"{what} {path} 或其上層目錄不是一般檔（symlink？）——不跟，請本人確認後再跑")
 
 
 def _chown_keys_pass(layout, report, name: str = "keys-pass") -> bool:
@@ -733,8 +799,13 @@ class _Lock:
         """拿鎖；``timeout`` 秒內拿不到回 False（中-3：短暫重試，不要靜默跳過）。"""
         directory = os.path.dirname(self.path) or "."
         os.makedirs(directory, exist_ok=True)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            os.chmod(directory, 0o700)
+            dir_fd = os.open(directory, flags)
+            try:
+                os.fchmod(dir_fd, 0o700)
+            finally:
+                os.close(dir_fd)
         except OSError:
             pass
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -1005,14 +1076,14 @@ def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
     if _target_exists(dst) and not force:
         report.skip("state-keys-env", f"{dst} 已存在（不覆蓋）")
         return
-    if _exists(old.keys_env) and not _regular_file(old.keys_env):
+    if _exists(old.keys_env) and not _regular_file(old.keys_env, old.home):
         # 中-5：舊檔在服務帳號控制下；symlink 會讓 root 把任意檔交給 llmgw。
         _refuse_symlink(report, "state-keys-env", old.keys_env)
         return
     if not os.path.isfile(old.keys_env):
         if not _exists(dst):
             try:
-                atomic.write_text(dst, "", 0o600)
+                atomic.write_text(dst, "", 0o600, owner=_service_owner_ids(layout))
                 install._chown_service(layout, dst)
             except OSError as exc:
                 report.fail("state-keys-env", f"建空檔失敗（{type(exc).__name__}）")
@@ -1021,7 +1092,7 @@ def _step_keys_env(layout, old: OldLayout, report, *, force: bool) -> None:
                     f"舊的 {old.keys_env} 不在；新版啟動後由 key 拉取補（或本人確認）")
         return
     try:
-        _copy_into_place(old.keys_env, dst, 0o600)
+        _copy_into_place(old.keys_env, dst, 0o600, owner=_service_owner_ids(layout))
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-keys-env", f"複製失敗（{type(exc).__name__}）")
@@ -1034,14 +1105,14 @@ def _step_db(layout, old: OldLayout, report, *, force: bool) -> None:
     if _target_exists(dst) and not force:
         report.skip("state-db", f"{dst} 已存在（不覆蓋）")
         return
-    if _exists(old.db_file) and not _regular_file(old.db_file):
+    if _exists(old.db_file) and not _regular_file(old.db_file, old.home):
         _refuse_symlink(report, "state-db", old.db_file)
         return
     if not os.path.isfile(old.db_file):
         report.todo("state-db", f"舊的 {old.db_file} 不在；新服務會自己建")
         return
     try:
-        _copy_db_consistent(old.db_file, dst)
+        _copy_db_consistent(old.db_file, dst, owner=_service_owner_ids(layout))
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-db", f"一致快照失敗（{type(exc).__name__}）")
@@ -1054,12 +1125,13 @@ def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
     if _target_exists(dst) and not force:
         report.skip(name, f"{dst} 已存在（不覆蓋）")
         return
-    if _exists(src) and not _regular_file(src):
+    if _exists(src) and not _regular_file(src, old.home):
         _refuse_symlink(report, name, src)
         return
     if not os.path.isfile(src):
         try:
-            atomic.write_text(dst, template, 0o640)
+            atomic.write_text(dst, template, 0o640,
+                              owner=_root_group_owner_ids(layout))
             install.chown_root_group(layout, dst)
         except KeyError:
             report.fail(name, f"找不到服務帳號 {layout.service_user} 的群組；"
@@ -1073,7 +1145,9 @@ def _step_env_file(layout, old: OldLayout, report, *, force: bool, name: str,
     try:
         # 內容原樣照抄（IDENTITY／KNOWN_HOSTS 是絕對路徑、不改寫），但 owner／
         # mode 是規格值：/etc 的設定檔 root:<llmgw 群組> 0640（中-7）。
-        _copy_into_place(src, dst, 0o640)
+        _copy_into_place(src, dst, 0o640,
+                         owner=_root_group_owner_ids(layout),
+                         base=old.home)
         install.chown_root_group(layout, dst)
     except KeyError:
         report.fail(name, f"找不到服務帳號 {layout.service_user} 的群組；"
@@ -1090,8 +1164,16 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
     if not force and _has_password(dst):
         # 低-9：有值就 skip，但權限還是要校正（人工建立／舊版留下的可能是
         # root:root 0600 或 llmgw:llmgw，llmgwctl sync 會讀不到）；與 install 對齊。
+        if os.path.islink(dst):
+            report.fail("keys-pass", f"{dst} 是 symlink；拒絕以 root 變更權限")
+            return
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            os.chmod(dst, 0o640)
+            fd = os.open(dst, flags)
+            try:
+                os.fchmod(fd, 0o640)
+            finally:
+                os.close(fd)
         except OSError as exc:
             report.fail("keys-pass", f"chmod 失敗（{type(exc).__name__}）")
             return
@@ -1099,13 +1181,13 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
             return
         report.skip("keys-pass", f"{dst} 已有值（不覆蓋；owner／mode 已校正）")
         return
-    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
         # 中-5：舊 keysync.env 在服務帳號控制下（symlink 到 /proc/… 或外部檔）。
         _refuse_symlink(report, "keys-pass", old.keysync_env_file)
         return
-    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1)
+    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1, base=old.home)
     if raw is None:
-        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
+        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
             _refuse_symlink(report, "keys-pass", old.keysync_env_file)
             return
         value = ""
@@ -1120,7 +1202,8 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
     if not value:
         if not _exists(dst):
             try:
-                atomic.write_text(dst, install.KEYS_PASS_TEMPLATE, 0o640)
+                atomic.write_text(dst, install.KEYS_PASS_TEMPLATE, 0o640,
+                                  owner=_root_group_owner_ids(layout))
             except OSError as exc:
                 report.fail("keys-pass", f"建空殼失敗（{type(exc).__name__}）")
                 return
@@ -1131,7 +1214,8 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
                     f"要本人填進 {dst}")
         return
     try:
-        atomic.write_text(dst, f"{install.KEYS_PASS_VAR}={value}\n", 0o640)
+        atomic.write_text(dst, f"{install.KEYS_PASS_VAR}={value}\n", 0o640,
+                          owner=_root_group_owner_ids(layout))
     except OSError as exc:
         report.fail("keys-pass", f"寫失敗（{type(exc).__name__}）")
         return
@@ -1148,7 +1232,7 @@ def _step_keysync_sha(layout, old: OldLayout, report, *, force: bool) -> None:
     if _target_exists(dst) and not force:
         report.skip("state-keysync-sha", f"{dst} 已存在（不覆蓋）")
         return
-    if _exists(src) and not _regular_file(src):
+    if _exists(src) and not _regular_file(src, old.home):
         _refuse_symlink(report, "state-keysync-sha", src)
         return
     if not os.path.isfile(src):
@@ -1156,7 +1240,8 @@ def _step_keysync_sha(layout, old: OldLayout, report, *, force: bool) -> None:
                     f"舊的 {src} 不在；第一次 key 拉取會全量重拉（功能不受影響）")
         return
     try:
-        _copy_into_place(src, dst, 0o600)
+        _copy_into_place(src, dst, 0o600, owner=_service_owner_ids(layout),
+                         base=old.home)
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("state-keysync-sha", f"複製失敗（{type(exc).__name__}）")
@@ -1894,9 +1979,12 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
     if not _db_has_new_writes(started, src):
         report.skip("db-copy", "新的 llm.db 沒有比較新（新服務沒寫過），不覆蓋舊的")
         return
+    if os.path.isfile(dst) and not _regular_file(dst, old.home):
+        report.fail("db-copy", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
+        return
     if os.path.isfile(dst):
         try:
-            bak = _backup_old_db(layout, dst)
+            bak = _backup_old_db(layout, dst, old_home=old.home)
         except OSError as exc:
             report.fail("db-bak", f"舊 llm.db 備份失敗（{type(exc).__name__}）；不覆蓋")
             return
@@ -1904,7 +1992,7 @@ def _restore_db(layout, old: OldLayout, state: dict, report) -> None:
         bak = None
         report.skip("db-bak", f"{dst} 不在（沒有舊的可以備份）")
     try:
-        _copy_db_consistent(src, dst)
+        _copy_db_consistent(src, dst, owner=_service_owner_ids(layout))
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("db-copy", f"複製失敗（{type(exc).__name__}）")
@@ -1932,7 +2020,7 @@ def _db_has_new_writes(started: float, src: str) -> bool:
         return False
 
 
-def _backup_old_db(layout, dst: str) -> str:
+def _backup_old_db(layout, dst: str, old_home: str | None = None) -> str:
     """把舊 db 一致快照成帶時間戳的備份；失敗丟 OSError（呼叫方不覆蓋）。"""
     stamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
     bak = f"{dst}.bak-{stamp}"
@@ -1940,7 +2028,7 @@ def _backup_old_db(layout, dst: str) -> str:
     while _exists(bak):
         bak = f"{dst}.bak-{stamp}-{index}"
         index += 1
-    _copy_db_consistent(dst, bak)
+    _copy_db_consistent(dst, bak, owner=_service_owner_ids(layout), base=old_home)
     install._chown_service(layout, bak)
     _prune_db_backups(dst)
     return bak
@@ -1953,6 +2041,9 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
         report.skip("keys-env", f"{src} 不在（不覆蓋舊的）")
         return
     if os.path.isfile(dst):
+        if not _regular_file(dst, old.home):
+            report.fail("keys-env", f"舊的 {dst} 或其上層目錄是 symlink；不覆蓋")
+            return
         try:
             newer = os.path.getmtime(src) > os.path.getmtime(dst)
         except OSError:
@@ -1964,7 +2055,7 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
             report.todo("keys-env", "新的 keys.env 格式驗不過，不覆蓋舊的；請本人確認")
             return
     try:
-        _copy_into_place(src, dst)
+        _copy_into_place(src, dst, 0o600, owner=_service_owner_ids(layout))
         install._chown_service(layout, dst)
     except OSError as exc:
         report.fail("keys-env", f"複製失敗（{type(exc).__name__}）")
