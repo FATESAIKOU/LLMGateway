@@ -1107,6 +1107,7 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
 
     # (b) 停舊 user 的服務與隧道，並且 disable：觀察期內重開機不得新舊雙跑（高-2）
     stopped: list[str] = []
+    disabled: list[str] = []
     for unit in OLD_STOP_ORDER:
         outcome = _stop_unit(layout, report, "stop-old", unit, layer="user",
                              ok=f"{unit}（user 層）已停",
@@ -1114,7 +1115,7 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
         if outcome == "ok":
             stopped.append(unit)
         elif outcome == "failed":
-            _restore_old_units(layout, stopped, report)
+            _restore_old_units(layout, disabled, stopped, report)
             _cancel_revert(layout, REVERT_TIMER_UNIT, report)
             try:
                 write_state(layout, phase=PHASE_ABORTED, tag=tag, reason="stop-old")
@@ -1124,9 +1125,10 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
             return 1
         # 停掉的（含本來就沒在跑但檔案在的）一律 disable：重開機不再自動起。
         if outcome != "failed":
-            disabled = _disable_unit(layout, report, "disable-old", unit, layer="user")
-            if disabled == "failed":
-                _restore_old_units(layout, stopped, report)
+            disabled_outcome = _disable_unit(layout, report, "disable-old", unit,
+                                             layer="user")
+            if disabled_outcome == "failed":
+                _restore_old_units(layout, disabled, stopped, report)
                 _cancel_revert(layout, REVERT_TIMER_UNIT, report)
                 try:
                     write_state(layout, phase=PHASE_ABORTED, tag=tag, reason="disable-old")
@@ -1134,8 +1136,9 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
                     pass
                 report.fail("cutover", "舊 unit disable 不掉（重開機會雙跑）；沒切換")
                 return 1
+            disabled.append(unit)
     if not _confirm_old_units_stopped(layout, report):
-        _restore_old_units(layout, stopped, report)
+        _restore_old_units(layout, disabled, stopped, report)
         _cancel_revert(layout, REVERT_TIMER_UNIT, report)
         try:
             write_state(layout, phase=PHASE_ABORTED, tag=tag, reason="old-still-active")
@@ -1147,7 +1150,7 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
 
     # 不可逆步驟前再確認一次狀態沒被回滾蓋掉（中-3）。
     if read_state(layout).get("phase") != PHASE_CUTOVER:
-        _restore_old_units(layout, stopped, report)
+        _restore_old_units(layout, disabled, stopped, report)
         _cancel_revert(layout, REVERT_TIMER_UNIT, report)
         report.fail("cutover", "狀態在切換中被改掉（可能已被回滾）；中止")
         return 1
@@ -1274,12 +1277,13 @@ def _wait_file(path: str, seconds: float, *, since: float | None = None) -> bool
         time.sleep(min(1.0, remaining))
 
 
-def _restore_old_units(layout, units_list: list, report) -> None:
-    """中止切換時，把剛剛停掉（且 disable 過）的舊 unit 叫回來。"""
-    for unit in units_list:
+def _restore_old_units(layout, enable_units: list, start_units: list, report) -> None:
+    """中止切換時，把 disable／停掉的舊 unit 復原（enable 全部、start 停過的）。"""
+    for unit in enable_units:
         outcome, _ = _user_systemctl_outcome(layout, "enable", unit)
         if outcome == "failed":
             report.fail("enable-old", f"{unit} enable 不回來（重開機不會自動起）")
+    for unit in start_units:
         outcome, detail = _user_systemctl_outcome(layout, "start", unit)
         if outcome == "ok":
             report.ok("start-old", f"{unit}（叫回來）")
@@ -1530,17 +1534,19 @@ def _restore_keys_env(layout, old: OldLayout, report) -> None:
 def _start_old_units(layout, report) -> bool:
     """以 llmgw 身分（重新 enable 並）啟動舊 user unit。
 
-    cutover 停舊 unit 時順便 disable（高-2，觀察期重開機不得雙跑）；回舊版時
-    要 enable 回來，不然回滾後重開機舊服務不會自己起。
+    cutover 停舊 unit 時把四個都 disable（高-2，觀察期重開機不得雙跑）；
+    回舊版時要全部 enable 回來（含 key-sync.timer，不然舊版的 key 不會再拉），
+    再啟動兩個服務。
     """
     ok = True
-    for unit in OLD_START_ORDER:
+    for unit in OLD_UNIT_NAMES:
         outcome, _ = _user_systemctl_outcome(layout, "enable", unit)
         if outcome == "failed":
             ok = False
             report.fail("enable-old", f"{unit} enable 不回來（重開機不會自動起）")
         else:
             report.ok("enable-old", f"{unit}（開機會自動起）")
+    for unit in OLD_START_ORDER:
         outcome, detail = _user_systemctl_outcome(layout, "start", unit)
         if outcome == "ok":
             report.ok("start-old", f"{unit}（user 層）")

@@ -895,6 +895,17 @@ class CutoverTests(MigrationTestCase):
         self.assertIn("systemctl stop lgw-revert.timer", self.box.order())
         self.assert_no_values(out, err)
 
+    def test_abort_reenables_the_units_it_disabled(self):
+        """高-2：中止切換時，先 disable 過的舊 unit 要 enable 回來（否則重開機不復原）。"""
+        self.box.fail_action("stop", "llmgateway-tunnel.service", layer="user")
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 1)
+        actions = self.box.actions()
+        self.assertIn("user disable llmgateway.service", actions)
+        self.assertIn("user enable llmgateway.service", actions)
+        self.assertIn("user start llmgateway.service", actions)
+        self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+
     def test_bus_failure_is_a_failure_not_a_skip(self):
         """中-2：user bus 連不上不能被當成「舊 unit 本來就沒在跑」。"""
         self.box.set_bus_failure("user")
@@ -1072,6 +1083,7 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertIn("system stop llmgateway-tunnel.service", actions)
         self.assertIn("system disable llmgateway.service", actions)
         self.assertIn("user enable llmgateway.service", actions)
+        self.assertIn("user enable key-sync.timer", actions)
         self.assertIn("user start llmgateway.service", actions)
         self.assertIn("user start llmgateway-tunnel.service", actions)
         # 新的 llm.db 複製回舊 state，舊的先備份（帶時間戳，中-6）
