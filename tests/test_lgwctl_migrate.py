@@ -1483,11 +1483,26 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertTrue(self.box.active("llmgateway.service"))
 
     def test_rollback_without_any_state_is_still_safe(self):
+        """演練補充：沒有狀態檔時不印假 fail，照常冪等回舊版。"""
         os.unlink(self.box.ctl(".cutover.state"))
         rc, out, err = self.rollback()
         self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "rollback-state", "ok"), out)
+        self.assertFalse(has_line(out, "revert-unit", "fail"), out)
+        self.assertNotIn("不是認得的值", out)
         self.assertEqual(self.box.cutover_state()["phase"], "reverted")
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
+
+    def test_rollback_without_state_returns_nonzero_if_old_service_fails(self):
+        """演練補充：沒有狀態檔時結束碼仍要看舊服務有沒有真的回來。"""
+        os.unlink(self.box.ctl(".cutover.state"))
+        self.box.fail_action("start", "llmgateway.service", layer="user")
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "start-old", "fail"), out)
+        self.assertFalse(has_line(out, "revert-unit", "fail"), out)
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        self.assertFalse(self.box.cutover_state()["local_ok"])
 
     @unittest.skipIf(os.geteuid() == 0, "root 身分下沒有 prefix 會動真機，略過")
     def test_rollback_needs_root_without_prefix(self):
