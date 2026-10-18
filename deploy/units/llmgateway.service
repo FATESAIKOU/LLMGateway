@@ -1,0 +1,32 @@
+# LLMGateway 服務（system 層；#35 安裝簡單化）。
+# llmgwctl install 會把當版目錄 deploy/units/llmgateway.service 裝到
+# /etc/systemd/system/llmgateway.service；cwd 是 current，lgwd 套件就在那裡。
+[Unit]
+Description=LLMGateway subscription registry (lgwd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=exec：等 exec 成功才算啟動中（systemd 250+；比預設的 simple 準——simple
+# 是 fork 完就算在跑）。exec 成功不等於 app 起得來，install 另外用本機 list 確認。
+Type=exec
+User=llmgw
+Group=llmgw
+WorkingDirectory=/opt/llmgateway/current
+# 路徑都用新版面（#35）：政策在當版目錄、key 與 db 在 state 目錄。
+# 埠從 /etc/llmgateway/llmgateway.env 的 LGW_API_PORT 來（systemd 的 ${…} 展開）；
+# 那個檔或那一行不在，unit 就起不來（fail-closed）。
+ExecStart=/usr/bin/python3 -m lgwd --policy /opt/llmgateway/current/policy/default.json --keys /var/lib/llmgateway/keys.env --db /var/lib/llmgateway/llm.db --api-port=${LGW_API_PORT}
+Restart=on-failure
+EnvironmentFile=/etc/llmgateway/llmgateway.env
+# 解密密碼只經 LoadCredential 交給服務（服務裡是 $CREDENTIALS_DIRECTORY/keys.pass；
+# 值不進環境、不進 argv）。
+LoadCredential=keys.pass:/etc/llmgateway/keys.pass
+# 加固（#35 spec）：不能提權、系統唯讀（只開狀態目錄）、私有 /tmp。
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/llmgateway
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
