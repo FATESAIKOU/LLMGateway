@@ -70,6 +70,7 @@ import fcntl
 import glob
 import json
 import os
+import pathlib
 import re
 import shutil
 import sqlite3
@@ -304,32 +305,40 @@ def _target_exists(path: str) -> bool:
 
 
 def _has_symlink_component(path: str, base: str | None = None) -> bool:
-    """低-2：檢查路徑或其相對於 base 的父目錄是否有任何一層是 symlink。"""
+    """低-2／低-1：檢查路徑或其相對於 base 的父目錄是否有任何一層是 symlink。
+
+    若指定 base，路徑必須在 base 底下（以路徑元件比對）；若不在 base 底下則 fail-closed 回傳 True。
+    """
     try:
         cur = os.path.normpath(path)
-        base_norm = os.path.normpath(base) if base else None
-        while cur and cur != "/":
-            if base_norm:
-                if cur == base_norm or not cur.startswith(base_norm):
-                    break
-            else:
-                try:
-                    return stat.S_ISLNK(os.lstat(cur).st_mode)
-                except OSError:
-                    return False
+        if base:
+            base_norm = os.path.normpath(base)
             try:
-                st = os.lstat(cur)
-                if stat.S_ISLNK(st.st_mode):
-                    return True
+                if not pathlib.PurePath(cur).is_relative_to(pathlib.PurePath(base_norm)):
+                    return True  # 低-1: 不在 base 底下 fail-closed
+            except (ValueError, AttributeError):
+                return True
+            while cur and cur != "/" and cur != base_norm:
+                try:
+                    st = os.lstat(cur)
+                    if stat.S_ISLNK(st.st_mode):
+                        return True
+                except OSError:
+                    pass
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+            return False
+        else:
+            try:
+                return stat.S_ISLNK(os.lstat(cur).st_mode)
             except OSError:
-                pass
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+                return False
     except Exception:
-        pass
-    return False
+        if base:
+            return True
+        return False
 
 
 def _open_regular(path: str, base: str | None = None) -> int:
@@ -2004,10 +2013,18 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
         if units.is_active(layout, TUNNEL_SERVICE_NAME):
             tunnel_ok = _switch_to_old_tunnel(layout, report, ok)
         else:
-            tunnel_ok = _wait_old_tunnel(layout, report)
-            if not tunnel_ok:
-                report.fail("tunnel-old", "舊隧道仍然起不來；新隧道先留著，"
-                                          "管理連線不會斷（修好後再跑一次 rollback-to-user）")
+            outcome, detail = _user_systemctl_outcome(layout, "start", TUNNEL_SERVICE_NAME)
+            if outcome != "ok":
+                report.fail("start-old-tunnel", f"{TUNNEL_SERVICE_NAME} 起不來（{detail or outcome}）")
+                _recover_new_tunnel(layout, report)
+                tunnel_ok = False
+            else:
+                report.ok("start-old-tunnel", f"{TUNNEL_SERVICE_NAME}（user 層）")
+                initial_restarts = _user_unit_restarts(layout, TUNNEL_SERVICE_NAME)
+                tunnel_ok = _wait_old_tunnel(layout, report, initial_restarts=initial_restarts)
+                if not tunnel_ok:
+                    _user_systemctl_outcome(layout, "stop", TUNNEL_SERVICE_NAME)
+                    _recover_new_tunnel(layout, report)
         _cancel_revert(layout, _state_revert_unit(state, report), report)
         try:
             write_state(layout, phase=PHASE_REVERTED,
@@ -2262,17 +2279,18 @@ def _switch_to_old_tunnel(layout, report, old_service_ok: bool) -> bool:
         report.fail("tunnel-old", "舊服務未恢復（本機 list 非 200），新隧道維持運行（管理連線未中斷）；修好後請再執行 rollback-to-user")
         return False
 
-    initial_restarts = _user_unit_restarts(layout, unit)
-
     # 停新隧道（先不 disable，讓出會合點 4710/4711 埠）
-    outcome, detail = _systemctl_outcome(layout, "stop", unit)
-    _report_outcome(report, "stop-new-tunnel", outcome, detail,
-                    ok=f"{unit}（system 層；短暫切換空窗，讓出會合點埠）已停",
-                    missing=f"{unit}（本來就沒在跑）",
-                    failed=f"停 {unit} 失敗（{detail}）")
-    if outcome == "failed":
-        report.fail("tunnel-old", "新隧道停止失敗；無法切換至舊隧道")
-        return False
+    if not units.is_active(layout, unit):
+        report.skip("stop-new-tunnel", f"{unit}（system 層本來就沒在跑）")
+    else:
+        outcome, detail = _systemctl_outcome(layout, "stop", unit)
+        _report_outcome(report, "stop-new-tunnel", outcome, detail,
+                        ok=f"{unit}（system 層；短暫切換空窗，讓出會合點埠）已停",
+                        missing=f"{unit}（本來就沒在跑）",
+                        failed=f"停 {unit} 失敗（{detail}）")
+        if outcome == "failed":
+            report.fail("tunnel-old", "新隧道停止失敗；無法切換至舊隧道")
+            return False
 
     # 啟動舊隧道
     outcome, detail = _user_systemctl_outcome(layout, "start", unit)
@@ -2281,6 +2299,9 @@ def _switch_to_old_tunnel(layout, report, old_service_ok: bool) -> bool:
         _recover_new_tunnel(layout, report)
         return False
     report.ok("start-old-tunnel", f"{unit}（user 層）")
+
+    # 低-2：NRestarts 基準要在舊隧道 start 之後才取（手動 start 會把 NRestarts 歸零）
+    initial_restarts = _user_unit_restarts(layout, unit)
 
     # 等舊隧道連續穩定
     if not _wait_old_tunnel(layout, report, initial_restarts=initial_restarts):
@@ -2315,7 +2336,10 @@ def _recover_new_tunnel(layout, report) -> None:
                     ok=f"{unit}（system 層）已重新啟動（保留管理通道）",
                     missing=f"{unit} 不在",
                     failed=f"重新啟動 {unit} 失敗（{detail}）；管理通道中斷，請以 console 登入處理")
-    report.fail("tunnel-old", "舊隧道未達連續穩定或探針非 200；已重新啟動新隧道留住管理通道，修好後再跑一次 rollback-to-user")
+    if outcome == "ok":
+        report.fail("tunnel-old", "舊隧道未達連續穩定或探針非 200；已重新啟動新隧道留住管理通道，修好後再跑一次 rollback-to-user")
+    else:
+        report.fail("tunnel-old", f"舊隧道未達連續穩定且重新啟動新隧道失敗（{detail}）；管理通道中斷，請以 console 登入處理")
 
 
 def _wait_old_tunnel(layout, report, initial_restarts: int | None = None) -> bool:
