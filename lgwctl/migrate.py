@@ -751,7 +751,8 @@ def _chown_keys_pass(layout, report, name: str = "keys-pass") -> bool:
 
 def ctl_dir(layout) -> str:
     """遷移控制檔的目錄（<prefix>/var/lib/llmgateway-ctl）：root 專屬（高-3）。"""
-    return os.path.join(layout.prefix, CTL_DIR.lstrip("/"))
+    # prefix 為空（真機）時必須是絕對路徑；用 os.path.join("", "var/...") 會變成相對於 cwd（演練抓到的 bug）。
+    return layout._path(CTL_DIR)
 
 
 def cutover_state_path(layout) -> str:

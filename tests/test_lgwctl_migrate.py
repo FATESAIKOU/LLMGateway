@@ -2379,3 +2379,29 @@ class SharedOwnershipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CtlDirAbsolutePathTests(unittest.TestCase):
+    """真機（LLMGW_PREFIX 為空）時，狀態檔與鎖必須在絕對路徑 /var/lib/llmgateway-ctl。
+
+    fh-l 演練抓到的 bug：prefix 為空時 os.path.join("", "var/lib/...") 變成相對路徑，
+    狀態檔寫到 cwd 底下，`llmgwctl confirm` 從別的 cwd 找不到狀態、保險照樣把舊版叫回來。
+    單元測試都用 prefix 沙箱，所以沒抓到。
+    """
+
+    def test_ctl_dir_is_absolute_without_prefix(self):
+        from lgwctl import migrate
+        from lgwctl.layout import Layout
+
+        layout = Layout.from_env({"LLMGW_PREFIX": ""})
+        self.assertEqual(migrate.ctl_dir(layout), "/var/lib/llmgateway-ctl")
+        self.assertEqual(migrate.cutover_state_path(layout),
+                         "/var/lib/llmgateway-ctl/.cutover.state")
+        self.assertTrue(os.path.isabs(migrate.cutover_state_path(layout)))
+
+    def test_ctl_dir_follows_prefix(self):
+        from lgwctl import migrate
+        from lgwctl.layout import Layout
+
+        layout = Layout.from_env({"LLMGW_PREFIX": "/tmp/pfx"})
+        self.assertEqual(migrate.ctl_dir(layout), "/tmp/pfx/var/lib/llmgateway-ctl")
