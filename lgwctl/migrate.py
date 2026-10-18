@@ -1088,8 +1088,6 @@ def _prepare_locked(layout, old: OldLayout, *, tag: str, force: bool,
     _step_gh_login(layout, report)
     _step_tunnel_config(layout, report)
     # 把正規化後的 old_home 綁進狀態檔（低-3）：finalize 不收命令列打錯的目錄。
-    # 上一輪若是終態（reverted／aborted），先把舊狀態檔歸檔再開新一輪（中-4）。
-    _start_new_round(layout, report)
     try:
         if not read_state(layout).get("old_home"):
             write_state(layout, old_home=old.home)

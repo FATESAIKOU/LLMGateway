@@ -2184,19 +2184,45 @@ class SharedOwnershipTests(unittest.TestCase):
         from lgwctl import install
 
         calls = []
+        open_calls = []
+        fake_stat_reg = mock.Mock(st_mode=stat.S_IFREG | 0o640)
         fake = types.SimpleNamespace(pw_uid=1001, pw_gid=2002, pw_dir="/home/lgwfake")
+
+        def fake_open(path, flags, *args):
+            open_calls.append((path, flags))
+            return 99
+
+        def fake_fchown(fd, uid, gid):
+            calls.append((open_calls[-1][0], uid, gid))
+
         with mock.patch.object(install.pwd, "getpwnam", return_value=fake), \
-                mock.patch.object(install.os, "chown",
-                                  side_effect=lambda *args: calls.append(args)):
+                mock.patch.object(install.os, "open", side_effect=fake_open), \
+                mock.patch.object(install.os, "fstat", return_value=fake_stat_reg), \
+                mock.patch.object(install.os, "fchown", side_effect=fake_fchown), \
+                mock.patch.object(install.os, "close", return_value=None):
             install.chown_root_group(self.layout, "/etc/llmgateway/keys.pass")
         self.assertEqual(calls, [("/etc/llmgateway/keys.pass", 0, 2002)])
+
+    def test_chown_service_refuses_fifo_and_non_regular(self):
+        """低-3：_chown_service 與 chown_root_group 拒絕 FIFO 與非一般檔。"""
+        from lgwctl import install
+        fake = types.SimpleNamespace(pw_uid=1001, pw_gid=2002, pw_dir="/home/lgwfake")
+        fake_stat_fifo = mock.Mock(st_mode=stat.S_IFIFO | 0o600)
+        with mock.patch.object(install.pwd, "getpwnam", return_value=fake), \
+                mock.patch.object(install.os, "open", return_value=99), \
+                mock.patch.object(install.os, "fstat", return_value=fake_stat_fifo), \
+                mock.patch.object(install.os, "close", return_value=None):
+            with self.assertRaises(OSError):
+                install._chown_service(self.layout, "/tmp/fake_fifo")
+            with self.assertRaises(OSError):
+                install.chown_root_group(self.layout, "/tmp/fake_fifo")
 
     def test_chown_root_group_skips_in_prefix_mode(self):
         from lgwctl import install
         from lgwctl.layout import Layout
 
         calls = []
-        with mock.patch.object(install.os, "chown",
+        with mock.patch.object(install.os, "fchown",
                                side_effect=lambda *args: calls.append(args)):
             install.chown_root_group(Layout.from_env(self.box.env), "/x")
         self.assertEqual(calls, [])
