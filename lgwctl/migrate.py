@@ -361,7 +361,10 @@ def _open_regular(path: str, base: str | None = None) -> int:
 def _read_regular(path: str, limit: int | None = None, base: str | None = None) -> bytes | None:
     """從驗過的 fd 讀整個檔（``limit`` 給時最多讀那麼多 bytes；上限用
     ``limit`` 的呼叫端自己再看 size，中-9）。不是一般檔、讀不到回 ``None``。"""
-    fd = _open_regular(path, base=base)
+    if base is not None:
+        fd = _open_regular(path, base=base)
+    else:
+        fd = _open_regular(path)
     if fd < 0:
         return None
     try:
@@ -400,7 +403,10 @@ def _copy_into_place(src: str, dst: str, mode: int | None = None, *,
     """
     directory = os.path.dirname(dst) or "."
     os.makedirs(directory, exist_ok=True)
-    src_fd = _open_regular(src, base=base)
+    if base is not None:
+        src_fd = _open_regular(src, base=base)
+    else:
+        src_fd = _open_regular(src)
     if src_fd < 0:
         raise OSError(f"{src} 不是一般檔")
     out_fd = -1
@@ -1203,13 +1209,13 @@ def _step_keys_pass(layout, old: OldLayout, report, *, force: bool) -> None:
             return
         report.skip("keys-pass", f"{dst} 已有值（不覆蓋；owner／mode 已校正）")
         return
-    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
+    if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
         # 中-5：舊 keysync.env 在服務帳號控制下（symlink 到 /proc/… 或外部檔）。
         _refuse_symlink(report, "keys-pass", old.keysync_env_file)
         return
-    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1, base=old.home)
+    raw = _read_regular(old.keysync_env_file, MAX_KEYS_ENV_BYTES + 1)
     if raw is None:
-        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file, old.home):
+        if _exists(old.keysync_env_file) and not _regular_file(old.keysync_env_file):
             _refuse_symlink(report, "keys-pass", old.keysync_env_file)
             return
         value = ""

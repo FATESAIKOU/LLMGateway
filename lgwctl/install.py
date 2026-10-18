@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import errno
 import grp
 import os
 import pwd
@@ -102,8 +103,10 @@ def _chown_service(layout, path: str) -> None:
         flags |= getattr(os, "O_DIRECTORY", 0)
     try:
         fd = os.open(path, flags)
-    except OSError:
-        os.chown(path, info.pw_uid, info.pw_gid, follow_symlinks=False)
+    except OSError as exc:
+        if os.path.islink(path) or getattr(exc, "errno", None) in (errno.ELOOP, errno.EMLINK):
+            raise
+        os.chown(path, info.pw_uid, info.pw_gid)
         return
     try:
         os.fchown(fd, info.pw_uid, info.pw_gid)
@@ -127,8 +130,10 @@ def chown_root_group(layout, path: str) -> None:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
-    except OSError:
-        os.chown(path, 0, gid, follow_symlinks=False)
+    except OSError as exc:
+        if os.path.islink(path) or getattr(exc, "errno", None) in (errno.ELOOP, errno.EMLINK):
+            raise
+        os.chown(path, 0, gid)
         return
     try:
         os.fchown(fd, 0, gid)
