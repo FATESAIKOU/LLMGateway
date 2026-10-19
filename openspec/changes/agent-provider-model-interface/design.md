@@ -74,6 +74,8 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 | claude-code＋api-key（其他 provider） | `ANTHROPIC_AUTH_TOKEN=<key>`、`ANTHROPIC_API_KEY=""`；`endpoint` 非 null 時 `ANTHROPIC_BASE_URL=<endpoint>`；model 變數同上 |
 | opencode（api-key） | 片段：`OPENCODE_API_KEY=<key>`、`OPENCODE_PROVIDER_ID=<opencode 的 provider id>`；model 非 null 時 `OPENCODE_MODEL=<供應商 model id>`、`OPENCODE_SMALL_MODEL=<供應商 model id>`。**不回 `OPENCODE_CONFIG_CONTENT`** |
 
+- **鍵集契約（PM 第二輪對齊 2）**：每個鍵的型別／空值／出現條件（含 `ANTHROPIC_API_KEY=""` 是刻意佔位、模型鍵只在 model 非 null 時出現）寫死在 spec「env 的組成」的鍵集清單；sidecar 對不在清單上的**未知鍵**：忽略並 WARN（log 只記**鍵名**、不記值），**不原樣塞進 `OPENCODE_CONFIG_CONTENT` 或子行程環境**（`env_schema` 拒收是第一道，這是第二道）；`permission`／`instructions` 由 sidecar 擁有，同名鍵 sidecar 贏。
+
 - **opencode config 由 sidecar 組**（PM 對齊 B-2；中-4、低-7）：sidecar 用上述片段＋自己的 `permission`／`instructions`＋worker 釘的 opencode 版本，組成 `OPENCODE_CONFIG_CONTENT`（例：`provider.<OPENCODE_PROVIDER_ID>.options.apiKey=<OPENCODE_API_KEY>`、`provider.<id>.models.<OPENCODE_MODEL>.name`、`model`／`small_model`＝`<OPENCODE_PROVIDER_ID>/<OPENCODE_MODEL>`；不加 `baseURL`——`endpoint` 是 provider 根位址，依 #28 不抄進 opencode 的 `options.baseURL`，內建 provider 自帶正確端點）。**`permission`／`instructions` 由 sidecar 擁有**：Gateway 的 env MUST NOT 含這兩個鍵；同名鍵 sidecar 贏（目前兩邊的鍵集沒有重疊，這條是將來的合併規則）。**原未決「opencode 的 permission 歸屬」因此關閉**：B-2 已定 sidecar 擁有 permission／instructions 與 config 形狀，Gateway 只給片段。
 - **為什麼回片段、不回整包 JSON**：
   1. opencode 的 config schema 在 v2 已把 top-level `provider`／`small_model` 標 deprecated（新的 `providers` 用 `settings`）。Gateway 若組整包 config，就把「config 形狀」綁進 Gateway 的版本；worker 釘的 opencode 版本不同時，Gateway 獨立升級會送出不認得的形狀。片段是 agent 中立的資料（provider id、api key、model id），config 形狀由**跟著 agent 版本走的 sidecar** 決定——這正好保留 v0 決定 7 原本的理由（env 名／形狀跟 agent 版本走），只把「值與 provider 對映」移到 Gateway。
@@ -83,7 +85,7 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 - **sidecar 的完整環境與 overlay（中-4）**：sidecar 子行程環境的組法是：
   1. **完整 base env**（PATH、HOME、Locale、TMPDIR 等）——照現行；
   2. sidecar 自己的維運／行為變數（auto-update／non-essential traffic 開關、`OPENCODE_SERVER_PASSWORD`、`AGORA_CLAUDE_CMD`、`MLP_AGENT_NAME`／`ANGAREION_IDENTITY`（#216）等）；
-  3. **resolve 的 `env` 全部鍵的不篩選 overlay**（Gateway 是受信任來源；不另做 allowlist，否則 Gateway 新增的鍵會被舊 sidecar 丟掉）。
+  3. **resolve 的 `env`（鍵集清單上的鍵）不篩選 overlay**（Gateway 是受信任來源；已知鍵不另做 allowlist 過濾，全數併入子行程環境）。**未知鍵**（不在鍵集清單＝Gateway 在同一個 `env_schema` 內違規加鍵）：忽略＋WARN（記鍵名不記值），不塞進 config 或子行程環境——Gateway 要加鍵的正路是 bump `env_schema`（sidecar 對不認得的更高版本拒收），不是靠 overlay 混進來（PM 第二輪對齊 2）。
   - 同名鍵：resolve 的 env 覆蓋 base env（憑證／模型值是 resolve 的權威）；sidecar 的維運變數不得與 resolve 的鍵同名（目前沒有）。
   - sidecar **自己行程繼承來的** `ANTHROPIC_*`／`OPENAI_*`／`OPENCODE_*` MUST NOT 原樣漏進子行程（現行紀律）；sidecar 要給子行程的維運變數（例 `OPENCODE_SERVER_PASSWORD`）是另外疊的，不在此限。子行程只看到 resolve 給的那一把的憑證變數。測試：sidecar 行程自己有 `ANTHROPIC_API_KEY=canary`，子行程只看到 resolve 的值或沒有。
   - 過渡期：新 sidecar 若收到舊版 Gateway 的整包 `OPENCODE_CONFIG_CONTENT`（get 路徑），照舊解析；新版 Gateway 回片段時改組裝。以「有沒有 `OPENCODE_CONFIG_CONTENT`」判斷，不靠版本猜。
@@ -112,7 +114,7 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 8. 挑 `priority` 最小；同分比 id（與 v5 sidecar 的選擇規則同一機械；政策檔是權威）。
 
 - **釘住的那把冷卻中**：回 409 `cooling`＋`until`，**不是** get 的「照回 key、`available:false`」。冷卻＝額度已死；釘住是帳號選擇，不是繞過冷卻的入口。若未來要「指定冷卻也照辦」，另開明確的 `force`，本次不做（高-1）。
-- **釘住的那把額度用完時要不要自動換另一把**：這是政策問題，列未決 1；**在本人裁定前，resolve 與 sidecar 的安全預設是不換**（回報失敗，讓控制者決定）。理由：釘住是呼叫方明確的帳號選擇（隱私／計費／額度保留），自動換到另一把會違反意圖；未釘住的路徑才照 priority 自動接力。
+- **釘住的那把額度用完時要不要自動換另一把**：這是政策問題，列未決 1；**在本人裁定前，resolve 與 sidecar 的安全預設是不換**——sidecar 當額度用完處理＝waiting-quota（記 cooldown、保留 agent、到期由重試 job 再 resolve 同一把；決定 6.6）。理由：釘住是呼叫方明確的帳號選擇（隱私／計費／額度保留），自動換到另一把會違反意圖；未釘住的路徑才照 priority 自動接力。
 - **`exclude` 後沒有候選**：回 409 `no_candidate`，sidecar 停下、回報、等控制者或冷卻解除；不回 `cooling`（沒有恢復時刻），也不選回被排除的那把（中-8）。
 - **為什麼排除冷卻、全部冷卻回 409 帶 `until`**：一次往返把「挑」做完（sidecar 不用自己迴圈試）；`until` 讓 sidecar 直接把自動重開 job 排到那個時刻（同今天「全部冷卻 → waiting-quota＋最早解除時刻」的行為）。
 - **政策 loader 的 openrouter 檢查（中-6）**：`load_policy` 加 `openrouter.agents == ("opencode",)`，不合法丟 `PolicyError`（固定字串）；加負向測試。否則 spec 的 MUST 與 loader 各說各話，resolve 對 `provider=openrouter&agent=claude-code` 會回 200。
@@ -154,7 +156,7 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 - **為什麼並存**：worker 映像裡的舊 sidecar 不能即時換；Gateway 先加後減，任何時刻都有一側可用；退版＝`install.sh --tag` 回舊 tag。部署順序：Gateway 先、sidecar 映像後；退版 Gateway 時，新 sidecar 在 resolve 404 回 get（design 6.2）。
 - **放棄的選項**：直接換掉（舊 sidecar 全 404，worker 停擺）；永遠並存（違反「必要且只有這些」）；本 change 直接 REMOVED get（規格與實作時序矛盾）。
 
-### 決定 6：對 sidecar 的介面需求與建議（給 MyLinuxPool 的 PM 對齊；本文只寫介面層級）
+### 決定 6：對 sidecar 的介面需求與建議（已與 MyLinuxPool 的 PM 兩輪對齊，2026-10-20；本文只寫介面層級）
 
 **需求**（這些成立，本設計才完整）：
 
@@ -162,17 +164,17 @@ LLMGateway 依（provider、kind、agent）組 `env`：
    - 只給 `subscription`（沒有 `provider`／`model`）→ **舊形狀**，走現行 get（過渡期）。這是合法功能，不硬切。
    - 三者都沒給（`provider`／`model`／`subscription` 都省略）→ sidecar 從 list 挑預設（priority＋可用性），再帶 provider＋model 去 resolve（不釘住）。
    - 給 `provider`（`model` 選填）→ **新形狀**，走 resolve；此時 `subscription` 若有給，解讀為**釘住**（不是舊形狀），sidecar 把它傳給 resolve。
-   - `subscription`＋`model` 但沒有 `provider`；或 `model` 沒有 `provider`；或 `subscription` 的 provider 與 `provider` 不一致 → 400 `invalid_request`（帶明確訊息）。這些是殘缺／矛盾的組合，不是合法舊形狀。
-   - **B-1 的「`subscription` 與 `provider/model` 同時給→400」收斂為**：舊形狀（只給 `subscription`）不得與新形狀欄位混用；新形狀內的 `subscription` 是釘住。這是 B-1 與 B-3 的合併解讀，PM 對齊時確認（tasks 2.2 的開工條件——確認前不開工，避免 PM 堅持字面時釘住入口返工）；若 MyLinuxPool PM 要 B-1 字面的全面 400，過渡期就沒有釘住入口，需另定（不是本人未決，屬 PM 對齊項）。
+   - `subscription`＋`model` 但沒有 `provider`；或 `model` 沒有 `provider`；或 `subscription` 的 provider 與 `provider` 不同；或該 subscription 不支援請求的 agent 種類 → 400 `invalid_request`（帶明確訊息）。這些是殘缺／矛盾的組合，不是合法舊形狀（PM 確認的「不一致」定義，2026-10-20）。
+   - **B-1 的「`subscription` 與 `provider/model` 同時給→400」收斂為——已與 MyLinuxPool PM 確認（2026-10-20）**：只給 `subscription`＝舊形狀，走現行 get；`provider`（可帶 `model`）＝新形狀，走 resolve；新形狀＋`subscription`＝釘住；不一致（`subscription` 的 provider 與給的 `provider` 不同、或 agent 不支援）→ 400 `invalid_request`。舊形狀不得與新形狀欄位混用；新形狀內的 `subscription` 是釘住——B-1 與 B-3 的合併解讀成立，原「若 PM 要 B-1 字面需另定」的備案不再需要（tasks 2.2 的開工前確認已完成）。
    - 呼叫端清冊（PM 腳本、dispatch、驗收腳本）與過渡期：舊形狀至少保留到 d 單；新形狀與舊形狀並存，不一次硬切合法功能。
    - `model` 是供應商 id；sidecar 若收到 `<provider>/<model>` 要正規化或回 400（決定 4）。
-2. **來源（subscription source）**：對 LLMGateway 改呼 list／resolve／cooldown；resolve 404 時回 get（支援舊 Gateway／退版）；錯誤對照補 409 `cooling`（帶 `until` → 自動重開排到 until）、409 `no_candidate`（停下回報）、403 `model_not_allowed`、400 `no_model`（回給控制者）；其餘對照照舊。**以 resolve 的 `meta.subscription` 為準**：sidecar 先用 list 挑候選時，若 resolve 選出的 subscription 與 list 的選擇不同，記 log／回報（不要兩邊各用一個答案）。sidecar 對控制者的錯誤仍是 sidecar 的巢狀 `{"error": {"code": …, "message": …}}`；Gateway 的碼是內部映射，不要把 Gateway 的平面 `{"error": "<碼>"}` 直接對外（資訊-6）。
-3. **driver**：`build_env` 的職責改為「sidecar 完整 base env＋sidecar 維運變數＋resolve env 的不篩選 overlay」（決定 2）；opencode 的 `OPENCODE_CONFIG_CONTENT` 由 sidecar 用 resolve 的片段＋`permission`／`instructions` 組（sidecar 擁有這兩個鍵，也擁有 config 形狀）；model-mismatch 檢查照舊（第一個 step 的模型＝`meta.model` 的期待值）。過渡期收到舊 Gateway 的整包 config 時照舊解析。
+2. **來源（subscription source）**：對 LLMGateway 改呼 list／resolve／cooldown；resolve 404 時回 get（支援舊 Gateway／退版）；錯誤對照補 409 `cooling`（帶 `until` → 自動重開排到 until；**釘住時＝額度用完處理，見 6.6**）、409 `no_candidate`（停下回報）、403 `model_not_allowed`、400 `no_model`（回給控制者）；其餘對照照舊。**以 resolve 的 `meta.subscription` 為準**：sidecar 先用 list 挑候選時，若 resolve 選出的 subscription 與 list 的選擇不同，記 log／回報（不要兩邊各用一個答案）。sidecar 對控制者的錯誤仍是 sidecar 的巢狀 `{"error": {"code": …, "message": …}}`；Gateway 的碼是內部映射，不要把 Gateway 的平面 `{"error": "<碼>"}` 直接對外（資訊-6）。
+3. **driver**：`build_env` 的職責改為「sidecar 完整 base env＋sidecar 維運變數＋resolve env 的不篩選 overlay（決定 2：鍵集清單上的鍵全數併入；未知鍵忽略＋WARN，不塞進 config 或子行程）」（決定 2）；opencode 的 `OPENCODE_CONFIG_CONTENT` 由 sidecar 用 resolve 的片段＋`permission`／`instructions` 組（sidecar 擁有這兩個鍵，也擁有 config 形狀）；model-mismatch 檢查照舊（第一個 step 的模型＝`meta.model` 的期待值）。過渡期收到舊 Gateway 的整包 config 時照舊解析。
 4. **`GET /agents` status**：**保留**既有的 `subscription`（低-1），加 `provider`／`model`（echo meta；**不含 env 值**）。
 5. **agora 接續**：換把後同 session continue 時，resolve 來的模型／憑證變數（例 `ANTHROPIC_MODEL`）照今天一樣要讓 `agora continue` 起的行程看到；#229 的互動終端路徑同樣只吃「疊好的 env」。
-6. **換把路徑（中-8）**：額度訊號 → cooldown（`meta.subscription`）→ resolve 帶 `exclude=<剛耗盡的 id>`（即使 cooldown 登錄失敗也帶）→ 新 env build 一次 → 同一個 agora session continue。`no_candidate` → 停下回報；`cooling`＋until → 自動重開排到 until。**釘住的那把**額度用完時，依未決 1 的安全預設：不自動換，回報失敗。
+6. **換把路徑（中-8）**：額度訊號 → cooldown（`meta.subscription`）→ resolve 帶 `exclude=<剛耗盡的 id>`（即使 cooldown 登錄失敗也帶）→ 新 env build 一次 → 同一個 agora session continue。`no_candidate` → 停下回報；`cooling`＋until → 自動重開排到 until。**釘住的那把**額度用完／釘住且冷卻中（resolve 回 409 `cooling`＋`until`；PM 第二輪對齊 3）：sidecar 當**額度用完**處理＝**waiting-quota**——記 cooldown（該把 id＋`until`）、保留 agent（不關、不回錯誤給控制者）、到期由重試 job 再 resolve **同一把**（帶同樣的釘住），不換另一把；**「釘住」記在 AgentRecord**（換把與自動重開讀得到）。「是否允許自動換另一把」依未決 1（建議不換，預設不換）。
 7. **值的紀律照舊並擴及 resolve 的值**：不上命令列、不進 log、不寫進任何檔案、不進 status；憑證值的 canary 在 Gateway（log／DB／稽核／list）與 MyLinuxPool 的 c 單（sidecar 的 log／status）各掃各的。
-8. **排序**：sidecar 的實作排在 MyLinuxPool#216 階段 2.5a（換把／自動重開重 render harness，改 `_swap`）merge 之後；#216 的 2a／2.6／2.8（opencode pin 2.0.32）／階段 3、#229 也會碰到 `POST /agents` 或 `_swap`，合併時對一次。**這是排序建議，排序以 PMO 為準**。
+8. **排序**：sidecar 的實作排在 MyLinuxPool#216 階段 2.5a（換把／自動重開重 render harness，改 `_swap`；MyLinuxPool#237）與階段 3 merge 之後（**MyLinuxPool PM 已確認，2026-10-20**）；#216 的 2a／2.6／2.8（opencode pin 2.0.32）、#229 也會碰到 `POST /agents` 或 `_swap`，合併時對一次。**排序以 PMO 為準**。
 
 **建議**（非必須）：錯誤對照表補 `no_candidate` 的映射；`GET /jobs` 的 open job 顯示 provider／model。
 
@@ -193,14 +195,14 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 - **[403 `model_not_allowed` 擋到人]** → 控制者點了不在 allow 的模型會被拒——這是政策守門的本意（例：免費額度外會計費的模型）；要開就改政策檔（本人），不是介面的事。
 - **[選把移進 Gateway]** → 與 v5「Gateway 不挑把」的說法相反：輸入已是 provider＋model，「挑哪一把 subscription」無法留在呼叫方；規則是政策檔（priority＋冷卻）的機械套用，沒有新的裁量。釘住與 exclude 是呼叫方的明確輸入，不是 Gateway 的裁量。
 - **[冷卻粒度是 subscription]**（中-7）→ 一把 subscription 上多個模型的額度是否獨立（例：Zen 免費層的限流單位）查無公開資料；冷卻以 subscription 為單位，可能「一個模型限流 → 整把冷卻 → 其他模型也被跳過」。本次維持保守的 subscription 粒度（未決 2），但 resolve 稽核記 model，保留未來分析／細粒度的資料；3b 只證明**初始選擇**（兩個模型、同一把），不證明「額度事件後還能換另一個免費模型」。
-- **[釘住的那把額度用完]**（未決 1）→ 建議不自動換、回報失敗；在本人裁定前 sidecar 以此為安全預設。若裁定要自動換，sidecar 要另做「釘住失效 → 通知控制者 → 換把」的路徑，不能安靜換。
+- **[釘住的那把額度用完]**（未決 1）→ 建議不自動換——sidecar 當額度用完處理（waiting-quota：記 cooldown、保留 agent、到期由重試 job 再 resolve 同一把；PM 第二輪對齊 3）；在本人裁定前 sidecar 以此為安全預設。若裁定要自動換，sidecar 要另做「釘住失效 → 通知控制者 → 換把」的路徑，不能安靜換。
 - **[稽核表 additive 遷移]**（中-2）→ 服務那台的既有 DB 是 v5 schema；`CREATE TABLE IF NOT EXISTS` 不會補欄位。啟動時以 `PRAGMA table_info` 檢查並 `ALTER TABLE audit ADD COLUMN provider TEXT`／`model TEXT`（nullable、additive）；舊 lgwd 的 SELECT 指定欄位，讀到多出的欄位不受影響，支援 `install.sh --tag` 退版。測試要從 v5 schema 的 DB 檔啟動並寫入。
 - **[get 並存與歸檔時序]**（中-3）→ 本 change 不 REMOVED get；歸檔 gate 要求 `gateway-v0` 先歸檔；get 的移除在 d 單。`gateway-v0` 歸檔前，主規格 `agent-lease` 仍是平均分攤舊語意，優先序選把只在本 change 的 delta 裡。
 
 ## Migration Plan
 
 1. **離線（不碰服務那台）**：本 repo 實作 resolve（決定 1–4）＋`lgw.client.resolve`＋稽核 additive 遷移＋policy loader 的 openrouter 檢查＋測試（loopback＋假 key＋假時鐘；spec 每個服務端 Scenario；canary：**憑證值**不出現在 log／資料庫／稽核／list 回覆；`env_schema` 拒收；`Cache-Control`；`model=a+b` 的編碼）。全在測試程序裡跑。
-2. **sidecar（MyLinuxPool，c 單）**：決定 6 的需求；單元測試用假來源；Mac 上臨時跑（loopback＋假 key 的 lgwd＋sidecar）驗「兩個模型、同一把」的形狀，跑完即停。**排序排在 #216 階段 2.5a merge 之後（以 PMO 為準）**。
+2. **sidecar（MyLinuxPool，c 單）**：決定 6 的需求；單元測試用假來源；Mac 上臨時跑（loopback＋假 key 的 lgwd＋sidecar）驗「兩個模型、同一把」的形狀，跑完即停。**排序排在 #216 階段 2.5a（MyLinuxPool#237）與階段 3 merge 之後（PM 已確認 2026-10-20；以 PMO 為準）**。
 3. **實機（動服務那台與 worker；要本人授權，先問再動）**：
    - **3.0 部署新版 lgwd**（`install.sh --tag`，前後 `--check`；get 仍在，退版＝回舊 tag）。**部署順序：先 lgwd、後 worker 映像**（新-中-2；順序反了，新 sidecar 會先對舊 lgwd 打 resolve——有 6.2 的回退不致停擺，但 3b／3c 會在錯的組合下跑、驗的不是設計要驗的）。
    - **3a 建含新 sidecar 的 worker 映像並部署**（中-5）：映像可先建好（3.0 之前）；`sidecar --version` 對上 MyLinuxPool 的 c 單 commit；**部署在 3.0 之後**，通過條件＝lgwd 版本（`install.sh --check`）與 worker 映像的 sidecar 版本（`sidecar --version`）都對上。沒有這步，3b／3c 會拿舊 sidecar 驗新介面。
@@ -211,7 +213,7 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 
 ## Open Questions（未決，請本人裁定；每題附建議與理由）
 
-1. **釘住的那把額度用完時，是失敗還是換另一把？** 建議：**失敗回報、不自動換**。理由：釘住是呼叫方明確的帳號選擇（公司／個人、隱私、計費、額度保留），自動換到另一把會違反意圖；回報讓控制者決定（改用別把、等冷卻、或改政策）。未釘住的路徑才照 priority 自動接力。替代：自動換，但 sidecar 必須通知控制者（不能安靜換），且要決定「換到哪一把」的規則。
+1. **釘住的那把額度用完時，是換另一把還是等這一把？** 建議：**不自動換**——sidecar 當額度用完處理＝waiting-quota（記 cooldown、保留 agent、到期由重試 job 再 resolve 同一把；PM 第二輪對齊 3）。理由：釘住是呼叫方明確的帳號選擇（公司／個人、隱私、計費、額度保留），自動換到另一把會違反意圖。未釘住的路徑才照 priority 自動接力。替代：自動換，但 sidecar 必須通知控制者（不能安靜換），且要決定「換到哪一把」的規則。
 2. **冷卻粒度要不要細到 `(subscription, model)`？** 建議：這次先維持 subscription 粒度的排除（保守；cooldown 的 id 是 subscription；Zen 限流單位查無公開資料），但 resolve 稽核已記 model，保留未來分析資料；下一單再決定是否只排除該 model。限制要明示：同一把的另一個免費模型也會被冷卻；3b 只證明初始選擇，不證明額度事件後還能換模型。替代：現在就做細粒度，需要 cooldown 帶 model、DB 改 `(subscription, model)`、sidecar 的訊號也要帶 model——介面與儲存都變大，且上游是否按模型限流未證實。
 3. **未釘住時，`anthropic` 兩把的預設選法**：建議維持 priority（personal 10 先、company 20 後；company 只在 personal 冷卻或未部署時用），因為釘住已提供「這次用公司／個人」的明確入口；平均分攤需要用量資料，v5 已移除。替代：恢復平均分攤或加「角色／team → 哪一把」的政策規則；前者要用量，後者要 resolve 有身分（會擴介面）。
 4. **get 的退場時點**：建議 sidecar 遷移＋實機驗收（3b／3c／3d）過後就開 d 單移除，不要拖（並存介面越多，「必要且只有這些」破得越久）。本 change 不 REMOVED get，d 單的 delta 以那時的主規格為底；d 單開單條件是 get 呼叫為零。

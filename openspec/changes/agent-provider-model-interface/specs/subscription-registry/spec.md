@@ -109,15 +109,22 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
 
 ### Requirement: env 的組成
 
-`env` SHALL 依（provider、kind、agent）組成，只含憑證、端點、模型三類變數（opencode 的 `OPENCODE_PROVIDER_ID` 是模型命名的一部分）；MUST NOT 含呼叫方的維運變數（auto-update 開關、server password、`AGORA_CLAUDE_CMD`、身分變數、`permission`、`instructions`——那些由 sidecar 疊）：
+`env` SHALL 依（provider、kind、agent）組成，只含憑證、端點、模型三類變數；MUST NOT 含呼叫方的維運變數（auto-update 開關、server password、`AGORA_CLAUDE_CMD`、身分變數、`permission`、`instructions`——那些由 sidecar 疊）。鍵集＝下列清單（`env` MUST 只含這些鍵；每鍵的型別／空值／出現條件；sidecar 對不在清單上的鍵見「未知鍵」）：
 
-- claude-code＋claude-subscription：`CLAUDE_CODE_OAUTH_TOKEN`＝key；model 非 null 時 `ANTHROPIC_MODEL`＝`ANTHROPIC_SMALL_FAST_MODEL`＝model；
-- claude-code＋api-key：provider 為 anthropic 時 `ANTHROPIC_API_KEY`＝key，否則 `ANTHROPIC_AUTH_TOKEN`＝key 且 `ANTHROPIC_API_KEY`＝空字串；`endpoint` 非 null 時 `ANTHROPIC_BASE_URL`＝endpoint；model 變數同上；
-- opencode：只回**片段**——`OPENCODE_API_KEY`＝key、`OPENCODE_PROVIDER_ID`＝opencode 的 provider id（`opencode-zen`→`opencode`、`openrouter`→`openrouter`、`ollama-cloud`→`ollama-cloud`，由 LLMGateway 維護）；model 非 null 時 `OPENCODE_MODEL`＝`OPENCODE_SMALL_MODEL`＝供應商 model id。Gateway MUST NOT 回 `OPENCODE_CONFIG_CONTENT`，也不回 `baseURL`（`endpoint` 是 provider 根位址，依 #28 不抄進 opencode 的 `options.baseURL`）。
+- `CLAUDE_CODE_OAUTH_TOKEN`（claude-code＋claude-subscription）：字串＝該把的 key（OAuth token）；不可空；該組合必然出現。
+- `ANTHROPIC_API_KEY`（claude-code＋api-key）：provider 為 anthropic 時字串＝該把的 key、不可空；其他 provider 時＝**空字串**（刻意佔位，蓋掉子行程環境可能殘留的繼承值）；claude-subscription 時不出現。
+- `ANTHROPIC_AUTH_TOKEN`（claude-code＋api-key、provider 非 anthropic）：字串＝該把的 key；不可空。
+- `ANTHROPIC_BASE_URL`（claude-code＋api-key、provider 非 anthropic）：字串＝該把的 `endpoint`（URL）；僅 `endpoint` 非 null 時出現。
+- `ANTHROPIC_MODEL`／`ANTHROPIC_SMALL_FAST_MODEL`（claude-code 全部組合）：字串＝選定的 model（供應商 model id；兩鍵同值）；不可空；僅 model 非 null 時出現。
+- `OPENCODE_API_KEY`（opencode、各 provider）：字串＝該把的 key；不可空；必然出現。
+- `OPENCODE_PROVIDER_ID`（opencode、各 provider）：字串＝opencode 的 provider id（`opencode-zen`→`opencode`、`openrouter`→`openrouter`、`ollama-cloud`→`ollama-cloud`，由 LLMGateway 維護；opencode config 內的模型名＝`<OPENCODE_PROVIDER_ID>/<OPENCODE_MODEL>`，由 sidecar 組）；不可空；必然出現。
+- `OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL`（opencode、各 provider）：字串＝選定的 model（供應商 model id；兩鍵同值）；不可空；僅 model 非 null 時出現。
 
-opencode 的 `OPENCODE_CONFIG_CONTENT` SHALL 由 sidecar 用上述片段＋自己的 `permission`／`instructions`＋worker 釘的 opencode 版本組成；`permission`／`instructions` 由 sidecar 擁有，同名鍵 sidecar 贏。sidecar 的子行程環境以現行**完整 base env**（PATH／HOME／Locale 等）＋維運變數為底，resolve 的 `env` 是**不篩選的 overlay**（resolve 的鍵全數併入、同名覆蓋 base）；sidecar 自己行程**繼承來的** `ANTHROPIC_*`／`OPENAI_*`／`OPENCODE_*` MUST NOT 原樣漏進子行程（sidecar 要給子行程的維運變數，例 `OPENCODE_SERVER_PASSWORD`，是另外疊的，不在此限）。
+opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回 `OPENCODE_CONFIG_CONTENT`，也不回 `baseURL`（`endpoint` 是 provider 根位址，依 #28 不抄進 opencode 的 `options.baseURL`）。model 為 null（agent 自己的預設）時 SHALL 不給模型變數。
 
-model 為 null（agent 自己的預設）時 SHALL 不給模型變數。
+**未知鍵（消費端規則；PM 第二輪對齊）**：`env` 出現不在上述清單的鍵＝Gateway 在同一個 `env_schema` 內違規改鍵集（sidecar 對更高 `env_schema` 拒收是第一道）。sidecar 對未知鍵 MUST 忽略並 WARN（log 只記**鍵名**、不記值），MUST NOT 原樣塞進 `OPENCODE_CONFIG_CONTENT` 或子行程環境；清單上的鍵照常併入。`permission`／`instructions` 由 sidecar 擁有（`env` 不含這兩個鍵），同名鍵 sidecar 贏。
+
+opencode 的 `OPENCODE_CONFIG_CONTENT` SHALL 由 sidecar 用上述片段＋自己的 `permission`／`instructions`＋worker 釘的 opencode 版本組成。sidecar 的子行程環境以現行**完整 base env**（PATH／HOME／Locale 等）＋維運變數為底，resolve 的 `env` 是**不篩選的 overlay**（清單上的鍵全數併入、同名覆蓋 base；未知鍵依「未知鍵」規則丟棄）；sidecar 自己行程**繼承來的** `ANTHROPIC_*`／`OPENAI_*`／`OPENCODE_*` MUST NOT 原樣漏進子行程（sidecar 要給子行程的維運變數，例 `OPENCODE_SERVER_PASSWORD`，是另外疊的，不在此限）。
 
 #### Scenario: claude 訂閱不帶模型變數
 - **WHEN** resolve 選中 `claude-personal`（claude-subscription）而 `meta.model` 為 null
@@ -134,6 +141,10 @@ model 為 null（agent 自己的預設）時 SHALL 不給模型變數。
 #### Scenario: 只注入這一把的憑證
 - **WHEN** sidecar 行程自己的環境有 `ANTHROPIC_API_KEY=canary`，子行程以 resolve 的 env 啟動
 - **THEN** 子行程只看到 resolve 給的憑證值（或沒有），看不到 sidecar 自己的 `canary`
+
+#### Scenario: env 出現未知鍵
+- **WHEN** resolve 的 `env` 含一個不在鍵集清單上的鍵（例：Gateway 在同一個 `env_schema` 內違規加了新鍵）
+- **THEN** sidecar 忽略該鍵並 WARN（log 記鍵名、不記值），不把它塞進 `OPENCODE_CONFIG_CONTENT` 或子行程環境；清單上的鍵照常併入
 
 ### Requirement: model 省略時的語意
 
