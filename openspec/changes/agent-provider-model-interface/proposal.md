@@ -18,11 +18,11 @@
 ## What Changes
 
 - **新介面 `resolve`**（spec `subscription-registry`）：`GET /v1/resolve?agent=<種類>&provider=<provider>[&model=<模型 id>][&subscription=<id>][&exclude=<id>[,<id>…]]` → `{schema, env_schema, meta, env}`。
-  - 輸入 provider（必填）＋model（選填）＋agent 種類（必填）；`subscription` 選填＝釘住某一把（必須與 `provider` 一致，不一致 400）；`exclude` 選填＝換把時排除剛耗盡的那一把（不需要新端點）。
-  - 輸出 meta（選中的 subscription、provider、kind、model、models（限制）、endpoint、priority）＋env（把這個 provider＋model 用起來的必要環境變數，名稱→值，依 agent 種類組成）。
+  - 輸入 provider（必填）＋model（選填）＋agent 種類（必填）；`subscription` 選填＝釘住某一把（必須與 `provider` 一致，不一致 400）；`exclude` 選填＝換把時排除剛耗盡的那一把（與 `subscription` 互斥，同時給 400；不需要新端點）。
+  - 輸出 meta（選中的 subscription、provider、kind、agent、model、models（限制）、endpoint、priority）＋env（把這個 provider＋model 用起來的必要環境變數，名稱→值，依 agent 種類組成）。
   - 釘住的那把冷卻中 → 409 `cooling`＋`until`，**不代換另一把**；`exclude` 後沒有候選 → 409 `no_candidate`，sidecar 停下回報（不原地打轉）。
   - `schema` 是該端點回覆形狀的版本；`env_schema` 是 env 組成（鍵集與語意）的版本；sidecar 對不認得的高版本拒收。
-- **選把移進 LLMGateway**：輸入已是 provider＋model，「挑哪一把 subscription」無法留在呼叫方；規則＝政策檔的機械套用（候選＝同 provider＋agent＋allow 涵蓋＋已部署→排除冷卻→priority→id）。全部冷卻中回 409 `cooling` 帶最早恢復時刻。冷卻登錄仍以 subscription id（resolve 的 meta 給）。政策載入補上 openrouter 的 `agents` MUST 只有 `opencode` 的檢查（目前 loader 只驗 `models.allow`）。
+- **選把移進 LLMGateway**：輸入已是 provider＋model，「挑哪一把 subscription」無法留在呼叫方；規則＝政策檔的機械套用（釘住先限縮成那把；未釘住時候選＝同 provider＋agent＋allow 涵蓋或能推導模型＋已部署→排除冷卻→priority→id）。全部冷卻中回 409 `cooling` 帶最早恢復時刻。冷卻登錄仍以 subscription id（resolve 的 meta 給）。政策載入補上 openrouter 的 `agents` MUST 只有 `opencode` 的檢查（目前 loader 只驗 `models.allow`）。
 - **env 的組成移進 LLMGateway**（反轉 v0 決定 7「row 不帶環境變數名」）：憑證、端點、模型的環境變數由 resolve 回（claude 系的 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`；opencode 的 `OPENCODE_API_KEY`／`OPENCODE_PROVIDER_ID`／`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL` 片段）。**Gateway 不回整包 `OPENCODE_CONFIG_CONTENT`**：opencode 的 config 由 sidecar 用這些片段＋自己的 `permission`／`instructions`＋worker 釘的 opencode 版本組；同名鍵 sidecar 贏。sidecar 疊自己的維運／行為變數（auto-update 開關、server password、`AGORA_CLAUDE_CMD`、身分變數）。**憑證值只進 sidecar 建的子行程環境**：不進 log、不進 status、不進稽核；model／provider／endpoint 是中介資料，稽核可記。
 - **稽核**：resolve 記（時刻、subscription、agent、provider、model）；audit 表加 `provider`／`model` 兩個 nullable 欄位，啟動時以 `PRAGMA table_info` 檢查並 `ALTER TABLE` 補上（additive，支援 `install.sh --tag` 退版）。
 - **get 退場（不是本 change）**：`GET /v1/subscriptions/{id}?agent=` 在 sidecar 遷移＋實機驗收後由 d 單移除；本 change 只保留並存期與終態說明。終態對外還是三個介面：list、resolve、cooldown。
