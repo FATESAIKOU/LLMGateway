@@ -1,8 +1,8 @@
-GLM-5.3（修訂 2／3 輪；修訂 1 DeepSeek V4.1 Flash；原設計 GLM-5.3）
+原設計 GLM-5.3；修訂 1 DeepSeek V4.1 Flash；修訂 2 GLM-5.3；修訂 3、4 DeepSeek V4.1 Flash
 
 # LLMGateway #33 設計概覽：agent 用的介面改成輸入 provider＋model
 
-> 設計作者的工作報告（2026-10-20，修訂 3）。完整設計在 `openspec/changes/agent-provider-model-interface/`（proposal／design／tasks／specs）；本頁是概覽：結論、三張圖、未決、沒查到的地方。修訂 1 的重點：resolve／`POST /agents` 可釘住某一把（`subscription`）、換把可排除剛耗盡那把（`exclude`）、opencode 改回片段由 sidecar 組 config、稽核補 provider／model 與 DB 遷移、get 的移除移到 d 單。修訂 2 的重點（第 2 輪審查 8 項全修）：`subscription`＋`exclude` 同時給＝400 寫死（選把步驟不套 `exclude`）、部署順序統一（先 lgwd、後 worker 映像，版本都對上才驗收）、釘住先限縮候選（該把推不出模型 → 400 `no_model` 不代換）、錯誤 precedence（形狀 400 → 查無 404 → 政策 403 → 狀態 409）、`endpoint` MUST NOT 內嵌憑證（loader 檢查＋canary 樣式掃描）、未決 7（`schema`／`env_schema` 兩欄）。修訂 3 的重點（PM 第二輪對齊）：env 鍵集（型別／空值／出現條件）寫死在 spec、未知鍵 sidecar 忽略＋WARN；釘住且冷卻＝sidecar waiting-quota（不換把）；排序（排在 #216 階段 2.5a（#237）與階段 3 之後）與 B-1 釘住解讀已由 PM 確認。
+> 設計作者的工作報告（2026-10-20，修訂 4）。完整設計在 `openspec/changes/agent-provider-model-interface/`（proposal／design／tasks／specs）；本頁是概覽：結論、三張圖、未決、沒查到的地方。修訂 1 的重點：resolve／`POST /agents` 可釘住某一把（`subscription`）、換把可排除剛耗盡那把（`exclude`）、opencode 改回片段由 sidecar 組 config、稽核補 provider／model 與 DB 遷移、get 的移除移到 d 單。修訂 2 的重點（第 2 輪審查 8 項全修）：`subscription`＋`exclude` 同時給＝400 寫死（選把步驟不套 `exclude`）、部署順序統一（先 lgwd、後 worker 映像，版本都對上才驗收）、釘住先限縮候選（該把推不出模型 → 400 `no_model` 不代換）、錯誤 precedence（形狀 400 → 查無 404 → 政策 403 → 狀態 409）、`endpoint` MUST NOT 內嵌憑證（loader 檢查＋canary 樣式掃描）、未決 7（`schema`／`env_schema` 兩欄）。修訂 3 的重點（PM 第二輪對齊）：env 鍵集（型別／空值／出現條件）寫死在 spec、未知鍵 sidecar 忽略＋WARN；釘住且冷卻＝sidecar waiting-quota（不換把）；排序（排在 #216 階段 2.5a（#237）與階段 3 之後）與 B-1 釘住解讀已由 PM 確認。修訂 4 的重點（第 3 輪審查新問題 6 項全修）：`no_model` 只落在非 `claude-subscription` 的 api-key 形狀（Scenario 改用假政策）、endpoint 檢查移到 providers 載入（測試用假 provider 表）、3d 改 waiting-quota、`OPENCODE_PROVIDER_ID` 歸回模型命名、釘住時 resolve 不帶 `exclude`、作者標註。
 
 ## 結論（一句）
 
@@ -54,6 +54,9 @@ GLM-5.3（修訂 2／3 輪；修訂 1 DeepSeek V4.1 Flash；原設計 GLM-5.3）
   │            │      蓋 model／能推導＋已部署＋非冷卻 → (priority,  │
   │            │      id) 最小；釘住那把推不出 → 400 no_model        │
   │            │      （不代換）；那把冷卻 → 409 cooling＋until      │
+  │            │      （no_model 僅限非 claude-subscription；        │
+  │            │      claude-subscription＋default null 是 200、     │
+  │            │      用 agent 預設，不是 no_model）                 │
   │            │      全部冷卻 → 409 cooling＋until（最早）           │
   │            │      排除後無候選 → 409 no_candidate                  │
   │            │  ◄── {schema, env_schema, meta:{subscription,…}, env}│
@@ -71,6 +74,8 @@ GLM-5.3（修訂 2／3 輪；修訂 1 DeepSeek V4.1 Flash；原設計 GLM-5.3）
   │            │ 溫和停 → agora 寫回 → 同一個 session continue、新 env ─►│
   │            │ 釘住那把用完／冷卻中：waiting-quota（記 cooldown、      │
   │            │ 保留 agent、到期再 resolve 同一把；不換把（未決 1）     │
+  │            │ 釘住時 resolve 只帶 subscription、不帶 exclude          │
+  │            │ （同時給回 400 bad_request）                            │
 ```
 
 ## 介面圖（終態的三個介面；get 在過渡期保留）

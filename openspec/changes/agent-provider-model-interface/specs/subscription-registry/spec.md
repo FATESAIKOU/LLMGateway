@@ -12,7 +12,7 @@ LLMGateway 對外提供三個介面（終態）：list（列菜單，不含 key�
 
 `meta` SHALL 含 `subscription`（選中的 subscription id）、`provider`、`kind`、`agent`、`model`（選定的，或 null）、`models`（該把的 `allow` 與 `default`）、`endpoint`、`priority`。`meta` MUST NOT 含 `cooldown`／`available`（200 已代表可用；這兩個在 resolve 恆為 null／true，不帶資訊）。
 
-`env` SHALL 是把選定的 provider＋model 用起來的必要環境變數（名稱→值），依 `agent` 組成（見「env 的組成」）。`env` 的**憑證值** MUST NOT 出現在 list 的回覆、稽核紀錄、log 或 `GET /agents` status；model、provider、endpoint 是中介資料，稽核可記——前提是 **`endpoint` MUST NOT 內嵌憑證**（query 的 `key=`／`token=`、userinfo 的 `@`；政策載入時拒絕，見「共通 JSON schema」）。錯誤回覆 MUST NOT 含 `env`。resolve 的 200 回覆 SHALL 帶 `Cache-Control: no-store` 與 `Pragma: no-cache`（過渡期的 get 亦同）。
+`env` SHALL 是把選定的 provider＋model 用起來的必要環境變數（名稱→值），依 `agent` 組成（見「env 的組成」）。`env` 的**憑證值** MUST NOT 出現在 list 的回覆、稽核紀錄、log 或 `GET /agents` status；model、provider、endpoint 是中介資料，稽核可記——前提是 **`endpoint` MUST NOT 內嵌憑證**（query 的 `key=`／`token=`／`api_key=`／`access_token=`、userinfo 的 `@`；providers 載入／啟動時拒絕，見「共通 JSON schema」）。錯誤回覆 MUST NOT 含 `env`。resolve 的 200 回覆 SHALL 帶 `Cache-Control: no-store` 與 `Pragma: no-cache`（過渡期的 get 亦同）。
 
 `schema` SHALL 是**該端點回覆形狀的版本**（resolve 與 list 各自獨立；目前皆為 1），resolve 形狀改變時 MUST bump。`env_schema` SHALL 是 **env 組成（鍵集與鍵的語意）的版本**（目前為 1）；新增／移除 env 鍵或改變鍵的語意時 MUST bump；Gateway MUST NOT 在同一個 `env_schema` 內改變鍵集（個別回應因 model 為 null 而少給模型鍵，不算鍵集變更）。sidecar MUST 對不認得的更高 `schema`／`env_schema` 拒收（較低版本若仍支援則接受）。
 
@@ -71,7 +71,7 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
 1. 有 `subscription`（釘住）時，候選**先限縮為這一把**，後續每一步只在這一把上判斷，不代換另一把；此步不套 `exclude`（同時給已在參數驗證回 400 `bad_request`）。
 2. `provider` 不存在，或該 provider 沒有任何 subscription → 404 `not_found`。
 3. 候選＝`provider` 相同、`agents` 含請求的 agent；無一允許 → 403 `agent_not_allowed`。
-4. `model` 有給時，候選限於被 `models.allow` 的樣式（fnmatch）涵蓋的；無一涵蓋 → 403 `model_not_allowed`。`model` 省略時，候選限於**能推導模型**的（kind 為 `claude-subscription`，或 `models.default` 非 null，或 `allow` 至少一個不含萬用字元的樣式）；無一能推導 → 400 `no_model`（釘住時就是該把——同 provider 另一把可推導也不代換）。
+4. `model` 有給時，候選限於被 `models.allow` 的樣式（fnmatch）涵蓋的；無一涵蓋 → 403 `model_not_allowed`。`model` 省略時，候選限於**能推導模型**的（kind 為 `claude-subscription`，或 `models.default` 非 null，或 `allow` 至少一個不含萬用字元的樣式）；無一能推導 → 400 `no_model`（釘住時就是該把——同 provider 另一把可推導也不代換）。`claude-subscription`＋default null 算能推導（用 agent 預設、合法 200），所以 `no_model` 只落在非 `claude-subscription` 且 default null、`allow` 全萬用字元的形狀（現行政策沒有這種 provider；單元測試用假政策）。
 5. 沒有釘住時，套 `exclude`（不在政策檔的 id 忽略）；沒有候選 → 409 `no_candidate`。
 6. 排除 key 未部署的候選；全部未部署 → 409 `not_deployed`。
 7. 排除冷卻中的（`cooldown` 有未來的 `until`）；全部冷卻 → 409 `cooling`（body 帶 `until`＝最早的恢復時刻）。
@@ -104,12 +104,12 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
 - **THEN** 選中下一個能推導模型的候選（不是直接 400 `no_model`）
 
 #### Scenario: 釘住那把推不出模型，同 provider 另一把可推導
-- **WHEN** `model` 省略，以 `provider=anthropic&subscription=claude-personal` resolve（釘住），而該把的 `default` 為 null 且 `allow` 全是萬用字元樣式（推不出模型），但同 provider 的另一把（例：`claude-company`）能推導模型
+- **WHEN** 用單元測試的假政策（現行政策下不可達；`claude-subscription`＋default null 是合法 200、不算推不出）：一個非 `claude-subscription` 的 provider 有兩把 api-key subscription，`model` 省略、以 `provider=<該 provider>&subscription=<第一把>` resolve（釘住），而該把的 `default` 為 null 且 `allow` 全是萬用字元樣式（推不出模型），但同 provider 的另一把能推導模型
 - **THEN** 回 400 `no_model`，不代換另一把（釘住在第 1 步先限縮候選，第 4 步的「另一把可推導」不觸發）
 
 ### Requirement: env 的組成
 
-`env` SHALL 依（provider、kind、agent）組成，只含憑證、端點、模型三類變數；MUST NOT 含呼叫方的維運變數（auto-update 開關、server password、`AGORA_CLAUDE_CMD`、身分變數、`permission`、`instructions`——那些由 sidecar 疊）。鍵集＝下列清單（`env` MUST 只含這些鍵；每鍵的型別／空值／出現條件；sidecar 對不在清單上的鍵見「未知鍵」）：
+`env` SHALL 依（provider、kind、agent）組成，只含憑證、端點、模型命名（含 opencode 的 provider id）三類變數；MUST NOT 含呼叫方的維運變數（auto-update 開關、server password、`AGORA_CLAUDE_CMD`、身分變數、`permission`、`instructions`——那些由 sidecar 疊）。鍵集＝下列清單（`env` MUST 只含這些鍵；每鍵的型別／空值／出現條件；sidecar 對不在清單上的鍵見「未知鍵」）：
 
 - `CLAUDE_CODE_OAUTH_TOKEN`（claude-code＋claude-subscription）：字串＝該把的 key（OAuth token）；不可空；該組合必然出現。
 - `ANTHROPIC_API_KEY`（claude-code＋api-key）：provider 為 anthropic 時字串＝該把的 key、不可空；其他 provider 時＝**空字串**（刻意佔位，蓋掉子行程環境可能殘留的繼承值）；claude-subscription 時不出現。
@@ -159,7 +159,7 @@ opencode 的 `OPENCODE_CONFIG_CONTENT` SHALL 由 sidecar 用上述片段＋自�
 - **THEN** `meta.model` 為 `mimo-v2.6-flash-free`（該把的 default）
 
 #### Scenario: 推不出模型
-- **WHEN** model 省略、釘住那把的 default 為 null、`models.allow` 全是萬用字元樣式
+- **WHEN** model 省略、釘住那把的 default 為 null、`models.allow` 全是萬用字元樣式，且該把的 kind 不是 `claude-subscription`（api-key 形狀；現行政策沒有這種 provider，用假政策測）
 - **THEN** 回 400 `no_model`，不代選
 
 ## MODIFIED Requirements
@@ -210,7 +210,7 @@ opencode 的 `OPENCODE_CONFIG_CONTENT` SHALL 由 sidecar 用上述片段＋自�
 
 ### Requirement: 共通 JSON schema
 
-list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`、`agents`、`priority`、`models`、`endpoint`、`cooldown`、`available`；`key` 只在 get，過渡期）。這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（沿 v5 的理由：條款；免費模型只經過 opencode）；政策載入 MUST 拒絕 openrouter 的 `agents` 不是剛好 `["opencode"]` 的政策檔（目前 loader 只驗 `models.allow`，本 change 補上）。`endpoint` MUST NOT 內嵌憑證：政策載入 MUST 拒絕 endpoint 值含 `key=`／`token=` query 樣式或 userinfo `@` 的政策檔（endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。
+list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`、`agents`、`priority`、`models`、`endpoint`、`cooldown`、`available`；`key` 只在 get，過渡期）。這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（沿 v5 的理由：條款；免費模型只經過 opencode）；政策載入 MUST 拒絕 openrouter 的 `agents` 不是剛好 `["opencode"]` 的政策檔（目前 loader 只驗 `models.allow`，本 change 補上）。`endpoint` MUST NOT 內嵌憑證：`endpoint` 不在政策檔，是 `lgwd/providers.py` 的 `CredentialProvider.endpoint` 常數；providers 載入／lgwd 啟動時 MUST 逐筆檢查 `PROVIDERS` 的 endpoint 值，含 `key=`／`token=`／`api_key=`／`access_token=` query 樣式或 userinfo `@` 即拒絕啟動（`PolicyError`；endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。
 
 #### Scenario: list 不變
 - **WHEN** 呼叫 list
@@ -220,9 +220,9 @@ list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`
 - **WHEN** 政策檔的 `openrouter.agents` 不是剛好 `["opencode"]`
 - **THEN** 政策載入失敗（`PolicyError`），lgwd 不啟動；resolve 不會把 Claude Code 指到 OpenRouter
 
-#### Scenario: 政策檔的 endpoint 內嵌憑證
-- **WHEN** 政策檔某把的 `endpoint` 值含 `key=`／`token=` 的 query 或 userinfo（`user:pass@`）樣式
-- **THEN** 政策載入失敗（`PolicyError`），lgwd 不啟動（endpoint 會進稽核與 meta——前提是不含憑證）
+#### Scenario: provider 表的 endpoint 內嵌憑證
+- **WHEN** 假 provider 表（monkeypatch `PROVIDERS`）某筆 `CredentialProvider.endpoint` 值含 `key=`／`token=`／`api_key=`／`access_token=` 的 query 或 userinfo（`user:pass@`）樣式
+- **THEN** providers 載入／lgwd 啟動失敗（`PolicyError`），lgwd 不啟動（endpoint 會進稽核與 meta——前提是不含憑證）
 
 ### Requirement: models.default 的語意
 

@@ -38,3 +38,14 @@ GLM-5.3
 1. **env 片段鍵名／型別寫進 spec＋未知鍵規則**：`specs/subscription-registry/spec.md`「env 的組成」改寫成鍵集清單（每鍵：型別／空值／出現條件；claude 系 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_API_KEY`／`ANTHROPIC_AUTH_TOKEN`／`ANTHROPIC_BASE_URL`／`ANTHROPIC_MODEL`／`ANTHROPIC_SMALL_FAST_MODEL`、opencode `OPENCODE_API_KEY`／`OPENCODE_PROVIDER_ID`／`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL`；`ANTHROPIC_API_KEY=""` 標為刻意佔位）＋「未知鍵」段（sidecar 忽略＋WARN：記鍵名不記值、不塞進 config 或子行程環境；`permission`／`instructions` sidecar 擁有、同名 sidecar 贏）＋新 Scenario「env 出現未知鍵」；`design.md` 決定 2（鍵集契約 bullet、overlay 第 3 層改寫：已知鍵不篩選、未知鍵丟棄）、6.3；`tasks.md` 2.3／2.6；`design-33-overview.md` 介面圖（未知鍵註記）與修訂說明。
 2. **釘住且冷卻中 sidecar＝waiting-quota**：`design.md` 決定 3（安全預設句）、6.2（409 對照加「釘住時＝額度用完處理，見 6.6」）、6.6（waiting-quota：記 cooldown、保留 agent、到期由重試 job 再 resolve 同一把；「釘住」記在 AgentRecord）、Risks、未決 1（題目改「換另一把還是等這一把」、建議不換＝waiting-quota）；`tasks.md` 2.4／3.4；`design-33-overview.md` 時序圖（末兩行）＋未決 1。Gateway 層（409 `cooling`＋`until` 不代換）不動。
 3. **排序與 B-1 確認**：`tasks.md` 開頭排序段（#33 sidecar 實作排在 #216 階段 2.5a（MyLinuxPool#237）與階段 3 merge 之後）、2.0、2.2（新-低-6 開工條件→已確認，含 PM 確認的四種組合）、5.1；`design.md` 決定 6 標題（兩輪已對齊）、6.1（B-1 收斂段改「已確認」；不一致補「agent 不支援」）、6.8；`design-33-overview.md`「沒查到」段的排序行。均仍標「排序以 PMO 為準」。
+
+## 第 4 輪（小修；2026-10-20，輸入：第 3 輪審查報告）
+
+1. **新-中-1（r3）「釘住＋推不出模型」例挑錯 kind**：`specs/subscription-registry/spec.md` 的「釘住那把推不出模型」Scenario 改成非 `claude-subscription` 的 api-key 假政策形狀（標明現行政策不可達）、「推不出模型」Scenario 標 api-key；spec 選把規則第 4 步、`design.md` 決定 3 第 4 步與決定 4、`tasks.md` 1.1、`design-33-overview.md` 時序圖補「`claude-subscription`＋default null 是合法 200（用 agent 預設）；`no_model` 只適用非 claude-subscription 且 default null、allow 全萬用字元」。
+2. **新-中-2（r3）endpoint 檢查位置**：`specs/subscription-registry/spec.md` 的值紀律與「共通 JSON schema」（Scenario 改「provider 表的 endpoint 內嵌憑證」）、`design.md` 決定 2 值的紀律與決定 3 新 bullet（`providers.validate_endpoints()` 逐筆驗、`load_policy` 轉 `PolicyError`；providers.py 不 import policy.py，避免循環 import）、`tasks.md` 1.0（改 providers 載入、測試 monkeypatch `PROVIDERS`）與 1.5（canary 樣式加寬）；樣式加寬為 `key=`／`token=`／`api_key=`／`access_token=`／`@`。
+3. **新-低-1（r3）3d 仍寫「回報」**：`design.md` Migration 3d 改成「預設不換＝waiting-quota（保留 agent、到期再 resolve 同一把）」，與 `tasks.md` 3.4 同文。
+4. **新-低-2（r3）三類變數與 `OPENCODE_PROVIDER_ID`**：`specs/subscription-registry/spec.md`「env 的組成」改成「只含憑證、端點、模型命名（含 opencode 的 provider id）三類變數」。
+5. **新-低-3（r3）釘住時不帶 `exclude`**：`design.md` 6.6、`tasks.md` 2.4、`design-33-overview.md` 時序圖各加「釘住時 resolve 只帶 `subscription`（釘住），不帶 `exclude`（同時給回 400 `bad_request`）」。
+6. **新-低-4（r3）overview 作者標註**：`design-33-overview.md` 第 1 行改成「原設計 GLM-5.3；修訂 1 DeepSeek V4.1 Flash；修訂 2 GLM-5.3；修訂 3、4 DeepSeek V4.1 Flash」；同頁修訂說明同步為修訂 4。
+
+驗證：`openspec validate --strict agent-provider-model-interface` 通過（exit 0）；grep 確認設計文件（openspec 與 overview）無三類舊措辭殘留（政策檔層級的 endpoint 檢查、3d 的失敗回報語意、釘住例用 `claude-personal`）。六點全照報告建議修，無不同意項；只改文件，未改程式。
