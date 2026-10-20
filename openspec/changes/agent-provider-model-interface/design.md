@@ -51,9 +51,9 @@
 - `exclude`：選填，逗號分隔的 subscription id 清單；選把時先排除這些 id（不在政策檔的 id 忽略）。**為什麼需要**：sidecar 換把時要排除剛耗盡的那一把；現行 sidecar「cooldown 登錄失敗也繼續換把」，新設計若只靠冷卻登錄成功來排除，登錄失敗（400／409／網路）時 resolve 會選回同一把（`claude-personal` priority 10），sidecar 可能立刻重開同一把形成迴圈。`exclude` 是 query 參數，不是新端點，維持「三個介面」。`subscription` 與 `exclude` 同時給 → 400 `bad_request`（釘住與排除是兩個互斥的意圖）。
 - `meta`（200 時）：`subscription`（選中的 id；冷卻登錄用它）、`provider`、`kind`、`agent`、`model`（選定的，或 null）、`models`（該把的 `allow` 與 `default`——「限制」）、`endpoint`、`priority`。**不含 `cooldown`／`available`**：200 已代表可用，這兩個在 resolve 回覆恆為 null／true，不帶資訊，違反「必要且只有這些」；list 仍保留它們（菜單要顯示）。
 - `env`（200 時）：名稱→值（決定 2）。錯誤回覆 MUST NOT 含 `env`。
-- `schema`：**該端點回覆形狀的版本**（resolve 與 list 各自獨立；目前都是 1）。resolve 形狀改變時 bump。sidecar 對不認得的更高版本拒收。
+- `schema`：**該端點回覆形狀的版本**（resolve 與 list 各自獨立；目前都是 1）。resolve 形狀有不相容變更（移除／改名／改語意）時 bump；只新增 meta 欄位不 bump（sidecar 讀已知欄位、忽略不認得的新欄位；pstack 重審 C1，本人 2026-10-20 裁定）。sidecar 對不認得的更高版本拒收。
 - `env_schema`：**env 組成（鍵集與鍵的語意）的版本**（目前 1）。新增／移除 env 鍵、或改變某個鍵的語意時 MUST bump；Gateway MUST NOT 在同一個 `env_schema` 內改變鍵集（個別回應因 model 為 null 而少給模型鍵，不算鍵集變更）。sidecar 對不認得的高版本拒收（較低版本若仍支援則接受）。這是中-10 的護欄：Gateway 獨立升級、worker 映像不動時，舊 sidecar 不會拿到不認得的鍵集。
-- **為什麼兩個版本欄（新-低-4）**：meta 形狀與 env 鍵集獨立演進——例：resolve 加一個 meta 欄位（`schema` bump）而 env 鍵集不變（`env_schema` 不 bump），sidecar 收到的信號是「只有 meta 形狀變了」、env 的處理不需重驗；反之改 env 鍵集只 bump `env_schema`、回覆形狀版本不抬。這也保留未來把 `schema` 一側放寬（meta 欄位 additive：sidecar 讀已知欄位、忽略新欄位）而不動 `env_schema` 嚴格護欄的空間。合併成一個版本號的替代（任何變更都 bump、sidecar 全量重驗）已被本人否決（2026-10-20，OQ 7）。
+- **為什麼兩個版本欄（新-低-4）**：meta 形狀與 env 鍵集獨立演進——例：resolve 加一個 meta 欄位**不 bump** `schema`（additive：sidecar 讀已知欄位、忽略新欄位），所以 Gateway 加 meta 欄位不需要 worker 映像跟著動；`schema` 只在不相容變更（移除／改名／改語意）時 bump；改 env 鍵集 bump `env_schema`（嚴格護欄不放寬）。合併成一個版本號的替代（任何變更都 bump、sidecar 全量重驗）已被本人否決（2026-10-20，OQ 7）。
 - **為什麼 GET＋query**：v5 的 get 已是「GET＋query 回 key」的先例；model id 可含 `/`（例 `openrouter/free`），放 query 參數不必處理路徑段的 percent-encoding。**query 的編碼**：呼叫端 MUST 對每個 query 值做 percent-encode（`lgw.client` 用 `urllib.parse.quote(value, safe="")`）；`+` 要編成 `%2B`（server 的 `parse_qs` 會把未編碼的 `+` 解成空白），`&`、`#`、`:` 同理；server 用 `parse_qs` 的預設 form 解碼。`exclude` 的逗號是清單分隔符，值內的逗號不合法（id 不會有逗號）。
 - **200 的標頭**：resolve（以及並存期的 get）回應 MUST 帶 `Cache-Control: no-store` 與 `Pragma: no-cache`——回覆含憑證值，不讓 HTTP 快取或本機工具留下。
 - **為什麼第四個端點、終態仍是三個**：resolve 取代 get（決定 5）；get 的移除在 d 單。

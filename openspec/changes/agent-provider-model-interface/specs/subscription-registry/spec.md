@@ -14,7 +14,7 @@ LLMGateway 對外提供三個介面（終態）：list（列菜單，不含 key�
 
 `env` SHALL 是把選定的 provider＋model 用起來的必要環境變數（名稱→值），依 `agent` 組成（見「env 的組成」）。`env` 的**憑證值** MUST NOT 出現在 list 的回覆、稽核紀錄、log 或 `GET /agents` status；model、provider、endpoint 是中介資料，稽核可記——前提是 **`endpoint` MUST NOT 內嵌憑證**（query 的 `key=`／`token=`／`api_key=`／`access_token=`、userinfo 的 `@`；providers 載入／啟動時拒絕，見「共通 JSON schema」）。錯誤回覆 MUST NOT 含 `env`。resolve 的 200 回覆 SHALL 帶 `Cache-Control: no-store` 與 `Pragma: no-cache`（過渡期的 get 亦同）。
 
-`schema` SHALL 是**該端點回覆形狀的版本**（resolve 與 list 各自獨立；目前皆為 1），resolve 形狀改變時 MUST bump。`env_schema` SHALL 是 **env 組成（鍵集與鍵的語意）的版本**（目前為 1）；新增／移除 env 鍵或改變鍵的語意時 MUST bump；Gateway MUST NOT 在同一個 `env_schema` 內改變鍵集（個別回應因 model 為 null 而少給模型鍵，不算鍵集變更）。sidecar MUST 對不認得的更高 `schema`／`env_schema` 拒收（較低版本若仍支援則接受）。
+`schema` SHALL 是**該端點回覆形狀的版本**（resolve 與 list 各自獨立；目前皆為 1），resolve 形狀有**不相容**變更（移除／改名／改語意）時 MUST bump；只**新增** meta 欄位不 bump（消費端忽略不認得的欄位）。`env_schema` SHALL 是 **env 組成（鍵集與鍵的語意）的版本**（目前為 1）；新增／移除 env 鍵或改變鍵的語意時 MUST bump；Gateway MUST NOT 在同一個 `env_schema` 內改變鍵集（個別回應因 model 為 null 而少給模型鍵，不算鍵集變更）。消費端對不認得的更高 `schema`／`env_schema` 的處理（拒收等）見 design 決定 6，由 sidecar 側規格承接。
 
 #### Scenario: 同一把的兩個免費模型
 - **WHEN** 分別以 `agent=opencode&provider=opencode-zen&model=mimo-v2.6-flash-free` 與 `agent=opencode&provider=opencode-zen&model=big-pickle` resolve
@@ -59,10 +59,6 @@ LLMGateway 對外提供三個介面（終態）：list（列菜單，不含 key�
 #### Scenario: 值不外洩與不快取
 - **WHEN** 以憑證樣式掃描稽核紀錄、log 與 list 的回覆（resolve 的 200 本來就含憑證值，只在 SSH 通道內），並檢查 resolve 的 200 標頭
 - **THEN** 沒有 env 任何**憑證值**的命中；回覆帶 `Cache-Control: no-store` 與 `Pragma: no-cache`
-
-#### Scenario: env 組成版本升高
-- **WHEN** Gateway 回覆的 `env_schema` 高於 sidecar 認得的版本
-- **THEN** sidecar 拒收該回覆（不把不認得的鍵集交給子行程）
 
 ### Requirement: resolve 的選把規則
 
@@ -122,9 +118,7 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
 
 opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回 `OPENCODE_CONFIG_CONTENT`，也不回 `baseURL`（`endpoint` 是 provider 根位址，依 #28 不抄進 opencode 的 `options.baseURL`）。model 為 null（agent 自己的預設）時 SHALL 不給模型變數。
 
-**未知鍵（消費端規則；PM 第二輪對齊）**：`env` 出現不在上述清單的鍵＝Gateway 在同一個 `env_schema` 內違規改鍵集（sidecar 對更高 `env_schema` 拒收是第一道）。sidecar 對未知鍵 MUST 忽略並 WARN（log 只記**鍵名**、不記值），MUST NOT 原樣塞進 `OPENCODE_CONFIG_CONTENT` 或子行程環境；清單上的鍵照常併入。`permission`／`instructions` 由 sidecar 擁有（`env` 不含這兩個鍵），同名鍵 sidecar 贏。
-
-opencode 的 `OPENCODE_CONFIG_CONTENT` SHALL 由 sidecar 用上述片段＋自己的 `permission`／`instructions`＋worker 釘的 opencode 版本組成。sidecar 的子行程環境以現行**完整 base env**（PATH／HOME／Locale 等）＋維運變數為底，resolve 的 `env` 是**不篩選的 overlay**（清單上的鍵全數併入、同名覆蓋 base；未知鍵依「未知鍵」規則丟棄）；sidecar 自己行程**繼承來的** `ANTHROPIC_*`／`OPENAI_*`／`OPENCODE_*` MUST NOT 原樣漏進子行程（sidecar 要給子行程的維運變數，例 `OPENCODE_SERVER_PASSWORD`，是另外疊的，不在此限）。
+**未知鍵與消費端規則**：`env` MUST 只含上述鍵（Gateway 在同一個 `env_schema` 內不得改鍵集）；sidecar 對未知鍵、overlay、`OPENCODE_CONFIG_CONTENT` 的組成、`permission`／`instructions` 的擁有、繼承環境不外漏等**消費端義務**見 design 決定 2 與決定 6，由 MyLinuxPool 的 sidecar 規格承接（本 spec 只定 Gateway 能實作與驗證的部分）。
 
 #### Scenario: claude 訂閱不帶模型變數
 - **WHEN** resolve 選中 `claude-personal`（claude-subscription）而 `meta.model` 為 null
@@ -133,18 +127,6 @@ opencode 的 `OPENCODE_CONFIG_CONTENT` SHALL 由 sidecar 用上述片段＋自�
 #### Scenario: opencode 的兩個模型（片段）
 - **WHEN** 同一把 `opencode-zen` 先後 resolve `mimo-v2.6-flash-free` 與 `big-pickle`
 - **THEN** 兩次 `env` 的 `OPENCODE_PROVIDER_ID` 都是 `opencode`、`OPENCODE_API_KEY` 相同，`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL` 各自是該模型；`env` 不含 `OPENCODE_CONFIG_CONTENT`
-
-#### Scenario: sidecar 組 opencode config
-- **WHEN** sidecar 收到 `OPENCODE_PROVIDER_ID=opencode`、`OPENCODE_MODEL=big-pickle`、`OPENCODE_API_KEY=…`
-- **THEN** sidecar 組出的 `OPENCODE_CONFIG_CONTENT` 有 `provider.opencode.options.apiKey`、`provider.opencode.models.big-pickle.name`、`model`／`small_model`＝`opencode/big-pickle`，並保留自己的 `permission`／`instructions`
-
-#### Scenario: 只注入這一把的憑證
-- **WHEN** sidecar 行程自己的環境有 `ANTHROPIC_API_KEY=canary`，子行程以 resolve 的 env 啟動
-- **THEN** 子行程只看到 resolve 給的憑證值（或沒有），看不到 sidecar 自己的 `canary`
-
-#### Scenario: env 出現未知鍵
-- **WHEN** resolve 的 `env` 含一個不在鍵集清單上的鍵（例：Gateway 在同一個 `env_schema` 內違規加了新鍵）
-- **THEN** sidecar 忽略該鍵並 WARN（log 記鍵名、不記值），不把它塞進 `OPENCODE_CONFIG_CONTENT` 或子行程環境；清單上的鍵照常併入
 
 ### Requirement: model 省略時的語意
 
