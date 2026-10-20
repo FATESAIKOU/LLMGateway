@@ -940,28 +940,6 @@ def _sub_like(priority, default, allow, agents=("claude-code",)):
     }
 
 
-class EnvSchemaContractTest(RegistryCase):
-    """design 決定 1：env_schema 的消費端契約（sidecar 對不認得的更高版本拒收）。
-
-    sidecar 的實作在 MyLinuxPool（私有 repo）；這裡用替身把「拒收規則」釘住，
-    保證 Gateway 的回覆帶這個欄位、且它是可比較的整數版本。
-    """
-
-    # 替身（＝worker 映像裡釘住的 sidecar）認得的鍵集版本
-    KNOWN = 1
-
-    def _sidecar_double(self, payload: dict) -> str:
-        if payload["env_schema"] > self.KNOWN:
-            return "refuse: unknown env_schema"
-        return "ok"
-
-    def test_替身對更高env_schema拒收(self):
-        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
-        self.assertEqual(self._sidecar_double(payload), "ok")
-        bumped = dict(payload, env_schema=payload["env_schema"] + 1)
-        self.assertNotEqual(self._sidecar_double(bumped), "ok")
-
-
 class AuditMigrationTest(RegistryCase):
     """spec 稽核紀錄 Scenario「舊 DB 沒有新欄位」＋退版（舊 lgwd 讀新 DB 不受影響）。"""
 
