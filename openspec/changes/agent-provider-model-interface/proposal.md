@@ -55,4 +55,4 @@
 - **不做租約式管控**（同時使用上限、「誰正在用」）：維持 v5 的稽核（誰在何時 resolve 過什麼）。
 - **不處理 Antigravity（agy）**：政策裡沒有 agy 的 subscription（期 1 就排除了）；要支援時另開單。
 - **不改 list／cooldown 的形狀、不改政策檔的語意**（只補 loader 對既有 MUST 的檢查，以及 #32 加內容）。
-- **不做冷卻細粒度**：本次維持 subscription 粒度的排除；`(subscription, model)` 粒度列未決 2，另開單。
+- **不做冷卻細粒度**：本次維持 subscription 粒度的排除；本人已裁定先以 subscription 為單位（OQ 2，見 design「已決定的問題」）；`(subscription, model)` 粒度另開單再議。
