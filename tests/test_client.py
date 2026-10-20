@@ -50,6 +50,12 @@ class FakeService:
             model = query.get("model", [None])[0]
             subscription = query.get("subscription", [None])[0]
             exclude = query.get("exclude", [None])[0]
+            missing = [
+                name for name, value in
+                (("agent", agent), ("provider", provider)) if not value
+            ]
+            if missing:
+                return 400, {"error": "bad_request", "missing": missing}
             if provider == "mna":
                 return 403, {"error": "model_not_allowed"}
             if provider == "cooling":
@@ -230,8 +236,16 @@ class ResolveTest(ClientCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 409)
         self.assertEqual(res.error, "cooling")
-        # until 在錯誤回覆的 body；Result.data 只留成功回覆（錯誤一律不進 data，與 get 同款）
-        self.assertEqual(res.data, {})
+        # until 在錯誤回覆的 body：resolve 把它放進 Result.data（env 不放）
+        self.assertEqual(res.data, {"until": "2026-10-11T15:00:00Z"})
+        self.assertNotIn("env", res.data)
+
+    def test_resolve_400帶missing(self):
+        res = self.client.resolve("", "opencode-zen")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 400)
+        self.assertEqual(res.error, "bad_request")
+        self.assertEqual(res.data, {"missing": ["agent"]})
 
 
 class GetTest(ClientCase):
@@ -263,6 +277,7 @@ class GetTest(ClientCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 409)
         self.assertEqual(res.error, "not_deployed")
+        self.assertEqual(res.data, {})  # get 的錯誤回覆照舊不進 data
 
     def test_bad_response_not_json(self):
         res = self.client.get("garbage", "claude-code")
