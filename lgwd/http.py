@@ -162,6 +162,7 @@ def _api_handler(service):
                     )
                     status = 200
                 elif route[0] == "get":
+                    # 過渡期、刻意不動（與 resolve 的 query 規則不同）：d 單移除 get 前不要順手統一。
                     agents = parse_qs(split.query).get("agent") or [None]
                     status, payload = 200, service.get_subscription(route[1], agents[0])
                 else:
