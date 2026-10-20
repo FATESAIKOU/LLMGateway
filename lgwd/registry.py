@@ -64,14 +64,21 @@ def _covered(patterns: tuple[str, ...], model: str) -> bool:
     return any(fnmatch.fnmatchcase(model, pattern) for pattern in patterns)
 
 
-def _derivable(sub: SubscriptionPolicy, kind: str) -> bool:
-    """model 省略時能不能從該把推導模型（design 決定 4）。
+def _derive_model(sub: SubscriptionPolicy, kind: str) -> tuple[bool, str | None]:
+    """model 省略時能不能從該把推導，以及推導出的值（design 決定 4）。
 
-    claude-subscription 恒算能推導（default null 時用 agent 自己的預設、合法 200）。
+    default 非 null 用 default；claude-subscription 恒算能推導（default null 時用
+    agent 自己的預設、合法 200）；其他 kind 用 allow 第一個不含萬用字元的項。
+    (False, None)＝推不出，步驟 4 據此回 400 no_model。
     """
-    if kind == "claude-subscription" or sub.models_default is not None:
-        return True
-    return any(not _has_wildcard(pattern) for pattern in sub.models_allow)
+    if sub.models_default is not None:
+        return True, sub.models_default
+    if kind == "claude-subscription":
+        return True, None
+    for pattern in sub.models_allow:
+        if not _has_wildcard(pattern):
+            return True, pattern
+    return False, None
 
 
 class RegistryService:
@@ -151,30 +158,37 @@ class RegistryService:
 
         # 步驟 4：model 守門（403）／能推導模型（400）；在 priority 之前過濾，
         # 避免「最高 priority 的候選推不出、下一個可以」直接 400（design 決定 3）。
+        # 每個候選只算一次並保留 (sub, model)，步驟 8 直接用被選中那組。
         if model is not None:
-            candidates = [sub for sub in candidates if _covered(sub.models_allow, model)]
+            candidates = [(sub, model) for sub in candidates
+                          if _covered(sub.models_allow, model)]
             if not candidates:
                 raise model_not_allowed()
         else:
-            candidates = [
-                sub for sub in candidates
-                if _derivable(sub, provider_for(sub.name).kind)
-            ]
+            derived_candidates = []
+            for sub in candidates:
+                ok, derived = _derive_model(sub, provider_for(sub.name).kind)
+                if ok:
+                    derived_candidates.append((sub, derived))
+            candidates = derived_candidates
             if not candidates:
                 raise no_model()
 
         if subscription is None:
             # 步驟 5（没有釘住）：排除 exclude 的 id；不在政策檔的 id 自然不命中。
             excluded = set(exclude.split(",")) if exclude else set()
-            candidates = [sub for sub in candidates if sub.name not in excluded]
+            candidates = [(sub, value) for sub, value in candidates
+                          if sub.name not in excluded]
             if not candidates:
                 raise no_candidate()
 
         # 步驟 6：key 未部署的候選排除；全部未部署 → 409（先於冷卻）。
         # 每把只在這裡讀一次 key（None＝未部署），後面沿用同一份值：deployed() 與
         # get() 分兩次讀的話，中間換檔會讓 200 帶 null 憑證（TOCTOU）。
-        candidates = [(sub, self._keys.get(sub.name)) for sub in candidates]
-        candidates = [(sub, key) for sub, key in candidates if key is not None]
+        candidates = [(sub, value, self._keys.get(sub.name))
+                      for sub, value in candidates]
+        candidates = [(sub, value, key) for sub, value, key in candidates
+                      if key is not None]
         if not candidates:
             raise not_deployed()
 
@@ -183,21 +197,19 @@ class RegistryService:
             now = self._clock.now()
             live = []
             earliest = None
-            for sub, key in candidates:
+            for sub, value, key in candidates:
                 cooldown = self._cooldown(cur, sub.name, now)
                 if cooldown is None:
-                    live.append((sub, key))
+                    live.append((sub, value, key))
                 elif earliest is None or from_rfc3339(cooldown["until"]) < earliest:
                     earliest = from_rfc3339(cooldown["until"])
             if not live:
                 raise cooling(until=to_rfc3339(earliest))
 
             # 步驟 8：priority 最小；同分按 id。
-            selected, key = min(live, key=lambda item: (item[0].priority, item[0].name))
+            selected, model_value, key = min(
+                live, key=lambda item: (item[0].priority, item[0].name))
             provider_info = provider_for(selected.name)
-            model_value = (
-                model if model is not None else self._derive_model(selected, provider_info)
-            )
             # env 依（provider、kind、agent）組成（providers.build_env）；
             # key 是步驟 6 讀到的那份（非 null）。env 的憑證值只在這裡出現。
             env = provider_info.build_env(agent, key, model_value)
@@ -225,23 +237,6 @@ class RegistryService:
             "meta": meta,
             "env": env,
         }
-
-    @staticmethod
-    def _derive_model(sub: SubscriptionPolicy, provider_info) -> str | None:
-        """model 省略時選中那把的模型值（design 決定 4；sidecar 現行推導的同一個機械）。
-
-        default 非 null 用 default；claude-subscription 用 agent 自己的預設（null）；
-        其他 kind 用 allow 第一個不含萬用字元的項。沒有候選能到這裡還推不出
-        （選把步驟 4 已擋），最後一行只是防禦。
-        """
-        if sub.models_default is not None:
-            return sub.models_default
-        if provider_info.kind == "claude-subscription":
-            return None
-        for pattern in sub.models_allow:
-            if not _has_wildcard(pattern):
-                return pattern
-        raise no_model()  # pragma: no cover - 選把已保證可推導
 
     def get_subscription(self, subscription: str, agent: str | None) -> dict:
         """GET /v1/subscriptions/{id}?agent=：一筆的共通 JSON，含 key。"""
