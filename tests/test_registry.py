@@ -777,6 +777,37 @@ class ResolveTest(RegistryCase):
                                     "claude-code", "anthropic")
         self.assertNotIn("env", err.body())
 
+    def test_resolve每把key只讀一次(self):
+        # 替身模擬 keysync 在「已部署檢查」與「取值」之間換檔：deployed() 被呼叫過
+        # 之後，get() 就回 None。resolve 只讀一次 get()，所以不會組出 null 憑證。
+        class _FlipKeys:
+            def __init__(self, values):
+                self._values = values
+                self.reads = 0
+                self.deployed_calls = 0
+
+            def get(self, subscription):
+                self.reads += 1
+                if self.deployed_calls:
+                    return None
+                return self._values[subscription]
+
+            def deployed(self, subscription):
+                self.deployed_calls += 1
+                return subscription in self._values
+
+        keys = _FlipKeys(CANARY)
+        service = RegistryService(self.db_path, self.policy, keys, self.clock)
+        try:
+            payload = service.resolve(
+                "claude-code", "anthropic", subscription="claude-personal")
+        finally:
+            service.close()
+        self.assertEqual(
+            payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"], CANARY["claude-personal"])
+        self.assertEqual(keys.reads, 1)
+        self.assertEqual(keys.deployed_calls, 0)
+
     # --- env 的組成的 Scenario ---
 
     def test_claude訂閱不帶模型變數(self):

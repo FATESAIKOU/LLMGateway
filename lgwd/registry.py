@@ -171,8 +171,11 @@ class RegistryService:
                 raise no_candidate()
 
         # 步驟 6：key 未部署的候選排除；全部未部署 → 409（先於冷卻）。
-        deployed = [sub for sub in candidates if self._keys.deployed(sub.name)]
-        if not deployed:
+        # 每把只在這裡讀一次 key（None＝未部署），後面沿用同一份值：deployed() 與
+        # get() 分兩次讀的話，中間換檔會讓 200 帶 null 憑證（TOCTOU）。
+        candidates = [(sub, self._keys.get(sub.name)) for sub in candidates]
+        candidates = [(sub, key) for sub, key in candidates if key is not None]
+        if not candidates:
             raise not_deployed()
 
         with self._store.txn() as cur:
@@ -180,24 +183,24 @@ class RegistryService:
             now = self._clock.now()
             live = []
             earliest = None
-            for sub in deployed:
+            for sub, key in candidates:
                 cooldown = self._cooldown(cur, sub.name, now)
                 if cooldown is None:
-                    live.append(sub)
+                    live.append((sub, key))
                 elif earliest is None or from_rfc3339(cooldown["until"]) < earliest:
                     earliest = from_rfc3339(cooldown["until"])
             if not live:
                 raise cooling(until=to_rfc3339(earliest))
 
             # 步驟 8：priority 最小；同分按 id。
-            selected = min(live, key=lambda sub: (sub.priority, sub.name))
+            selected, key = min(live, key=lambda item: (item[0].priority, item[0].name))
             provider_info = provider_for(selected.name)
             model_value = (
                 model if model is not None else self._derive_model(selected, provider_info)
             )
             # env 依（provider、kind、agent）組成（providers.build_env）；
-            # deployed 檢查已保證 key 非 null（env 的憑證值只在這裡出現）。
-            env = provider_info.build_env(agent, self._keys.get(selected.name), model_value)
+            # key 是步驟 6 讀到的那份（非 null）。env 的憑證值只在這裡出現。
+            env = provider_info.build_env(agent, key, model_value)
             self._store.audit_add(
                 cur, to_rfc3339(now), selected.name, "resolve",
                 agent=agent, provider=provider_info.provider, model=model_value,
