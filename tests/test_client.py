@@ -230,7 +230,7 @@ class ResolveTest(ClientCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 409)
         self.assertEqual(res.error, "cooling")
-        # until 與錯誤碼都在 Result 裡可讀（repr 不印）
+        # until 在錯誤回覆的 body；Result.data 只留成功回覆（錯誤一律不進 data，與 get 同款）
         self.assertEqual(res.data, {})
 
 

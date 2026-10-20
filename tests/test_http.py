@@ -183,6 +183,10 @@ class ApiTest(ServerCase):
         status, _ = self.call(
             "GET", "/v1/resolve?agent=opencode&provider=x&provider=y")
         self.assertEqual(status, 400)
+        # 重複出現（其中一次是空白）也算重複，不是「空白＝沒給」就放行
+        status, _ = self.call(
+            "GET", "/v1/resolve?agent=&agent=opencode&provider=opencode-zen")
+        self.assertEqual(status, 400)
         # %2B 由 server 的 parse_qs 解回 +（client 端編碼在 test_client 驗）
         status, _ = self.call(
             "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=a%2Bb")
@@ -547,11 +551,10 @@ class ResolveHttpTest(ServerCase):
 
     def test_resolve端到端_預設與釘住(self):
         # api-key 的預設：model 省略 → 該把的 models.default
-        self.call("GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
-        self.assertEqual(
-            self.json_of(self.call("GET", "/v1/resolve?agent=opencode&provider=opencode-zen")[1])[
-                "meta"]["model"],
-            "mimo-v2.6-flash-free")
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload)["meta"]["model"], "mimo-v2.6-flash-free")
         # 釘住公司那一把
         status, payload = self.call(
             "GET", "/v1/resolve?agent=claude-code&provider=anthropic&subscription=claude-company")
@@ -623,7 +626,8 @@ class ResolveHttpTest(ServerCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.json_of(payload)["meta"]["subscription"], "claude-company")
         # 空白的 model 視為省略
-        status, payload = self.call("GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=")
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=")
         self.assertEqual(status, 200)
         self.assertEqual(self.json_of(payload)["meta"]["model"], "mimo-v2.6-flash-free")
         # 重複參數回 400

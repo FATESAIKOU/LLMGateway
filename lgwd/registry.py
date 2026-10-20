@@ -37,7 +37,7 @@ from .errors import (
 )
 from .keys import KeyStore
 from .policy import AGENTS, Policy, SubscriptionPolicy
-from .providers import PROVIDERS, provider_for
+from .providers import provider_for
 from .store import Store
 
 SCHEMA_VERSION = 1
@@ -81,13 +81,11 @@ class RegistryService:
         policy: Policy,
         keys: KeyStore,
         clock: Clock,
-        providers=None,
     ):
         self._store = Store(db_path)
         self._policy = policy
         self._keys = keys
         self._clock = clock
-        self._providers = dict(PROVIDERS if providers is None else providers)
 
     def close(self) -> None:
         self._store.close()

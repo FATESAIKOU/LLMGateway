@@ -105,14 +105,18 @@ def _match_route(method: str, path: str):
 def _resolve_query(query: str) -> dict:
     """resolve 的 query 規則（design 決定 1）：parse_qs 的 form 解碼。
 
-    空白值＝沒給（parse_qs 預設丟掉）；已知參數重複出現 → 400；未知參數忽略。
-    回 {name: 第一個值}，只含給了非空值的已知參數。
+    空白值＝沒給；已知參數重複出現（含空白的那一次）→ 400；未知參數忽略。
+    回 {name: 第一個非空值}，只含給了非空值的已知參數。
     """
-    groups = parse_qs(query)
+    groups = parse_qs(query, keep_blank_values=True)
     for name in _RESOLVE_PARAMS:
         if len(groups.get(name, ())) > 1:
             raise bad_request()
-    return {name: values[0] for name, values in groups.items() if name in _RESOLVE_PARAMS}
+    return {
+        name: values[0]
+        for name, values in groups.items()
+        if name in _RESOLVE_PARAMS and values[0]
+    }
 
 
 def _api_handler(service):

@@ -67,6 +67,10 @@ class RegistryCase(unittest.TestCase):
     def get(self, subscription, agent):
         return self.service.get_subscription(subscription, agent)
 
+    def resolve(self, agent, provider, model=None, subscription=None, exclude=None):
+        return self.service.resolve(agent, provider, model=model,
+                                    subscription=subscription, exclude=exclude)
+
     def cooldown(self, subscription, until):
         return self.service.register_cooldown(subscription, {"until": until})
 
@@ -502,10 +506,6 @@ class _FakeApiKeyProvider(lgwd_providers.CredentialProvider):
 class ResolveTest(RegistryCase):
     """spec subscription-registry「resolve」的需求（design 決定 1～4；選把集中 registry）。"""
 
-    def resolve(self, agent, provider, model=None, subscription=None, exclude=None):
-        return self.service.resolve(agent, provider, model=model,
-                                    subscription=subscription, exclude=exclude)
-
     def _service_with_policy(self, obj) -> RegistryService:
         path = self.root / "policy-under-resolve.json"
         path.write_text(json.dumps(obj), encoding="utf-8")
@@ -578,6 +578,9 @@ class ResolveTest(RegistryCase):
         del obj["subscriptions"]["claude-company"]
         service = self._service_with_policy(obj)
         try:
+            # 被排除的那把冷卻中也不回 cooling：no_candidate 是 exclude 造成的
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
             err = self.assert_api_error(
                 409, "no_candidate", service.resolve,
                 "claude-code", "anthropic", exclude="claude-personal")
@@ -667,6 +670,40 @@ class ResolveTest(RegistryCase):
     def test_未知provider(self):
         self.assert_api_error(404, "not_found", self.resolve, "opencode", "NoSuchProvider")
 
+    def test_provider在政策檔沒有subscription(self):
+        # provider 存在於 PROVIDERS，但政策檔沒有它的一把 → 404（步驟 2）
+        obj = {
+            "subscriptions": {"opencode-zen": _sub_like(10, "m", ["*"], agents=("opencode",))},
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            self.assert_api_error(404, "not_found", service.resolve, "claude-code", "anthropic")
+        finally:
+            service.close()
+
+    def test_agent不被provider允許(self):
+        # 步驟 3：有候選但沒有一把允許這個 agent → 403（釘住時只看該把）
+        for kwargs in ({}, {"subscription": "claude-personal"}):
+            with self.subTest(subscription=kwargs.get("subscription")):
+                err = self.assert_api_error(
+                    403, "agent_not_allowed", self.resolve, "opencode", "anthropic", **kwargs)
+                self.assertNotIn("env", err.body())
+
+    def test_釘住未知id(self):
+        err = self.assert_api_error(
+            404, "not_found", self.resolve, "claude-code", "anthropic",
+            subscription="not-a-subscription")
+        self.assertNotIn("env", err.body())
+        # 形狀錯誤（同時給 exclude）先於未知 id 的 404
+        self.assert_api_error(
+            400, "bad_request", self.resolve, "claude-code", "anthropic",
+            subscription="not-a-subscription", exclude="claude-personal")
+
+    def test_exclude未知id忽略(self):
+        payload = self.resolve("claude-code", "anthropic", exclude="not-a-subscription")
+        self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+
     def test_最高priority的候選推不出模型選下一個(self):
         self._patch_two_api_key_subscriptions()
         obj = {
@@ -700,6 +737,25 @@ class ResolveTest(RegistryCase):
                 400, "no_model", service.resolve,
                 "claude-code", "fake-api", subscription="claude-personal")
             self.assertNotIn("env", err.body())
+        finally:
+            service.close()
+
+    def test_同priority同provider以id排序(self):
+        # 步驟 8：priority 最小；同分比 id（claude-company < claude-personal）
+        self._patch_two_api_key_subscriptions()
+        obj = {
+            "subscriptions": {
+                "claude-personal": _sub_like(10, "m", ["*"]),
+                "claude-company": _sub_like(10, "m", ["*"]),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            payload = service.resolve("claude-code", "fake-api")
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")
+            self.assertEqual(payload["meta"]["provider"], "fake-api")
+            self.assertEqual(payload["meta"]["model"], "m")
         finally:
             service.close()
 
@@ -771,6 +827,22 @@ class ResolveTest(RegistryCase):
     def test_api_key的預設(self):
         payload = self.resolve("opencode", "opencode-zen")
         self.assertEqual(payload["meta"]["model"], "mimo-v2.6-flash-free")
+
+    def test_api_key的預設_allow第一個具體項(self):
+        # default 為 null 時用 allow 第一個不含萬用字元的樣式（design 決定 4）
+        obj = {
+            "subscriptions": {
+                "ollama-cloud": _sub_like(
+                    10, None, ["*-free", "big-pickle"], agents=("opencode",)),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            payload = service.resolve("opencode", "ollama-cloud")
+            self.assertEqual(payload["meta"]["model"], "big-pickle")
+        finally:
+            service.close()
 
     def test_推不出模型_假政策(self):
         # 非 claude-subscription 且 default null、allow 全萬用字元（現行政策不可達）
