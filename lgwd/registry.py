@@ -50,9 +50,6 @@ RESOLVE_SCHEMA_VERSION = 1
 # 鍵的語意時 MUST bump；同一個 env_schema 內不改變鍵集。
 ENV_SCHEMA_VERSION = 1
 
-# resolve 認得的 agent 與 AGENTS 同一張表；未知 → 400 bad_request（不是 403：
-# 403 的語意是政策不允許，不是輸入打錯）。
-
 
 def _has_wildcard(pattern: str) -> bool:
     """樣式裡有 fnmatch 的萬用字元（*、?、開頭字元的 [）。"""
