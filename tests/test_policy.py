@@ -1,4 +1,8 @@
-"""policy/default.json 載入與驗證規則的測試。只用假資料。"""
+"""policy/default.json 載入與驗證規則的測試。只用假資料。
+
+1.0 的 endpoint 檢查在這裡：monkeypatch PROVIDERS 的假 provider 表（不是假政策檔）
+＋直接呼叫 validate_endpoints；組裝點（Gateway）的行為在 test_main。
+"""
 
 import fnmatch
 import json
@@ -6,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from lgwd import providers as lgwd_providers
 from lgwd.policy import PolicyError, load_policy
 
 # 假資料：絕不是真的 key
@@ -31,7 +36,7 @@ def _good_policy(**over):
     base = {
         "subscriptions": {
             "claude-personal": _sub(10, ("claude-code",)),
-            "openrouter": _sub(20, ("claude-code", "opencode"),
+            "openrouter": _sub(20, ("opencode",),
                                ("*:free", "openrouter/free"), "openrouter/free"),
         },
         "until_max_ahead_seconds": 691200,
@@ -164,6 +169,21 @@ class PolicyValidationTests(unittest.TestCase):
                     obj["subscriptions"]["openrouter"]["models"]["allow"] = allow
                     self._reload(obj)
 
+    def test_openrouter_agents_must_only_allow_opencode(self):
+        # 政策檔把 openrouter 的 agents 改寫 → 拒收（免費模型只經過 opencode；
+        # resolve 才不會把 Claude Code 指到 OpenRouter）
+        for agents in (["claude-code", "opencode"], ["claude-code"], []):
+            with self.subTest(agents=agents):
+                with self.assertRaises(PolicyError):
+                    obj = _good_policy()
+                    obj["subscriptions"]["openrouter"]["agents"] = agents
+                    self._reload(obj)
+
+    def test_openrouter_agents剛好opencode可載入(self):
+        obj = _good_policy()
+        policy = self._reload(obj)
+        self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
+
     def test_bad_numbers_rejected(self):
         for mutate in (
             lambda o: o["subscriptions"]["openrouter"].update(priority=-1),
@@ -268,6 +288,62 @@ class PolicyValidationTests(unittest.TestCase):
                 else:
                     # 合法值（models.allow）可載入也確認一次
                     self.assertIn(CANARY, policy.subscriptions["openrouter"].models_allow)
+
+
+class _FakeEndpointProvider(lgwd_providers.CredentialProvider):
+    """假 provider：只為了塞一個 endpoint 值進 PROVIDERS 表（1.0 的檢查在這臉上跑）。"""
+
+    def __init__(self, provider: str, endpoint):
+        self.provider = provider
+        self.kind = "api-key"
+        self.endpoint = endpoint
+
+
+class ValidateEndpointsTests(unittest.TestCase):
+    """providers 表的 endpoint 不得內嵌憑證（design 決定 2、3；新-低-5、新-中-2）。
+
+    以 monkeypatch PROVIDERS 的假 provider 表為測樣（不是假政策檔）；組裝點的
+    行為（Gateway 不啟動）在 tests/test_main。
+    """
+
+    def _endpoint(self, endpoint) -> str:
+        table = {"opencode-zen": _FakeEndpointProvider("fake", endpoint)}
+        original = lgwd_providers.PROVIDERS
+        lgwd_providers.PROVIDERS = table
+        try:
+            lgwd_providers.validate_endpoints()
+        finally:
+            lgwd_providers.PROVIDERS = original
+
+    def test_出廠endpoint與null都通過(self):
+        # 沒有丟錯即可
+        self._endpoint("https://opencode.ai/zen/v1")
+        self._endpoint("https://openrouter.ai/api")
+        self._endpoint(None)  # claude-subscription：agent 直連
+
+    def test_query憑證樣式被拒(self):
+        for endpoint in ("https://host/?key=abc", "https://host/?token=abc",
+                         "https://host/?api_key=abc", "https://host/?access_token=abc"):
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(ValueError):
+                    self._endpoint(endpoint)
+
+    def test_userinfo樣式被拒(self):
+        for endpoint in ("https://user:pass@host", "https://me@host"):
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(ValueError):
+                    self._endpoint(endpoint)
+
+    def test_error_message_carries_no_values(self):
+        # 固定字串：不回顯 endpoint 的值（值永不進例外）
+        canary = "canary-3b1f-endpoint-value-never-real"
+        try:
+            self._endpoint(f"https://host/?key={canary}")
+        except ValueError as exc:
+            self.assertNotIn(canary, str(exc))
+            self.assertNotIn("host", str(exc))
+        else:
+            self.fail("endpoint with credentials must be rejected")
 
 
 if __name__ == "__main__":

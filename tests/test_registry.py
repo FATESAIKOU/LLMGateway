@@ -5,10 +5,12 @@
 
 import datetime as _dt
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from lgwd import providers as lgwd_providers
 from lgwd.clock import FakeClock
 from lgwd.errors import ApiError
 from lgwd.keys import KEY_NAMES, KeyStore
@@ -486,6 +488,431 @@ class KeyRotationTest(RegistryCase):
         self.assertEqual(self.get("claude-personal", "claude-code")["key"],
                          "canary-rotated-9999")
         self.assertNotIn("canary-rotated-9999", json.dumps(self.list_items()))
+
+
+class _FakeApiKeyProvider(lgwd_providers.CredentialProvider):
+    """假 provider 表用的 api-key provider（兩把 id 映射到同一個 provider 時用）。"""
+
+    provider = "fake-api"
+    kind = "api-key"
+    endpoint = "https://fake.example/api"
+    opencode_provider_id = "fake-api"
+
+
+class ResolveTest(RegistryCase):
+    """spec subscription-registry「resolve」的需求（design 決定 1～4；選把集中 registry）。"""
+
+    def resolve(self, agent, provider, model=None, subscription=None, exclude=None):
+        return self.service.resolve(agent, provider, model=model,
+                                    subscription=subscription, exclude=exclude)
+
+    def _service_with_policy(self, obj) -> RegistryService:
+        path = self.root / "policy-under-resolve.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        return RegistryService(self.db_path, load_policy(str(path)),
+                               self.keys, self.clock)
+
+    def _patch_two_api_key_subscriptions(self):
+        """把 Claude 兩把映射成同一個非 claude-subscription 的 provider。
+
+        「同 provider 兩把 api-key」在現行政策下不可達（claude 兩把恆為
+        claude-subscription），spec 的 Scenario 也明說用假政策；假政策需要
+        provider 表同時支援（policy loader 的鍵集是固定的），所以 monkeypatch
+        PROVIDERS。
+        """
+        original = lgwd_providers.PROVIDERS
+        lgwd_providers.PROVIDERS = {
+            "claude-personal": _FakeApiKeyProvider(),
+            "claude-company": _FakeApiKeyProvider(),
+            "openrouter": original["openrouter"],
+            "opencode-zen": original["opencode-zen"],
+            "ollama-cloud": original["ollama-cloud"],
+        }
+        self.addCleanup(setattr, lgwd_providers, "PROVIDERS", original)
+
+    # --- resolve 需求的 Scenario ---
+
+    def test_同一把的兩個免費模型(self):
+        a = self.resolve("opencode", "opencode-zen", model="mimo-v2.6-flash-free")
+        b = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        for payload, model in ((a, "mimo-v2.6-flash-free"), (b, "big-pickle")):
+            self.assertEqual(payload["schema"], 1)
+            self.assertEqual(payload["env_schema"], 1)
+            self.assertEqual(payload["meta"]["subscription"], "opencode-zen")
+            self.assertEqual(payload["meta"]["model"], model)
+        self.assertNotEqual(a["env"], b["env"])  # 模型設定不同
+
+    def test_釘住公司那一把(self):
+        # claude-personal（priority 10）未冷卻、已部署；釘住後仍選 company
+        payload = self.resolve("claude-code", "anthropic", subscription="claude-company")
+        self.assertEqual(payload["meta"]["subscription"], "claude-company")
+
+    def test_釘住的那把冷卻中(self):
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        err = self.assert_api_error(
+            409, "cooling", self.resolve, "claude-code", "anthropic",
+            subscription="claude-personal")
+        self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
+        self.assertNotIn("env", err.body())
+
+    def test_釘住的subscription與provider不一致(self):
+        err = self.assert_api_error(
+            400, "bad_request", self.resolve, "claude-code", "anthropic",
+            subscription="opencode-zen")
+        self.assertNotIn("env", err.body())
+
+    def test_釘住與排除同時給(self):
+        err = self.assert_api_error(
+            400, "bad_request", self.resolve, "claude-code", "anthropic",
+            subscription="claude-company", exclude="claude-personal")
+        self.assertNotIn("env", err.body())
+
+    def test_換把時排除剛耗盡的那一把(self):
+        # cooldown 登錄失敗＝沒有進冷卻；exclude 在選把先擋掉 personal
+        payload = self.resolve("claude-code", "anthropic", exclude="claude-personal")
+        self.assertEqual(payload["meta"]["subscription"], "claude-company")
+
+    def test_排除後沒有候選(self):
+        # claude-company 不在政策檔；exclude 掉 personal 後沒有候選
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        del obj["subscriptions"]["claude-company"]
+        service = self._service_with_policy(obj)
+        try:
+            err = self.assert_api_error(
+                409, "no_candidate", service.resolve,
+                "claude-code", "anthropic", exclude="claude-personal")
+            self.assertNotIn("env", err.body())
+            self.assertNotIn("until", err.body())  # 不回 cooling（沒有恢復時刻）
+        finally:
+            service.close()
+
+    def test_缺必填(self):
+        cases = [
+            ((None, "opencode-zen"), ["agent"]),
+            ((None, None), ["agent", "provider"]),
+            (("opencode", None), ["provider"]),
+        ]
+        for (agent, provider), missing in cases:
+            with self.subTest(agent=agent, provider=provider):
+                err = self.assert_api_error(400, "bad_request", self.resolve, agent, provider)
+                self.assertEqual(err.body()["missing"], sorted(missing))
+                self.assertNotIn("env", err.body())
+        # 空字串也是沒給（HTTP 層後同一個入口）
+        err = self.assert_api_error(400, "bad_request", self.resolve, None, "opencode-zen")
+        self.assertEqual(err.body()["missing"], ["agent"])
+
+    def test_未知的agent(self):
+        err = self.assert_api_error(400, "bad_request", self.resolve, "foo", "opencode-zen")
+        self.assertNotEqual(err.status, 403)  # 不是 403 agent_not_allowed
+
+    def test_meta只帶有資訊的欄位(self):
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.assertEqual(
+            sorted(payload["meta"]),
+            ["agent", "endpoint", "kind", "model", "models", "priority",
+             "provider", "subscription"],
+        )
+        self.assertNotIn("cooldown", payload["meta"])
+        self.assertNotIn("available", payload["meta"])
+
+    def test_值不外洩(self):
+        # 憑證樣式掃描稽核、list 回覆與 DB；endpoint 的值只掃憑證樣式（providers 已擋）
+        self.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.resolve("claude-code", "anthropic")
+        rows = self.service._store.audit_all()
+        blobs = [
+            json.dumps(rows, ensure_ascii=False),
+            json.dumps(self.list_items(), ensure_ascii=False),
+        ]
+        for blob in blobs:
+            for value in CANARY.values():
+                self.assertNotIn(value, blob)
+            for mark in ("key=", "token=", "api_key=", "access_token=", "@"):
+                self.assertNotIn(mark, blob)
+        raw = self.db_bytes()
+        for value in CANARY.values():
+            self.assertNotIn(value.encode(), raw)
+
+    # --- resolve 的選把規則的 Scenario ---
+
+    def test_同provider兩把一把冷卻中(self):
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        payload = self.resolve("claude-code", "anthropic")
+        self.assertEqual(payload["meta"]["subscription"], "claude-company")  # priority 20
+
+    def test_全部候選冷卻中(self):
+        self.cooldown("claude-personal", "2026-10-11T16:00:00Z")
+        self.cooldown("claude-company", "2026-10-11T15:00:00Z")
+        err = self.assert_api_error(409, "cooling", self.resolve, "claude-code", "anthropic")
+        self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")  # 最早恢復時刻
+        self.assertNotIn("env", err.body())
+
+    def test_model不在allow(self):
+        err = self.assert_api_error(
+            403, "model_not_allowed", self.resolve,
+            "opencode", "opencode-zen", model="muse-spark-1.3")
+        self.assertNotIn("env", err.body())
+
+    def test_帶provider前綴的model(self):
+        # model 不是供應商 id（opencode/big-pickle）；Gateway 不正規化前綴
+        err = self.assert_api_error(
+            403, "model_not_allowed", self.resolve,
+            "opencode", "opencode-zen", model="opencode/big-pickle")
+        self.assertNotIn("env", err.body())
+
+    def test_供應商自己的模型id(self):
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.assertEqual(payload["meta"]["model"], "big-pickle")  # 供應商 id，不帶 opencode/ 前綴
+
+    def test_未知provider(self):
+        self.assert_api_error(404, "not_found", self.resolve, "opencode", "NoSuchProvider")
+
+    def test_最高priority的候選推不出模型選下一個(self):
+        self._patch_two_api_key_subscriptions()
+        obj = {
+            "subscriptions": {
+                "claude-personal": _sub_like(10, None, ["*"]),
+                "claude-company": _sub_like(20, "m2", ["*"]),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            payload = service.resolve("claude-code", "fake-api")  # model 省略
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")
+            self.assertEqual(payload["meta"]["model"], "m2")
+        finally:
+            service.close()
+
+    def test_釘住那把推不出模型不代換(self):
+        # 同 provider 的另一把可推導也不代換（釘住在第 1 步先限縮候選）
+        self._patch_two_api_key_subscriptions()
+        obj = {
+            "subscriptions": {
+                "claude-personal": _sub_like(10, None, ["*"]),
+                "claude-company": _sub_like(20, "m2", ["*"]),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            err = self.assert_api_error(
+                400, "no_model", service.resolve,
+                "claude-code", "fake-api", subscription="claude-personal")
+            self.assertNotIn("env", err.body())
+        finally:
+            service.close()
+
+    def test_釘住的key未部署(self):
+        self.keys_path.write_text(
+            key_text({k: v for k, v in CANARY.items() if k != "claude-company"}),
+            encoding="utf-8",
+        )
+        self.keys.reload()
+        err = self.assert_api_error(
+            409, "not_deployed", self.resolve,
+            "claude-code", "anthropic", subscription="claude-company")
+        self.assertNotIn("env", err.body())
+
+    def test_全部候選未部署(self):
+        self.keys_path.write_text("# 沒有任何 key\n", encoding="utf-8")
+        self.keys.reload()
+        err = self.assert_api_error(409, "not_deployed", self.resolve,
+                                    "claude-code", "anthropic")
+        self.assertNotIn("env", err.body())
+
+    # --- env 的組成的 Scenario ---
+
+    def test_claude訂閱不帶模型變數(self):
+        payload = self.resolve("claude-code", "anthropic", subscription="claude-personal")
+        self.assertEqual(sorted(payload["env"]), ["CLAUDE_CODE_OAUTH_TOKEN"])
+        self.assertEqual(payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"], CANARY["claude-personal"])
+
+    def test_opencode的兩個模型_片段(self):
+        a = self.resolve("opencode", "opencode-zen", model="mimo-v2.6-flash-free")
+        b = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        for payload, model in ((a, "mimo-v2.6-flash-free"), (b, "big-pickle")):
+            env = payload["env"]
+            self.assertEqual(sorted(env),
+                             ["OPENCODE_API_KEY", "OPENCODE_MODEL",
+                              "OPENCODE_PROVIDER_ID", "OPENCODE_SMALL_MODEL"])
+            self.assertEqual(env["OPENCODE_PROVIDER_ID"], "opencode")
+            self.assertEqual(env["OPENCODE_API_KEY"], CANARY["opencode-zen"])
+            self.assertEqual(env["OPENCODE_MODEL"], model)
+            self.assertEqual(env["OPENCODE_SMALL_MODEL"], model)
+            blob = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("OPENCODE_CONFIG_CONTENT", blob)
+            self.assertNotIn("baseURL", blob)
+
+    def test_opencode的ollama_env(self):
+        # opencode 的片段同一套鍵；endpoint 不抄進 env（provider 根位址由 sidecar 決定接法）
+        payload = self.resolve("opencode", "ollama-cloud", model="deepseek-v4.1-flash")
+        env = payload["env"]
+        self.assertEqual(env["OPENCODE_PROVIDER_ID"], "ollama-cloud")
+        self.assertNotIn("ANTHROPIC_BASE_URL", env)
+        self.assertNotIn("OPENCODE_CONFIG_CONTENT", payload)
+
+    def test_claude_code的api_key形狀(self):
+        payload = self.resolve("claude-code", "ollama-cloud", model="deepseek-v4.1-flash")
+        env = payload["env"]
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], CANARY["ollama-cloud"])
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "")  # 刻意佔位
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://ollama.com")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "deepseek-v4.1-flash")
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "deepseek-v4.1-flash")
+
+    # --- model 省略時的語意的 Scenario ---
+
+    def test_claude_subscription的預設(self):
+        payload = self.resolve("claude-code", "anthropic", subscription="claude-personal")
+        self.assertEqual(payload["meta"]["model"], None)  # agent 自己的預設
+        self.assertNotIn("ANTHROPIC_MODEL", payload["env"])
+
+    def test_api_key的預設(self):
+        payload = self.resolve("opencode", "opencode-zen")
+        self.assertEqual(payload["meta"]["model"], "mimo-v2.6-flash-free")
+
+    def test_推不出模型_假政策(self):
+        # 非 claude-subscription 且 default null、allow 全萬用字元（現行政策不可達）
+        obj = {
+            "subscriptions": {
+                "ollama-cloud": _sub_like(10, None, ["*"], agents=("opencode",)),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            err = self.assert_api_error(400, "no_model", service.resolve,
+                                        "opencode", "ollama-cloud")
+            self.assertNotIn("env", err.body())
+        finally:
+            service.close()
+
+    # --- 稽核紀錄（MODIFIED）的 Scenario ---
+
+    def test_resolve留下紀錄(self):
+        self.resolve("opencode", "opencode-zen", model="big-pickle")
+        rows = self.service._store.audit_all()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["action"], "resolve")
+        self.assertEqual(row["subscription"], "opencode-zen")
+        self.assertEqual(row["agent"], "opencode")
+        self.assertEqual(row["provider"], "opencode-zen")
+        self.assertEqual(row["model"], "big-pickle")
+        self.assertEqual(row["ts"], "2026-10-11T00:00:00Z")
+        blob = json.dumps(rows, ensure_ascii=False)
+        for value in CANARY.values():
+            self.assertNotIn(value, blob)
+
+    def test_resolve失敗不記稽核(self):
+        self.assert_api_error(
+            403, "model_not_allowed", self.resolve,
+            "opencode", "opencode-zen", model="muse-spark-1.3")
+        self.assertEqual(self.service._store.audit_all(), [])
+
+    def test_resolve留紀錄model為null(self):
+        # claude-subscription 用 agent 預設：model 欄位是 null，不是空字串
+        self.resolve("claude-code", "anthropic", subscription="claude-company")
+        row = self.service._store.audit_all()[0]
+        self.assertIsNone(row["model"])
+        self.assertEqual(row["provider"], "anthropic")
+
+    def test_get與cooldown的稽核照舊(self):
+        self.get("claude-personal", "claude-code")
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        rows = self.service._store.audit_all()
+        self.assertIsNone(rows[0]["provider"])  # get（過渡期）照舊只記 agent
+        self.assertIsNone(rows[0]["model"])
+        self.assertIsNone(rows[1]["provider"])  # 冷卻照舊記 until
+        self.assertIsNone(rows[1]["model"])
+        self.assertEqual(rows[1]["until"], "2026-10-11T15:00:00Z")
+
+
+def _sub_like(priority, default, allow, agents=("claude-code",)):
+    return {
+        "priority": priority,
+        "agents": list(agents),
+        "models": {"allow": list(allow), "default": default},
+    }
+
+
+class EnvSchemaContractTest(RegistryCase):
+    """design 決定 1：env_schema 的消費端契約（sidecar 對不認得的更高版本拒收）。
+
+    sidecar 的實作在 MyLinuxPool（私有 repo）；這裡用替身把「拒收規則」釘住，
+    保證 Gateway 的回覆帶這個欄位、且它是可比較的整數版本。
+    """
+
+    # 替身（＝worker 映像裡釘住的 sidecar）認得的鍵集版本
+    KNOWN = 1
+
+    def _sidecar_double(self, payload: dict) -> str:
+        if payload["env_schema"] > self.KNOWN:
+            return "refuse: unknown env_schema"
+        return "ok"
+
+    def test_替身對更高env_schema拒收(self):
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.assertEqual(self._sidecar_double(payload), "ok")
+        bumped = dict(payload, env_schema=payload["env_schema"] + 1)
+        self.assertNotEqual(self._sidecar_double(bumped), "ok")
+
+
+class AuditMigrationTest(RegistryCase):
+    """spec 稽核紀錄 Scenario「舊 DB 沒有新欄位」＋退版（舊 lgwd 讀新 DB 不受影響）。"""
+
+    # v5（gateway-v0）的 audit 沒有 provider／model
+    _V5_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cooldowns (
+    subscription TEXT PRIMARY KEY,
+    until TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    subscription TEXT NOT NULL,
+    action TEXT NOT NULL,
+    agent TEXT,
+    until TEXT
+);
+"""
+
+    def test_從v5schema的DB檔啟動並寫入resolve(self):
+        self.service.close()
+        Path(self.db_path).unlink()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executescript(self._V5_SCHEMA)
+            conn.execute(
+                "INSERT INTO audit (ts, subscription, action, agent)"
+                " VALUES ('2026-10-11T00:00:00Z', 'claude-personal', 'get', 'claude-code')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = RegistryService(self.db_path, self.policy, self.keys, self.clock)
+        try:
+            reopened.resolve("opencode", "opencode-zen", model="big-pickle")
+            rows = reopened._store.audit_all()
+            self.assertEqual([r["action"] for r in rows], ["get", "resolve"])
+            # 舊資料的新欄位是 null
+            self.assertIsNone(rows[0]["provider"])
+            self.assertIsNone(rows[0]["model"])
+            self.assertEqual(rows[1]["provider"], "opencode-zen")
+            self.assertEqual(rows[1]["model"], "big-pickle")
+
+            # 舊 lgwd 的 SELECT 指定欄位；讀到多出的欄位不受影響（退版支援）
+            conn = sqlite3.connect(self.db_path)
+            try:
+                legacy = conn.execute(
+                    "SELECT seq, ts, subscription, action, agent, until"
+                    " FROM audit ORDER BY seq").fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(legacy), 2)
+        finally:
+            reopened.close()
 
 
 if __name__ == "__main__":

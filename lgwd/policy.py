@@ -104,6 +104,7 @@ def load_policy(path: str) -> Policy:
     - subscriptions 的鍵只能是 SUBSCRIPTIONS；
     - claude-personal／claude-company 的 agents 只能剛好是 ["claude-code"]（條款）；
     - opencode-zen 的 agents 只能剛好是 ["opencode"]（沒有官方的 Claude Code 接法）；
+    - openrouter 的 agents 只能剛好是 ["opencode"]（免費模型只經過 opencode；design 決定 3）；
     - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
     - 非 null 的 models.default 必須被同一筆的 models.allow 樣式涵蓋（fnmatch；fail-closed）；
     - priority 為非負整數；cooldown 的 until 上限為正整數。
@@ -130,6 +131,9 @@ def load_policy(path: str) -> Policy:
     for name in _ZEN_ONLY:
         if name in parsed_subs and parsed_subs[name].agents != ("opencode",):
             raise PolicyError("opencode-zen must only allow opencode")
+    if "openrouter" in parsed_subs and parsed_subs["openrouter"].agents != ("opencode",):
+        # 免費模型只經過 opencode（v5 既有 MUST，本 change 補上檢查；design 決定 3）。
+        raise PolicyError("openrouter must only allow opencode")
     if "openrouter" in parsed_subs and parsed_subs["openrouter"].models_allow != _OPENROUTER_ALLOW:
         raise PolicyError("openrouter must only allow *:free models")
     max_ahead = data.get("until_max_ahead_seconds")
