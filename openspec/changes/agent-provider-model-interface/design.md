@@ -70,7 +70,7 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 | agent＋kind | env |
 |---|---|
 | claude-code＋claude-subscription | `CLAUDE_CODE_OAUTH_TOKEN=<key>`；model 非 null 時 `ANTHROPIC_MODEL=<model>`、`ANTHROPIC_SMALL_FAST_MODEL=<model>` |
-| claude-code＋api-key（anthropic） | `ANTHROPIC_API_KEY=<key>`；model 變數同上 |
+| claude-code＋api-key（anthropic；**現行不可達**：anthropic 恆為 claude-subscription，預留形狀，啟用前需 bump `env_schema`） | `ANTHROPIC_API_KEY=<key>`；model 變數同上 |
 | claude-code＋api-key（其他 provider） | `ANTHROPIC_AUTH_TOKEN=<key>`、`ANTHROPIC_API_KEY=""`；`endpoint` 非 null 時 `ANTHROPIC_BASE_URL=<endpoint>`；model 變數同上 |
 | opencode（api-key） | 片段：`OPENCODE_API_KEY=<key>`、`OPENCODE_PROVIDER_ID=<opencode 的 provider id>`；model 非 null 時 `OPENCODE_MODEL=<供應商 model id>`、`OPENCODE_SMALL_MODEL=<供應商 model id>`。**不回 `OPENCODE_CONFIG_CONTENT`** |
 
@@ -118,7 +118,7 @@ LLMGateway 依（provider、kind、agent）組 `env`：
 - **`exclude` 後沒有候選**：回 409 `no_candidate`，sidecar 停下、回報、等控制者或冷卻解除；不回 `cooling`（沒有恢復時刻），也不選回被排除的那把（中-8）。
 - **為什麼排除冷卻、全部冷卻回 409 帶 `until`**：一次往返把「挑」做完（sidecar 不用自己迴圈試）；`until` 讓 sidecar 直接把自動重開 job 排到那個時刻（同今天「全部冷卻 → waiting-quota＋最早解除時刻」的行為）。
 - **政策 loader 的 openrouter 檢查（中-6）**：`load_policy` 加 `openrouter.agents == ("opencode",)`，不合法丟 `PolicyError`（固定字串）；加負向測試。否則 spec 的 MUST 與 loader 各說各話，resolve 對 `provider=openrouter&agent=claude-code` 會回 200。
-- **providers 的 endpoint 檢查（新-中-2）**：`endpoint` 來自 `lgwd/providers.py` 的 `PROVIDERS`（政策檔沒有這個欄位），所以檢查放 providers 載入：`providers.validate_endpoints()` 逐筆驗 `CredentialProvider.endpoint`，不合法丟固定字串 `ValueError`；`policy.load_policy` 末尾呼叫並轉 `PolicyError`（providers.py 不 import policy.py，避免循環 import；`PolicyError` 留在 policy.py）。測試 monkeypatch `PROVIDERS` 的假 provider 表。
+- **providers 的 endpoint 檢查（新-中-2）**：`endpoint` 來自 `lgwd/providers.py` 的 `PROVIDERS`（政策檔沒有這個欄位），所以檢查放 providers 層：`providers.validate_endpoints()` 逐筆驗 `CredentialProvider.endpoint`，不合法丟固定字串 `ValueError`；**呼叫點在組裝根**（`main.Gateway.__init__`，`load_policy` 之後；`load_policy` 只管它讀的政策檔，不去驗它沒讀的全域表），啟動失敗接頭（`main()` 已捕 `PolicyError`）把 `ValueError` 一併接住——不合法不啟動（pstack 重審，Act on；原本掛在 `load_policy` 末尾）。測試 monkeypatch `PROVIDERS` 的假 provider 表，以組裝點為測樣。
 - **錯誤碼**（疊在 v5 的表上；錯誤回覆 MUST NOT 含 `env`，訊息固定字串、不回顯請求值）：
 
 | 狀態 | 碼 | 什麼時候 | 附帶 |
@@ -169,7 +169,7 @@ LLMGateway 依（provider、kind、agent）組 `env`：
    - **B-1 的「`subscription` 與 `provider/model` 同時給→400」收斂為——已與 MyLinuxPool PM 確認（2026-10-20）**：只給 `subscription`＝舊形狀，走現行 get；`provider`（可帶 `model`）＝新形狀，走 resolve；新形狀＋`subscription`＝釘住；不一致（`subscription` 的 provider 與給的 `provider` 不同、或 agent 不支援）→ 400 `invalid_request`。舊形狀不得與新形狀欄位混用；新形狀內的 `subscription` 是釘住——B-1 與 B-3 的合併解讀成立，原「若 PM 要 B-1 字面需另定」的備案不再需要（tasks 2.2 的開工前確認已完成）。
    - 呼叫端清冊（PM 腳本、dispatch、驗收腳本）與過渡期：舊形狀至少保留到 d 單；新形狀與舊形狀並存，不一次硬切合法功能。
    - `model` 是供應商 id；sidecar 若收到 `<provider>/<model>` 要正規化或回 400（決定 4）。
-2. **來源（subscription source）**：對 LLMGateway 改呼 list／resolve／cooldown；resolve 404 時回 get（支援舊 Gateway／退版）；錯誤對照補 409 `cooling`（帶 `until` → 自動重開排到 until；**釘住時＝額度用完處理，見 6.6**）、409 `no_candidate`（停下回報）、403 `model_not_allowed`、400 `no_model`（回給控制者）；其餘對照照舊。**以 resolve 的 `meta.subscription` 為準**：sidecar 先用 list 挑候選時，若 resolve 選出的 subscription 與 list 的選擇不同，記 log／回報（不要兩邊各用一個答案）。sidecar 對控制者的錯誤仍是 sidecar 的巢狀 `{"error": {"code": …, "message": …}}`；Gateway 的碼是內部映射，不要把 Gateway 的平面 `{"error": "<碼>"}` 直接對外（資訊-6）。
+2. **來源（subscription source）**：對 LLMGateway 改呼 list／resolve／cooldown；resolve 404 時回 get（支援舊 Gateway／退版；語意見下一段）；錯誤對照補 409 `cooling`（帶 `until` → 自動重開排到 until；**釘住時＝額度用完處理，見 6.6**）、409 `no_candidate`（停下回報）、403 `model_not_allowed`、400 `no_model`（回給控制者）；其餘對照照舊。**以 resolve 的 `meta.subscription` 為準**：sidecar 先用 list 挑候選時，若 resolve 選出的 subscription 與 list 的選擇不同，記 log／回報（不要兩邊各用一個答案）。sidecar 對控制者的錯誤仍是 sidecar 的巢狀 `{"error": {"code": …, "message": …}}`；Gateway 的碼是內部映射，不要把 Gateway 的平面 `{"error": "<碼>"}` 直接對外（資訊-6）。退版模式（新 sidecar＋舊 Gateway）的語意（pstack 重審，Act on）：404 `not_found` 本身分不出「舊 Gateway 沒有這個路由」與「新 Gateway 查無這個 id」，所以 resolve 404 回退時 sidecar 走**現行 v5 的機械**——只給 `subscription` 的舊形狀本來就走 get；新形狀沒有 subscription id 可 get，就用 list 挑候選再 get（同「三者都省略」的挑法）。回退內的 get 若也 404，錯誤照回控制者，sidecar 不得吞錯。**退版模式下 `exclude`／`no_candidate`／`cooling`＋until 的保證不成立**：換把退回「list 挑下一把＋get」，sidecar 須保留現行「不重選剛耗盡那把（cooldown 登錄失敗也跳過）」的邏輯；釘住的 waiting-quota 退化為 get 的「冷卻照回」（舊語意，與決定 3 相反），屬已知退化，**驗收不在此模式下做**。
 3. **driver**：`build_env` 的職責改為「sidecar 完整 base env＋sidecar 維運變數＋resolve env 的不篩選 overlay（決定 2：鍵集清單上的鍵全數併入；未知鍵忽略＋WARN，不塞進 config 或子行程）」（決定 2）；opencode 的 `OPENCODE_CONFIG_CONTENT` 由 sidecar 用 resolve 的片段＋`permission`／`instructions` 組（sidecar 擁有這兩個鍵，也擁有 config 形狀）；model-mismatch 檢查照舊（第一個 step 的模型＝`meta.model` 的期待值）。過渡期收到舊 Gateway 的整包 config 時照舊解析。
 4. **`GET /agents` status**：**保留**既有的 `subscription`（低-1），加 `provider`／`model`（echo meta；**不含 env 值**）。
 5. **agora 接續**：換把後同 session continue 時，resolve 來的模型／憑證變數（例 `ANTHROPIC_MODEL`）照今天一樣要讓 `agora continue` 起的行程看到；#229 的互動終端路徑同樣只吃「疊好的 env」。
