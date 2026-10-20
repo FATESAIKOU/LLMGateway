@@ -23,6 +23,7 @@ from pathlib import Path
 from lgwd.clock import FakeClock
 from lgwd.keys import KEY_NAMES, KeyFileError
 from lgwd.main import Config, Gateway, load_config
+from lgwd.policy import PolicyError
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
@@ -393,7 +394,7 @@ class ProviderEndpointGateTest(unittest.TestCase):
     """1.0：endpoint 檢查的呼叫點在組裝根（Gateway.__init__、load_policy 之後）。
 
     以 monkeypatch PROVIDERS 的假 provider 表為測樣；不合法（內嵌憑證）＝
-    ValueError，服務不啟動（unit 的 PolicyError 同一家族）。
+    PolicyError（Gateway 在 validate_endpoints 的 ValueError 之後轉型），服務不啟動。
     """
 
     def setUp(self):
@@ -429,7 +430,7 @@ class ProviderEndpointGateTest(unittest.TestCase):
                          "https://user:pass@host"):
             with self.subTest(endpoint=endpoint):
                 self._patch_providers(endpoint)
-                with self.assertRaises(ValueError):
+                with self.assertRaises(PolicyError):
                     Gateway(self.config, clock=FakeClock())
 
     def test_出廠provider表組裝成功(self):
