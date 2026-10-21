@@ -20,7 +20,7 @@
 │   sidecar（一台機器一個）                               │
 │      │  ①list（菜單）②resolve（點菜；可釘住／排除）     │
 │      │  ③cooldown（額度）                               │
-│      │  env＝完整 base env＋維運變數＋resolve env       │
+│      │  env＝allow-list base env＋維運變數＋resolve env       │
 │      │  （不篩選 overlay；值只在這裡疊；不進 log／status）│
 │      │  opencode：用 resolve 片段＋permission／          │
 │      │  instructions 組 OPENCODE_CONFIG_CONTENT          │
@@ -61,7 +61,7 @@
   │            │      排除後無候選 → 409 no_candidate                  │
   │            │  ◄── {schema, env_schema, meta:{subscription,…}, env}│
   │            │ meta.subscription 為準；與 list 的選擇不同→記 log／回報│
-  │            │ 完整 base env＋維運變數＋resolve env overlay           │
+  │            │ allow-list base env＋維運變數＋resolve env overlay           │
   │            │ opencode：片段＋permission／instructions→config       │
   │            │ ── 子行程 env（值只在這裡）──► spawn／agora continue ─►│
   │ ◄─ 201 status {provider, model, subscription}（無 env 值）        │

@@ -40,7 +40,7 @@
 
 ## Impact
 
-- **MyLinuxPool sidecar**（#114 一系）：`POST /agents` 的新形狀是平面 `provider`＋選填 `model`，並可帶選填 `subscription` 釘住（`subscription` 沿用 `{"id": …}`）；三者都省略時 sidecar 從 list 挑預設再 resolve。舊形狀（只給 `subscription`）在過渡期走現行 get，兩者不混用（組合矩陣見 design 決定 6.1）。來源改呼 resolve（resolve 404 時可回 get，支援 Gateway 退版）、錯誤對照補 `cooling`（帶 until）、`model_not_allowed`、`no_model`、`no_candidate`；driver 改為「sidecar 完整環境＋resolve env overlay＋維運變數」，opencode 的 `OPENCODE_CONFIG_CONTENT` 由 sidecar 組；換把用 `exclude` 排除剛耗盡那把。寫成「對 sidecar 的介面需求與建議」（design 決定 6），由 PM 與 MyLinuxPool 的 PM 對齊。
+- **MyLinuxPool sidecar**（#114 一系）：`POST /agents` 的新形狀是平面 `provider`＋選填 `model`，並可帶選填 `subscription` 釘住（`subscription` 沿用 `{"id": …}`）；三者都省略時 sidecar 從 list 挑預設再 resolve。舊形狀（只給 `subscription`）在過渡期走現行 get，兩者不混用（組合矩陣見 design 決定 6.1）。來源改呼 resolve（resolve 404 時可回 get，支援 Gateway 退版）、錯誤對照補 `cooling`（帶 until）、`model_not_allowed`、`no_model`、`no_candidate`；driver 改為「sidecar 的 allow-list base env＋resolve env overlay＋維運變數」，opencode 的 `OPENCODE_CONFIG_CONTENT` 由 sidecar 組；換把用 `exclude` 排除剛耗盡那把。寫成「對 sidecar 的介面需求與建議」（design 決定 6），由 PM 與 MyLinuxPool 的 PM 對齊。
 - **排序**：sidecar 的實作排在 MyLinuxPool#216 階段 2.5a（換把／自動重開重 render harness；MyLinuxPool#237）**與階段 3** merge 之後（**MyLinuxPool PM 已確認，2026-10-20**），避免 `_swap` 與 `POST /agents` 欄位白名單同時改；**排序以 PMO 為準**（tasks 2.0／5.1）。
 - **進行中的 sidecar 工單不撞**：MyLinuxPool#216（AI 名／身分／harness）、#229（互動版 PM）動的是身分與終端，與 provider＋model 正交（design 決定 6 末節）；交會是 `POST /agents` 欄位白名單與 `_swap` 路徑，合併時對一次。
 - **#32（provider 追加可用模型）**：政策檔內容的擴充，與本 change 的介面互補；先後不互相依賴（design 決定 7）。
