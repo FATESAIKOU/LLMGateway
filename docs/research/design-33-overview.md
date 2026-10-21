@@ -78,6 +78,8 @@
   │            │ （同時給回 400 bad_request）                            │
 ```
 
+（上圖的「額度用完」由 agent 自己的額度訊號觸發，不是 Gateway 的冷卻狀態；Gateway 側手動登錄 cooldown 只影響之後的 resolve 選把。）
+
 ## 介面圖（終態的三個介面；get 在過渡期保留）
 
 ```
@@ -142,4 +144,4 @@ Gateway 掃 Gateway（log／DB／稽核／list）；sidecar 的 log／status
 - **MyLinuxPool#216 的 `harness` 欄位、#229 的終端／hook 細節、#216 階段 2.5a 的 `_swap` 實作**：只讀到 issue 內文與 master 現況；排序已由 MyLinuxPool PM 確認（2026-10-20：#33 sidecar 實作排在 #216 階段 2.5a（#237）與階段 3 merge 之後），實際依存以 PMO 為準。
 - **OpenSpec 的 `archive`／`apply` 實際行為**：只跑 `validate --strict`，沒有真的 archive／apply；歸檔 gate 是依 delta／REMOVED 語意推理，沒有用 `openspec archive` 實測（中-3）。
 - **`#33` 的 issue 全文與「meta 到期」的原意**：作者只有工單標題與 prompt 摘要；本人已裁定 meta 到期＝冷卻 `until`（OQ 5），此項關閉。
-- **服務那台與 worker 的現況**：沒有連線、沒有讀 `keys.env`、沒有跑 `install.sh --check`；部署與驗收是計畫，沒有實機證據；3.1 的 worker 映像重建也尚未做。
+- **服務那台與 worker 的現況**：已於 2026-10-21 實機驗過 3.0／3.1／3.2／3.4 的釘住；3.3 換把以測試為證、實機觀察待補。
