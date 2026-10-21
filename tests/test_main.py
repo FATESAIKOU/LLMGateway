@@ -23,6 +23,7 @@ from pathlib import Path
 from lgwd.clock import FakeClock
 from lgwd.keys import KEY_NAMES, KeyFileError
 from lgwd.main import Config, Gateway, load_config
+from lgwd.policy import PolicyError
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
@@ -387,6 +388,55 @@ class ReloadTest(MainCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+class ProviderEndpointGateTest(unittest.TestCase):
+    """1.0：endpoint 檢查的呼叫點在組裝根（Gateway.__init__、load_policy 之後）。
+
+    以 monkeypatch PROVIDERS 的假 provider 表為測樣；不合法（內嵌憑證）＝
+    PolicyError（Gateway 在 validate_endpoints 的 ValueError 之後轉型），服務不啟動。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "keys.env").write_text(key_text(FAKE_KEYS), encoding="utf-8")
+        shutil.copy(REPO / "policy" / "default.json", self.root / "policy.json")
+        self.config = Config(
+            db=str(self.root / "llm.db"),
+            policy_path=str(self.root / "policy.json"),
+            keys_path=str(self.root / "keys.env"),
+            api_host="127.0.0.1",
+            api_port=0,
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _patch_providers(self, endpoint):
+        from lgwd import providers as lgwd_providers
+
+        class _Bad(lgwd_providers.CredentialProvider):
+            provider = "fake"
+            kind = "api-key"
+
+        _Bad.endpoint = endpoint
+        original = lgwd_providers.PROVIDERS
+        lgwd_providers.PROVIDERS = {name: _Bad() for name in KEY_NAMES}
+        self.addCleanup(setattr, lgwd_providers, "PROVIDERS", original)
+
+    def test_假provider表endpoint內嵌憑證_組裝失敗(self):
+        for endpoint in ("https://host/?key=canary-main-001",
+                         "https://user:pass@host"):
+            with self.subTest(endpoint=endpoint):
+                self._patch_providers(endpoint)
+                with self.assertRaises(PolicyError):
+                    Gateway(self.config, clock=FakeClock())
+
+    def test_出廠provider表組裝成功(self):
+        # 沒有丟錯（所有既有測試都在這條路上，這裡只作正面的最小確認）
+        from lgwd import providers as lgwd_providers
+        lgwd_providers.validate_endpoints()
 
 
 if __name__ == "__main__":

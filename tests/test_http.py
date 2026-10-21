@@ -39,6 +39,26 @@ LIST = {
     "schema": 1,
     "subscriptions": [{k: v for k, v in ITEM.items() if k != "key"}],
 }
+RESOLVE = {
+    "schema": 1,
+    "env_schema": 1,
+    "meta": {
+        "subscription": "opencode-zen",
+        "provider": "opencode-zen",
+        "kind": "api-key",
+        "agent": "opencode",
+        "model": "mimo-v2.6-flash-free",
+        "models": {"allow": ["*-free", "big-pickle"], "default": "mimo-v2.6-flash-free"},
+        "endpoint": "https://opencode.ai/zen/v1",
+        "priority": 10,
+    },
+    "env": {
+        "OPENCODE_API_KEY": "fake-key-in-resolve-reply",
+        "OPENCODE_PROVIDER_ID": "opencode",
+        "OPENCODE_MODEL": "mimo-v2.6-flash-free",
+        "OPENCODE_SMALL_MODEL": "mimo-v2.6-flash-free",
+    },
+}
 
 
 class FakeService:
@@ -59,6 +79,10 @@ class FakeService:
 
     def get_subscription(self, sub_id, agent):
         return self._finish("get_subscription", dict(ITEM), sub_id, agent)
+
+    def resolve(self, agent, provider, model=None, subscription=None, exclude=None):
+        return self._finish("resolve", json.loads(json.dumps(RESOLVE)),
+                            agent, provider, model, subscription, exclude)
 
     def register_cooldown(self, sub_id, body):
         return self._finish("register_cooldown", None, sub_id, body)
@@ -115,6 +139,97 @@ class ApiTest(ServerCase):
     def test_list_query被忽略(self):
         status, _ = self.call("GET", "/v1/subscriptions?x=1&agent=opencode")
         self.assertEqual(status, 200)
+
+    def test_list_200沒有不快取標頭(self):
+        # design 決定 1：不快取標頭是 get／resolve 的 200 才帶；list 不變
+        req = urllib.request.Request(self.base + "/v1/subscriptions")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            self.assertIsNone(resp.headers.get("Cache-Control"))
+
+    # --- resolve ---
+    def test_resolve_ok(self):
+        status, payload = self.call(
+            "GET",
+            "/v1/resolve?agent=opencode&provider=opencode-zen&model=big-pickle")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload), RESOLVE)
+        self.assertEqual(self.fake.calls[-1],
+                         ("resolve", "opencode", "opencode-zen", "big-pickle",
+                          None, None))
+
+    def test_resolve_query規則(self):
+        # 未知參數忽略
+        status, _ = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&flag=1&x=")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1],
+                         ("resolve", "opencode", "opencode-zen", None, None, None))
+        # 空白值＝沒給（subscription=x&exclude= 是合法釘住）
+        status, _ = self.call(
+            "GET", "/v1/resolve?agent=claude-code&provider=anthropic"
+                   "&subscription=claude-company&exclude=")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1],
+                         ("resolve", "claude-code", "anthropic", None,
+                          "claude-company", None))
+        # 已知參數重複出現 → 400
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&agent=claude-code&provider=opencode-zen")
+        self.assertEqual(status, 400)
+        data = self.json_of(payload)
+        self.assertEqual(data["error"], "bad_request")
+        self.assertNotIn("env", data)
+        self.assertNotIn("detail", data)
+        status, _ = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=x&provider=y")
+        self.assertEqual(status, 400)
+        # 重複出現（其中一次是空白）也算重複，不是「空白＝沒給」就放行
+        status, _ = self.call(
+            "GET", "/v1/resolve?agent=&agent=opencode&provider=opencode-zen")
+        self.assertEqual(status, 400)
+        # %2B 由 server 的 parse_qs 解回 +（client 端編碼在 test_client 驗）
+        status, _ = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=a%2Bb")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1][3], "a+b")
+
+    def test_resolve_200帶不快取標頭(self):
+        req = urllib.request.Request(
+            self.base + "/v1/resolve?agent=opencode&provider=opencode-zen")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+            self.assertEqual(resp.headers.get("Pragma"), "no-cache")
+
+    def test_get_200帶不快取標頭(self):
+        req = urllib.request.Request(
+            self.base + "/v1/subscriptions/claude-personal?agent=claude-code")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+            self.assertEqual(resp.headers.get("Pragma"), "no-cache")
+
+    def test_resolve錯誤對應_不含env(self):
+        cases = [
+            (errors.bad_request(), 400, "bad_request"),
+            (errors.no_model(), 400, "no_model"),
+            (errors.model_not_allowed(), 403, "model_not_allowed"),
+            (errors.not_found(), 404, "not_found"),
+            (errors.not_deployed(), 409, "not_deployed"),
+            (errors.cooling("2026-10-11T15:00:00Z"), 409, "cooling"),
+            (errors.no_candidate(), 409, "no_candidate"),
+        ]
+        for exc, code, err in cases:
+            with self.subTest(code=err):
+                self.fake.raise_for["resolve"] = exc
+                status, payload = self.call(
+                    "GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
+                self.assertEqual(status, code)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], err)
+                self.assertNotIn("env", data)
+                self.assertNotIn("OPENCODE_API_KEY", data)
+                self.assertNotIn("detail", data)
+                if exc.extra.get("until"):
+                    self.assertEqual(data["until"], exc.extra["until"])
 
     # --- get ---
     def test_get_ok(self):
@@ -221,6 +336,8 @@ class ApiTest(ServerCase):
             ("POST", "/v1/subscriptions/claude-personal"),
             ("GET", "/v1/subscriptions/claude-personal/cooldown"),
             ("PUT", "/v1/subscriptions/claude-personal/cooldown"),
+            ("POST", "/v1/resolve"), ("DELETE", "/v1/resolve"),
+            ("GET", "/v1/resolve/"),
         ]
         for method, path in cases:
             with self.subTest(method=method, path=path):
@@ -393,6 +510,135 @@ class RealServiceHttpTest(ServerCase):
             {"until": "2026-10-11T00:00:00Z"}
         )
         self.assertEqual(status, 204)
+
+
+class ResolveHttpTest(ServerCase):
+    """resolve 經 HTTP 的端到端（真 RegistryService＋假 key＋FakeClock）。"""
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    FAKE_KEYS = {"claude-personal": "fake-personal", "claude-company": "fake-company",
+                 "openrouter": "fake-openrouter", "opencode-zen": "fake-zen",
+                 "ollama-cloud": "fake-ollama"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        keys_path = root / "keys.env"
+        canary = (
+            "# 測試用假 key\n"
+            "CLAUDE_PERSONAL_OAUTH_TOKEN=fake-personal\n"
+            "CLAUDE_COMPANY_OAUTH_TOKEN=fake-company\n"
+            "OPENROUTER_API_KEY=fake-openrouter\n"
+            "OPENCODE_ZEN_API_KEY=fake-zen\n"
+            "OLLAMA_API_KEY=fake-ollama\n"
+        )
+        keys_path.write_text(canary, encoding="utf-8")
+        policy_path = str(self.REPO_ROOT / "policy" / "default.json")
+        self.clock = FakeClock()  # 預設 2026-10-11T00:00:00Z
+        self.service = RegistryService(
+            str(root / "llm.db"),
+            load_policy(policy_path), KeyStore(str(keys_path)), self.clock,
+        )
+        self.base = self.serve(self.service)
+
+    def tearDown(self):
+        super().tearDown()
+        self.service.close()
+        self.tmp.cleanup()
+
+    def json_of(self, payload):
+        return json.loads(payload.decode())
+
+    def test_resolve端到端_預設與釘住(self):
+        # api-key 的預設：model 省略 → 該把的 models.default
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload)["meta"]["model"], "mimo-v2.6-flash-free")
+        # 釘住公司那一把
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=claude-code&provider=anthropic&subscription=claude-company")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data["meta"]["subscription"], "claude-company")
+        self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "fake-company")
+
+    def test_resolve端到端_錯誤precedence(self):
+        cases = [
+            # 缺必填（missing 列出缺的欄位）
+            ("/v1/resolve?provider=opencode-zen", 400, "bad_request", {"missing": ["agent"]}),
+            ("/v1/resolve", 400, "bad_request", {"missing": ["agent", "provider"]}),
+            (# 未知的 agent 是輸入錯誤（不是 403）
+             "/v1/resolve?agent=foo&provider=opencode-zen", 400, "bad_request", None),
+            (# 輸入形狀錯誤先於查無：subscription 與 provider 不一致先於 provider 404
+             "/v1/resolve?agent=claude-code&provider=NoSuchProvider&subscription=claude-personal",
+             400, "bad_request", None),
+            ("/v1/resolve?agent=claude-code&provider=anthropic&subscription=opencode-zen",
+             400, "bad_request", None),
+            ("/v1/resolve?agent=claude-code&provider=anthropic"
+             "&subscription=claude-company&exclude=claude-personal",
+             400, "bad_request", None),
+            (# 查無
+             "/v1/resolve?agent=opencode&provider=NoSuchProvider", 404, "not_found", None),
+            # 政策守門：model 不在 allow（含帶前綴的不正規化）
+            ("/v1/resolve?agent=opencode&provider=opencode-zen&model=muse-spark-1.3",
+             403, "model_not_allowed", None),
+            ("/v1/resolve?agent=opencode&provider=opencode-zen&model=opencode%2Fbig-pickle",
+             403, "model_not_allowed", None),
+        ]
+        for path, code, err, extra in cases:
+            with self.subTest(path=path):
+                status, payload = self.call("GET", path)
+                self.assertEqual(status, code)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], err)
+                self.assertNotIn("env", data)
+                if extra:
+                    self.assertEqual(data["missing"], extra["missing"])
+                else:
+                    self.assertNotIn("missing", data)
+
+    def test_resolve端到端_錯誤不記稽核(self):
+        self.call("GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=muse-spark-1.3")
+        self.assertEqual(self.service._store.audit_all(), [])
+        status, _ = self.call("GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
+        self.assertEqual(status, 200)
+        self.assertEqual([r["action"] for r in self.service._store.audit_all()], ["resolve"])
+
+    def test_resolve_log不含憑證值(self):
+        # 值的紀律（中-1）：log 只記方法／路徑／狀態碼，env 的憑證值不進 log
+        with self.assertLogs("lgwd.http", level="INFO") as logs:
+            status, _ = self.call(
+                "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=big-pickle")
+        self.assertEqual(status, 200)
+        text = "\n".join(logs.output)
+        for value in self.FAKE_KEYS.values():
+            self.assertNotIn(value, text)
+        # log 只記方法／路徑／狀態碼（query 根本不進 log，嚴於「非機密」的要求）
+        self.assertIn("GET /v1/resolve -> 200", text)
+        self.assertNotIn("model", text)
+
+    def test_resolve空白值與重複鍵(self):
+        # 空白值＝沒給：exclude= 是合法釘住（透明語意）
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=claude-code&provider=anthropic"
+                   "&subscription=claude-company&exclude=")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload)["meta"]["subscription"], "claude-company")
+        # 空白的 model 視為省略
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload)["meta"]["model"], "mimo-v2.6-flash-free")
+        # 重複參數回 400
+        for query in ("agent=x&agent=y&provider=opencode-zen",
+                      "agent=opencode&provider=x&provider=y",
+                      "agent=opencode&provider=opencode-zen&model=a&model=b",
+                      "agent=opencode&provider=opencode-zen&exclude=a&exclude=b"):
+            with self.subTest(query=query):
+                status, payload = self.call("GET", "/v1/resolve?" + query)
+                self.assertEqual(status, 400)
+                self.assertEqual(self.json_of(payload)["error"], "bad_request")
 
 
 if __name__ == "__main__":

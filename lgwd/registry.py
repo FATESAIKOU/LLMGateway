@@ -2,10 +2,17 @@
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；
 - get_subscription(id, agent)：一筆的共通 JSON，含 key（agent 必填、要在該筆的 agents 裡、key 要已部署）；
+- resolve(agent, provider[, model, subscription, exclude])：照政策選把後回
+  {schema, env_schema, meta, env}（meta 不含 cooldown／available；env 依 agent 組成）。
+  選把集中在這裡（design 決定 3）：純規則在 _pick（釘住先限縮成那把 → provider＋
+  agent＋allow 涵蓋／能推導模型 → exclude），resolve 再接已部署 → 非冷卻 → priority→id；
+  錯誤 precedence＝輸入形狀 400 → 查無 404 → 政策 403／no_model → 候選狀態 409。
+  每次成功 resolve 記一筆只追加的稽核（provider／model 是中介資料）。
 - register_cooldown(id, body)：登錄冷卻，body {"until": RFC 3339 UTC}（過去或超過上限拒絕；
   同一筆重複登錄取較晚的 until；到時自動解除）。
-- 每次 get 與登錄冷卻記一筆只追加的稽核（時刻、subscription id、agent 或 until；不含 key）。
+- 每次 get（過渡期）與登錄冷卻也記一筆只追加的稽核（get 照舊只記 agent；不含 key）。
 - 所有時刻經注入的 Clock；對外是 RFC 3339 UTC。
+- 環境變數的組成在 providers.build_env（design 決定 2）；這裡只選把與聚合回覆。
 
 HTTP 層把 ApiError 轉成狀態碼與 JSON；這裡不碰 HTTP。
 """
@@ -13,22 +20,62 @@ HTTP 層把 ApiError 轉成狀態碼與 JSON；這裡不碰 HTTP。
 from __future__ import annotations
 
 import datetime as _dt
+import fnmatch
 
 from .clock import Clock, from_rfc3339, to_rfc3339
 from .errors import (
     agent_not_allowed,
     bad_request,
+    cooling,
     invalid_until,
+    model_not_allowed,
+    no_candidate,
+    no_model,
     not_deployed,
     not_found,
     until_out_of_range,
 )
 from .keys import KeyStore
-from .policy import Policy
-from .providers import PROVIDERS, provider_for
+from .policy import AGENTS, Policy, SubscriptionPolicy
+from .providers import CredentialProvider, provider_for
 from .store import Store
 
 SCHEMA_VERSION = 1
+
+# resolve 回覆形狀的版本（與 list 的 SCHEMA_VERSION 各自獨立；design 決定 1）：
+# 不相容變更（移除／改名／改語意）才 bump；只新增 meta 欄位不 bump（消費端忽略新欄位）。
+RESOLVE_SCHEMA_VERSION = 1
+
+# env 組成（鍵集與鍵的語意）的版本（design 決定 1、2）：新增／移除 env 鍵或改變
+# 鍵的語意時 MUST bump；同一個 env_schema 內不改變鍵集。
+ENV_SCHEMA_VERSION = 1
+
+
+def _has_wildcard(pattern: str) -> bool:
+    """樣式含 fnmatch 的萬用字元（*、?、[；任何位置的 [ 都算）即不可推導。"""
+    return any(ch in pattern for ch in ("*", "?", "["))
+
+
+def _covered(patterns: tuple[str, ...], model: str) -> bool:
+    """model 被任一 allow 樣式涵蓋（與政策 loader 同一個 fnmatch）。"""
+    return any(fnmatch.fnmatchcase(model, pattern) for pattern in patterns)
+
+
+def _derive_model(sub: SubscriptionPolicy, kind: str) -> tuple[bool, str | None]:
+    """model 省略時能不能從該把推導，以及推導出的值（design 決定 4）。
+
+    default 非 null 用 default；claude-subscription 恒算能推導（default null 時用
+    agent 自己的預設、合法 200）；其他 kind 用 allow 第一個不含萬用字元的項。
+    (False, None)＝推不出，步驟 4 據此回 400 no_model。
+    """
+    if sub.models_default is not None:
+        return True, sub.models_default
+    if kind == "claude-subscription":
+        return True, None
+    for pattern in sub.models_allow:
+        if not _has_wildcard(pattern):
+            return True, pattern
+    return False, None
 
 
 class RegistryService:
@@ -38,18 +85,16 @@ class RegistryService:
         policy: Policy,
         keys: KeyStore,
         clock: Clock,
-        providers=None,
     ):
         self._store = Store(db_path)
         self._policy = policy
         self._keys = keys
         self._clock = clock
-        self._providers = dict(PROVIDERS if providers is None else providers)
 
     def close(self) -> None:
         self._store.close()
 
-    # --- 三個介面 ---
+    # --- 介面 ---
     def list_subscriptions(self) -> dict:
         """GET /v1/subscriptions：{schema, subscriptions:[…]}，依 priority，不含 key。"""
         now = self._clock.now()
@@ -59,6 +104,78 @@ class RegistryService:
                 for sub in self._policy.in_priority_order()
             ]
         return {"schema": SCHEMA_VERSION, "subscriptions": subs}
+
+    def resolve(
+        self,
+        agent: str | None,
+        provider: str | None,
+        model: str | None = None,
+        subscription: str | None = None,
+        exclude: str | None = None,
+    ) -> dict:
+        """GET /v1/resolve：選把後回 {schema, env_schema, meta, env}。
+
+        subscription 是釘住（有給時只看該把，不代換另一把）；exclude 是逗號分隔的
+        id 清單（不在政策檔的 id 忽略），只在沒有釘住時套用。錯誤照 design 決定 3
+        的步驟與 precedence 斷在最前面的一層。成功才記一筆 resolve 稽核。
+        """
+        # 形狀驗證與步驟 1～5（純規則）在 _pick；這裡只做 key、冷卻、挑選與回覆。
+        candidates = self._pick(agent, provider, model, subscription, exclude)
+
+        # 步驟 6：key 未部署的候選排除；全部未部署 → 409（先於冷卻）。
+        # 每把只在這裡讀一次 key（None＝未部署），後面沿用同一份值：deployed() 與
+        # get() 分兩次讀的話，中間換檔會讓 200 帶 null 憑證（TOCTOU）。
+        candidates = [(sub, info, value, self._keys.get(sub.name))
+                      for sub, info, value in candidates]
+        candidates = [item for item in candidates if item[3] is not None]
+        if not candidates:
+            raise not_deployed()
+
+        with self._store.txn() as cur:
+            # 步驟 7：冷卻中的候選排除；全部冷卻 → 409 cooling（until＝最早恢復時刻）。
+            now = self._clock.now()
+            live = []
+            earliest = None
+            for item in candidates:
+                sub = item[0]
+                cooldown = self._cooldown(cur, sub.name, now)
+                if cooldown is None:
+                    live.append(item)
+                elif earliest is None or from_rfc3339(cooldown["until"]) < earliest:
+                    earliest = from_rfc3339(cooldown["until"])
+            if not live:
+                raise cooling(until=to_rfc3339(earliest))
+
+            # 步驟 8：priority 最小；同分按 id。
+            selected, provider_info, model_value, key = min(
+                live, key=lambda item: (item[0].priority, item[0].name))
+            # env 依（provider、kind、agent）組成（providers.build_env）；
+            # key 是步驟 6 讀到的那份（非 null）。env 的憑證值只在這裡出現。
+            env = provider_info.build_env(agent, key, model_value)
+            self._store.audit_add(
+                cur, to_rfc3339(now), selected.name, "resolve",
+                agent=agent, provider=provider_info.provider, model=model_value,
+            )
+
+        meta = {
+            "subscription": selected.name,
+            "provider": provider_info.provider,
+            "kind": provider_info.kind,
+            "agent": agent,
+            "model": model_value,
+            "models": {
+                "allow": list(selected.models_allow),
+                "default": selected.models_default,
+            },
+            "endpoint": provider_info.endpoint,
+            "priority": selected.priority,
+        }
+        return {
+            "schema": RESOLVE_SCHEMA_VERSION,
+            "env_schema": ENV_SCHEMA_VERSION,
+            "meta": meta,
+            "env": env,
+        }
 
     def get_subscription(self, subscription: str, agent: str | None) -> dict:
         """GET /v1/subscriptions/{id}?agent=：一筆的共通 JSON，含 key。"""
@@ -116,6 +233,80 @@ class RegistryService:
         return moment
 
     # --- 內部 ---
+    def _pick(
+        self,
+        agent: str | None,
+        provider: str | None,
+        model: str | None,
+        subscription: str | None,
+        exclude: str | None,
+    ) -> list[tuple[SubscriptionPolicy, CredentialProvider, str | None]]:
+        """形狀驗證與步驟 1～5（純規則）：回候選 [(sub, provider_info, model)]。
+
+        不碰 keys／DB；每個候選的 provider_info 只解析一次。錯誤照 design 決定 3
+        的步驟與 precedence：400 → 404 → 403／no_model → 409 no_candidate。
+        """
+        # 形狀驗證（400 先於 404；訊息固定字串、不回顯請求值）。
+        missing = [
+            name for name, value in (("agent", agent), ("provider", provider))
+            if not value
+        ]
+        if missing:
+            raise bad_request(missing=missing)
+        if agent not in AGENTS:
+            raise bad_request()
+        if subscription is not None and exclude:
+            # 釘住與排除是兩個互斥的意圖；此檢查先於 id 存在與 provider 一致。
+            raise bad_request()
+
+        if subscription is not None:
+            # 步驟 1：釘住＝候選先限縮為這一把；後續每一步只在這一把上判斷。
+            sub = self._policy.subscriptions.get(subscription)
+            if sub is None:
+                raise not_found()
+            provider_info = provider_for(subscription)
+            if provider_info.provider != provider:
+                raise bad_request()
+            candidates = [(sub, provider_info)]
+        else:
+            # 步驟 2：provider 查無 → 404（先於步驟 3 的政策拒絕）。
+            candidates = []
+            for sub in self._policy.in_priority_order():
+                provider_info = provider_for(sub.name)
+                if provider_info.provider == provider:
+                    candidates.append((sub, provider_info))
+            if not candidates:
+                raise not_found()
+
+        # 步驟 3：agent 不被任何候選允許 → 403（釘住時只看該把）。
+        candidates = [(sub, info) for sub, info in candidates if agent in sub.agents]
+        if not candidates:
+            raise agent_not_allowed()
+
+        # 步驟 4：model 守門（403）／能推導模型（400）；在 priority 之前過濾，
+        # 避免「最高 priority 的候選推不出、下一個可以」直接 400（design 決定 3）。
+        if model is not None:
+            picked = [(sub, info, model) for sub, info in candidates
+                      if _covered(sub.models_allow, model)]
+            if not picked:
+                raise model_not_allowed()
+        else:
+            picked = []
+            for sub, info in candidates:
+                ok, derived = _derive_model(sub, info.kind)
+                if ok:
+                    picked.append((sub, info, derived))
+            if not picked:
+                raise no_model()
+
+        if subscription is None:
+            # 步驟 5（沒有釘住）：排除 exclude 的 id；不在政策檔的 id 自然不命中。
+            excluded = set(exclude.split(",")) if exclude else set()
+            picked = [item for item in picked if item[0].name not in excluded]
+            if not picked:
+                raise no_candidate()
+        return picked
+
     def _item(
         self, cur, subscription: str, now: _dt.datetime, key: str | None = None
     ) -> dict:

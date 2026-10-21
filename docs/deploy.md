@@ -14,7 +14,7 @@
 
 ## 0. 全貌與架構
 
-服務只做三件事：list、get、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
+服務只做這幾件事：list、resolve、get（過渡期，之後由 d 單移除）、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
 
 - `lgwd` 只綁放服務那台的 `127.0.0.1:<API 埠>`（預設 8480），不綁任何對外或容器網路的介面。
 - 隧道守護 `llmgateway-tunnel.service` 用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：

@@ -1,7 +1,8 @@
 """lgw/client.py 的測試（v4 design 決定 6）：假 service（in-process HTTP）＋隨機埠。
 
-- 三個介面：list、get、cooldown；只驗 request 形狀、狀態碼與 Result 語意。
-- 假 service 固定回覆；key 一律是假 canary，不用真 key、不連真機器。
+- 三個介面（並存期四個呼叫）：list、resolve、get、cooldown；只驗 request 形狀、
+  狀態碼與 Result 語意。
+- 假 service 固定回覆；key／env 的憑證值一律是假 canary，不用真 key、不連真機器。
 """
 
 from __future__ import annotations
@@ -43,6 +44,34 @@ class FakeService:
         self.requests.append((method, path, query, body, authorization))
         if method == "GET" and path == "/v1/subscriptions":
             return 200, {"schema": 1, "subscriptions": [dict(SUBSCRIPTION)]}
+        if method == "GET" and path == "/v1/resolve":
+            agent = query.get("agent", [None])[0]
+            provider = query.get("provider", [None])[0]
+            model = query.get("model", [None])[0]
+            subscription = query.get("subscription", [None])[0]
+            exclude = query.get("exclude", [None])[0]
+            missing = [
+                name for name, value in
+                (("agent", agent), ("provider", provider)) if not value
+            ]
+            if missing:
+                return 400, {"error": "bad_request", "missing": missing}
+            if provider == "mna":
+                return 403, {"error": "model_not_allowed"}
+            if provider == "cooling":
+                return 409, {"error": "cooling", "until": "2026-10-11T15:00:00Z"}
+            if provider == "nom":
+                return 400, {"error": "no_model"}
+            if provider == "nc":
+                return 409, {"error": "no_candidate"}
+            return 200, {
+                "schema": 1,
+                "env_schema": 1,
+                "meta": {"subscription": subscription or "opencode-zen",
+                         "provider": provider, "agent": agent,
+                         "model": model or "m2"},
+                "env": {"OPENCODE_API_KEY": CANARY},
+            }
         if method == "GET" and path.startswith("/v1/subscriptions/"):
             sub_id = urllib.parse.unquote(path.rsplit("/", 1)[1])
             if sub_id == "gone":
@@ -148,6 +177,77 @@ class ListTest(ClientCase):
         self.assertIsNone(auth)  # 不帶任何認證標頭
 
 
+class ResolveTest(ClientCase):
+    def test_resolve_ok(self):
+        res = self.client.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.data["meta"]["provider"], "opencode-zen")
+        self.assertEqual(res.data["env"]["OPENCODE_API_KEY"], CANARY)
+        method, path, query, _, auth = self.fake.requests[-1]
+        self.assertEqual((method, path), ("GET", "/v1/resolve"))
+        self.assertEqual(query, {"agent": ["opencode"], "provider": ["opencode-zen"],
+                                 "model": ["big-pickle"]})
+        self.assertIsNone(auth)  # 不帶任何認證標頭
+
+    def test_resolve_省略時不帶參數(self):
+        self.client.resolve("claude-code", "anthropic")
+        _, path, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query, {"agent": ["claude-code"], "provider": ["anthropic"]})
+
+    def test_resolve_model_plus編碼(self):
+        # `+` 由 client 編成 %2B；server 的 parse_qs form 解碼會把未編碼的 + 解成空白
+        self.client.resolve("opencode", "opencode-zen", model="a+b")
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query["model"], ["a+b"])
+        self.assertNotIn("a b", ",".join(query["model"]))
+
+    def test_resolve_model可含斜線(self):
+        res = self.client.resolve("opencode", "openrouter", model="openrouter/free")
+        self.assertTrue(res.ok)
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query["model"], ["openrouter/free"])
+
+    def test_resolve_exclude合併(self):
+        self.client.resolve("claude-code", "anthropic",
+                            exclude=["claude-personal", "x y"])
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query["exclude"], ["claude-personal,x y"])
+
+    def test_resolve_pin住(self):
+        self.client.resolve("claude-code", "anthropic", subscription="claude-company")
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query, {"agent": ["claude-code"], "provider": ["anthropic"],
+                                 "subscription": ["claude-company"]})
+
+    def test_resolve_錯誤對照(self):
+        cases = [("mna", 403, "model_not_allowed"),
+                 ("nom", 400, "no_model"),
+                 ("nc", 409, "no_candidate")]
+        for provider, code, err in cases:
+            with self.subTest(err=err):
+                res = self.client.resolve("opencode", provider)
+                self.assertFalse(res.ok)
+                self.assertEqual(res.status, code)
+                self.assertEqual(res.error, err)
+
+    def test_resolve_cooling帶until(self):
+        res = self.client.resolve("opencode", "cooling")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 409)
+        self.assertEqual(res.error, "cooling")
+        # until 在錯誤回覆的 body：resolve 把它放進 Result.data（env 不放）
+        self.assertEqual(res.data, {"until": "2026-10-11T15:00:00Z"})
+        self.assertNotIn("env", res.data)
+
+    def test_resolve_400帶missing(self):
+        res = self.client.resolve("", "opencode-zen")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 400)
+        self.assertEqual(res.error, "bad_request")
+        self.assertEqual(res.data, {"missing": ["agent"]})
+
+
 class GetTest(ClientCase):
     def test_get_ok_returns_key(self):
         res = self.client.get("claude-personal", "claude-code")
@@ -177,6 +277,7 @@ class GetTest(ClientCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 409)
         self.assertEqual(res.error, "not_deployed")
+        self.assertEqual(res.data, {})  # get 的錯誤回覆照舊不進 data
 
     def test_bad_response_not_json(self):
         res = self.client.get("garbage", "claude-code")

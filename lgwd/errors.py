@@ -3,12 +3,17 @@
 訊息只用固定字串；不回顯請求裡的值（值永不進例外或 log）。
 
 完整錯誤碼表（回覆 JSON 一律為 {"error": "<碼>", ...}）：
-- 400 bad_request：JSON 解析失敗、body 不是物件、缺必填（保留 "missing": [...] 欄位）
+- 400 bad_request：JSON 解析失敗、body 不是物件、缺必填（保留 "missing": [...] 欄位）、
+  resolve 的輸入形狀錯（未知 agent、subscription＋exclude 同時給、subscription 與 provider
+  不一致）、400 no_model：resolve 的 model 省略且沒有候選能推導模型
 - 400 invalid_until：until 不是 RFC 3339 字串（或型別不對）
 - 400 until_out_of_range：until 在過去或超過 8 天以後
-- 403 agent_not_allowed：agent 不在該筆的 agents 裡
-- 404 not_found：不存在的 id 或未知路徑
+- 403 agent_not_allowed：agent 不在該筆的 agents 裡（resolve 的選把步驟 3 同用）
+- 403 model_not_allowed：resolve 的 model 不被任何候選的 models.allow 涵蓋
+- 404 not_found：不存在的 id 或未知路徑（resolve 的未知 provider／未知 subscription 同用）
 - 409 not_deployed：key 尚未部署
+- 409 cooling：resolve 的候選全部冷卻中（until＝最早恢復時刻）
+- 409 no_candidate：resolve 的 exclude 排除後沒有候選（沒有恢復時刻）
 - 413 body_too_large：body 超過 1 MB
 - 500 internal：伺服器內部非預期錯誤
 """
@@ -52,6 +57,11 @@ def agent_not_allowed() -> ApiError:
     return ApiError(403, "agent_not_allowed")
 
 
+# 403：resolve 的 model 不被任何候選的 models.allow 涵蓋（政策守門，不代選）
+def model_not_allowed() -> ApiError:
+    return ApiError(403, "model_not_allowed")
+
+
 # 404：不存在的 id 或未知路徑
 def not_found() -> ApiError:
     return ApiError(404, "not_found")
@@ -60,6 +70,21 @@ def not_found() -> ApiError:
 # 409：key 沒部署
 def not_deployed() -> ApiError:
     return ApiError(409, "not_deployed")
+
+
+# 400：resolve 的 model 省略且沒有候選能推導模型（不代選）
+def no_model() -> ApiError:
+    return ApiError(400, "no_model")
+
+
+# 409：resolve 的候選全部冷卻中；until＝最早恢復時刻（呼叫方把重試排到那個時刻）
+def cooling(until: str) -> ApiError:
+    return ApiError(409, "cooling", until=until)
+
+
+# 409：resolve 的 exclude 排除後沒有候選（沒有恢復時刻；不是冷卻）
+def no_candidate() -> ApiError:
+    return ApiError(409, "no_candidate")
 
 
 # 413：body 超過 1 MB

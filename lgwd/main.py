@@ -29,6 +29,7 @@ from .keysync import DEFAULT_INTERVAL as DEFAULT_KEYSYNC_INTERVAL
 from .keysync import DEFAULT_TIMEOUT as DEFAULT_KEYSYNC_TIMEOUT
 from .keysync import KeySyncTimer, default_script as default_keysync_script
 from .policy import PolicyError, load_policy
+from .providers import validate_endpoints
 from .registry import RegistryService
 
 _LOG = logging.getLogger("lgwd.main")
@@ -198,6 +199,12 @@ class Gateway:
         self._config = config
         self._clock = clock or SystemClock()
         policy = load_policy(config.policy_path)  # 不合法直接丟，服務不啟動
+        try:
+            validate_endpoints()  # providers 表的 endpoint 不得內嵌憑證；不合法不啟動
+        except ValueError as exc:
+            # providers 不 import policy（避免循環）：固定字串在這裡轉成 PolicyError，
+            # 讓 spec 的「PolicyError、lgwd 不啟動」字面成立。
+            raise PolicyError(str(exc)) from None
         self._keys_stamp = _stat_stamp(config.keys_path)  # 讀檔前先記，避免漏掉變動
         keys = KeyStore(config.keys_path)  # 讀不到直接丟，服務不啟動
         self._keys = keys
