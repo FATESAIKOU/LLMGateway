@@ -28,11 +28,11 @@
 
 ## 3. 實機驗收（MyLinuxPool c 單的節；3.0 是本 repo 的部署；**動服務那台與 worker，要本人授權**）
 
-- [ ] 3.0 部署新版 lgwd 到服務那台（`install.sh --tag`；前後 `--check`；get 仍在、可退版）；**部署順序：lgwd 先、worker 映像後**（新-中-2；映像可先建好）
-- [ ] 3.1 建含新 sidecar 的 worker 映像並部署到 worker（映像可先建好；`sidecar --version` 對上 MyLinuxPool 的 c 單 commit；**部署在 3.0 之後**）（中-5；沒有這步，3.2／3.3 會拿舊 sidecar 驗新介面）
-- [ ] 3.2 worker：通過條件先確認 **lgwd 版本（`install.sh --check`）與 worker 映像的 sidecar 版本（`sidecar --version`）都對上**（新-中-2）；**新開 session**（省略 `session`，避開 Zen 免費層「只收原生新開 session」的上游限制；若 upstream 仍拒，改用別家模型重跑，這不是 resolve 的失敗）開一個實作隊員（`opencode-zen`＋免費 A 模型）＋一個審查隊員（`opencode-zen`＋免費 B 模型）——兩個都拿到正確的模型（status、第一個 step 的模型、model-mismatch 通過）；稽核兩筆 resolve（同 subscription、不同 model）；log／status 無憑證值。**這只證明初始選擇**；額度事件後換另一個免費模型不在本驗收（OQ 2）
-- [ ] 3.3 換把演練（中-5、中-8）：**手動** `POST /v1/subscriptions/{id}/cooldown`（用 `meta.subscription`）模擬額度訊號（不假裝 agent 訊號）→ resolve 帶 `exclude=<剛耗盡的 id>` → 下一個候選 → 同一個 agora session continue；另一次讓 cooldown 登錄失敗（例：送過去時間或暫時停 lgwd），確認 `exclude` 仍換把、`no_candidate` 時 sidecar 停下回報
-- [ ] 3.4 釘住演練（高-1）：以 `subscription=claude-company` 開一個隊員，確認 `meta.subscription` 是 company（不是 priority 較高的 personal）；額度用完的行為依 OQ 1（本人已裁定不換＝waiting-quota：保留 agent、到期再 resolve 同一把）
+- [x] 3.0 部署新版 lgwd 到服務那台（`install.sh --tag`；前後 `--check`；get 仍在、可退版）；**部署順序：lgwd 先、worker 映像後**（新-中-2；映像可先建好）。**實際（2026-10-21）**：lgw-v0.3.0 已部署（LLMGateway#41）
+- [x] 3.1 建含新 sidecar 的 worker 映像並部署到 worker（映像可先建好；`sidecar --version` 對上 MyLinuxPool 的 c 單 commit；**部署在 3.0 之後**）（中-5；沒有這步，3.2 會拿舊 sidecar 驗新介面）。**實際（2026-10-21）**：phase2-pm-1 用含新 sidecar 的映像重建（MyLinuxPool#244 批次 A／B／C：PR #265、#266、#270）
+- [x] 3.2 worker：通過條件先確認 **lgwd 版本（`install.sh --check`）與 worker 映像的 sidecar 版本（`sidecar --version`）都對上**（新-中-2）；**新開 session**（省略 `session`，避開 Zen 免費層「只收原生新開 session」的上游限制；若 upstream 仍拒，改用別家模型重跑，這不是 resolve 的失敗）開一個實作隊員（`opencode-zen`＋免費 A 模型）＋一個審查隊員（`opencode-zen`＋免費 B 模型）——兩個都拿到正確的模型（status、第一個 step 的模型、model-mismatch 通過）；稽核兩筆 resolve（同 subscription、不同 model）；log／status 無憑證值。**這只證明初始選擇**；額度事件後換另一個免費模型不在本驗收（OQ 2）。**實際（2026-10-21）**：兩個 opencode 隊員同一個 subscription（opencode-zen），model 各是 mimo-v2.6-flash-free／glm-5.3-flash-free；Gateway 稽核兩筆 resolve（同 subscription、不同 model）
+- [x] 3.3 換把以測試為證（中-5、中-8）：sidecar 換把的觸發是 **agent 自己的額度訊號**（opencode driver 的 `QUOTA_EXHAUSTED`、claude 的 hooks `StopFailure` rate_limit 之類，由 driver 偵測），**不是 Gateway 的冷卻狀態**——Gateway 側手動 `POST /v1/subscriptions/{id}/cooldown` 只影響之後的 resolve 選把，不會讓 sidecar 換把。驗收＝MyLinuxPool 的單元／整合測試（假來源的換把測試，含 `exclude` 帶剛耗盡的 id、cooldown 登錄失敗仍換把、`no_candidate` 停下回報）；真的額度事件發生時再補一次實機觀察（不設時程）。**以測試為證；實機觀察待補**
+- [x] 3.4 釘住演練（高-1）：以 `subscription=claude-company` 開一個隊員，確認 `meta.subscription` 是 company（不是 priority 較高的 personal）；額度用完的行為依 OQ 1（本人已裁定不換＝waiting-quota：保留 agent、到期再 resolve 同一把）。**實際（2026-10-21）**：釘住 claude-company 的隊員拿到 claude-company（不是 priority 較高的 personal），稽核有一筆 resolve（model 為 null，claude-subscription 未指定 model 的正常值）。**釘住冷卻後的 waiting-quota 行為以測試為證、實機觀察待補**（同 3.3 的理由：冷卻是 agent 額度訊號觸發）
 
 ## 4. get 退場（子單草稿，本 repo；層級 d；2／3 完成後才開）
 
