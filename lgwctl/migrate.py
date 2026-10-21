@@ -1928,7 +1928,9 @@ def rollback_to_user(layout, *, old_home: str | None = None, inner: bool = False
 
     人手跑的這一次只排一個 transient unit 就結束（ssh 連線斷了也不影響）；
     真正的工作在 ``--inner``（要求 systemd 設的 ``INVOCATION_ID``，與 cutover
-    同一套判斷），跑在 ``lgw-rollback`` unit 裡、輸出進 journal。
+    同一套判斷），跑在 ``lgw-rollback`` unit 裡、輸出進 journal。一定會被
+    拒絕的情況（finalized、舊 unit 檔不在）在外層就直接回 1，不排 unit——
+    不然印了「已排入」，實際拒絕的是 inner。
     """
     report = report or MigrationReport()
     if not runmod.require_root(layout, report):
@@ -1943,6 +1945,13 @@ def rollback_to_user(layout, *, old_home: str | None = None, inner: bool = False
                                  "llmgwctl rollback-to-user，它會分離執行）")
             return 1
         return _rollback_inner(layout, old, report)
+    # 中-4 同理：一定會被拒絕的情況在排 transient unit 之前就擋下來（訊息與
+    # inner 同一句，不然外層會印「已排入」而真正拒絕的是 inner）。只讀狀態、
+    # 不拿 flock——提早拒絕而已，真正的決定仍在 inner 持鎖後再判一次。
+    refusal = _rollback_refusal(old, read_state(layout))
+    if refusal is not None:
+        report.fail(*refusal)
+        return 1
     # 分離執行：立刻返回，操作者看重連後的 journal／status。
     argv = rollback_unit_argv(layout, old_home=old.home)
     try:
@@ -1978,6 +1987,25 @@ def _rollback_inner(layout, old: OldLayout, report) -> int:
         lock.release()
 
 
+def _rollback_refusal(old: OldLayout, state: dict) -> tuple[str, str] | None:
+    """回舊版「一定會被拒絕」的兩個條件（outer 排程前與 ``_rollback_locked`` 共用）。
+
+    只判斷、不動任何東西：回 ``(報告項目名, 訊息)`` 給呼叫方 ``report.fail``；
+    可以回舊版就回 ``None``。訊息與原本寫在 ``_rollback_locked`` 裡的一字不差
+    （外層要印同一句，不然「已排入」與實際結果對不上）。
+    """
+    if state.get("phase") == PHASE_FINALIZED:
+        return ("rollback", "狀態是 finalized（舊 unit 與舊目錄已收走）；"
+                            "不能回舊版（要新的就修新版或重裝）")
+    missing = [unit for unit in OLD_UNIT_NAMES
+               if not os.path.isfile(old.unit_file(unit))]
+    if missing:
+        # 中-4／低-2：舊 unit 檔不在就停手——停掉新版只會讓機器沒有任何服務。
+        return ("rollback", f"舊 unit 檔不在（{old.unit_dir} 的 "
+                            f"{'、'.join(missing)}）；不動新 unit")
+    return None
+
+
 def _rollback_locked(layout, old: OldLayout, report) -> int:
     """回舊版的本體（呼叫方已持有 flock；停損時由 inner 直接呼叫）。
 
@@ -1989,16 +2017,9 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
     """
     state = read_state(layout)
     phase = state.get("phase")
-    if phase == PHASE_FINALIZED:
-        report.fail("rollback", "狀態是 finalized（舊 unit 與舊目錄已收走）；"
-                                "不能回舊版（要新的就修新版或重裝）")
-        return 1
-    missing = [unit for unit in OLD_UNIT_NAMES
-               if not os.path.isfile(old.unit_file(unit))]
-    if missing:
-        # 中-4／低-2：舊 unit 檔不在就停手——停掉新版只會讓機器沒有任何服務。
-        report.fail("rollback", f"舊 unit 檔不在（{old.unit_dir} 的 "
-                                f"{'、'.join(missing)}）；不動新 unit")
+    refusal = _rollback_refusal(old, state)
+    if refusal is not None:
+        report.fail(*refusal)
         return 1
     if not state:
         # 提示要求：無狀態檔時照常冪等回舊版，但不能印 fail 卻回 0。

@@ -1834,6 +1834,66 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertIn("lgw-rollback", out)
         self.assert_no_values(out, err)
 
+    def test_outer_rollback_refuses_after_finalize_without_scheduling(self):
+        """#39：finalized 後外層就拒絕——不排 unit，也不印「已排入」。"""
+        self.box.write_cutover_state(phase="finalized", tag=FAKE_TAG,
+                                     old_home=self.box.service_home)
+        rc, out, err = self.box.run_migrate(["rollback-to-user"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "rollback", "fail"), out)
+        self.assertFalse(has_line(out, "rollback", "ok"), out)
+        # 訊息就是 _rollback_locked 那一句（外層與 inner 同一個判斷）
+        self.assertIn("狀態是 finalized（舊 unit 與舊目錄已收走）", out)
+        # 假 systemd-run 沒被呼叫：外層什麼都沒排、unit 與狀態都沒動
+        self.assertEqual(self.box.order(), [])
+        self.assertEqual(self.box.actions(), [])
+        self.assertTrue(self.box.active("llmgateway.service"))
+        self.assertTrue(self.box.active("llmgateway-tunnel.service"))
+        self.assertEqual(self.box.cutover_state()["phase"], "finalized")
+        self.assert_no_values(out, err)
+        # inner 自己再判一次（跑在同一個鎖裡），拒絕的字串一模一樣
+        rc_inner, out_inner, _ = self.rollback()
+        self.assertEqual(rc_inner, 1)
+        same = [line for line in out.splitlines() if line.startswith("fail rollback")]
+        self.assertEqual(same,
+                         [line for line in out_inner.splitlines()
+                          if line.startswith("fail rollback")], same)
+        self.assertEqual(self.box.order(), [])
+
+    def test_outer_rollback_refuses_when_an_old_unit_file_is_missing(self):
+        """#39：舊 unit 檔不在時外層就不排 unit（停新版只會讓機器沒服務）。"""
+        os.unlink(self.box.old_units("key-sync.service"))
+        rc, out, err = self.box.run_migrate(["rollback-to-user"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(has_line(out, "rollback", "fail"), out)
+        self.assertIn("key-sync.service", out)
+        self.assertEqual(self.box.order(), [])
+        self.assertEqual(self.box.actions(), [])
+        self.assertTrue(self.box.active("llmgateway.service"))
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+        self.assert_no_values(out, err)
+
+    def test_outer_rollback_still_schedules_outside_the_refusals(self):
+        """#39 的反面：只有「一定會被拒絕」才提早擋，其餘照舊排 unit 回 0。"""
+        cases = (("confirmed", {"phase": "confirmed", "tag": FAKE_TAG}),
+                 ("reverted", {"phase": "reverted", "tag": FAKE_TAG}),
+                 ("沒有狀態檔", None))
+        for label, fields in cases:
+            with self.subTest(label):
+                seen = len(self.box.order())
+                if fields is None:
+                    os.unlink(self.box.ctl(".cutover.state"))
+                else:
+                    self.box.write_cutover_state(**fields)
+                rc, out, err = self.box.run_migrate(["rollback-to-user"])
+                self.assertEqual(rc, 0, out + err)
+                self.assertTrue(has_line(out, "rollback", "ok"), out)
+                order = self.box.order()[seen:]
+                self.assertEqual(len(order), 1, order)
+                self.assertIn("systemd-run --unit=lgw-rollback", order[0])
+                self.assertIn("--inner", order[0])
+                self.assertEqual(self.box.actions(), [])
+
     @unittest.skipIf(os.geteuid() == 0, "root 身分下沒有 prefix 會動真機，略過")
     def test_rollback_needs_root_without_prefix(self):
         env = {name: value for name, value in self.box.env.items()
