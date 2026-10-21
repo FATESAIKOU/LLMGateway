@@ -66,8 +66,7 @@ class Store:
 
     @contextlib.contextmanager
     def txn(self) -> Iterator[sqlite3.Cursor]:
-        """一筆 BEGIN IMMEDIATE 交易；成功或預期的拒絕（ApiError）都 commit，
-        非預期錯誤才 rollback。"""
+        """一筆 BEGIN IMMEDIATE 交易；成功才 commit；任何例外（含 ApiError）都 rollback。"""
         with self._lock:
             cur = self._conn.cursor()
             try:

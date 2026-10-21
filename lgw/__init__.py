@@ -6,7 +6,7 @@
   （不帶認證標頭；連不上回「無法確認」）。
 - `lgw.signals`：額度訊號規則，給 sidecar 的 AgentDriver 當函式庫用。
 
-規格：openspec/changes/gateway-v0/（design 決定 6、9；v5 拿掉客戶端連線程式）。
+規格：openspec/changes/gateway-v0/（design 決定 6、9；v5 拿掉客戶端連線程式）、openspec/changes/agent-provider-model-interface/（resolve）。
 """
 
 from __future__ import annotations

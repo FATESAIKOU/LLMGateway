@@ -600,8 +600,8 @@ class ResolveTest(RegistryCase):
                 err = self.assert_api_error(400, "bad_request", self.resolve, agent, provider)
                 self.assertEqual(err.body()["missing"], sorted(missing))
                 self.assertNotIn("env", err.body())
-        # 空字串也是沒給（HTTP 層後同一個入口）
-        err = self.assert_api_error(400, "bad_request", self.resolve, None, "opencode-zen")
+        # service 層只對 agent／provider 做 falsy 檢查，空字串也是沒給；model／subscription 的空值歸一化在 HTTP 層（test_http）
+        err = self.assert_api_error(400, "bad_request", self.resolve, "", "opencode-zen")
         self.assertEqual(err.body()["missing"], ["agent"])
 
     def test_未知的agent(self):

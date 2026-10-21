@@ -52,7 +52,7 @@ ENV_SCHEMA_VERSION = 1
 
 
 def _has_wildcard(pattern: str) -> bool:
-    """樣式裡有 fnmatch 的萬用字元（*、?、開頭字元的 [）。"""
+    """樣式含 fnmatch 的萬用字元（*、?、[；任何位置的 [ 都算）即不可推導。"""
     return any(ch in pattern for ch in ("*", "?", "["))
 
 
