@@ -564,6 +564,7 @@ class ResolveHttpTest(ServerCase):
         self.assertEqual(data["meta"]["model"], "claude-sonnet-5-5")
         self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "fake-personal")
         self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5-5")
+        self.assertEqual(data["env"]["ANTHROPIC_SMALL_FAST_MODEL"], "claude-sonnet-5-5")
         # 釘住已移除的公司那一把 → 404
         status, payload = self.call(
             "GET", "/v1/resolve?agent=claude-code&provider=anthropic&subscription=claude-company")

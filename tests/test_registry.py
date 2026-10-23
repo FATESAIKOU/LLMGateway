@@ -316,6 +316,16 @@ class GetTest(RegistryCase):
     def test_不存在的id回404(self):
         self.assert_api_error(404, "not_found", self.get, "ghost", "opencode")
 
+    def test_已移除的claude_company回404(self):
+        # #50：claude-company 還在 lgwd 的名單與 key 檔，但不在政策檔 → 404
+        err = self.assert_api_error(
+            404, "not_found", self.get, "claude-company", "claude-code")
+        self.assertNotIn("key", err.body())
+        err = self.assert_api_error(
+            404, "not_found", self.cooldown, "claude-company",
+            "2026-10-11T15:00:00Z")
+        self.assertNotIn("key", err.body())
+
     def test_key沒部署回409(self):
         self.keys_path.write_text(
             key_text({k: v for k, v in CANARY.items() if k != "claude-personal"}),
@@ -517,6 +527,22 @@ class ResolveTest(RegistryCase):
         return RegistryService(self.db_path, load_policy(str(path)),
                                self.keys, self.clock)
 
+    def _policy_with_company(self):
+        """真政策為底，把 claude-company 加回去（假政策；出廠政策已移除它）。
+
+        lgwd 仍認得 claude-company，選把規則（冷卻、exclude、最早 until）
+        要有兩把才測得到。personal 的 priority 設回 10（出廠是 40），讓
+        「personal 優先、company 次之」成立，Scenario 才照原意。
+        """
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        obj["subscriptions"]["claude-personal"]["priority"] = 10
+        obj["subscriptions"]["claude-company"] = {
+            "priority": 20,
+            "agents": ["claude-code"],
+            "models": {"allow": ["*"], "default": None},
+        }
+        return obj
+
     def _patch_two_api_key_subscriptions(self):
         """把 Claude 兩把映射成同一個非 claude-subscription 的 provider。
 
@@ -555,12 +581,18 @@ class ResolveTest(RegistryCase):
         self.assertNotIn("env", err.body())
 
     def test_釘住的那把冷卻中(self):
-        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
-        err = self.assert_api_error(
-            409, "cooling", self.resolve, "claude-code", "anthropic",
-            subscription="claude-personal")
-        self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
-        self.assertNotIn("env", err.body())
+        # 兩把的假政策：釘住的 personal 冷卻中，不代換成 company
+        service = self._service_with_policy(self._policy_with_company())
+        try:
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
+            err = self.assert_api_error(
+                409, "cooling", service.resolve, "claude-code", "anthropic",
+                subscription="claude-personal")
+            self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
+            self.assertNotIn("env", err.body())
+        finally:
+            service.close()
 
     def test_釘住的subscription與provider不一致(self):
         err = self.assert_api_error(
@@ -571,29 +603,30 @@ class ResolveTest(RegistryCase):
     def test_釘住與排除同時給(self):
         err = self.assert_api_error(
             400, "bad_request", self.resolve, "claude-code", "anthropic",
-            subscription="claude-company", exclude="claude-personal")
+            subscription="claude-personal", exclude="ollama-cloud")
         self.assertNotIn("env", err.body())
 
     def test_排除唯一一把回no_candidate(self):
-        # #50：anthropic 只剩 claude-personal；exclude 掉它就沒有候選
+        # claude-company 已不在出廠政策檔，anthropic 只剩 claude-personal；
+        # exclude 掉它就沒有候選
         err = self.assert_api_error(
             409, "no_candidate", self.resolve, "claude-code", "anthropic",
             exclude="claude-personal")
         self.assertNotIn("env", err.body())
+        # 被排除的那把冷卻中也不回 cooling：no_candidate 是 exclude 造成的
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        err = self.assert_api_error(
+            409, "no_candidate", self.resolve, "claude-code", "anthropic",
+            exclude="claude-personal")
+        self.assertNotIn("env", err.body())
+        self.assertNotIn("until", err.body())  # 不回 cooling（沒有恢復時刻）
 
-    def test_排除後沒有候選(self):
-        # anthropic 只有 personal 一把；exclude 掉後沒有候選
-        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
-        service = self._service_with_policy(obj)
+    def test_換把時排除剛耗盡的那一把(self):
+        service = self._service_with_policy(self._policy_with_company())
         try:
-            # 被排除的那把冷卻中也不回 cooling：no_candidate 是 exclude 造成的
-            service.register_cooldown(
-                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
-            err = self.assert_api_error(
-                409, "no_candidate", service.resolve,
+            payload = service.resolve(
                 "claude-code", "anthropic", exclude="claude-personal")
-            self.assertNotIn("env", err.body())
-            self.assertNotIn("until", err.body())  # 不回 cooling（沒有恢復時刻）
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")
         finally:
             service.close()
 
@@ -647,18 +680,35 @@ class ResolveTest(RegistryCase):
     # --- resolve 的選把規則的 Scenario ---
 
     def test_唯一一把冷卻中(self):
-        # #50：anthropic 只剩 claude-personal，冷卻中沒有別把可換
+        # #50：出廠政策 anthropic 只剩 claude-personal，冷卻中沒有別把可換
         self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         err = self.assert_api_error(409, "cooling", self.resolve, "claude-code", "anthropic")
         self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
         self.assertNotIn("env", err.body())
 
+    def test_同provider兩把一把冷卻中(self):
+        service = self._service_with_policy(self._policy_with_company())
+        try:
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
+            payload = service.resolve("claude-code", "anthropic")
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")  # priority 20
+        finally:
+            service.close()
+
     def test_全部候選冷卻中(self):
-        # 出廠政策下 claude-code 的 ollama-cloud（provider 不同）不算 anthropic 候選
-        self.cooldown("claude-personal", "2026-10-11T16:00:00Z")
-        err = self.assert_api_error(409, "cooling", self.resolve, "claude-code", "anthropic")
-        self.assertEqual(err.body()["until"], "2026-10-11T16:00:00Z")
-        self.assertNotIn("env", err.body())
+        service = self._service_with_policy(self._policy_with_company())
+        try:
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T16:00:00Z"})
+            service.register_cooldown(
+                "claude-company", {"until": "2026-10-11T15:00:00Z"})
+            err = self.assert_api_error(
+                409, "cooling", service.resolve, "claude-code", "anthropic")
+            self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")  # 最早恢復時刻
+            self.assertNotIn("env", err.body())
+        finally:
+            service.close()
 
     def test_model不在allow(self):
         err = self.assert_api_error(
@@ -827,6 +877,7 @@ class ResolveTest(RegistryCase):
                          ["ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
                           "CLAUDE_CODE_OAUTH_TOKEN"])
         self.assertEqual(payload["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5-5")
+        self.assertEqual(payload["env"]["ANTHROPIC_SMALL_FAST_MODEL"], "claude-sonnet-5-5")
         self.assertEqual(payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"], CANARY["claude-personal"])
 
     def test_opencode的兩個模型_片段(self):
