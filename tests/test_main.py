@@ -143,7 +143,7 @@ class ApiTest(MainCase):
         status, raw = http_get(self.base + "/v1/subscriptions")
         self.assertEqual(status, 200)  # 不做應用層認證
         data = json.loads(raw)
-        self.assertEqual(len(data["subscriptions"]), 5)
+        self.assertEqual(len(data["subscriptions"]), 4)
         blob = raw.decode()
         for value in FAKE_KEYS.values():
             self.assertNotIn(value, blob)
@@ -160,7 +160,7 @@ class ApiTest(MainCase):
 
     def test_opencode拿不到Claude訂閱(self):
         status, raw = http_get(
-            self.base + "/v1/subscriptions/claude-company?agent=opencode")
+            self.base + "/v1/subscriptions/claude-personal?agent=opencode")
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(raw), {"error": "agent_not_allowed"})
 

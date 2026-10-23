@@ -54,8 +54,8 @@ class LoadDefaultPolicyTests(unittest.TestCase):
     def test_default_policy_loads(self):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         order = [s.name for s in policy.in_priority_order()]
-        self.assertEqual(order, ["claude-personal", "opencode-zen",
-                                 "claude-company", "openrouter", "ollama-cloud"])
+        self.assertEqual(order, ["opencode-zen", "openrouter",
+                                 "ollama-cloud", "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
         self.assertEqual(policy.subscriptions["openrouter"].models_allow,
@@ -65,6 +65,16 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
         self.assertFalse(hasattr(policy, "cooldown_buffer_seconds"))  # 窗口欄位拿掉
         self.assertFalse(hasattr(policy, "resets_at_max_ahead_seconds"))
+
+    def test_出廠政策移除claude_company且claude_personal排最後(self):
+        # #50：拔掉公司 Claude 訂閱；claude-personal 排在 Ollama 之後並預設 Sonnet
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        self.assertEqual(set(policy.subscriptions),
+                         {"claude-personal", "opencode-zen", "openrouter", "ollama-cloud"})
+        self.assertEqual([s.name for s in policy.in_priority_order()],
+                         ["opencode-zen", "openrouter", "ollama-cloud", "claude-personal"])
+        self.assertEqual(policy.subscriptions["claude-personal"].models_default,
+                         "claude-sonnet-5-5")
 
     def test_openrouter出廠預設openrouter_free(self):
         # 出廠政策檔：openrouter 的 default 是 openrouter/free，allow 含 *:free 與
@@ -76,15 +86,14 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertIn("openrouter/free", or_sub.models_allow)
         self.assertEqual(len(or_sub.models_allow), 2)
 
-    def test_出廠五筆訂閱的models_default(self):
-        # 出廠政策檔逐筆釘住：Claude 兩筆維持 null（kind=claude-subscription 時
-        # 表示用 Claude Code 自己的預設），其餘三筆各自有 default。非 null 的
+    def test_出廠四筆訂閱的models_default(self):
+        # 出廠政策檔逐筆釘住：四筆各自有 default（#50 起 claude-personal 預設
+        # claude-sonnet-5-5，claude-company 已移除）。非 null 的
         # default 必須被同一筆的 allow 樣式涵蓋（allow 是 fnmatch 樣式；
         # lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         expected = {
-            "claude-personal": None,
-            "claude-company": None,
+            "claude-personal": "claude-sonnet-5-5",
             "opencode-zen": "mimo-v2.6-flash-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",

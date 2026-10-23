@@ -2,14 +2,9 @@
   "version": 1,
   "subscriptions": {
     "claude-personal": {
-      "priority": 10,
+      "priority": 40,
       "agents": ["claude-code"],
-      "models": {"allow": ["*"], "default": null}
-    },
-    "claude-company": {
-      "priority": 20,
-      "agents": ["claude-code"],
-      "models": {"allow": ["*"], "default": null}
+      "models": {"allow": ["*"], "default": "claude-sonnet-5-5"}
     },
     "opencode-zen": {
       "priority": 10,

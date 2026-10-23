@@ -555,13 +555,25 @@ class ResolveHttpTest(ServerCase):
             "GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
         self.assertEqual(status, 200)
         self.assertEqual(self.json_of(payload)["meta"]["model"], "mimo-v2.6-flash-free")
-        # 釘住公司那一把
+        # anthropic 只剩 personal：預設挑它，model 取政策預設
         status, payload = self.call(
-            "GET", "/v1/resolve?agent=claude-code&provider=anthropic&subscription=claude-company")
+            "GET", "/v1/resolve?agent=claude-code&provider=anthropic")
         self.assertEqual(status, 200)
         data = self.json_of(payload)
-        self.assertEqual(data["meta"]["subscription"], "claude-company")
-        self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "fake-company")
+        self.assertEqual(data["meta"]["subscription"], "claude-personal")
+        self.assertEqual(data["meta"]["model"], "claude-sonnet-5-5")
+        self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "fake-personal")
+        self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5-5")
+        # 釘住已移除的公司那一把 → 404
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=claude-code&provider=anthropic&subscription=claude-company")
+        self.assertEqual(status, 404)
+        self.assertEqual(self.json_of(payload)["error"], "not_found")
+        # exclude 掉唯一一把 → 409 no_candidate
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=claude-code&provider=anthropic&exclude=claude-personal")
+        self.assertEqual(status, 409)
+        self.assertEqual(self.json_of(payload)["error"], "no_candidate")
 
     def test_resolve端到端_錯誤precedence(self):
         cases = [
@@ -576,7 +588,7 @@ class ResolveHttpTest(ServerCase):
             ("/v1/resolve?agent=claude-code&provider=anthropic&subscription=opencode-zen",
              400, "bad_request", None),
             ("/v1/resolve?agent=claude-code&provider=anthropic"
-             "&subscription=claude-company&exclude=claude-personal",
+             "&subscription=claude-personal&exclude=ollama-cloud",
              400, "bad_request", None),
             (# 查無
              "/v1/resolve?agent=opencode&provider=NoSuchProvider", 404, "not_found", None),
@@ -622,9 +634,9 @@ class ResolveHttpTest(ServerCase):
         # 空白值＝沒給：exclude= 是合法釘住（透明語意）
         status, payload = self.call(
             "GET", "/v1/resolve?agent=claude-code&provider=anthropic"
-                   "&subscription=claude-company&exclude=")
+                   "&subscription=claude-personal&exclude=")
         self.assertEqual(status, 200)
-        self.assertEqual(self.json_of(payload)["meta"]["subscription"], "claude-company")
+        self.assertEqual(self.json_of(payload)["meta"]["subscription"], "claude-personal")
         # 空白的 model 視為省略
         status, payload = self.call(
             "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=")
