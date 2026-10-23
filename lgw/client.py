@@ -5,7 +5,7 @@
     client = lgw.client.Client("http://127.0.0.1:4710")  # base URL 由呼叫方給
     client.list()
     client.resolve("opencode", "opencode-zen", model="big-pickle")
-    client.resolve("claude-code", "anthropic", subscription="claude-company")
+    client.resolve("claude-code", "anthropic", subscription="claude-personal")
     client.get("claude-personal", "claude-code")
     client.cooldown("claude-personal", "2026-10-12T03:00:00Z")
 

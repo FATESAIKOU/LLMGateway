@@ -108,7 +108,6 @@ class JsonSchemaTest(RegistryCase):
     def test_provider欄位(self):
         expected = {
             "claude-personal": ("anthropic", "claude-subscription", None),
-            "claude-company": ("anthropic", "claude-subscription", None),
             "openrouter": ("openrouter", "api-key", "https://openrouter.ai/api"),
             "opencode-zen": ("opencode-zen", "api-key", "https://opencode.ai/zen/v1"),
             "ollama-cloud": ("ollama-cloud", "api-key", "https://ollama.com"),
@@ -126,14 +125,12 @@ class JsonSchemaTest(RegistryCase):
         # lgwd/providers.py 為準）；Claude 訂閱是 null（由 agent 直連）。
         expected = {
             "claude-personal": None,
-            "claude-company": None,
             "openrouter": "https://openrouter.ai/api",
             "ollama-cloud": "https://ollama.com",
             "opencode-zen": "https://opencode.ai/zen/v1",
         }
         agents = {
             "claude-personal": "claude-code",
-            "claude-company": "claude-code",
             "openrouter": "opencode",
             "ollama-cloud": "opencode",
             "opencode-zen": "opencode",
@@ -171,18 +168,16 @@ class JsonSchemaTest(RegistryCase):
         )
 
     def test_get與list照出廠值帶出models_default(self):
-        # get 與 list 的回覆逐筆帶出出廠的 models.default；Claude 兩筆是 JSON
-        # 的 null（不是空字串、也沒有缺欄）。
+        # get 與 list 的回覆逐筆帶出出廠的 models.default（#50 起 claude-personal
+        # 預設 claude-sonnet-5-5）。
         expected = {
-            "claude-personal": None,
-            "claude-company": None,
+            "claude-personal": "claude-sonnet-5-5",
             "opencode-zen": "mimo-v2.6-flash-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
         agents = {
             "claude-personal": "claude-code",
-            "claude-company": "claude-code",
             "opencode-zen": "opencode",
             "openrouter": "opencode",
             "ollama-cloud": "opencode",
@@ -197,7 +192,7 @@ class JsonSchemaTest(RegistryCase):
                                   f"{sub} 的 {source} 缺 default 欄")
                     self.assertEqual(payload["models"]["default"], default,
                                      f"{sub} 的 {source} 回傳的 default 不對")
-                    # JSON 往返後照樣（Claude 兩筆仍是 null）
+                    # JSON 往返後照樣
                     roundtrip = json.loads(json.dumps(payload, ensure_ascii=False))
                     self.assertEqual(roundtrip["models"]["default"], default)
                     if default is None:
@@ -214,19 +209,29 @@ class ModelsDefaultSemanticsTest(RegistryCase):
         return RegistryService(self.db_path, load_policy(str(path)),
                                self.keys, self.clock)
 
-    def test_Claude訂閱沒有預設(self):
-        # Scenario: Claude 訂閱沒有預設—讀 claude-personal 的共通 JSON，
-        # models.default 為 null；呼叫方不帶模型參數，用 Claude Code 自己的預設。
+    def test_Claude訂閱預設Sonnet(self):
+        # #50：出廠政策把 claude-personal 的 models.default 設成 claude-sonnet-5-5
+        # （原本是 null＝用 Claude Code 自己的預設）。
         item = self.get("claude-personal", "claude-code")
         self.assertEqual(item["kind"], "claude-subscription")
-        self.assertIn("default", item["models"])
-        self.assertIsNone(item["models"]["default"])
+        self.assertEqual(item["models"]["default"], "claude-sonnet-5-5")
         listed = _by_id(self.list_items())["claude-personal"]
-        self.assertIsNone(listed["models"]["default"])
-        # JSON 的 null，不是空字串
-        blob = json.dumps(item, ensure_ascii=False)
-        self.assertIn('"default": null', blob)
-        self.assertEqual(json.loads(blob)["models"]["default"], None)
+        self.assertEqual(listed["models"]["default"], "claude-sonnet-5-5")
+
+    def test_Claude訂閱default為null時照回null(self):
+        # 假政策檔（claude-personal 的 default 改成 null），不動出廠政策檔。
+        with open(REPO_ROOT / "policy" / "default.json", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        obj["subscriptions"]["claude-personal"]["models"]["default"] = None
+        service = self._service_with_policy(obj)
+        try:
+            item = service.get_subscription("claude-personal", "claude-code")
+            self.assertIn("default", item["models"])
+            self.assertIsNone(item["models"]["default"])
+            # JSON 的 null，不是空字串
+            self.assertIn('"default": null', json.dumps(item, ensure_ascii=False))
+        finally:
+            service.close()
 
     def test_其他kind沒有預設(self):
         # Scenario: 其他 kind 沒有預設—非 claude-subscription 的 default 為
@@ -267,7 +272,7 @@ class ListTest(RegistryCase):
         self.assertEqual(priorities, sorted(priorities))
         self.assertEqual(
             [item["id"] for item in items],
-            ["claude-personal", "opencode-zen", "claude-company", "openrouter", "ollama-cloud"],
+            ["opencode-zen", "openrouter", "ollama-cloud", "claude-personal"],
         )
 
     def test_冷卻反映在list(self):
@@ -291,7 +296,7 @@ class GetTest(RegistryCase):
         self.assertEqual(item["key"], CANARY["claude-personal"])
 
     def test_opencode不能拿Claude訂閱(self):
-        err = self.assert_api_error(403, "agent_not_allowed", self.get, "claude-company", "opencode")
+        err = self.assert_api_error(403, "agent_not_allowed", self.get, "claude-personal", "opencode")
         self.assertNotIn("key", err.body())
 
     def test_冷卻中仍可get(self):
@@ -311,13 +316,23 @@ class GetTest(RegistryCase):
     def test_不存在的id回404(self):
         self.assert_api_error(404, "not_found", self.get, "ghost", "opencode")
 
+    def test_已移除的claude_company回404(self):
+        # #50：claude-company 還在 lgwd 的名單與 key 檔，但不在政策檔 → 404
+        err = self.assert_api_error(
+            404, "not_found", self.get, "claude-company", "claude-code")
+        self.assertNotIn("key", err.body())
+        err = self.assert_api_error(
+            404, "not_found", self.cooldown, "claude-company",
+            "2026-10-11T15:00:00Z")
+        self.assertNotIn("key", err.body())
+
     def test_key沒部署回409(self):
         self.keys_path.write_text(
-            key_text({k: v for k, v in CANARY.items() if k != "claude-company"}),
+            key_text({k: v for k, v in CANARY.items() if k != "claude-personal"}),
             encoding="utf-8",
         )
         self.keys.reload()
-        err = self.assert_api_error(409, "not_deployed", self.get, "claude-company", "claude-code")
+        err = self.assert_api_error(409, "not_deployed", self.get, "claude-personal", "claude-code")
         self.assertNotIn("key", err.body())
 
     def test_get_openrouter回傳default模型(self):
@@ -512,6 +527,22 @@ class ResolveTest(RegistryCase):
         return RegistryService(self.db_path, load_policy(str(path)),
                                self.keys, self.clock)
 
+    def _policy_with_company(self):
+        """真政策為底，把 claude-company 加回去（假政策；出廠政策已移除它）。
+
+        lgwd 仍認得 claude-company，選把規則（冷卻、exclude、最早 until）
+        要有兩把才測得到。personal 的 priority 設回 10（出廠是 40），讓
+        「personal 優先、company 次之」成立，Scenario 才照原意。
+        """
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        obj["subscriptions"]["claude-personal"]["priority"] = 10
+        obj["subscriptions"]["claude-company"] = {
+            "priority": 20,
+            "agents": ["claude-code"],
+            "models": {"allow": ["*"], "default": None},
+        }
+        return obj
+
     def _patch_two_api_key_subscriptions(self):
         """把 Claude 兩把映射成同一個非 claude-subscription 的 provider。
 
@@ -542,18 +573,26 @@ class ResolveTest(RegistryCase):
             self.assertEqual(payload["meta"]["model"], model)
         self.assertNotEqual(a["env"], b["env"])  # 模型設定不同
 
-    def test_釘住公司那一把(self):
-        # claude-personal（priority 10）未冷卻、已部署；釘住後仍選 company
-        payload = self.resolve("claude-code", "anthropic", subscription="claude-company")
-        self.assertEqual(payload["meta"]["subscription"], "claude-company")
+    def test_釘住已移除的公司那一把(self):
+        # #50：claude-company 已不在出廠政策檔 → 404
+        err = self.assert_api_error(
+            404, "not_found", self.resolve, "claude-code", "anthropic",
+            subscription="claude-company")
+        self.assertNotIn("env", err.body())
 
     def test_釘住的那把冷卻中(self):
-        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
-        err = self.assert_api_error(
-            409, "cooling", self.resolve, "claude-code", "anthropic",
-            subscription="claude-personal")
-        self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
-        self.assertNotIn("env", err.body())
+        # 兩把的假政策：釘住的 personal 冷卻中，不代換成 company
+        service = self._service_with_policy(self._policy_with_company())
+        try:
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
+            err = self.assert_api_error(
+                409, "cooling", service.resolve, "claude-code", "anthropic",
+                subscription="claude-personal")
+            self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
+            self.assertNotIn("env", err.body())
+        finally:
+            service.close()
 
     def test_釘住的subscription與provider不一致(self):
         err = self.assert_api_error(
@@ -564,28 +603,30 @@ class ResolveTest(RegistryCase):
     def test_釘住與排除同時給(self):
         err = self.assert_api_error(
             400, "bad_request", self.resolve, "claude-code", "anthropic",
-            subscription="claude-company", exclude="claude-personal")
+            subscription="claude-personal", exclude="ollama-cloud")
         self.assertNotIn("env", err.body())
 
-    def test_換把時排除剛耗盡的那一把(self):
-        # cooldown 登錄失敗＝沒有進冷卻；exclude 在選把先擋掉 personal
-        payload = self.resolve("claude-code", "anthropic", exclude="claude-personal")
-        self.assertEqual(payload["meta"]["subscription"], "claude-company")
+    def test_排除唯一一把回no_candidate(self):
+        # claude-company 已不在出廠政策檔，anthropic 只剩 claude-personal；
+        # exclude 掉它就沒有候選
+        err = self.assert_api_error(
+            409, "no_candidate", self.resolve, "claude-code", "anthropic",
+            exclude="claude-personal")
+        self.assertNotIn("env", err.body())
+        # 被排除的那把冷卻中也不回 cooling：no_candidate 是 exclude 造成的
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        err = self.assert_api_error(
+            409, "no_candidate", self.resolve, "claude-code", "anthropic",
+            exclude="claude-personal")
+        self.assertNotIn("env", err.body())
+        self.assertNotIn("until", err.body())  # 不回 cooling（沒有恢復時刻）
 
-    def test_排除後沒有候選(self):
-        # claude-company 不在政策檔；exclude 掉 personal 後沒有候選
-        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
-        del obj["subscriptions"]["claude-company"]
-        service = self._service_with_policy(obj)
+    def test_換把時排除剛耗盡的那一把(self):
+        service = self._service_with_policy(self._policy_with_company())
         try:
-            # 被排除的那把冷卻中也不回 cooling：no_candidate 是 exclude 造成的
-            service.register_cooldown(
-                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
-            err = self.assert_api_error(
-                409, "no_candidate", service.resolve,
+            payload = service.resolve(
                 "claude-code", "anthropic", exclude="claude-personal")
-            self.assertNotIn("env", err.body())
-            self.assertNotIn("until", err.body())  # 不回 cooling（沒有恢復時刻）
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")
         finally:
             service.close()
 
@@ -638,17 +679,36 @@ class ResolveTest(RegistryCase):
 
     # --- resolve 的選把規則的 Scenario ---
 
-    def test_同provider兩把一把冷卻中(self):
+    def test_唯一一把冷卻中(self):
+        # #50：出廠政策 anthropic 只剩 claude-personal，冷卻中沒有別把可換
         self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
-        payload = self.resolve("claude-code", "anthropic")
-        self.assertEqual(payload["meta"]["subscription"], "claude-company")  # priority 20
+        err = self.assert_api_error(409, "cooling", self.resolve, "claude-code", "anthropic")
+        self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
+        self.assertNotIn("env", err.body())
+
+    def test_同provider兩把一把冷卻中(self):
+        service = self._service_with_policy(self._policy_with_company())
+        try:
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
+            payload = service.resolve("claude-code", "anthropic")
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")  # priority 20
+        finally:
+            service.close()
 
     def test_全部候選冷卻中(self):
-        self.cooldown("claude-personal", "2026-10-11T16:00:00Z")
-        self.cooldown("claude-company", "2026-10-11T15:00:00Z")
-        err = self.assert_api_error(409, "cooling", self.resolve, "claude-code", "anthropic")
-        self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")  # 最早恢復時刻
-        self.assertNotIn("env", err.body())
+        service = self._service_with_policy(self._policy_with_company())
+        try:
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T16:00:00Z"})
+            service.register_cooldown(
+                "claude-company", {"until": "2026-10-11T15:00:00Z"})
+            err = self.assert_api_error(
+                409, "cooling", service.resolve, "claude-code", "anthropic")
+            self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")  # 最早恢復時刻
+            self.assertNotIn("env", err.body())
+        finally:
+            service.close()
 
     def test_model不在allow(self):
         err = self.assert_api_error(
@@ -761,13 +821,13 @@ class ResolveTest(RegistryCase):
 
     def test_釘住的key未部署(self):
         self.keys_path.write_text(
-            key_text({k: v for k, v in CANARY.items() if k != "claude-company"}),
+            key_text({k: v for k, v in CANARY.items() if k != "claude-personal"}),
             encoding="utf-8",
         )
         self.keys.reload()
         err = self.assert_api_error(
             409, "not_deployed", self.resolve,
-            "claude-code", "anthropic", subscription="claude-company")
+            "claude-code", "anthropic", subscription="claude-personal")
         self.assertNotIn("env", err.body())
 
     def test_全部候選未部署(self):
@@ -810,9 +870,14 @@ class ResolveTest(RegistryCase):
 
     # --- env 的組成的 Scenario ---
 
-    def test_claude訂閱不帶模型變數(self):
+    def test_claude訂閱帶預設模型變數(self):
+        # #50：claude-personal 有 default（claude-sonnet-5-5），env 多模型變數
         payload = self.resolve("claude-code", "anthropic", subscription="claude-personal")
-        self.assertEqual(sorted(payload["env"]), ["CLAUDE_CODE_OAUTH_TOKEN"])
+        self.assertEqual(sorted(payload["env"]),
+                         ["ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+                          "CLAUDE_CODE_OAUTH_TOKEN"])
+        self.assertEqual(payload["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5-5")
+        self.assertEqual(payload["env"]["ANTHROPIC_SMALL_FAST_MODEL"], "claude-sonnet-5-5")
         self.assertEqual(payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"], CANARY["claude-personal"])
 
     def test_opencode的兩個模型_片段(self):
@@ -852,8 +917,20 @@ class ResolveTest(RegistryCase):
 
     def test_claude_subscription的預設(self):
         payload = self.resolve("claude-code", "anthropic", subscription="claude-personal")
-        self.assertEqual(payload["meta"]["model"], None)  # agent 自己的預設
-        self.assertNotIn("ANTHROPIC_MODEL", payload["env"])
+        self.assertEqual(payload["meta"]["model"], "claude-sonnet-5-5")  # #50 的政策預設
+        self.assertEqual(payload["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5-5")
+
+    def test_claude_subscription的預設為null(self):
+        # 假政策（default null）：agent 自己的預設，不帶 ANTHROPIC_MODEL
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        obj["subscriptions"]["claude-personal"]["models"]["default"] = None
+        service = self._service_with_policy(obj)
+        try:
+            payload = service.resolve("claude-code", "anthropic")
+            self.assertIsNone(payload["meta"]["model"])
+            self.assertNotIn("ANTHROPIC_MODEL", payload["env"])
+        finally:
+            service.close()
 
     def test_api_key的預設(self):
         payload = self.resolve("opencode", "opencode-zen")
@@ -915,11 +992,18 @@ class ResolveTest(RegistryCase):
         self.assertEqual(self.service._store.audit_all(), [])
 
     def test_resolve留紀錄model為null(self):
-        # claude-subscription 用 agent 預設：model 欄位是 null，不是空字串
-        self.resolve("claude-code", "anthropic", subscription="claude-company")
-        row = self.service._store.audit_all()[0]
-        self.assertIsNone(row["model"])
-        self.assertEqual(row["provider"], "anthropic")
+        # claude-subscription 用 agent 預設（政策 default 為 null）：model 欄位是
+        # null，不是空字串
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        obj["subscriptions"]["claude-personal"]["models"]["default"] = None
+        service = self._service_with_policy(obj)
+        try:
+            service.resolve("claude-code", "anthropic")
+            row = service._store.audit_all()[0]
+            self.assertIsNone(row["model"])
+            self.assertEqual(row["provider"], "anthropic")
+        finally:
+            service.close()
 
     def test_get與cooldown的稽核照舊(self):
         self.get("claude-personal", "claude-code")
