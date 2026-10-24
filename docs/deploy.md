@@ -394,3 +394,5 @@ cat /var/lib/llmgateway/.keysync.status
    ```
 3. 舊版升級依賴 `deploy/install.sh --tag <tag>`，無自動 policy dry-run 與 rollback 機制。
 4. 解密密碼存放於 `~/.config/llmgateway/keysync.env`（0600，llmgw 自有）。
+
+本文件最後核對：2026-10-24
