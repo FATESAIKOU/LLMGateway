@@ -24,7 +24,7 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 - **THEN** 沒有任何命中
 
 ### Requirement: 不做應用層認證
-服務 SHALL NOT 要求應用層的憑證；能連到服務的就能 list、get、登錄冷卻。存取控制只靠 SSH：服務只綁 127.0.0.1，只能經會合點的 SSH 轉發連入（本人選定，design 決定 5a）。發現外洩時，以更新加密檔並等一次拉取因應；客戶端不持有 key，不用改。客戶端裝置（例如手機）遺失時，先由 MyLinuxPool 撤掉那把 sshproxy 金鑰，再更新加密檔等一次拉取。
+服務 SHALL NOT 要求應用層的憑證；能連到服務的就能 list、resolve、get（過渡期）、登錄冷卻。存取控制只靠 SSH：服務只綁 127.0.0.1，只能經會合點的 SSH 轉發連入（本人選定，`archive/2026-10-24-gateway-v0/design.md` 決定 5a）。發現外洩時，以更新加密檔並等一次拉取因應；客戶端不持有 key，不用改。客戶端裝置（例如手機）遺失時，先由 MyLinuxPool 撤掉那把 sshproxy 金鑰，再更新加密檔等一次拉取。
 
 #### Scenario: 經會合點連入
 - **WHEN** 持有會合點 SSH 金鑰的客戶端經轉發呼叫 list
@@ -42,7 +42,7 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 - **THEN** 連不上
 
 ### Requirement: key 只保管在一處
-五把 key 的正本 SHALL 是 private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `keys.env.enc`（格式與加密方式見 design v5；值由本人更新，AI 不經手值）。使用前提是服務那台以 `llmgw` 身分登入過 `gh`（`gh auth login`，憑證在該帳號家目錄；LLMGateway 不做登入引導、不碰憑證值）。LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密驗證過的內容寫到放服務那台、只有服務帳號讀得到的檔案（權限 0600）。拉取與解密過程中 MUST NOT 把值放在命令列或寫進 log。
+五把 key 的正本 SHALL 是 private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `keys.env.enc`（格式與加密方式見 `archive/2026-10-24-gateway-v0/design.md` 的 v5 變更；值由本人更新，AI 不經手值）。使用前提是服務那台以 `llmgw` 身分登入過 `gh`（`gh auth login`，憑證在該帳號家目錄；LLMGateway 不做登入引導、不碰憑證值）。LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密驗證過的內容寫到放服務那台、只有服務帳號讀得到的檔案（權限 0600）。拉取與解密過程中 MUST NOT 把值放在命令列或寫進 log。
 
 #### Scenario: 部署
 - **WHEN** 本人更新加密檔並等一次拉取
