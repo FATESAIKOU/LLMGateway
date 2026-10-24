@@ -1,7 +1,7 @@
 # key-vault Specification
 
 ## Purpose
-把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；正本是 private repo 的加密檔，服務定期自己拉；客戶端經會合點的 SSH 轉發用 get 拿到，其他地方不再放 key。
+把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；正本是 private repo 的加密檔，服務定期自己拉；客戶端經會合點的 SSH 轉發，由 resolve 回覆的 `env` 拿到（過渡期也可用 get，由 LLMGateway#48 移除），其他地方不再放 key。
 
 > v5（2026-10-12）：`key 只保管在一處`以 v5 全文為準；新增`拉取與輪替`。`值不外洩`、`不做應用層認證`、`服務不對外`不變。第二輪（同日，本人）：拉取改 `gh api`，repo 寫死，`gh` 登入是使用前提。
 ## Requirements
@@ -17,7 +17,7 @@ key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一�
 - **THEN** key-sync 記一行 log、`keys.env` 不動，服務照用舊 key；`install.sh --check` 看得出「gh 不能用」（以服務帳號身分問，並實際驗一次讀得到那個 repo）
 
 ### Requirement: 值不外洩
-key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務的 log、list 的回覆、錯誤訊息。值只出現在 get 的回覆，以及由 sidecar 開的 agent 的環境。
+key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務的 log、list 的回覆、錯誤訊息。值只出現在 resolve 回覆的 `env`（以及過渡期 get 的回覆），以及由 sidecar 開的 agent 的環境。get 是過渡期介面，由 LLMGateway#48 移除。
 
 #### Scenario: 掃描
 - **WHEN** 以憑證樣式掃描 repo、服務資料庫、服務 log 與 list 的回覆

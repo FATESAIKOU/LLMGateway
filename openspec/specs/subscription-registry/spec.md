@@ -1,7 +1,7 @@
 # subscription-registry Specification
 
 ## Purpose
-LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得一個 subscription 的詳細（共通 JSON schema，sidecar 直接拿來開 agent）、登錄冷卻（只收何時能再用 `until`）。換哪一把由 sidecar 自己挑；LLMGateway 只保管、列出、記冷卻。
+LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單，共通 JSON schema，不含 key）、resolve（呼叫方給 agent、provider、可選的 model，由 Gateway 依政策挑把，回選定的 subscription 與開 agent 要用的環境變數 `env`）、登錄冷卻（只收何時能再用 `until`）。換哪一把由 resolve 依政策決定；LLMGateway 保管 key、列出菜單、記冷卻、挑把。`get`（取得單一 subscription 含 key）是過渡期介面，由 LLMGateway#48 移除。
 
 > 本檔 Scenario 中的 subscription 名稱、priority 與 models.default 是**示例政策**，用來說明選把規則，不是出廠政策；出廠政策以 `policy/default.json` 為準（2026-10-23 LLMGateway#50 起：沒有 claude-company，claude-personal 為 priority 40＋default `claude-sonnet-5-5`）。
 
@@ -46,13 +46,13 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 - **WHEN** 以 `provider=opencode-zen&model=opencode/big-pickle` resolve
 - **THEN** 回 403 `model_not_allowed`（不是自動去掉 `opencode/` 後成功）
 
-#### Scenario: Claude 訂閱沒有預設
-- **WHEN** 讀取 `claude-personal` 的共通 JSON
-- **THEN** `models.default` 為 null，呼叫方不帶模型參數，用 Claude Code 自己的預設模型
+#### Scenario: claude-subscription 的 default 為 null 時
+- **WHEN** 某把 claude-subscription 的 `models.default` 為 null
+- **THEN** 呼叫方不帶模型參數，用 Claude Code 自己的預設模型
 
 #### Scenario: 其他 kind 沒有預設
 - **WHEN** 某筆非 `claude-subscription` 的 `models.default` 為 null
-- **THEN** 服務不代選模型；呼叫方自己從 `allow` 選一個模型來用，或不用這一筆
+- **THEN** 服務不代選模型；呼叫方自己從 `allow` 選一個模型來用，或不用這一筆（經 resolve 時依「model 省略時的語意」推導）
 
 ### Requirement: models.default 必須被 allow 涵蓋
 政策檔載入時 SHALL 檢查：`models.default` 不是 null 時，必須被同一筆 `models.allow` 的樣式涵蓋（fnmatch）；不符合 MUST 載入失敗（`PolicyError`），服務不啟動。`default` 為 null 時不做這項檢查。
@@ -82,11 +82,23 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 
 ### Requirement: 共通 JSON schema
 
-list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`、`agents`、`priority`、`models`、`endpoint`、`cooldown`、`available`；`key` 只在 get，過渡期）。這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（沿 v5 的理由：條款；免費模型只經過 opencode）；政策載入 MUST 拒絕 openrouter 的 `agents` 不是剛好 `["opencode"]` 的政策檔（目前 loader 只驗 `models.allow`，本 change 補上）。`endpoint` MUST NOT 內嵌憑證：`endpoint` 不在政策檔，是 `lgwd/providers.py` 的 `CredentialProvider.endpoint` 常數；providers 載入／lgwd 啟動時 MUST 逐筆檢查 `PROVIDERS` 的 endpoint 值，含 `key=`／`token=`／`api_key=`／`access_token=` query 樣式或 userinfo `@` 即拒絕啟動（`PolicyError`；endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。
+每個 subscription SHALL 以同一個 JSON 形狀描述，欄位如下：
+- `schema`：該端點回覆形狀的版本（整數）；
+- `id`：subscription 的名稱；
+- `provider`、`kind`：供應商，與型態（`claude-subscription` 或 api-key 類）；
+- `agents`：允許使用這一把的 agent 種類清單；
+- `priority`：整數，**數字小的先**；
+- `models`：`{allow, default}`，`allow` 是模型 id 樣式（fnmatch）清單，`default` 是供應商自己的模型 id 或 null（語意見「models.default 的語意」）；
+- `endpoint`：provider 的根位址，或 null（語意見「endpoint 的語意」）；
+- `key`：憑證值，**只在 get 的回覆出現**（過渡期，由 LLMGateway#48 移除）；list 不含；
+- `cooldown`：`{"until": RFC 3339 UTC}` 或 null，不分窗口；過了 `until` 即視為 null；
+- `available`：已部署（key 在）而且沒有未來的 `until` 時為 true，否則 false。
 
-#### Scenario: list 不變
+這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（條款；免費模型只經過 opencode）；政策載入 MUST 拒絕 openrouter 的 `agents` 不是剛好 `["opencode"]` 的政策檔。`endpoint` MUST NOT 內嵌憑證：`endpoint` 不在政策檔，是 `lgwd/providers.py` 的 `CredentialProvider.endpoint` 常數；providers 載入／lgwd 啟動時 MUST 逐筆檢查 `PROVIDERS` 的 endpoint 值，含 `key=`／`token=`／`api_key=`／`access_token=` query 樣式或 userinfo `@` 即拒絕啟動（`PolicyError`；endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。
+
+#### Scenario: list 的形狀
 - **WHEN** 呼叫 list
-- **THEN** row 形狀與 v5 相同：不含 key、不含任何環境變數名
+- **THEN** row 只有上列欄位：不含 key、不含任何環境變數名
 
 #### Scenario: 政策檔把 openrouter 的 agents 改寬
 - **WHEN** 政策檔的 `openrouter.agents` 不是剛好 `["opencode"]`
@@ -148,13 +160,21 @@ list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`
 
 ### Requirement: 錯誤回覆
 
-所有錯誤 SHALL 以 `{"error": "<碼>"}` 的 JSON 回覆，訊息不得回顯請求裡的值；resolve 的錯誤回覆 MUST NOT 含 `env`。碼在 v5 的表上新增／明確化：
-- 400 `bad_request`：缺 `agent`／`provider`；`agent` 不是 `claude-code`／`opencode`；`subscription` 與 `provider` 不一致；`subscription` 與 `exclude` 同時給；
-- 400 `no_model`：`model` 省略且沒有候選能推導模型（不代選）；
-- 403 `model_not_allowed`：model 不被任何候選的 `models.allow` 涵蓋；
-- 404 `not_found`：`subscription` 指定的 id 不存在；
-- 409 `cooling`：候選全部冷卻中（body 帶 `until`＝最早恢復時刻；釘住時就是該把）；
-- 409 `no_candidate`：`exclude` 排除後沒有候選（沒有恢復時刻）。
+所有錯誤 SHALL 以 `{"error": "<碼>"}` 的 JSON 回覆，訊息不得回顯請求裡的值；resolve 的錯誤回覆 MUST NOT 含 `env`。完整碼表：
+- 400 `bad_request`：JSON 解析失敗、body 不是物件、缺必填（帶 `missing: [...]`）；resolve 的輸入形狀錯（缺 `agent`／`provider`、`agent` 不是 `claude-code`／`opencode`、`subscription` 與 `provider` 不一致、`subscription` 與 `exclude` 同時給、同一 query 參數重複）；
+- 400 `invalid_until`：`until` 不是 RFC 3339 字串（或型別不對）；
+- 400 `until_out_of_range`：`until` 在過去或超過 8 天以後；
+- 400 `no_model`：resolve 的 `model` 省略且沒有候選能推導模型（不代選）；
+- 403 `agent_not_allowed`：`agent` 不在該筆的 `agents` 裡（get 與 resolve 的選把步驟 3 共用）；
+- 403 `model_not_allowed`：resolve 的 model 不被任何候選的 `models.allow` 涵蓋；
+- 404 `not_found`：未知路徑，或不存在的 subscription id（resolve 的未知 provider／未知 `subscription` 同用）；
+- 409 `not_deployed`：key 尚未部署；
+- 409 `cooling`：resolve 的候選全部冷卻中（body 帶 `until`＝最早恢復時刻；釘住時就是該把）；
+- 409 `no_candidate`：resolve 的 `exclude` 排除後沒有候選（沒有恢復時刻）；
+- 413 `body_too_large`：body 超過 1 MB；
+- 500 `internal`：伺服器內部非預期錯誤（不帶細節）。
+
+客戶端（`lgw.client`）另外判讀兩種結果，不是服務回的碼：`unreachable`（連不上或逾時，呼叫方不會拿到例外）、`bad_response`（回覆不是 JSON 物件）。
 
 多個錯誤同時成立時 SHALL 回優先序最前者：輸入形狀（400 `bad_request`）先於查無（404 `not_found`）先於政策拒絕（403，與 400 `no_model`）先於候選狀態（409）；與「resolve 的選把規則」的步驟同一軸。
 
