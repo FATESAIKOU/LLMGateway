@@ -2,7 +2,7 @@
 
 LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得一個 subscription 的詳細（共通 JSON schema，sidecar 直接拿來開 agent）、登錄冷卻（只收何時能再用 `until`）。換哪一把由 sidecar 自己挑；LLMGateway 只保管、列出、記冷卻。
 
-> v5（2026-10-12）：冷卻 until-only。`共通 JSON schema`、`登錄冷卻`、`稽核紀錄`、`錯誤回覆`四條搬到下面的 MODIFIED（全文更新）；`list`、`get` 不變，留在 ADDED。
+> v5（2026-10-12）：冷卻 until-only。`共通 JSON schema`、`登錄冷卻`、`稽核紀錄`、`錯誤回覆`四條以 v5 全文寫在下面的 ADDED（主規格原本沒有 subscription-registry，歸檔時只能 ADDED，故從 MODIFIED 改過來）。
 
 ## ADDED Requirements
 
@@ -72,8 +72,6 @@ LLMGateway 對外只提供三個介面：列出 Provider-Subscription、取得�
 #### Scenario: Claude 訂閱沒有 endpoint
 - **WHEN** 讀取 `claude-personal` 的共通 JSON
 - **THEN** `endpoint` 為 null，agent 直連、不使用 base
-
-## MODIFIED Requirements
 
 ### Requirement: 共通 JSON schema
 每個 subscription SHALL 以同一個 JSON 形狀描述，欄位如下：
