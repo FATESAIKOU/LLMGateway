@@ -2,6 +2,8 @@
 
 LLMGateway 對外提供三個介面（終態）：list（列菜單，不含 key）、resolve（輸入 agent＋provider＋選填 model／subscription／exclude，輸出選中的 subscription 的 meta 與必要的環境變數）、登錄冷卻（只收何時能再用 `until`）。呼叫方（sidecar）以 provider＋model 點菜，也可以用 `subscription` 釘住某一把、用 `exclude` 排除剛耗盡的那一把；換哪一把 subscription 由 resolve 依政策挑；`models.allow` 是模型守門。過渡期另有 get（舊 sidecar 使用），由 d 單移除；本 change 不 `REMOVED` get。
 
+> 本檔 Scenario 中的 subscription 名稱、priority 與 models.default 是**示例政策**，用來說明選把規則，不是出廠政策；出廠政策以 `policy/default.json` 為準（2026-10-23 LLMGateway#50 起：沒有 claude-company，claude-personal 為 priority 40＋default `claude-sonnet-5-5`）。
+
 ## ADDED Requirements
 
 ### Requirement: resolve

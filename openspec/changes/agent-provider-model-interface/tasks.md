@@ -36,12 +36,12 @@
 
 ## 4. get 退場（子單草稿，本 repo；層級 d；2／3 完成後才開）
 
-- [ ] 4.1 開單條件：sidecar 遷移＋3.1／3.2／3.4 實機驗收與 3.3 的測試為證之後＋get 呼叫為零；移除 `GET /v1/subscriptions/{id}?agent=` 與 `lgw.client.get` 及其測試；介面文件同步（終態：list、resolve、cooldown）；delta spec 以那時的主規格為底 `REMOVED` get（本 change 不做，中-3）
+- [ ] 4.1 開單條件：sidecar 遷移＋3.1／3.2／3.4 實機驗收與 3.3 的測試為證之後＋get 呼叫為零；移除 `GET /v1/subscriptions/{id}?agent=` 與 `lgw.client.get` 及其測試；介面文件同步（終態：list、resolve、cooldown）；delta spec 以那時的主規格為底 `REMOVED` get（本 change 不做，中-3）（已拆成 LLMGateway#48（get 退場，觀察期中））
 
 ## 5. 銜接與紀錄
 
-- [ ] 5.1 PM 把「對 sidecar 的介面需求與建議」（design 決定 6）交 MyLinuxPool 的 PM 對齊（不由設計作者代問；**兩輪已對齊，2026-10-20**——第二輪：B-1 釘住解讀、片段鍵集與未知鍵、釘住冷卻＝waiting-quota、排序）；把 B-5 的排序（2 排在 #216 階段 2.5a（MyLinuxPool#237）與階段 3 之後；PM 已確認）一起交，**排序以 PMO 為準**
-- [ ] 5.2 MyPMO dispatch（若需要；層級 d）：PM 派工參數帶 provider＋model＋選填 subscription 的接法（對模型輪換表的對接）；只有 dispatch 有「開 agent 的直通」時才需要
-- [ ] 5.3 與 #32 的先後照 design 決定 7（互不 blocked；#33 先行）
-- [ ] 5.4 歸檔 gate（中-3）：`gateway-v0` 已歸檔（本 delta 的基準存在於主規格）＋1 實作完成＋2／3 完成，才 `openspec archive agent-provider-model-interface`；get 的移除不是本 change 的歸檔條件（d 單可後做）；`gateway-v0` 歸檔前，主規格 `agent-lease` 仍是平均分攤舊語意
-- [ ] 5.5 sidecar 的值紀律 canary（低-10）：在 MyLinuxPool 的 c 單加「sidecar log／`GET /agents` status 不含憑證值」的測試；本 repo 的 canary 只掃 Gateway
+- [x] 5.1 PM 把「對 sidecar 的介面需求與建議」（design 決定 6）交 MyLinuxPool 的 PM 對齊（不由設計作者代問；**兩輪已對齊，2026-10-20**——第二輪：B-1 釘住解讀、片段鍵集與未知鍵、釘住冷卻＝waiting-quota、排序）；把 B-5 的排序（2 排在 #216 階段 2.5a（MyLinuxPool#237）與階段 3 之後；PM 已確認）一起交，**排序以 PMO 為準**。**證據**：兩輪對齊在 2026-10-20 完成；之後 MyLinuxPool#244 照此實作完成（PR #265／#266／#270，2026-10-21 結案）；排序由 PMO 定。
+- [x] 5.2 MyPMO dispatch（若需要；層級 d）：PM 派工參數帶 provider＋model＋選填 subscription 的接法（對模型輪換表的對接）；只有 dispatch 有「開 agent 的直通」時才需要。**證據**：MyPMO#143 已合併（MyPMO PR #144，2026-10-22）；MyPMO 的團隊設定檔的派工設定改成新形狀，帶 provider＋model、subscription 選填。
+- [x] 5.3 與 #32 的先後照 design 決定 7（互不 blocked；#33 先行）。**證據**：#33 先行；#32 仍在構想，兩者互不 blocked，符合 design 決定 7。
+- [ ] 5.4 歸檔 gate（中-3）：`gateway-v0` 已歸檔（本 delta 的基準存在於主規格）＋1 實作完成＋2／3 完成，才 `openspec archive agent-provider-model-interface`；get 的移除不是本 change 的歸檔條件（d 單可後做）；`gateway-v0` 歸檔前，主規格 `agent-lease` 仍是平均分攤舊語意（拆到 LLMGateway#52（gateway-v0 tasks 對帳＋兩個 change 依序歸檔））
+- [x] 5.5 sidecar 的值紀律 canary（低-10）：在 MyLinuxPool 的 c 單加「sidecar log／`GET /agents` status 不含憑證值」的測試；本 repo 的 canary 只掃 Gateway。**證據**：MyLinuxPool#244 的測試，都在 sidecar 的 CI 裡跑——`modules/sidecar/tests/test_sidecar_resolve_open.py::test_status_shows_provider_and_model_but_no_env_value`（PR #265）；`modules/sidecar/tests/test_sidecar_sources.py::test_llmgateway_resolve_never_logs_or_returns_env_values`（PR #265）；`modules/sidecar/tests/test_sidecar_resolve_env.py`（批次 B 的 canary，PR #266）；`modules/sidecar/tests/test_sidecar_core.py::test_subscription_secret_only_reaches_the_child_env`（較早就有）。
