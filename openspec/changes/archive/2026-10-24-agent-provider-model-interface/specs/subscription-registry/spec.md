@@ -156,6 +156,10 @@ opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回
 - **WHEN** 有客戶端以 `agent=opencode&provider=opencode-zen&model=big-pickle` resolve
 - **THEN** 稽核紀錄有一筆（subscription、agent、provider、model），內容沒有憑證值或 env 的憑證值
 
+#### Scenario: get 留下紀錄
+- **WHEN** 有客戶端以 `agent=claude-code` get `claude-personal`（過渡期，get 退場前，LLMGateway#48）
+- **THEN** 稽核紀錄有一筆，內容沒有 key 的值
+
 #### Scenario: 舊 DB 沒有新欄位
 - **WHEN** 以 v5 schema 的既有 DB 檔啟動新 lgwd，並寫入一筆 resolve
 - **THEN** 啟動時補上 `provider`／`model` 欄位，寫入成功；舊資料的這兩個欄位為 null
@@ -192,6 +196,18 @@ opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回
 - **WHEN** 以 `provider=NoSuchProvider&subscription=claude-personal` resolve（`claude-personal` 存在、其 provider 是 `anthropic`，與請求的 `provider` 不一致；`NoSuchProvider` 也不是政策裡的 provider）
 - **THEN** 回 400 `bad_request`（`subscription` 與 `provider` 不一致先於 provider 不存在的 404）
 
+#### Scenario: 缺必填
+- **WHEN** 登錄冷卻的 body 沒有 `until`
+- **THEN** 回 400 `bad_request`，`missing` 含 `until`
+
+#### Scenario: 時刻格式不對
+- **WHEN** `until` 不是 RFC 3339 字串
+- **THEN** 回 400 `invalid_until`，冷卻不變
+
+#### Scenario: 連不上
+- **WHEN** 客戶端連不上服務
+- **THEN** 結果的 `error` 為 `unreachable`，呼叫方沒有拿到例外
+
 ### Requirement: 共通 JSON schema
 
 list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`、`agents`、`priority`、`models`、`endpoint`、`cooldown`、`available`；`key` 只在 get，過渡期）。這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（沿 v5 的理由：條款；免費模型只經過 opencode）；政策載入 MUST 拒絕 openrouter 的 `agents` 不是剛好 `["opencode"]` 的政策檔（目前 loader 只驗 `models.allow`，本 change 補上）。`endpoint` MUST NOT 內嵌憑證：`endpoint` 不在政策檔，是 `lgwd/providers.py` 的 `CredentialProvider.endpoint` 常數；providers 載入／lgwd 啟動時 MUST 逐筆檢查 `PROVIDERS` 的 endpoint 值，含 `key=`／`token=`／`api_key=`／`access_token=` query 樣式或 userinfo `@` 即拒絕啟動（`PolicyError`；endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。
@@ -208,6 +224,18 @@ list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`
 - **WHEN** 假 provider 表（monkeypatch `PROVIDERS`）某筆 `CredentialProvider.endpoint` 值含 `key=`／`token=`／`api_key=`／`access_token=` 的 query 或 userinfo（`user:pass@`）樣式
 - **THEN** providers 載入／lgwd 啟動失敗（`PolicyError`），lgwd 不啟動（endpoint 會進稽核與 meta——前提是不含憑證）
 
+#### Scenario: Claude 訂閱的描述
+- **WHEN** 讀取 `claude-personal` 的描述
+- **THEN** `provider` 為 anthropic、`kind` 為 claude-subscription、`agents` 只有 `claude-code`，形狀裡沒有任何環境變數名
+
+#### Scenario: openrouter 只給 opencode
+- **WHEN** 以 `agent=claude-code` get `openrouter`
+- **THEN** 回 403 `agent_not_allowed`，不含 key
+
+#### Scenario: 能不能用
+- **WHEN** 某把的 key 已部署，而且沒有未來的 `until`
+- **THEN** `available` 為 true；有未來的 `until` 或 key 沒部署時為 false
+
 ### Requirement: models.default 的語意
 
 `models.default`（與 resolve 的 `model` 參數）SHALL 是**供應商自己的模型 id**（例 `mimo-v2.6-flash-free`、`openrouter/free`——可含 `/`），不帶 agent 專用的 provider 前綴；組成 agent 專用的字串（例 opencode 的 `<id>/<model>`）由 sidecar 在 `OPENCODE_CONFIG_CONTENT` 內組，`meta.model` 一律不帶前綴。resolve 的 `model` 參數不做前綴正規化：帶 `<provider>/<model>` 的值會照 `models.allow` 比對（通常 403 `model_not_allowed`）；sidecar 的 `POST /agents` 若收到前綴，要自己正規化或回 400。null 的語意依 `kind`（見「model 省略時的語意」）：`claude-subscription` 表示用 agent 自己的預設；其他 kind 表示沒有預設、服務不代選。
@@ -219,3 +247,12 @@ list 的 row 形狀不變（v5 的欄位：`schema`、`id`、`provider`、`kind`
 #### Scenario: 帶前綴的 model 不自動正規化
 - **WHEN** 以 `provider=opencode-zen&model=opencode/big-pickle` resolve
 - **THEN** 回 403 `model_not_allowed`（不是自動去掉 `opencode/` 後成功）
+
+#### Scenario: Claude 訂閱沒有預設
+- **WHEN** 讀取 `claude-personal` 的共通 JSON
+- **THEN** `models.default` 為 null，呼叫方不帶模型參數，用 Claude Code 自己的預設模型
+
+#### Scenario: 其他 kind 沒有預設
+- **WHEN** 某筆非 `claude-subscription` 的 `models.default` 為 null
+- **THEN** 服務不代選模型；呼叫方自己從 `allow` 選一個模型來用，或不用這一筆
+
