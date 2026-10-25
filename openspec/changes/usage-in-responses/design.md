@@ -96,7 +96,7 @@ list 每筆新增兩個欄位（示例數字皆為假值）：
 2. token 只以子行程的**環境變數** `CLAUDE_CODE_OAUTH_TOKEN` 傳入，不放 argv、不寫檔；子行程環境用白名單（不繼承服務的環境）。
 3. 子行程 stdout／stderr 不進 log；只留 `rate_limits` 的四個數字欄位。解析失敗（欄位缺、型別不對、非 Pro／Max）→ `unknown`（`parse_error`／`no_windows`）；**不猜、不補 0**。
 4. 逾時 60 秒；逾時只終止**自己記下 pid 的那個行程群組**，不依名稱殺行程。
-5. 不呼叫沒有文件的 usage endpoint；管道 1 取不到時就是 `unknown`，不再找別條路（管道 2 已不採用，見探測結果）。預設關閉（`reason: "disabled"`），本人授權部署後在政策檔開。
+5. 不呼叫沒有文件的 usage endpoint；管道 1 取不到時就是 `unknown`，不再找別條路（管道 2 已不採用，見探測結果）。**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前須完成 10.1／10.2 與 C1（原版 Claude Code、trust 固定目錄、服務的 PATH 與 `LGW_USAGE_CLAUDE_CWD`），未完成時 `usage` 會是 `unknown`／`upstream_error`。
 
 ## 決定 4：取得頻率、快取、隔離
 
@@ -136,7 +136,7 @@ list 每筆新增兩個欄位（示例數字皆為假值）：
 - 回應帶 `stale`、`reason`；超過 6 小時的舊值不再顯示。
 - 取用量的 TTL（Claude 30 分鐘除外，那是本人指定）、逾時、退避數字，以及政策檔新增 `usage` 設定段（開關與 TTL）。
 - `available_again_at` 的「取最晚者」合併規則。
-- Claude 取用量預設關閉、需本人授權才開。
+- Claude 取用量：**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**自 #60 階段 C 起開啟（經本人授權）；部署前須完成 10.1／10.2 與 C1，否則 `usage` 會是 `unknown`／`upstream_error`。
 - 不依用量自動登錄冷卻（避免與呼叫方登錄的 `until` 互相覆蓋）。
 - **E1 的實作方式**：同一 subscription 同時只取一次、失敗後退避；本人只指示「被查到且過期才取、快取 30 分鐘」。（非阻塞已由本人 F 裁定，見文首。）
 - Ollama 的 TTL 120 秒也改成「被查到才取」。

@@ -1146,12 +1146,16 @@ class ListUsageTest(UsageRegistryCase):
         self.assertEqual(self.ollama.calls, 1)
 
     def test_Claude預設disabled且不觸發_真的providers掛點(self):
+        # 預設關閉由 UsageService settings 守（不依政策段）；出廠已開另測
         fetcher = AnthropicProvider().make_usage_fetcher(UsageDeps())
         self.assertFalse(fetcher.default_enabled)
-        self.usage = UsageService(self.clock, fetchers={"claude-personal": fetcher},
+        self.usage = UsageService(self.clock,
+                                  settings={"claude-personal": UsageSetting(enabled=False)},
+                                  fetchers={"claude-personal": fetcher},
                                   key_of=self.keys.get, deployed=self.keys.deployed)
-        self.service = RegistryService(self.db_path, self.policy, self.keys, self.clock,
-                                       usage=self.usage)
+        self.service.close()
+        self.service = RegistryService(self.db_path, self.policy, self.keys,
+                                       self.clock, usage=self.usage)
         got = self.item("claude-personal")["usage"]
         self.assertEqual((got["status"], got["reason"], got["source"]),
                          ("unknown", "disabled", "claude-statusline"))
@@ -1392,9 +1396,11 @@ class UsageSecretsTest(UsageRegistryCase):
 class RealFetcherTtlTest(RegistryCase):
     """真的 provider 掛點上的 TTL 常數（spec「TTL 與下限」）：Claude 下限 1800、Ollama 下限 60。"""
 
-    def usage_for(self, **usage_policy):
+    def usage_for(self, drop_usage=False, **usage_policy):
         obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
-        if usage_policy:
+        if drop_usage:
+            obj.pop("usage", None)
+        elif usage_policy:
             obj["usage"] = usage_policy
         path = self.root / "policy-ttl.json"
         path.write_text(json.dumps(obj), encoding="utf-8")
@@ -1403,12 +1409,42 @@ class RealFetcherTtlTest(RegistryCase):
                     for name in ("claude-personal", "ollama-cloud")}
         return UsageService(self.clock, fetchers=fetchers, settings=policy.usage)
 
-    def test_沒有usage段_Ollama120_Claude1800(self):
-        service = self.usage_for()
+    def test_沒有usage段_真的無段_Ollama120_Claude1800(self):
+        # 真的沒有 usage 段 → 預設關閉（由 settings fallback 守）
+        service = self.usage_for(drop_usage=True)
         self.assertEqual(service._ttl["ollama-cloud"], 120)
         self.assertEqual(service._ttl["claude-personal"], 1800)
         self.assertFalse(service._enabled["claude-personal"])
         self.assertTrue(service._enabled["ollama-cloud"])
+
+    def test_明確disabled_Claude1800(self):
+        service = self.usage_for(**{"claude-personal": {"enabled": False}})
+        self.assertEqual(service._ttl["claude-personal"], 1800)
+        self.assertFalse(service._enabled["claude-personal"])
+        self.assertTrue(service._enabled["ollama-cloud"])
+
+    def test_出廠政策開啟_Claude不是disabled(self):
+        service = self.usage_for()
+        self.assertTrue(service._enabled["claude-personal"])
+        self.assertEqual(service._ttl["claude-personal"], 1800)
+
+    def test_出廠政策開啟_已部署key_list_not_fetched_yet_觸發一次(self):
+        # C3 行為：出廠政策（enabled: true）＋已部署的 key → list 回 not_fetched_yet
+        # 並觸發一次取用量；用假 fetcher，不 exec 真的 claude。
+        fake = FakeFetcher(enabled=True, base=self.clock.now())
+        fake.source = "claude-statusline"
+        usage = UsageService(self.clock, fetchers={"claude-personal": fake},
+                             settings=self.policy.usage, key_of=self.keys.get,
+                             deployed=self.keys.deployed)
+        self.addCleanup(usage.stop)
+        service = RegistryService(self.db_path, self.policy, self.keys, self.clock,
+                                  usage=usage)
+        self.addCleanup(service.close)
+        got = _by_id(service.list_subscriptions()["subscriptions"])["claude-personal"]["usage"]
+        self.assertEqual((got["status"], got["reason"], got["source"]),
+                         ("unknown", "not_fetched_yet", "claude-statusline"))
+        self.assertTrue(usage.wait_idle())
+        self.assertEqual(fake.calls, 1)
 
     def test_Claude政策300_夾到1800並記log(self):
         with self.assertLogs("lgwd.usage", level="WARNING") as logs:

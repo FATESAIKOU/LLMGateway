@@ -284,6 +284,10 @@ class PolicyValidationTests(unittest.TestCase):
         self.assertIsNone(policy.usage["claude-personal"].ttl_seconds)
         self.assertEqual(policy.usage["openrouter"].ttl_seconds, 600)
 
+    def test_usage_明確關閉_解析為False(self):
+        policy = self._usage({"claude-personal": {"enabled": False}})
+        self.assertIs(policy.usage["claude-personal"].enabled, False)
+
     def test_usage不合法一律PolicyError(self):
         bad = {
             "usage不是object": [],

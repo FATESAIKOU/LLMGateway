@@ -349,7 +349,7 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
             "claude-personal": {"enabled": false}}
   ```
 
-  只認 `enabled`（布林）與 `ttl_seconds`（正整數），其他鍵一律拒收。**Claude 預設 `enabled: false`（`usage.reason: "disabled"`）**；要開，先完成本人授權的真機部署：裝原版 Claude Code、事先 trust 固定工作目錄、探測（計畫由 PMO 排定，見 `openspec/changes/usage-in-responses/tasks.md` 第 10 節），再把該目錄設給 lgwd（環境變數 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`；沒設定時 Claude 取用量回 `unknown`／`upstream_error`），最後才在政策檔開啟。
+  只認 `enabled`（布林）與 `ttl_seconds`（正整數），其他鍵一律拒收。**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前需完成 10.1／10.2 與 C1（原版 Claude Code、trust 固定目錄、服務的 PATH 與 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`，見 `openspec/changes/usage-in-responses/tasks.md` 第 10 節），未完成時 `usage` 會是 `unknown`／`upstream_error`。
 - **`available_again_at`**：`cooldown.until`（未來）與「用完（`remaining_percent` ≤ 0）的窗口之 `resets_at`」中最晚者；`available` 不因用量為 0 而變 false，選把規則也不變。
 - 退版（`install.sh --tag` 回前一版）安全：欄位是新增的，舊消費端忽略即可。
 

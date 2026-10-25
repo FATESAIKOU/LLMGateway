@@ -35,9 +35,10 @@ FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
 
 
 def write_policy(root):
-    """出廠政策＋關掉 Ollama 取用量：起真 lgwd 子行程的測試不對外連線（#60）。"""
+    """出廠政策＋關掉 Ollama 與 Claude 取用量：起真 lgwd 子行程的測試不對外連線（#60）。"""
     policy = json.loads((REPO / "policy" / "default.json").read_text(encoding="utf-8"))
-    policy["usage"] = {"ollama-cloud": {"enabled": False}}
+    policy["usage"] = {"ollama-cloud": {"enabled": False},
+                        "claude-personal": {"enabled": False}}
     (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
 
 
@@ -470,8 +471,11 @@ class UsageGatewayTest(unittest.TestCase):
 
     def make_policy(self, usage=None):
         obj = json.loads((REPO / "policy" / "default.json").read_text(encoding="utf-8"))
-        if usage is not None:
-            obj["usage"] = usage
+        if usage is None:
+            # 出廠政策已開啟 Claude（#60 階段 C）；不談 Claude 的測試一律明確關閉，
+            # 免得 list 一列就 spawn 真的 `claude`（測試要自足）。
+            usage = {"claude-personal": {"enabled": False}}
+        obj["usage"] = usage
         path = self.root / "policy.json"
         path.write_text(json.dumps(obj), encoding="utf-8")
         return str(path)
@@ -529,7 +533,8 @@ class UsageGatewayTest(unittest.TestCase):
         self.assertEqual(self.requests[-1], "Bearer test-main-rotated-222")
 
     def test_Claude預設關閉_不起子行程(self):
-        gw, base = self.gateway(claude_mode="ok")
+        # 預設關閉測試：用明確 disabled（出廠已開，不能再假設預設關閉）
+        gw, base = self.gateway(usage={"claude-personal": {"enabled": False}}, claude_mode="ok")
         got = self.items(base)["claude-personal"]["usage"]
         self.assertEqual((got["status"], got["reason"]), ("unknown", "disabled"))
         self.assertTrue(gw._usage.wait_idle())
