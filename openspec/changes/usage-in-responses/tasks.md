@@ -9,7 +9,7 @@
 ## 2. 政策檔 `usage` 設定段（spec `usage-reporting`「政策檔的 usage 設定」）
 
 - [x] 2.1 `lgwd/policy.py`：解析頂層選填 `usage`（鍵＝政策裡的 subscription id，值 `{enabled, ttl_seconds}`），不合法丟 `PolicyError`；`Policy` 帶出各 subscription 的設定（未設定時的預設在 3.x 套用）。驗證：`python -m pytest tests/test_policy.py -q`（新增：合法、未知 id、`usage` 非 object、值非 object、內層未知鍵（如 `enable`）、`enabled` 非布林、`ttl_seconds` 為 0／負數／非整數，一律 `PolicyError`；沒有 `usage` 段維持原行為）。
-- [x] 2.2 `policy/default.json`：**不開** Claude（不加 `usage` 段或明寫 `claude-personal.enabled: false`）；Ollama 用預設。驗證：`python -m pytest tests/test_policy.py -q`（出廠 `policy/default.json` 可載入）與 `tests/test_registry.py` 內新增的 `tests/test_registry.py::ListUsageTest::test_Claude預設disabled且不觸發_真的providers掛點`。
+- [x] 2.2 `policy/default.json`：出廠值改為**開啟** Claude（`usage.claude-personal.enabled: true`，無 `ttl_seconds`＝預設 30 分鐘）；Ollama 用預設。驗證：`python -m pytest tests/test_policy.py -q`（出廠可載入）與 `tests/test_registry.py`（`test_Claude預設disabled` 改為用 `UsageService(settings={"claude-personal": UsageSetting(enabled=False)})` 守預設關閉、不依政策段測；沒有 `usage` 段另由 `test_沒有usage段_真的無段_Ollama120_Claude1800` 守；另加 `test_出廠政策開啟_Claude不是disabled` 與行為測試 `test_出廠政策開啟_已部署key_list_not_fetched_yet_觸發一次`）。
 
 ## 3. 用量核心（spec `usage-reporting` 的形狀、stale、available_again_at、觸發、single-flight、退避、TTL、隔離）
 
