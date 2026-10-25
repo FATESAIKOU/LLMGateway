@@ -81,9 +81,15 @@ list 每筆新增兩個欄位（示例數字皆為假值）：
 | 文件 | 有（欄位、單位、缺席規則） | 互動指令有文件；`-p` 下可用與輸出格式**沒有** |
 | 穩定性 | 官方欄位，版本升級有變更記錄 | 版本一改可能就壞 |
 | 成本 | 要第一個 API 回應才有值 → 每次取用量耗少量訂閱額度（只在被查到且快取過期時才取，見決定 4） | 可能不耗，但未知；`/usage` 自己也會被限流（文件：顯示 last-known usage） |
-| 未驗證處 | statusline 在 `-p` 是否執行沒有文件；互動式 pty 又有 workspace trust 關卡 | 同上 |
+| 未驗證處 | statusline 在 `-p` 是否執行沒有文件（已探測：不跑，見下方「探測結果」）；互動式 pty 又有 workspace trust 關卡 | 同上 |
 
 **本人已決定：管道 1 為主、管道 2 為退路、都失敗回 `unknown`；先實測再鎖定。** 做法：最小環境下跑 Claude Code（最便宜的模型、一則最短的輸入），以 `--settings` 指定一個只把 stdin JSON 的 `rate_limits` 寫進暫存檔的 statusLine 命令。statusline 文件寫「Until you accept the workspace trust dialog, the status line stays blank」，所以**不能每次新建空目錄**：互動式（pty）改用服務帳號下一個**固定、事先 trust 過**的工作目錄；暫存檔放服務帳號自己目錄下的固定前綴子目錄，lgwd 啟動時掃掉前綴相符的舊殘留。實作第一步是在真機做一次**探測**，結果回報後才鎖定實作；探測需本人授權。探測項目：(a) trust 關卡（`-p` 與 pty 下 statusline 會不會跑）；(b) `/usage` 的 `-p` 輸出；(c) `~/.claude` 的 session 紀錄去向與累積量；(d) 子行程連了哪些主機，以及 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` 是否影響 `rate_limits`。**探測失敗（statusline 取不到值）時，C 一律回 `unknown`。**
+
+**探測結果（2026-10-25）**（#68；只記結論）：
+- `claude -p` 下 statusline **一次都不跑**，所以 `rate_limits` 拿不到 → 改用 **pty** 啟動互動式 claude（不加 `-p`），cwd 是事先 trust 的固定目錄；第一個 API 回應之後 statusline 才帶 `rate_limits`（第 1 次呼叫沒有，之後有）。
+- `claude -p "/usage"` 只回 session cost，**沒有窗口**（沒有 used／remaining／resets）→ 管道 2 取不到值；是否從 spec 拿掉由 PMO 另行處理，本 change 不動。
+- 互動式 claude 回完 `ok` **不會自己退出**，所以結束條件不依賴它：rate 檔（statusline 只在帶 `rate_limits` 時以 tmp＋mv 寫入）出現就收；statusline 每次呼叫另留一個記號，送出輸入後記號增加、rate 檔卻遲遲不出現（再等一段寬限）→ `no_windows`（非 Pro／Max）；收行程時先送 `/exit`，短暫等待沒退出再終止自己記下的行程群組。畫面只在記憶體判斷關卡（trust／主題／登入、送出後的 `run /login` 錯誤），不進 log。
+- 以上尚待階段 C 在真機確認的：寬限秒數、關卡字樣是否對得上真畫面。
 
 硬規則：
 1. Gateway 主機要裝**原版** Claude Code（依官方安裝方式、不修改、不重新包裝），由服務帳號執行；版本號只記在 log（不記其他輸出）。

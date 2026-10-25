@@ -29,6 +29,20 @@ class SpawnTest(unittest.TestCase):
         self.assertIsNone(proc.stdout)  # DEVNULL
         self.assertEqual(os.getpgid(proc.pid) if proc.poll() is None else proc.pid, proc.pid)
 
+    def test_tty直接exec的程式有控制終端(self):
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        code = ("import os,sys\ntry:\n os.close(os.open('/dev/tty', os.O_RDWR)); sys.exit(0)\n"
+                "except OSError: sys.exit(7)")
+        try:
+            proc = subproc.spawn([sys.executable, "-c", code], dict(os.environ), tty=slave)
+        finally:
+            os.close(slave)
+        self.addCleanup(_reap, proc)
+        proc.wait(timeout=10)
+        self.assertEqual(proc.returncode, 0)
+
     def test_環境與cwd由呼叫方給(self):
         code = "import os,sys;sys.stderr.write(os.getcwd()+'|'+os.environ.get('ONLY_ME','')+'|'+str('GH_TOKEN' in os.environ))"
         cwd = os.path.realpath(os.path.dirname(__file__))
