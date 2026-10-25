@@ -9,8 +9,8 @@
 ## What Changes
 
 - **list 的每一筆多一個 `usage` 物件與一個 `available_again_at`**（design 決定 1）：用量以 `session`／`weekly` 兩個窗口表示（`remaining_percent`、`resets_at`），附 `source`、`fetched_at`；讀不到回 `unknown`（帶原因碼），沒有用量來源的 provider 回 `not_applicable`，**不回 0%**。list 仍然不回 key。
-- **resolve 的 `meta` 多帶同一個 `usage`**（本人已決定；同 list，只讀快取，快取過期時觸發一次非阻塞（作者提議，見待決 F）的取用量，design 決定 1、4）。**get 不帶**（#48 退場）：`usage`／`available_again_at` 在 `list_subscriptions` 內合入，不經 get 也用的 `_item`。
-- **Gateway 自己取用量**（design 決定 2～4）：只在 list／resolve 被呼叫、而且快取過期時才取（本人已決定 E1；不做定時排程，Claude 快取 30 分鐘；Ollama 120 秒且被查到才取為作者提議），取用量在另一條執行緒做、不阻塞回應（作者提議，是否接受見 design「待本人決定 F」），結果放記憶體快取；上游慢或壞不影響 list／resolve。
+- **resolve 的 `meta` 多帶同一個 `usage`**（本人已決定；同 list，只讀快取，快取過期時觸發一次非阻塞（本人 10-25 裁定 F）的取用量，design 決定 1、4）。**get 不帶**（#48 退場）：`usage`／`available_again_at` 在 `list_subscriptions` 內合入，不經 get 也用的 `_item`。
+- **Gateway 自己取用量**（design 決定 2～4）：只在 list／resolve 被呼叫、而且快取過期時才取（本人已決定 E1；不做定時排程，Claude 快取 30 分鐘；Ollama 120 秒且被查到才取為作者提議），取用量在另一條執行緒做、不阻塞回應（本人 10-25 裁定 F：都不等、背景取，回上次快照並標 stale），結果放記憶體快取；上游慢或壞不影響 list／resolve。
   - Ollama Cloud：官方 `GET /api/balance`，用 vault 的 key 當 Bearer；
   - Claude 訂閱：在 Gateway 主機跑**原版 Claude Code**，讀 statusline 的 `rate_limits`（有文件）；`/usage` 為退路（沒文件）；不拿訂閱 token 打沒有文件的 usage endpoint。
 - **其他 provider**（OpenRouter、OpenCode Zen）：`not_applicable`（design 決定 5）。
@@ -33,7 +33,7 @@
 - **Gateway 主機（真機動作）**：要裝原版 Claude Code、讓服務帳號可執行、政策檔多一段 `usage` 設定。部署計畫交 PMO，由本人授權；在授權前 Claude 取用量預設關閉（`unknown`／`disabled`）。
 - **呼叫方**：sidecar、PMO 的 list 消費端忽略不認得的欄位即可；要用 `available_again_at` 的（#58、#2）之後再接。
 - **額度成本**：Ollama 取用量不耗額度；Claude 的 statusline 管道要一次 API 回應，會耗少量訂閱額度，但只在被查到且快取（30 分鐘）過期時才取，沒人查就是 0（design 決定 3、4）。
-- **本人已決定**（2026-10-25）：A～D 照建議、E1 被查到才取、E2 維持現狀不另開單（design 文首）。
+- **本人已決定**（2026-10-25）：A～D 照建議、E1 被查到才取、F 都不等背景取、E2 維持現狀不另開單（design 文首）。
 
 ## 不做
 

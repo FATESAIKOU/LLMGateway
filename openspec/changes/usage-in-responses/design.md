@@ -24,6 +24,7 @@
 - **A～D 都照建議**：A 用量放在 list＋resolve（舊 get 退場）；B 額度用完不自動把 key 標成不可用（交給既有冷卻）；C Claude 用量由 Gateway 上的原版 Claude Code 取（statusline 為主、`/usage` 為退路，先實測）；D Ollama 只取 `/api/balance`。
 - **E1**：只在有人查時才取，快取 30 分鐘（不做每 30 分鐘的主動排程）：list／resolve 被呼叫、而且快取過期，才取一次。細節見決定 4。
 - **E2**：維持現狀，不另開單。本人原話：「實際上使用者只有我，並且 key 是實際上會配到機器上，LLM 通訊不經過 LLMGateway，所以應該沒關係？」理由與結論見決定 6。
+- **F**：都不等、背景取——list／resolve 不等取用量，回上次快照並標 `stale`（最舊 6 小時）；Ollama 與 Claude 一律如此，不做有上限的同步等待。細節見決定 4。
 
 ## 決定 1：介面放在哪（本人已決定 A）
 
@@ -33,7 +34,7 @@
 | 只放 list | 最小；PMO 與人看菜單就有；resolve 完全不動 | sidecar 換把時看不到選中那把的用量 |
 | list＋resolve（`meta.usage`） | 換把的人在拿 env 時順便知道；與 list 同一份快取、同一個形狀 | resolve 形狀多一塊；`meta` 原則是「只帶有資訊的欄位」 |
 
-**本人已決定：list＋resolve。** resolve 與 list 一樣只讀快取、並依決定 4 在快取過期時觸發一次非阻塞（作者提議，見待決 F）的取用量（回應本身不等）；`available_again_at` 不放 resolve（200 代表可用，恆為 null，沿用 `cooldown`／`available` 不進 meta 的理由）。
+**本人已決定：list＋resolve。** resolve 與 list 一樣只讀快取、並依決定 4 在快取過期時觸發一次非阻塞（本人 10-25 裁定 F）的取用量（回應本身不等）；`available_again_at` 不放 resolve（200 代表可用，恆為 null，沿用 `cooldown`／`available` 不進 meta 的理由）。
 **get 不帶**：`_item` 是 list 與 get 共用（`registry.py`），所以不改 `_item`；`usage`／`available_again_at` 在 `list_subscriptions` 內逐筆合入，resolve 的 `meta.usage` 在 resolve 路徑組裝。get 的回應形狀不變。
 
 list 每筆新增兩個欄位（示例數字皆為假值）：
@@ -96,18 +97,18 @@ list 每筆新增兩個欄位（示例數字皆為假值）：
 本人已決定 E1：**只在有人查時才取**，不做定時的主動排程。
 
 - **觸發**：list／resolve 組裝某個 subscription 的 `usage` 時，若該 subscription 有取用量實作、已啟用，而且快取不存在或 `now - fetched_at` 超過 TTL，就觸發一次取用量。沒有人查就不取；重啟後從 `not_fetched_yet` 開始，也不在啟動時預取。resolve 回非 200（409 `cooling`、404）時不組裝 `meta.usage`，也不觸發。
-- **非阻塞（作者提議）**：觸發只是「叫一條取用量執行緒去做」，這次 list／resolve 的回應**不等它**：
+- **非阻塞（本人 10-25 裁定 F）**：觸發只是「叫一條取用量執行緒去做」，這次 list／resolve 的回應**不等它**：
   - 有舊值 → 回舊值（`stale: true`，`fetched_at` 照實）；
   - 從沒取過 → 回 `unknown`／`not_fetched_yet`；
   - 新值在取完後寫進快取，**下一次**查詢才看到。Claude 取一次最多 60 秒，若阻塞，list 與 resolve 會被拖住，違反「用量壞了不能拖累主要功能」。
   - 同一個 subscription **同時只有一個**取用量在跑（記憶體裡一個 in-flight 旗標）；執行中再被查到不重複觸發。觸發判斷、in-flight 旗標與一個「已停止」旗標用**同一把鎖**；`Gateway.stop` 設下「已停止」之後不再觸發任何取用量。spawn 子行程與登記該子行程（pid）在同一把鎖內，spawn 前再檢查一次「已停止」旗標，避免 stop 與 spawn 交錯而漏收。
   - 失敗（含 `rate_limited`）記下「下次最早可再觸發的時間」＝ max(退避, `Retry-After`)：連續失敗時退避間隔加倍（從 TTL 起算），上限 max(30 分鐘, TTL)；成功即重置；在這段時間內被查到不觸發，回的仍是舊值或 `unknown`（`reason` 帶最近一次失敗的碼）。Claude 的 TTL 已是 30 分鐘＝退避上限，所以其退避實際上就等於 TTL；真正會延後的只有 `Retry-After` 更晚的情況（以及 Ollama）。
-- **非阻塞的後果（讀者要知道）**：推估：本人的用法是零星查詢（使用者只有一人），查詢間隔常超過 TTL，所以多半**每次拿到的是上一次查詢那一刻觸發的快照**，`stale: true`（最舊 6 小時，之後轉 `unknown`／`stale_expired`）；重啟後第一次查一律是 `unknown`／`not_fetched_yet`；sidecar 換把時 resolve 拿到的也多半是舊值。要看到新值，得在第一次查觸發後，等取完（Claude 最多約 60 秒、Ollama 最多約 5 秒）再查一次。這個語意是作者選的，見「待本人決定」。
+- **非阻塞的後果（讀者要知道）**：推估：本人的用法是零星查詢（使用者只有一人），查詢間隔常超過 TTL，所以多半**每次拿到的是上一次查詢那一刻觸發的快照**，`stale: true`（最舊 6 小時，之後轉 `unknown`／`stale_expired`）；重啟後第一次查一律是 `unknown`／`not_fetched_yet`；sidecar 換把時 resolve 拿到的也多半是舊值。要看到新值，得在第一次查觸發後，等取完（Claude 最多約 60 秒、Ollama 最多約 5 秒）再查一次。這個語意已由本人 10-25 裁定 F（都不等、背景取）。
 - **TTL**：Claude 30 分鐘（本人指定；每次耗額度，窗口以小時／天計）；政策檔**不能調低**，下限 30 分鐘（可調高）；設定值低於 30 分鐘時夾到 30 分鐘並記一筆 log。Ollama 120 秒（作者提議，同樣改成「被查到才取」；不耗額度、查詢本來就稀疏，TTL 只是防止連續查詢打爆 10 次／分的限額）。
 - **子行程護欄**：殺行程的護欄（`start_new_session`＋`killpg`，不打到自己的群）、stderr 只留尾端、秘密只放子行程環境，這些與 `lgwd/keysync.py` 的 `KeySyncTimer` 同一類需求。沒有定時排程以後 **runner 不需要「計時」**，所以作者提議：只把子行程起停、killpg 護欄、stderr 尾端抽成共同函式讓 keysync 與 Claude 取用量共用（不另寫一套），計時留在 keysync；環境由呼叫方給（keysync 照舊繼承，Claude 用白名單）；**keysync 的對外行為與狀態檔都不變**。取用量執行緒由觸發時才建立；`Gateway.stop`（`lgwd/main.py`）先設「已停止」旗標，再**一律終止**仍在跑的取用量子行程，不等它跑完：SIGTERM→join→SIGKILL，同 `KeySyncTimer.stop`，只終止自己記下 pid 的群組；順序在 `api_server.shutdown()` 之前，也不會因還在處理的 list 而再起新子行程（已停止旗標擋掉）。每次取之前先 `reload_keys_if_changed()`，免得換 key 後一直用舊 key；結果放記憶體 dict（鍵＝subscription id），不進 SQLite、不進稽核。
 - **逾時**：Ollama 5 秒、Claude 60 秒。
 - **額度估算（推估）**：Claude 每次取耗少量訂閱額度；上限是每 30 分鐘一次（若全天都有人查，最多約 48 次／天），實際次數取決於查詢頻率，沒人查就是 0（推估，未實測；實際耗量待探測）。這是「ordinary usage」判斷的依據之一：不是固定的每日 48 次。
-- **隔離**：list／resolve 只做一次字典讀取、純計算（`available_again_at`、`stale`）與「是否觸發」的判斷（旗標檢查＋建一條執行緒），不做網路／子行程 I/O、不拿取用量執行緒的鎖超過一次複製的時間；取用量的任何例外在執行緒內捕捉並轉成 `unknown`；組裝 `usage` 欄位與觸發判斷本身再包一層 try，失敗時該欄位回 `unknown`／`internal`，list 與 resolve 仍 200。測試要有「取用量卡住或拋例外時 list 與 resolve 的延遲與結果不變」，以及：「過期後連續多次查詢只觸發一次取用量」；「失敗後退避期間內查詢不觸發」；「429 照 `Retry-After` 延後」；「stop 之後再查不觸發，在跑的子行程被收掉」。F 選 2 時，Ollama 的隔離與測試照 F 調整。
+- **隔離**：list／resolve 只做一次字典讀取、純計算（`available_again_at`、`stale`）與「是否觸發」的判斷（旗標檢查＋建一條執行緒），不做網路／子行程 I/O、不拿取用量執行緒的鎖超過一次複製的時間；取用量的任何例外在執行緒內捕捉並轉成 `unknown`；組裝 `usage` 欄位與觸發判斷本身再包一層 try，失敗時該欄位回 `unknown`／`internal`，list 與 resolve 仍 200。測試要有「取用量卡住或拋例外時 list 與 resolve 的延遲與結果不變」，以及：「過期後連續多次查詢只觸發一次取用量」；「失敗後退避期間內查詢不觸發」；「429 照 `Retry-After` 延後」；「stop 之後再查不觸發，在跑的子行程被收掉」。
 
 ## 決定 5：其他訂閱
 
@@ -131,12 +132,10 @@ list 每筆新增兩個欄位（示例數字皆為假值）：
 - `available_again_at` 的「取最晚者」合併規則。
 - Claude 取用量預設關閉、需本人授權才開。
 - 不依用量自動登錄冷卻（避免與呼叫方登錄的 `until` 互相覆蓋）。
-- **E1 的實作方式**：觸發後取用量為非阻塞（這次回舊值或 `not_fetched_yet`、下次才見新值）、同一 subscription 同時只取一次、失敗後退避；本人只指示「被查到且過期才取、快取 30 分鐘」。
+- **E1 的實作方式**：同一 subscription 同時只取一次、失敗後退避；本人只指示「被查到且過期才取、快取 30 分鐘」。（非阻塞已由本人 F 裁定，見文首。）
 - Ollama 的 TTL 120 秒也改成「被查到才取」。
 - 不做定時排程後，只共用子行程護欄（起停、killpg、stderr 尾端），不共用 `KeySyncTimer` 的計時。
 
 ## 待本人決定
 
-- **F. 非阻塞取用量的語意**（作者提議的後果，見決定 4「非阻塞的後果」）：
-  1. **接受非阻塞（建議）**：list／resolve 一律不等取用量，零星查詢時本人看到的多半是上次查詢時的快照（`stale: true`，最舊 6 小時）；要新值要查兩次：第一次觸發後，等取完（Claude 最多約 60 秒、Ollama 最多約 5 秒）再查一次才看到新值。理由：Claude 取一次最多 60 秒，不能卡住 list／resolve；list／resolve 完全不做 I/O，隔離最單純。
-  2. **Ollama 改為有上限的同步等待**（例最多 5 秒），Claude 仍非阻塞：查 Ollama 時，過期的那一次查詢就能拿到新值（逾時才退回舊值）；Claude 不變。代價：list／resolve 會對 Ollama 做 I/O、最慢多等 5 秒，違反「list／resolve 不做 I/O」的隔離，且卡住時會拖慢主要功能。
+無。（F 已由本人 10-25 裁定，見文首「本人的決定」。）
