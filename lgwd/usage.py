@@ -72,12 +72,13 @@ class ProcessGuard:
         self.stopped = False
         self.procs: set = set()
 
-    def spawn(self, argv: list, env: dict, cwd: str | None = None, stderr=subprocess.PIPE):
+    def spawn(self, argv: list, env: dict, cwd: str | None = None, stderr=subprocess.PIPE,
+              tty: int | None = None):
         """起子行程並登記；已停止回 None。OSError 照丟給呼叫方。"""
         with self._lock:
             if self.stopped:
                 return None
-            proc = subproc.spawn(argv, env, cwd=cwd, stderr=stderr)
+            proc = subproc.spawn(argv, env, cwd=cwd, stderr=stderr, tty=tty)
             self.procs.add(proc)
             return proc
 

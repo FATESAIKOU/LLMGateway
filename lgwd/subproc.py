@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 STDERR_TAIL_LIMIT = 4096    # 子行程 stderr 只留最後這些位元組（記憶體有上限）
 
@@ -34,10 +35,28 @@ def read_tail(stream, holder: list, limit: int = STDERR_TAIL_LIMIT) -> None:
     holder.append(bytes(buf))
 
 
+# 全新單執行緒直譯器裡把 stdin（pty 從端）設成新 session 的控制終端，再 exec 原版程式
+# （不用 preexec_fn：多執行緒服務裡 fork 後跑 Python 不安全）。
+_CTTY_TRAMPOLINE = ("import fcntl,os,signal,sys,termios;"
+                    "signal.signal(signal.SIGPIPE,signal.SIG_DFL);"
+                    "fcntl.ioctl(0,termios.TIOCSCTTY,0);"
+                    "os.execv(sys.argv[1],sys.argv[1:])")
+
+
 def spawn(argv: list, env: dict, cwd: str | None = None,
-          stderr=subprocess.PIPE) -> subprocess.Popen:
+          stderr=subprocess.PIPE, tty: int | None = None) -> subprocess.Popen:
     """起子行程：stdin／stdout 丟掉、獨立行程群；stderr 預設走管線（呼叫方用 read_tail 讀），
-    不需要時傳 subprocess.DEVNULL。"""
+    不需要時傳 subprocess.DEVNULL。
+
+    傳 `tty`（pty 從端的 fd）時，stdin／stdout／stderr 全接到它並成為控制終端
+    （給要求互動式終端的程式用；此時 `stderr` 參數無效；`argv[0]` 要是可執行檔的完整路徑，
+    經 Python 跳板取得控制終端後 exec）。從端 fd 由呼叫方在 spawn 後關掉。
+    """
+    if tty is not None:
+        return subprocess.Popen(
+            [sys.executable, "-I", "-c", _CTTY_TRAMPOLINE, *argv],
+            stdin=tty, stdout=tty, stderr=tty, env=env, cwd=cwd, start_new_session=True,
+        )
     return subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
