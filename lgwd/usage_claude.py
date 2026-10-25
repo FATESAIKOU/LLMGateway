@@ -15,7 +15,7 @@ Gateway 不自己用訂閱 token 打 Anthropic：執行**未修改的原版 Clau
   結束條件不依賴它：statusline 的 rate 檔出現就收（只在帶 `rate_limits` 時以 tmp＋mv 寫入，存在＝完整）；
   或 statusline 在「已有 API 回應」的呼叫留下記號、送出後有新記號而 rate 檔遲遲不出現 → no_windows。收法：先送
   `/exit`，短暫等待沒退出再終止自己記下的行程群組。pty 畫面只在記憶體判斷（首次畫面與送出後的
-  登入／錯誤關卡），不進 log、不落檔。管道 2（`/usage`）已探測：`-p` 下沒有窗口，不啟用（design.md「探測結果」）。
+  登入／錯誤關卡），不進 log、不落檔。管道 2（`/usage`）已探測：`-p` 下沒有窗口，不採用（design.md「探測結果」）。
 只用標準函式庫。
 """
 
@@ -331,7 +331,3 @@ class ClaudeUsageFetcher:
         except (OSError, ValueError):
             return failure(PARSE_ERROR)
         return parse_rate_limits(text)
-
-    def fetch_via_usage_command(self, key: str, guard) -> FetchResult:
-        """管道 2（`-p` 下的 `/usage`）：已探測，沒有窗口；不啟用、不鎖定格式（tasks 10.3）。"""
-        return failure(UPSTREAM_ERROR)

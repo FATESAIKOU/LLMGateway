@@ -391,11 +391,5 @@ class SweepTest(ClaudeCase):
         self.assertEqual(self.fetcher().sweep(), 0)
 
 
-class UsageCommandStubTest(ClaudeCase):
-    def test_管道2是未啟用的stub(self):
-        got = self.fetcher().fetch_via_usage_command(TOKEN, self.guard)
-        self.assertEqual((got.ok, got.reason), (False, "upstream_error"))
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@
 - **resolve 的 `meta` 多帶同一個 `usage`**（本人已決定；同 list，只讀快取，快取過期時觸發一次非阻塞（本人 10-25 裁定 F）的取用量，design 決定 1、4）。**get 不帶**（#48 退場）：`usage`／`available_again_at` 在 `list_subscriptions` 內合入，不經 get 也用的 `_item`。
 - **Gateway 自己取用量**（design 決定 2～4）：只在 list／resolve 被呼叫、而且快取過期時才取（本人已決定 E1；不做定時排程，Claude 快取 30 分鐘；Ollama 120 秒且被查到才取為作者提議），取用量在另一條執行緒做、不阻塞回應（本人 10-25 裁定 F：都不等、背景取，回上次快照並標 stale），結果放記憶體快取；上游慢或壞不影響 list／resolve。
   - Ollama Cloud：官方 `GET /api/balance`，用 vault 的 key 當 Bearer；
-  - Claude 訂閱：在 Gateway 主機跑**原版 Claude Code**，讀 statusline 的 `rate_limits`（有文件）；`/usage` 為退路（沒文件）；不拿訂閱 token 打沒有文件的 usage endpoint。
+  - Claude 訂閱：在 Gateway 主機跑**原版 Claude Code**，讀 statusline 的 `rate_limits`（有文件）；`/usage` 退路已於 2026-10-25 實測不可用（只回 session cost、沒有窗口），不採用；不拿訂閱 token 打沒有文件的 usage endpoint。
 - **其他 provider**（OpenRouter、OpenCode Zen）：`not_applicable`（design 決定 5）。
 - `schema` 不 bump（只新增欄位，消費端忽略不認得的欄位）。`available` 的語意不變、resolve 的選把規則不變。
 
