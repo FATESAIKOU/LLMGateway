@@ -267,6 +267,43 @@ class PolicyValidationTests(unittest.TestCase):
         policy = self._reload(obj)
         self.assertIsNone(policy.subscriptions["opencode-zen"].models_default)
 
+    # --- #60 usage 段（spec usage-reporting「政策檔的 usage 設定」） ---
+    def _usage(self, usage):
+        obj = _good_policy()
+        obj["usage"] = usage
+        return self._reload(obj)
+
+    def test_沒有usage段時維持原行為(self):
+        policy = self._reload()
+        self.assertEqual(policy.usage, {})
+
+    def test_usage合法(self):
+        policy = self._usage({"claude-personal": {"enabled": True},
+                              "openrouter": {"enabled": False, "ttl_seconds": 600}})
+        self.assertIs(policy.usage["claude-personal"].enabled, True)
+        self.assertIsNone(policy.usage["claude-personal"].ttl_seconds)
+        self.assertEqual(policy.usage["openrouter"].ttl_seconds, 600)
+
+    def test_usage不合法一律PolicyError(self):
+        bad = {
+            "usage不是object": [],
+            "usage是字串": "x",
+            "未知id": {"nope": {"enabled": True}},
+            "政策裡沒有的id": {"ollama-cloud": {"enabled": True}},
+            "值不是object": {"claude-personal": True},
+            "內層未知鍵": {"claude-personal": {"enable": False}},
+            "enabled是字串": {"claude-personal": {"enabled": "yes"}},
+            "enabled是整數": {"claude-personal": {"enabled": 1}},
+            "ttl為0": {"claude-personal": {"ttl_seconds": 0}},
+            "ttl為負": {"claude-personal": {"ttl_seconds": -5}},
+            "ttl是字串": {"claude-personal": {"ttl_seconds": "60"}},
+            "ttl是浮點": {"claude-personal": {"ttl_seconds": 60.5}},
+            "ttl是布林": {"claude-personal": {"ttl_seconds": True}},
+        }
+        for label, usage in bad.items():
+            with self.subTest(label), self.assertRaises(PolicyError):
+                self._usage(usage)
+
     def test_bad_json_and_missing_file_rejected(self):
         with self.assertRaises(PolicyError):
             self._reload(raw="{not json")

@@ -335,6 +335,24 @@ git add keys.env.enc && git commit -m 'update keys' && git push
 
 ---
 
+### 5.7 用量（`usage`）與政策檔的 `usage` 段
+
+list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多同形狀的 `usage`（get 不帶）。`usage` 是附加資訊：取用量壞了、卡住，list／resolve 照常回應，該筆只是 `unknown`。
+
+- **來源**：Ollama Cloud 取官方 `GET /api/balance`（用 vault 的 key，只在 lgwd 行程內）；Claude 訂閱執行原版 Claude Code 讀 statusline 的 `rate_limits`；OpenRouter、OpenCode Zen 為 `not_applicable`。
+- **語意（重要）**：只在有人 list／resolve、而且快取過期時才在**背景**取一次，回應不等它。零星查詢時，多半拿到的是**上一次查詢觸發的快照**（`stale: true`；超過 6 小時轉 `unknown`／`stale_expired`）；重啟後第一次查一律 `unknown`／`not_fetched_yet`，要看新值得等取完（Ollama 約 5 秒內、Claude 最多約 60 秒）再查一次。
+- **TTL**：Ollama 預設 120 秒（下限 60 秒）；Claude 預設與下限都是 30 分鐘（每次取耗少量訂閱額度，低於 30 分鐘會被夾到 30 分鐘並記 log）。失敗後依 TTL 加倍退避（上限 max(30 分鐘, TTL)），429 照 `Retry-After`。
+- **政策檔**（選填，頂層 `usage`；鍵是 subscription id，不合法 lgwd 不啟動，改檔後先經 `llmgwctl` 的 policy 預檢）：
+
+  ```json
+  "usage": {"ollama-cloud": {"enabled": true, "ttl_seconds": 300},
+            "claude-personal": {"enabled": false}}
+  ```
+
+  只認 `enabled`（布林）與 `ttl_seconds`（正整數），其他鍵一律拒收。**Claude 預設 `enabled: false`（`usage.reason: "disabled"`）**；要開，先完成本人授權的真機部署：裝原版 Claude Code、事先 trust 固定工作目錄、探測（計畫由 PMO 排定，見 `openspec/changes/usage-in-responses/tasks.md` 第 10 節），再把該目錄設給 lgwd（環境變數 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`；沒設定時 Claude 取用量回 `unknown`／`upstream_error`），最後才在政策檔開啟。
+- **`available_again_at`**：`cooldown.until`（未來）與「用完（`remaining_percent` ≤ 0）的窗口之 `resets_at`」中最晚者；`available` 不因用量為 0 而變 false，選把規則也不變。
+- 退版（`install.sh --tag` 回前一版）安全：欄位是新增的，舊消費端忽略即可。
+
 ## 6. 故障排除
 
 ### 6.1 不需要設定 `XDG_RUNTIME_DIR` 或 `DBUS`

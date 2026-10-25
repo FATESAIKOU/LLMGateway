@@ -13,6 +13,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+
+@dataclass
+class UsageDeps:
+    """組裝取用量實作時的外部相依（#60）；全部可注入，測試用假的。"""
+    http_get: object = None        # (url, headers, timeout) -> (status, headers, body)；None＝標準函式庫
+    claude_cwd: str | None = None  # Claude 取用量的固定工作目錄（Config.usage_claude_cwd）
+    claude_command: str = "claude"
+    claude_work_dir: str | None = None
+
 
 class CredentialProvider:
     """介面：一個 provider 的靜態描述。"""
@@ -22,6 +33,14 @@ class CredentialProvider:
     endpoint: str | None = None
     # opencode 全域的 provider id（resolve env 的 OPENCODE_PROVIDER_ID；design 決定 2）
     opencode_provider_id = ""
+
+    def make_usage_fetcher(self, deps: "UsageDeps"):
+        """取用量的實作（#60）；預設沒有＝list／resolve 回 not_applicable。
+
+        回 fetcher（介面見 lgwd/usage.py UsageService）。實作模組延後 import，
+        不讓 providers 在載入時依賴 HTTP／子行程相關程式。
+        """
+        return None
 
     def describe(self) -> dict:
         """回 schema 中與 provider 有關的欄位。"""
@@ -69,6 +88,11 @@ class AnthropicProvider(CredentialProvider):
     kind = "claude-subscription"
     endpoint = None
 
+    def make_usage_fetcher(self, deps: "UsageDeps"):
+        from .usage_claude import ClaudeUsageFetcher
+        return ClaudeUsageFetcher(cwd=deps.claude_cwd, command=deps.claude_command,
+                                  work_dir=deps.claude_work_dir)
+
 
 class OpenRouterProvider(CredentialProvider):
     provider = "openrouter"
@@ -82,6 +106,10 @@ class OllamaCloudProvider(CredentialProvider):
     kind = "api-key"
     endpoint = "https://ollama.com"
     opencode_provider_id = "ollama-cloud"
+
+    def make_usage_fetcher(self, deps: "UsageDeps"):
+        from .usage_ollama import OllamaUsageFetcher
+        return OllamaUsageFetcher(http_get=deps.http_get)
 
 
 class OpenCodeZenProvider(CredentialProvider):

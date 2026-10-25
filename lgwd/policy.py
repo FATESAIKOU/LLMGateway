@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "openrouter", "ollama-cloud")
 AGENTS = ("claude-code", "opencode")
@@ -40,9 +40,17 @@ class SubscriptionPolicy:
 
 
 @dataclass(frozen=True)
+class UsageSetting:
+    """政策檔 `usage` 段裡一個 subscription 的設定（#60）；None＝沿用預設。"""
+    enabled: bool | None = None
+    ttl_seconds: int | None = None
+
+
+@dataclass(frozen=True)
 class Policy:
     subscriptions: dict[str, SubscriptionPolicy]
     until_max_ahead_seconds: int
+    usage: dict[str, UsageSetting] = field(default_factory=dict)
 
     def in_priority_order(self) -> tuple[SubscriptionPolicy, ...]:
         """依 priority 排序（數字小的先；同分照 id）。list 用。"""
@@ -99,6 +107,37 @@ def _parse_subscription(name: str, spec: object) -> SubscriptionPolicy:
     )
 
 
+_USAGE_KEYS = ("enabled", "ttl_seconds")
+
+
+def _parse_usage(data: object, subs: dict) -> dict[str, UsageSetting]:
+    """頂層 `usage`（選填）：{subscription id: {enabled?, ttl_seconds?}}；fail-closed。
+
+    本身不是 object、鍵不在政策的 subscriptions、值不是 object、有 enabled／ttl_seconds
+    以外的鍵（打錯的鍵不能靜默忽略）、enabled 不是布林、ttl_seconds 不是正整數，一律拒收。
+    """
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise PolicyError("policy.usage must be an object")
+    out: dict[str, UsageSetting] = {}
+    for name, spec in data.items():
+        if name not in subs:
+            raise PolicyError("policy.usage has unknown subscription")
+        if not isinstance(spec, dict):
+            raise PolicyError("policy.usage entry must be an object")
+        if any(key not in _USAGE_KEYS for key in spec):
+            raise PolicyError("policy.usage entry has unknown key")
+        enabled = spec.get("enabled")
+        if "enabled" in spec and not isinstance(enabled, bool):
+            raise PolicyError("policy.usage enabled must be a boolean")
+        ttl = spec.get("ttl_seconds")
+        if "ttl_seconds" in spec and not _positive_int(ttl):
+            raise PolicyError("policy.usage ttl_seconds must be a positive integer")
+        out[name] = UsageSetting(enabled=enabled, ttl_seconds=ttl)
+    return out
+
+
 def load_policy(path: str) -> Policy:
     """驗證規則（不合法丟 PolicyError，訊息說明哪裡錯、不含檔案字串）：
     - subscriptions 的鍵只能是 SUBSCRIPTIONS；
@@ -107,7 +146,8 @@ def load_policy(path: str) -> Policy:
     - openrouter 的 agents 只能剛好是 ["opencode"]（免費模型只經過 opencode；design 決定 3）；
     - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
     - 非 null 的 models.default 必須被同一筆的 models.allow 樣式涵蓋（fnmatch；fail-closed）；
-    - priority 為非負整數；cooldown 的 until 上限為正整數。
+    - priority 為非負整數；cooldown 的 until 上限為正整數；
+    - 選填的頂層 `usage`（#60）：見 _parse_usage，不合法 fail-closed。
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -139,7 +179,9 @@ def load_policy(path: str) -> Policy:
     max_ahead = data.get("until_max_ahead_seconds")
     if not _positive_int(max_ahead):
         raise PolicyError("policy.until_max_ahead_seconds must be a positive integer")
+    usage = _parse_usage(data.get("usage"), parsed_subs) if "usage" in data else {}
     return Policy(
         subscriptions=parsed_subs,
         until_max_ahead_seconds=max_ahead,
+        usage=usage,
     )

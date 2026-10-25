@@ -33,6 +33,8 @@ from lgwd.keysync import (
     status_path_for,
 )
 from lgwd.main import Config, Gateway, load_config, make_keysync
+from lgwd.providers import UsageDeps
+from tests.usage_fakes import refuse_http
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PASSWORD = "FakeKeysyncPassword_ForTests_0007"  # 假值，只在測試裡用
@@ -441,7 +443,7 @@ class TimerCase(unittest.TestCase):
                         keys_path=self.keys_path, api_host="127.0.0.1", api_port=0,
                         keysync_script=self.script, keysync_interval=0.05,
                         keysync_timeout=5.0)
-        gateway = Gateway(config, clock=FakeClock())
+        gateway = Gateway(config, clock=FakeClock(), usage_deps=UsageDeps(http_get=refuse_http))
         self.assertIsNotNone(gateway.keysync)
         try:
             gateway.start()
@@ -570,7 +572,7 @@ class GatewayDisabledTest(unittest.TestCase):
 
     def _gateway(self, **overrides):
         config = dict(self.config, db=os.path.join(self.root, "llm.db"), **overrides)
-        return Gateway(Config(**config), clock=FakeClock())
+        return Gateway(Config(**config), clock=FakeClock(), usage_deps=UsageDeps(http_get=refuse_http))
 
     def test_interval0_沒有計時器(self):
         with self.assertLogs("lgwd.main", level="INFO"):

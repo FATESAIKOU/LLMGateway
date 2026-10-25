@@ -6,6 +6,7 @@
 
 import http.client
 import json
+import logging
 import tempfile
 import threading
 import unittest
@@ -652,6 +653,83 @@ class ResolveHttpTest(ServerCase):
                 status, payload = self.call("GET", "/v1/resolve?" + query)
                 self.assertEqual(status, 400)
                 self.assertEqual(self.json_of(payload)["error"], "bad_request")
+
+
+class UsageHttpTest(ServerCase):
+    """#60 tasks 6.2／6.3：用量欄位經 HTTP 的端到端（不加路由、標頭不變、log 不含值）。"""
+
+    KEY = "canary-http-ollama-0001"
+
+    def setUp(self):
+        from tests.usage_fakes import FakeFetcher
+        from lgwd.usage import UsageService
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        keys_path = root / "keys.env"
+        keys_path.write_text(
+            "CLAUDE_PERSONAL_OAUTH_TOKEN=canary-http-claude\n"
+            "OPENROUTER_API_KEY=canary-http-or\n"
+            "OPENCODE_ZEN_API_KEY=canary-http-zen\n"
+            f"OLLAMA_API_KEY={self.KEY}\n", encoding="utf-8")
+        policy_path = str(Path(__file__).resolve().parent.parent / "policy" / "default.json")
+        clock = FakeClock()
+        keys = KeyStore(str(keys_path))
+        self.fetcher = FakeFetcher(base=clock.now())
+        self.usage = UsageService(clock, fetchers={"ollama-cloud": self.fetcher},
+                                  key_of=keys.get, deployed=keys.deployed)
+        self.service = RegistryService(str(root / "llm.db"), load_policy(policy_path), keys,
+                                       clock, usage=self.usage)
+        self.base = self.serve(self.service)
+
+    def tearDown(self):
+        super().tearDown()
+        self.usage.stop()
+        self.service.close()
+        self.tmp.cleanup()
+
+    def raw(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=5) as resp:
+            return resp.status, resp.headers, json.loads(resp.read())
+
+    def test_list帶usage_resolve的meta帶usage_標頭不變(self):
+        status, _, body = self.raw("/v1/subscriptions")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["schema"], 1)
+        ollama = {i["id"]: i for i in body["subscriptions"]}["ollama-cloud"]
+        self.assertEqual(ollama["usage"]["reason"], "not_fetched_yet")
+        self.assertTrue(self.usage.wait_idle())
+        status, headers, body = self.raw("/v1/resolve?agent=opencode&provider=ollama-cloud")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+        self.assertEqual(headers.get("Pragma"), "no-cache")
+        self.assertEqual(body["meta"]["usage"]["status"], "ok")
+        self.assertNotIn("available_again_at", body["meta"])
+        self.assertEqual(body["schema"], 1)
+
+    def test_get沒有usage(self):
+        status, _, body = self.raw("/v1/subscriptions/ollama-cloud?agent=opencode")
+        self.assertEqual(status, 200)
+        self.assertNotIn("usage", body)
+        self.assertNotIn("available_again_at", body)
+
+    def test_沒有新路由(self):
+        for path in ("/v1/usage", "/v1/subscriptions/ollama-cloud/usage"):
+            with self.subTest(path):
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    self.raw(path)
+                self.assertIn(ctx.exception.code, (404, 405))
+
+    def test_取用量失敗後log與回覆不含key(self):
+        self.fetcher.outcome = RuntimeError(f"leak {self.KEY}")
+        with self.assertLogs(level="DEBUG") as logs:
+            logging.getLogger("lgwd.usage").info("probe")
+            self.raw("/v1/subscriptions")
+            self.assertTrue(self.usage.wait_idle())
+            _, _, listed = self.raw("/v1/subscriptions")
+            _, _, resolved = self.raw("/v1/resolve?agent=opencode&provider=ollama-cloud")
+        blob = json.dumps([listed, resolved["meta"]]) + "\n".join(logs.output)
+        self.assertNotIn(self.KEY, blob)
+        self.assertEqual(resolved["meta"]["usage"]["reason"], "internal")
 
 
 if __name__ == "__main__":
