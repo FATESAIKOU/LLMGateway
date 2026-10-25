@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -24,11 +25,20 @@ from lgwd.clock import FakeClock
 from lgwd.keys import KEY_NAMES, KeyFileError
 from lgwd.main import Config, Gateway, load_config
 from lgwd.policy import PolicyError
+from lgwd.providers import UsageDeps
+from tests.usage_fakes import refuse_http
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
              ("claude-personal", "claude-company", "openrouter",
               "opencode-zen", "ollama-cloud")}
+
+
+def write_policy(root):
+    """出廠政策＋關掉 Ollama 取用量：起真 lgwd 子行程的測試不對外連線（#60）。"""
+    policy = json.loads((REPO / "policy" / "default.json").read_text(encoding="utf-8"))
+    policy["usage"] = {"ollama-cloud": {"enabled": False}}
+    (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
 
 
 def key_text(values):
@@ -74,7 +84,7 @@ class MainCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         (self.root / "keys.env").write_text(key_text(FAKE_KEYS), encoding="utf-8")
-        shutil.copy(REPO / "policy" / "default.json", self.root / "policy.json")
+        write_policy(self.root)
         self.config = Config(
             db=str(self.root / "llm.db"),
             policy_path=str(self.root / "policy.json"),
@@ -83,7 +93,7 @@ class MainCase(unittest.TestCase):
             api_port=0,
         )
         self.clock = FakeClock()
-        self.gw = Gateway(self.config, clock=self.clock)
+        self.gw = Gateway(self.config, clock=self.clock, usage_deps=UsageDeps(http_get=refuse_http))
         self.gw.start()
         host, port = self.gw.addr[:2]
         self.base = f"http://{host}:{port}"
@@ -401,7 +411,7 @@ class ProviderEndpointGateTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         (self.root / "keys.env").write_text(key_text(FAKE_KEYS), encoding="utf-8")
-        shutil.copy(REPO / "policy" / "default.json", self.root / "policy.json")
+        write_policy(self.root)
         self.config = Config(
             db=str(self.root / "llm.db"),
             policy_path=str(self.root / "policy.json"),
@@ -431,12 +441,166 @@ class ProviderEndpointGateTest(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 self._patch_providers(endpoint)
                 with self.assertRaises(PolicyError):
-                    Gateway(self.config, clock=FakeClock())
+                    Gateway(self.config, clock=FakeClock(), usage_deps=UsageDeps(http_get=refuse_http))
 
     def test_出廠provider表組裝成功(self):
         # 沒有丟錯（所有既有測試都在這條路上，這裡只作正面的最小確認）
         from lgwd import providers as lgwd_providers
         lgwd_providers.validate_endpoints()
+
+
+class UsageGatewayTest(unittest.TestCase):
+    """#60 tasks 7.1：Gateway 組裝取用量、stop 的語意、Config 的 cwd 設定。
+
+    HTTP 層與 claude 都是假的（假 HTTP 回呼、tests/fakes/fake_claude.py 的包裝腳本）。
+    """
+
+    FAKE = str(REPO / "tests" / "fakes" / "fake_claude.py")
+    BALANCE = json.dumps({"included": {
+        "session": {"remaining_percent": 75, "resets_at": "2026-10-12T07:00:00Z"},
+        "weekly": {"remaining_percent": 40, "resets_at": "2026-10-14T00:00:00Z"}}}).encode()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        (self.root / "keys.env").write_text(key_text(FAKE_KEYS), encoding="utf-8")
+        self.requests = []
+        self.gateways = []
+
+    def make_policy(self, usage=None):
+        obj = json.loads((REPO / "policy" / "default.json").read_text(encoding="utf-8"))
+        if usage is not None:
+            obj["usage"] = usage
+        path = self.root / "policy.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        return str(path)
+
+    def http(self, url, headers, timeout):
+        self.requests.append(headers["Authorization"])
+        return 200, {}, self.BALANCE
+
+    def claude_command(self, mode):
+        path = self.root / f"claude-{mode}"
+        path.write_text(
+            "#!/bin/sh\n"
+            f"export FAKE_CLAUDE_MODE={mode} FAKE_CLAUDE_PIDFILE={self.root}/child.pid\n"
+            f"exec {sys.executable} {self.FAKE} \"$@\"\n", encoding="utf-8")
+        path.chmod(0o755)
+        return str(path)
+
+    def gateway(self, usage=None, claude_mode=None, cwd=True):
+        from lgwd.providers import UsageDeps
+        trusted = self.root / "trusted"
+        trusted.mkdir(exist_ok=True)
+        config = Config(db=str(self.root / "llm.db"), policy_path=self.make_policy(usage),
+                        keys_path=str(self.root / "keys.env"), api_host="127.0.0.1", api_port=0,
+                        usage_claude_cwd=str(trusted) if cwd else None)
+        deps = UsageDeps(http_get=self.http, claude_cwd=config.usage_claude_cwd,
+                         claude_command=self.claude_command(claude_mode) if claude_mode else "claude",
+                         claude_work_dir=str(self.root / "work"))
+        gw = Gateway(config, clock=FakeClock(), usage_deps=deps)
+        gw.start()
+        self.gateways.append(gw)
+        self.addCleanup(gw.stop)
+        host, port = gw.addr[:2]
+        return gw, f"http://{host}:{port}"
+
+    def items(self, base):
+        return {i["id"]: i for i in json.loads(http_get(base + "/v1/subscriptions")[1])["subscriptions"]}
+
+    def test_組裝後list與resolve帶usage_下一次才看到新值(self):
+        gw, base = self.gateway()
+        self.assertEqual(self.items(base)["ollama-cloud"]["usage"]["reason"], "not_fetched_yet")
+        self.assertTrue(gw._usage.wait_idle())
+        got = self.items(base)["ollama-cloud"]
+        self.assertEqual(got["usage"]["status"], "ok")
+        self.assertEqual(got["usage"]["session"]["remaining_percent"], 75)
+        meta = json.loads(http_get(base + "/v1/resolve?agent=opencode&provider=ollama-cloud")[1])["meta"]
+        self.assertEqual(meta["usage"]["status"], "ok")
+        self.assertEqual(self.requests, [f"Bearer {FAKE_KEYS['ollama-cloud']}"])
+
+    def test_換key後取用量用新key(self):
+        gw, base = self.gateway()
+        self.items(base); gw._usage.wait_idle()
+        rotate(str(self.root / "keys.env"), key_text({**FAKE_KEYS, "ollama-cloud": "test-main-rotated-222"}))
+        gw.service._clock.advance(seconds=121)       # 過 TTL
+        self.items(base); gw._usage.wait_idle()
+        self.assertEqual(self.requests[-1], "Bearer test-main-rotated-222")
+
+    def test_Claude預設關閉_不起子行程(self):
+        gw, base = self.gateway(claude_mode="ok")
+        got = self.items(base)["claude-personal"]["usage"]
+        self.assertEqual((got["status"], got["reason"]), ("unknown", "disabled"))
+        self.assertTrue(gw._usage.wait_idle())
+        self.assertEqual(gw._usage._guard.procs, set())
+
+    def test_政策開啟Claude_用Config的固定cwd(self):
+        dump = self.root / "dump.jsonl"
+        path = self.claude_command("ok")
+        text = Path(path).read_text().replace("\n", f"\nexport FAKE_CLAUDE_DUMP={dump}\n", 1)
+        Path(path).write_text(text)
+        gw, base = self.gateway(usage={"claude-personal": {"enabled": True}}, claude_mode="ok")
+        Path(self.claude_command("ok")).write_text(text)    # gateway() 重寫了包裝腳本：補回 dump
+        self.items(base); gw._usage.wait_idle(30)
+        self.assertTrue(dump.exists())
+        self.assertEqual(json.loads(dump.read_text().splitlines()[0])["cwd"], str(self.root / "trusted"))
+
+    def test_沒設cwd_Claude是upstream_error(self):
+        gw, base = self.gateway(usage={"claude-personal": {"enabled": True}}, claude_mode="ok", cwd=False)
+        self.items(base); gw._usage.wait_idle(30)
+        got = self.items(base)["claude-personal"]["usage"]
+        self.assertEqual((got["status"], got["reason"]), ("unknown", "upstream_error"))
+
+    def test_stop後再查不觸發(self):
+        gw, base = self.gateway()
+        gw._usage.stop()
+        self.items(base)
+        self.assertTrue(gw._usage.wait_idle())
+        self.assertEqual(self.requests, [])
+
+    def test_stop收掉在跑的子行程且在有限時間內返回(self):
+        gw, base = self.gateway(usage={"claude-personal": {"enabled": True}}, claude_mode="hang")
+        self.items(base)
+        pidfile = self.root / "child.pid"
+        for _ in range(200):
+            if gw._usage._guard.procs and pidfile.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(gw._usage._guard.procs, "假 claude 沒有起來")
+        procs = list(gw._usage._guard.procs)
+        grandchild = int(pidfile.read_text())
+        started = time.monotonic()
+        gw.stop()
+        self.assertLess(time.monotonic() - started, 15)
+        for proc in procs:
+            self.assertIsNotNone(proc.poll())
+        for _ in range(100):
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("孫行程還活著")
+        self.assertEqual(gw._usage._guard.procs, set())
+
+    def test_stop與spawn交錯_不留殘留(self):
+        from lgwd.usage import ProcessGuard
+        guard = ProcessGuard(threading.Lock())
+        guard.stopped = True        # stop() 先拿到鎖、設了旗標
+        self.assertIsNone(guard.spawn([sys.executable, "-c", "pass"], dict(os.environ)))
+        self.assertEqual(guard.procs, set())
+
+    def test_load_config的cwd設定(self):
+        self.assertEqual(load_config([], env={"LGW_USAGE_CLAUDE_CWD": "/x"}).usage_claude_cwd, "/x")
+        self.assertEqual(load_config(["--usage-claude-cwd", "/y"], env={"LGW_USAGE_CLAUDE_CWD": "/x"})
+                         .usage_claude_cwd, "/y")
+        self.assertIsNone(load_config([], env={}).usage_claude_cwd)
+
+    def test_壞的usage設定_服務不啟動(self):
+        with self.assertRaises(PolicyError):
+            self.gateway(usage={"claude-personal": {"enable": True}})
 
 
 if __name__ == "__main__":

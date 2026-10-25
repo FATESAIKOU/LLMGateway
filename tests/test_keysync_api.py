@@ -81,8 +81,11 @@ class KeysyncApiTest(unittest.TestCase):
         self.policy = os.path.join(self.root, "policy.json")
         with open(os.path.join(REPO, "policy", "default.json"), encoding="utf-8") as fh:
             policy_text = fh.read()
+        # 起真 lgwd 子行程：關掉 Ollama 取用量，免得測試對外連線（#60）
+        policy_obj = json.loads(policy_text)
+        policy_obj["usage"] = {"ollama-cloud": {"enabled": False}}
         with open(self.policy, "w", encoding="utf-8") as fh:
-            fh.write(policy_text)
+            fh.write(json.dumps(policy_obj))
         self.cred = os.path.join(self.root, "cred")
         os.makedirs(self.cred)
         with open(os.path.join(self.cred, "keys.pass"), "w", encoding="utf-8") as fh:

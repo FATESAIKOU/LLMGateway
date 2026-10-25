@@ -1,9 +1,9 @@
 """Subscription registry 的服務邏輯（design 決定 6、7、8、10 與 v5 的決定 8 取代；spec subscription-registry）。
 
-- list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；
+- list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；另帶 usage／available_again_at（#60）；
 - get_subscription(id, agent)：一筆的共通 JSON，含 key（agent 必填、要在該筆的 agents 裡、key 要已部署）；
 - resolve(agent, provider[, model, subscription, exclude])：照政策選把後回
-  {schema, env_schema, meta, env}（meta 不含 cooldown／available；env 依 agent 組成）。
+  {schema, env_schema, meta, env}（meta 不含 cooldown／available／available_again_at，帶 usage；env 依 agent 組成）。
   選把集中在這裡（design 決定 3）：純規則在 _pick（釘住先限縮成那把 → provider＋
   agent＋allow 涵蓋／能推導模型 → exclude），resolve 再接已部署 → 非冷卻 → priority→id；
   錯誤 precedence＝輸入形狀 400 → 查無 404 → 政策 403／no_model → 候選狀態 409。
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import fnmatch
+import logging
 
 from .clock import Clock, from_rfc3339, to_rfc3339
 from .errors import (
@@ -39,6 +40,9 @@ from .keys import KeyStore
 from .policy import AGENTS, Policy, SubscriptionPolicy
 from .providers import CredentialProvider, provider_for
 from .store import Store
+from .usage import UsageService, available_again_at, internal_usage
+
+_LOG = logging.getLogger("lgwd.registry")
 
 SCHEMA_VERSION = 1
 
@@ -85,11 +89,15 @@ class RegistryService:
         policy: Policy,
         keys: KeyStore,
         clock: Clock,
+        usage: UsageService | None = None,
     ):
         self._store = Store(db_path)
         self._policy = policy
         self._keys = keys
         self._clock = clock
+        # 沒注入＝沒有任何取用量實作（所有 subscription 都是 not_applicable）；
+        # 真正的取用量由 main.Gateway 組裝後注入（#60）。
+        self._usage = usage if usage is not None else UsageService(clock)
 
     def close(self) -> None:
         self._store.close()
@@ -103,6 +111,12 @@ class RegistryService:
                 self._item(cur, sub.name, now)
                 for sub in self._policy.in_priority_order()
             ]
+        # 用量欄位在交易外合入（只讀快取與觸發判斷，不做 I/O；壞了只影響該筆的 usage）。
+        # _item 不動：get 與 list 共用它，get 不帶 usage／available_again_at。
+        for item in subs:
+            usage, again = self._usage_fields(item, now)
+            item["available_again_at"] = again
+            item["usage"] = usage
         return {"schema": SCHEMA_VERSION, "subscriptions": subs}
 
     def resolve(
@@ -169,6 +183,7 @@ class RegistryService:
             },
             "endpoint": provider_info.endpoint,
             "priority": selected.priority,
+            "usage": self._safe_usage(selected.name),
         }
         return {
             "schema": RESOLVE_SCHEMA_VERSION,
@@ -233,6 +248,31 @@ class RegistryService:
         return moment
 
     # --- 內部 ---
+    def _safe_usage(self, subscription: str) -> dict:
+        """resolve meta 用：任何錯誤都回 unknown／internal，不拖累 resolve（#60）。"""
+        try:
+            return self._usage.usage_for(subscription)
+        except Exception as exc:
+            _LOG.warning("usage unavailable for %s: %s", subscription, type(exc).__name__)
+            return internal_usage(self._source_of(subscription))
+
+    def _source_of(self, subscription: str) -> str | None:
+        try:
+            return self._usage.source_of(subscription)
+        except Exception:
+            return None
+
+    def _usage_fields(self, item: dict, now: _dt.datetime) -> tuple[dict, str | None]:
+        """list 用：回 (usage, available_again_at)；失敗該筆 unknown／internal＋null。"""
+        try:
+            usage = self._usage.usage_for(item["id"])
+            cooldown = item["cooldown"]
+            until = from_rfc3339(cooldown["until"]) if cooldown else None
+            return usage, available_again_at(usage, until, now, self._keys.deployed(item["id"]))
+        except Exception as exc:
+            _LOG.warning("usage unavailable for %s: %s", item["id"], type(exc).__name__)
+            return internal_usage(self._source_of(item["id"])), None
+
     def _pick(
         self,
         agent: str | None,

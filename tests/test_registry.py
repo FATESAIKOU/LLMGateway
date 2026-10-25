@@ -5,8 +5,11 @@
 
 import datetime as _dt
 import json
+import logging
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -14,8 +17,11 @@ from lgwd import providers as lgwd_providers
 from lgwd.clock import FakeClock
 from lgwd.errors import ApiError
 from lgwd.keys import KEY_NAMES, KeyStore
-from lgwd.policy import load_policy
+from lgwd.policy import UsageSetting, load_policy
+from lgwd.providers import AnthropicProvider, UsageDeps
 from lgwd.registry import RegistryService
+from lgwd.usage import FetchResult, UsageService, failure
+from tests.usage_fakes import FakeFetcher, windows
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 POLICY_PATH = str(REPO_ROOT / "policy" / "default.json")
@@ -654,10 +660,11 @@ class ResolveTest(RegistryCase):
         self.assertEqual(
             sorted(payload["meta"]),
             ["agent", "endpoint", "kind", "model", "models", "priority",
-             "provider", "subscription"],
+             "provider", "subscription", "usage"],
         )
         self.assertNotIn("cooldown", payload["meta"])
         self.assertNotIn("available", payload["meta"])
+        self.assertNotIn("available_again_at", payload["meta"])
 
     def test_值不外洩(self):
         # 憑證樣式掃描稽核、list 回覆與 DB；endpoint 的值只掃憑證樣式（providers 已擋）
@@ -1078,6 +1085,349 @@ CREATE TABLE IF NOT EXISTS audit (
             self.assertEqual(len(legacy), 2)
         finally:
             reopened.close()
+
+
+
+SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly"}
+
+
+class UsageRegistryCase(RegistryCase):
+    """真 RegistryService＋真 UsageService＋假 fetcher（#60 tasks 6.x）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.ollama = FakeFetcher(base=self.clock.now())
+        self.claude = FakeFetcher(enabled=False, base=self.clock.now())
+        self.claude.source = "fake-claude"
+        self.build()
+        self.addCleanup(self.usage.stop)
+
+    def build(self, policy=None, **settings):
+        self.usage = UsageService(
+            self.clock,
+            fetchers={"ollama-cloud": self.ollama, "claude-personal": self.claude},
+            settings=settings,
+            key_of=lambda s: self.keys.get(s), deployed=self.keys.deployed)
+        self.service.close()
+        self.service = RegistryService(self.db_path, policy or self.policy, self.keys,
+                                       self.clock, usage=self.usage)
+
+    def settle(self):
+        self.assertTrue(self.usage.wait_idle())
+
+    def item(self, sub):
+        return _by_id(self.list_items())[sub]
+
+
+class ListUsageTest(UsageRegistryCase):
+    def test_每筆都有usage與available_again_at(self):
+        for item in self.list_items():
+            with self.subTest(item["id"]):
+                self.assertEqual(set(item["usage"]), SHAPE)
+                self.assertIn("available_again_at", item)
+        self.assertEqual(self.item("opencode-zen")["usage"],
+                         {"status": "not_applicable", "source": None, "fetched_at": None,
+                          "stale": None, "reason": None, "session": None, "weekly": None})
+        self.assertEqual(self.item("openrouter")["usage"]["status"], "not_applicable")
+
+    def test_schema仍為1且既有欄位不變(self):
+        item = self.item("ollama-cloud")
+        self.assertEqual(item["schema"], 1)
+        self.assertEqual(set(item) - {"usage", "available_again_at"},
+                         {"schema", "id", "provider", "kind", "agents", "priority", "models",
+                          "endpoint", "cooldown", "available"})
+
+    def test_第一次查詢_not_fetched_yet_下一次看到新值(self):
+        first = self.item("ollama-cloud")["usage"]
+        self.assertEqual((first["status"], first["reason"]), ("unknown", "not_fetched_yet"))
+        self.settle()
+        second = self.item("ollama-cloud")["usage"]
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(self.ollama.calls, 1)
+
+    def test_Claude預設disabled且不觸發_真的providers掛點(self):
+        fetcher = AnthropicProvider().make_usage_fetcher(UsageDeps())
+        self.assertFalse(fetcher.default_enabled)
+        self.usage = UsageService(self.clock, fetchers={"claude-personal": fetcher},
+                                  key_of=self.keys.get, deployed=self.keys.deployed)
+        self.service = RegistryService(self.db_path, self.policy, self.keys, self.clock,
+                                       usage=self.usage)
+        got = self.item("claude-personal")["usage"]
+        self.assertEqual((got["status"], got["reason"], got["source"]),
+                         ("unknown", "disabled", "claude-statusline"))
+        self.assertTrue(self.usage.wait_idle())
+        self.assertEqual(self.usage._threads, [])       # 沒有任何取用量被觸發
+
+    def test_政策開啟Claude後觸發(self):
+        self.build(**{"claude-personal": UsageSetting(enabled=True)})
+        self.assertEqual(self.item("claude-personal")["usage"]["reason"], "not_fetched_yet")
+        self.settle()
+        self.assertEqual(self.claude.calls, 1)
+
+    def test_key沒部署_no_key且不觸發(self):
+        self.keys_path.write_text(key_text({**CANARY, "ollama-cloud": ""}), encoding="utf-8")
+        self.keys.reload()
+        item = self.item("ollama-cloud")
+        self.assertEqual((item["usage"]["status"], item["usage"]["reason"]), ("unknown", "no_key"))
+        self.assertIsNone(item["available_again_at"])
+        self.settle()
+        self.assertEqual(self.ollama.calls, 0)
+
+    def test_key沒部署但快取有舊值_不回舊值且不觸發(self):
+        self.item("ollama-cloud"); self.settle()
+        self.assertEqual(self.item("ollama-cloud")["usage"]["status"], "ok")
+        self.keys_path.write_text(key_text({**CANARY, "ollama-cloud": ""}), encoding="utf-8")
+        self.keys.reload()
+        got = self.item("ollama-cloud")["usage"]
+        self.assertEqual((got["status"], got["reason"], got["session"], got["weekly"]),
+                         ("unknown", "no_key", None, None))
+        self.settle()
+        self.assertEqual(self.ollama.calls, 1)
+
+    def test_disabled優先於no_key(self):
+        self.build(**{"ollama-cloud": UsageSetting(enabled=False)})
+        self.keys_path.write_text(key_text({**CANARY, "ollama-cloud": ""}), encoding="utf-8")
+        self.keys.reload()
+        self.assertEqual(self.item("ollama-cloud")["usage"]["reason"], "disabled")
+
+    def _fill(self, session, weekly):
+        self.ollama.outcome = FetchResult(windows=windows(session=session, weekly=weekly,
+                                                          base=self.clock.now()))
+        self.item("ollama-cloud"); self.settle()
+
+    def test_available_again_at_額度用完且available仍true(self):
+        reset = self.clock.now() + _dt.timedelta(days=1)
+        self._fill((50.0, None), (0.0, reset))
+        item = self.item("ollama-cloud")
+        self.assertEqual(item["available_again_at"], "2026-10-12T00:00:00Z")
+        self.assertTrue(item["available"])
+
+    def test_available_again_at_取冷卻與額度中最晚者(self):
+        reset = self.clock.now() + _dt.timedelta(hours=2)
+        self._fill((0.0, reset), (40.0, None))
+        self.cooldown("ollama-cloud", "2026-10-11T05:00:00Z")
+        self.assertEqual(self.item("ollama-cloud")["available_again_at"], "2026-10-11T05:00:00Z")
+        self.cooldown("ollama-cloud", "2026-10-11T01:00:00Z")      # 較早：取較晚者不變
+        self.assertEqual(self.item("ollama-cloud")["available_again_at"], "2026-10-11T05:00:00Z")
+
+    def test_available_again_at_只有冷卻(self):
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        item = self.item("claude-personal")
+        self.assertEqual(item["available_again_at"], "2026-10-11T15:00:00Z")
+        self.assertFalse(item["available"])
+
+    def test_available_again_at_小數0與unknown不推測(self):
+        self._fill((0.2, None), (40.0, None))
+        self.assertIsNone(self.item("ollama-cloud")["available_again_at"])
+        self.assertIsNone(self.item("opencode-zen")["available_again_at"])
+
+    def test_get不帶新欄位(self):
+        item = self.get("ollama-cloud", "opencode")
+        self.assertNotIn("usage", item)
+        self.assertNotIn("available_again_at", item)
+        self.get("ollama-cloud", "opencode")
+        self.assertEqual(self.ollama.calls, 0)
+
+    def test_get與登錄冷卻不觸發(self):
+        self.cooldown("ollama-cloud", "2026-10-11T15:00:00Z")
+        self.get("ollama-cloud", "opencode")
+        self.assertEqual(self.ollama.calls, 0)
+
+    def test_取用量卡住時list照回_內容除usage外一致(self):
+        self.ollama.gate = threading.Event()
+        self.addCleanup(self.ollama.gate.set)
+        baseline = [{k: v for k, v in i.items() if k not in ("usage", "available_again_at")}
+                    for i in self.list_items()]
+        started = time.monotonic()
+        items = self.list_items()
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual([{k: v for k, v in i.items() if k not in ("usage", "available_again_at")}
+                          for i in items], baseline)
+        self.assertEqual(_by_id(items)["ollama-cloud"]["usage"]["reason"], "not_fetched_yet")
+
+    def test_取用量拋例外時list照回(self):
+        self.ollama.outcome = RuntimeError("boom")
+        with self.assertLogs("lgwd.usage", level="WARNING"):
+            self.list_items(); self.settle()
+        got = self.item("ollama-cloud")
+        self.assertEqual(got["usage"]["status"], "unknown")
+        self.assertTrue(got["available"])
+
+    def test_組裝出錯_該筆internal_其他筆不受影響(self):
+        real = self.usage.usage_for
+
+        def broken(sub):
+            if sub == "ollama-cloud":
+                raise RuntimeError("canary-secret-assemble")
+            return real(sub)
+        self.usage.usage_for = broken
+        with self.assertLogs("lgwd.registry", level="WARNING") as logs:
+            items = _by_id(self.list_items())
+        self.assertEqual((items["ollama-cloud"]["usage"]["status"], items["ollama-cloud"]["usage"]["reason"]),
+                         ("unknown", "internal"))
+        self.assertEqual(items["ollama-cloud"]["usage"]["source"], "fake-source")   # 保底也帶 source
+        self.assertIsNone(items["ollama-cloud"]["available_again_at"])
+        self.assertEqual(items["opencode-zen"]["usage"]["status"], "not_applicable")
+        self.assertNotIn("canary-secret", "\n".join(logs.output))
+
+
+class ResolveUsageTest(UsageRegistryCase):
+    def test_meta帶usage_不帶cooldown_available_available_again_at(self):
+        payload = self.resolve("opencode", "ollama-cloud")
+        meta = payload["meta"]
+        self.assertEqual(set(meta["usage"]), SHAPE)
+        self.assertEqual(meta["usage"]["reason"], "not_fetched_yet")
+        for name in ("cooldown", "available", "available_again_at"):
+            self.assertNotIn(name, meta)
+        self.settle()
+        self.assertEqual(self.resolve("opencode", "ollama-cloud")["meta"]["usage"],
+                         self.item("ollama-cloud")["usage"])
+
+    def test_選中沒有用量來源的provider(self):
+        meta = self.resolve("opencode", "opencode-zen")["meta"]
+        self.assertEqual(meta["usage"]["status"], "not_applicable")
+
+    def test_成功resolve觸發一次_不等(self):
+        self.ollama.gate = threading.Event()
+        self.addCleanup(self.ollama.gate.set)
+        started = time.monotonic()
+        for _ in range(5):
+            self.resolve("opencode", "ollama-cloud")
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(self.ollama.entered.wait(5))
+        self.assertEqual(self.ollama.calls, 1)
+
+    def test_非200不組裝usage也不觸發(self):
+        # 400 bad_request／404／403 agent_not_allowed／403 model_not_allowed／409 no_candidate／
+        # 409 cooling／409 not_deployed／400 no_model：取用量實作都不能被呼叫
+        cases = [
+            (400, "bad_request", dict(agent="opencode", provider=None)),
+            (404, "not_found", dict(agent="opencode", provider="nope")),
+            (403, "agent_not_allowed", dict(agent="claude-code", provider="openrouter")),
+            (403, "model_not_allowed", dict(agent="opencode", provider="openrouter", model="gpt")),
+            (409, "no_candidate", dict(agent="opencode", provider="ollama-cloud",
+                                       exclude="ollama-cloud")),
+        ]
+        for status, code, kw in cases:
+            with self.subTest(code=code):
+                err = self.assert_api_error(status, code, self.resolve, **kw)
+                self.assertNotIn("usage", err.body())
+        # 400 no_model：另一份政策（ollama-cloud 沒 default 且 allow 只有萬用字元）
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        obj["subscriptions"]["ollama-cloud"]["models"]["default"] = None
+        path = self.root / "p-no-model.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        self.build(policy=load_policy(str(path)))
+        err = self.assert_api_error(400, "no_model", self.resolve, "opencode", "ollama-cloud")
+        self.assertNotIn("usage", err.body())
+        self.build()
+        # 409 cooling
+        self.cooldown("ollama-cloud", "2026-10-11T15:00:00Z")
+        err = self.assert_api_error(409, "cooling", self.resolve, "opencode", "ollama-cloud")
+        self.assertNotIn("usage", err.body())
+        # 409 not_deployed
+        self.keys_path.write_text(key_text({**CANARY, "ollama-cloud": ""}), encoding="utf-8")
+        self.keys.reload()
+        err = self.assert_api_error(409, "not_deployed", self.resolve, "opencode", "ollama-cloud")
+        self.assertNotIn("usage", err.body())
+        self.settle()
+        self.assertEqual(self.ollama.calls, 0)
+        self.assertEqual(self.claude.calls, 0)
+
+    def test_用量為0仍選它_不自動冷卻(self):
+        self.ollama.outcome = FetchResult(windows=windows(
+            session=(0.0, None), weekly=(0.0, None), base=self.clock.now()))
+        self.resolve("opencode", "ollama-cloud"); self.settle()
+        payload = self.resolve("opencode", "ollama-cloud")
+        self.assertEqual(payload["meta"]["subscription"], "ollama-cloud")
+        self.assertEqual(payload["meta"]["usage"]["session"]["remaining_percent"], 0.0)
+        self.assertIsNone(self.item("ollama-cloud")["cooldown"])
+
+    def test_取用量壞了resolve的env與選把不變(self):
+        baseline = self.resolve("opencode", "ollama-cloud")
+        for broken in (RuntimeError("boom"), "hang"):
+            with self.subTest(broken=repr(broken)):
+                if broken == "hang":
+                    self.ollama.gate = threading.Event()
+                    self.addCleanup(self.ollama.gate.set)
+                else:
+                    self.ollama.outcome = broken
+                self.build()
+                started = time.monotonic()
+                got = self.resolve("opencode", "ollama-cloud")
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertEqual(got["env"], baseline["env"])
+                self.assertEqual({k: v for k, v in got["meta"].items() if k != "usage"},
+                                 {k: v for k, v in baseline["meta"].items() if k != "usage"})
+                self.usage.wait_idle(0.2)
+
+    def test_組裝出錯resolve照回200(self):
+        self.usage.usage_for = lambda sub: 1 / 0
+        got = self.resolve("opencode", "ollama-cloud")
+        self.assertEqual((got["meta"]["usage"]["status"], got["meta"]["usage"]["reason"]),
+                         ("unknown", "internal"))
+        self.assertTrue(got["env"])
+        self.assertEqual(got["meta"]["usage"]["source"], "fake-source")
+
+
+class UsageSecretsTest(UsageRegistryCase):
+    def test_值不外洩_新欄位與稽核與DB(self):
+        for fetch_outcome in (None, failure("upstream_error"), failure("rate_limited", 60),
+                              RuntimeError(f"leak {CANARY['ollama-cloud']}")):
+            if fetch_outcome is not None:
+                self.ollama.outcome = fetch_outcome
+            self.clock.advance(hours=1)
+            with self.assertLogs(level="DEBUG") as logs:
+                logging.getLogger("lgwd.usage").info("probe")
+                self.list_items(); self.settle()
+                meta = self.resolve("opencode", "ollama-cloud")["meta"]
+            blob = json.dumps([self.list_items(), meta], ensure_ascii=False)
+            blob += json.dumps(self.service._store.audit_all(), ensure_ascii=False)
+            blob += "\n".join(logs.output)
+            for value in CANARY.values():
+                self.assertNotIn(value, blob)
+                self.assertNotIn(value.encode(), self.db_bytes())
+
+
+class RealFetcherTtlTest(RegistryCase):
+    """真的 provider 掛點上的 TTL 常數（spec「TTL 與下限」）：Claude 下限 1800、Ollama 下限 60。"""
+
+    def usage_for(self, **usage_policy):
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        if usage_policy:
+            obj["usage"] = usage_policy
+        path = self.root / "policy-ttl.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        policy = load_policy(str(path))
+        fetchers = {name: lgwd_providers.provider_for(name).make_usage_fetcher(UsageDeps())
+                    for name in ("claude-personal", "ollama-cloud")}
+        return UsageService(self.clock, fetchers=fetchers, settings=policy.usage)
+
+    def test_沒有usage段_Ollama120_Claude1800(self):
+        service = self.usage_for()
+        self.assertEqual(service._ttl["ollama-cloud"], 120)
+        self.assertEqual(service._ttl["claude-personal"], 1800)
+        self.assertFalse(service._enabled["claude-personal"])
+        self.assertTrue(service._enabled["ollama-cloud"])
+
+    def test_Claude政策300_夾到1800並記log(self):
+        with self.assertLogs("lgwd.usage", level="WARNING") as logs:
+            service = self.usage_for(**{"claude-personal": {"ttl_seconds": 300}})
+        self.assertEqual(service._ttl["claude-personal"], 1800)
+        self.assertEqual(len(logs.output), 1)
+        self.assertNotIn(CANARY["claude-personal"], logs.output[0])
+
+    def test_Claude調高有效(self):
+        self.assertEqual(self.usage_for(**{"claude-personal": {"ttl_seconds": 7200}})._ttl["claude-personal"], 7200)
+
+    def test_Ollama設1_夾到60並記log(self):
+        with self.assertLogs("lgwd.usage", level="WARNING") as logs:
+            service = self.usage_for(**{"ollama-cloud": {"ttl_seconds": 1}})
+        self.assertEqual(service._ttl["ollama-cloud"], 60)
+        self.assertEqual(len(logs.output), 1)
+
+    def test_Ollama調高有效(self):
+        self.assertEqual(self.usage_for(**{"ollama-cloud": {"ttl_seconds": 300}})._ttl["ollama-cloud"], 300)
 
 
 if __name__ == "__main__":

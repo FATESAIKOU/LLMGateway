@@ -35,6 +35,10 @@ import tempfile
 import threading
 import time
 
+from . import subproc
+from .subproc import read_tail as _read_tail
+from .subproc import signal_child as _signal_child
+
 _LOG = logging.getLogger("lgwd.keysync")
 
 DEFAULT_INTERVAL = 600.0    # 秒；沒設 LGW_KEYSYNC_INTERVAL 時每 10 分鐘一次
@@ -65,7 +69,6 @@ KNOWN_FAILED_TAGS = frozenset({
 
 _FAILED_RE = re.compile(r"failed=([A-Za-z_][A-Za-z0-9_]*)")
 _SHUTDOWN_GRACE = 5.0       # stop() 等子行程與執行緒收乾淨的秒數
-STDERR_TAIL_LIMIT = 4096    # 子行程 stderr 只留最後這些位元組（低-3）
 
 
 def default_script(env=None) -> str:
@@ -128,57 +131,12 @@ def _failed_reason(stderr: bytes, returncode: int) -> str:
     return f"signal_{-returncode}" if returncode < 0 else f"exit_{returncode}"
 
 
-def _read_tail(stream, holder: list, limit: int = STDERR_TAIL_LIMIT) -> None:
-    """把子行程的 stderr 管線讀乾，只留最後 limit 位元組（低-3：記憶體有上限）。
-
-    在背景執行緒跑：子行程輸出比管線緩衝大時才不會卡住；讀完把尾巴放進 holder。
-    """
-    buf = bytearray()
-    try:
-        while True:
-            chunk = stream.read(4096)
-            if not chunk:
-                break
-            buf.extend(chunk)
-            if len(buf) > limit:
-                del buf[:-limit]
-    except (OSError, ValueError):
-        pass  # 關閉或管線斷掉：留著已經讀到的部分
-    holder.append(bytes(buf))
-
-
 def _spawn(script: str, env: dict) -> subprocess.Popen:
-    """起 key-sync 子行程：stdout 丟掉、stderr 只讀尾巴、獨立行程群。
+    """起 key-sync 子行程：stdout 丟掉、stderr 只讀尾巴、獨立行程群（lgwd/subproc.py）。
 
     包成一支是為了測試能模擬「spawn 還沒回來的窗口」（低-1）。
     """
-    return subprocess.Popen(
-        [script],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env=env,
-        start_new_session=True,
-    )
-
-
-def _signal_child(proc: subprocess.Popen, sig: int) -> None:
-    """把子行程（start_new_session 起的，pgid＝pid）連它的行程群叫停。
-
-    直接用 spawn 當下記下的 pid 當 pgid，不在要殺的時候重查 getpgid（低-2：
-    重查的瞬間 PID 可能已被回收再配置，killpg 就會打到無關的行程群）。
-    """
-    pid = proc.pid
-    if hasattr(os, "killpg") and pid != os.getpgid(0):  # 護欄：不要打到自己的群
-        try:
-            os.killpg(pid, sig)
-            return
-        except OSError:
-            pass
-    try:
-        proc.send_signal(sig)
-    except OSError:
-        pass
+    return subproc.spawn([script], env)
 
 
 def _atomic_write(path: str, data: bytes, mode: int) -> None:

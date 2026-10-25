@@ -29,8 +29,9 @@ from .keysync import DEFAULT_INTERVAL as DEFAULT_KEYSYNC_INTERVAL
 from .keysync import DEFAULT_TIMEOUT as DEFAULT_KEYSYNC_TIMEOUT
 from .keysync import KeySyncTimer, default_script as default_keysync_script
 from .policy import PolicyError, load_policy
-from .providers import validate_endpoints
+from .providers import UsageDeps, provider_for, validate_endpoints
 from .registry import RegistryService
+from .usage import UsageService
 
 _LOG = logging.getLogger("lgwd.main")
 
@@ -51,6 +52,7 @@ ENV_API_PORT = "LGWD_API_PORT"
 ENV_KEYSYNC_SCRIPT = "LGW_KEYSYNC_SCRIPT"
 ENV_KEYSYNC_INTERVAL = "LGW_KEYSYNC_INTERVAL"
 ENV_KEYSYNC_TIMEOUT = "LGW_KEYSYNC_TIMEOUT"
+ENV_USAGE_CLAUDE_CWD = "LGW_USAGE_CLAUDE_CWD"
 
 
 @dataclass
@@ -64,6 +66,8 @@ class Config:
     keysync_script: str | None = None
     keysync_interval: float = DEFAULT_KEYSYNC_INTERVAL
     keysync_timeout: float = DEFAULT_KEYSYNC_TIMEOUT
+    # Claude 取用量子行程的固定工作目錄（部署時事先 trust；#60）。None＝沒設定→取用量回 unknown。
+    usage_claude_cwd: str | None = None
 
 
 def _parse_port(text: str) -> int:
@@ -106,6 +110,7 @@ def load_config(argv: list[str] | None = None, env=None) -> Config:
     parser.add_argument("--keysync-script", default=None)
     parser.add_argument("--keysync-interval", default=None)
     parser.add_argument("--keysync-timeout", default=None)
+    parser.add_argument("--usage-claude-cwd", default=None)
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     api_host = args.api_host or env_of(ENV_API_HOST) or DEFAULT_API_HOST
@@ -143,6 +148,7 @@ def load_config(argv: list[str] | None = None, env=None) -> Config:
         keysync_script=args.keysync_script or env_of(ENV_KEYSYNC_SCRIPT),
         keysync_interval=keysync_interval,
         keysync_timeout=keysync_timeout,
+        usage_claude_cwd=args.usage_claude_cwd or env_of(ENV_USAGE_CLAUDE_CWD),
     )
 
 
@@ -195,7 +201,8 @@ def _stat_stamp(path: str):
 class Gateway:
     """組裝並啟停服務；請求前偵測 key 檔變動，SIGTERM 時呼叫 stop()。"""
 
-    def __init__(self, config: Config, clock: Clock | None = None):
+    def __init__(self, config: Config, clock: Clock | None = None,
+                 usage_deps: UsageDeps | None = None):
         self._config = config
         self._clock = clock or SystemClock()
         policy = load_policy(config.policy_path)  # 不合法直接丟，服務不啟動
@@ -209,11 +216,32 @@ class Gateway:
         keys = KeyStore(config.keys_path)  # 讀不到直接丟，服務不啟動
         self._keys = keys
         self._keys_lock = threading.Lock()
-        self._service = RegistryService(config.db, policy, keys, self._clock)
+        self._usage = self._make_usage(policy, usage_deps)
+        self._service = RegistryService(config.db, policy, keys, self._clock, usage=self._usage)
         self._current = _Current(self, self._service)
         self.api_server = make_api_server(self._current, config.api_host, config.api_port)
         self.keysync = make_keysync(config)  # 關閉時是 None
         self._thread: threading.Thread | None = None
+
+    def _make_usage(self, policy, usage_deps: UsageDeps | None) -> UsageService:
+        """依 providers 的取用量掛點組裝 UsageService（#60）；啟動時掃 Claude 取用量的舊殘留。"""
+        deps = usage_deps or UsageDeps(claude_cwd=self._config.usage_claude_cwd)
+        fetchers = {}
+        for name in policy.subscriptions:
+            fetcher = provider_for(name).make_usage_fetcher(deps)
+            if fetcher is not None:
+                fetchers[name] = fetcher
+                sweep = getattr(fetcher, "sweep", None)
+                if sweep is not None:
+                    sweep()
+        return UsageService(
+            self._clock, fetchers=fetchers, settings=policy.usage,
+            key_of=self._usage_key, deployed=lambda name: self._keys.deployed(name))
+
+    def _usage_key(self, subscription: str) -> str | None:
+        """取用量執行緒用：換 key 後用新值（先重讀再取）；None＝沒部署。"""
+        self.reload_keys_if_changed()
+        return self._keys.get(subscription)
 
     @property
     def service(self) -> RegistryService:
@@ -238,6 +266,7 @@ class Gateway:
             self.keysync.start()  # 啟動後先跑一次（在 30 秒內），之後照 interval
 
     def stop(self) -> None:
+        self._usage.stop()  # 先設已停止旗標並收掉取用量子行程，再停其他
         if self.keysync is not None:
             self.keysync.stop()  # 先叫停 key 拉取，再關 API
         try:
