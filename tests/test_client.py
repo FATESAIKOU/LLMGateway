@@ -312,6 +312,19 @@ class CooldownTest(ClientCase):
         self.assertEqual(body, {"until": "2026-10-11T15:00:00Z"})
         self.assertIsNone(auth)
 
+    def test_cooldown帶model的body形狀(self):
+        # 有給才放進 body；沒給時 body 只有 until（舊呼叫方一字不改）
+        res = self.client.cooldown("opencode-zen", "2026-10-11T15:00:00Z",
+                                   model="big-pickle")
+        self.assertTrue(res.ok)
+        _, _, _, body, _ = self.fake.requests[-1]
+        self.assertEqual(body, {"until": "2026-10-11T15:00:00Z",
+                                "model": "big-pickle"})
+        # model=None 與不帶參數等價
+        self.client.cooldown("opencode-zen", "2026-10-11T15:00:00Z", model=None)
+        _, _, _, body, _ = self.fake.requests[-1]
+        self.assertEqual(body, {"until": "2026-10-11T15:00:00Z"})
+
     def test_cooldown_400_invalid_until(self):
         res = self.client.cooldown("claude-personal", "not-a-time")
         self.assertFalse(res.ok)

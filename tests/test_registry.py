@@ -108,7 +108,7 @@ class JsonSchemaTest(RegistryCase):
         self.assertEqual(
             set(item),
             {"schema", "id", "provider", "kind", "agents", "priority", "models",
-             "endpoint", "key", "cooldown", "available"},
+             "endpoint", "key", "cooldown", "model_cooldowns", "available"},
         )
 
     def test_provider欄位(self):
@@ -464,6 +464,284 @@ class CooldownTest(RegistryCase):
             reopened.close()
 
 
+class ModelCooldownTest(RegistryCase):
+    """spec「登錄冷卻」的 model 與 store 的模型冷卻表（design 決定 1、6）。"""
+
+    def model_cooldowns(self, sub):
+        return _by_id(self.list_items())[sub]["model_cooldowns"]
+
+    def test_只冷卻一個模型(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "mimo-v2.6-flash-free"})
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["model_cooldowns"],
+                         {"mimo-v2.6-flash-free": {"until": "2026-10-11T15:00:00Z"}})
+        self.assertIsNone(item["cooldown"])   # 整把沒被動到
+        self.assertTrue(item["available"])    # 模型冷卻不改 available
+
+    def test_同一模型重複登錄取較晚的(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T14:00:00Z", "model": "big-pickle"})   # 較早，不覆蓋
+        self.assertEqual(self.model_cooldowns("opencode-zen"),
+                         {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T16:00:00Z", "model": "big-pickle"})   # 較晚，覆蓋
+        self.assertEqual(self.model_cooldowns("opencode-zen"),
+                         {"big-pickle": {"until": "2026-10-11T16:00:00Z"}})
+        # 稽核記的是有效的（較晚的）時刻
+        self.assertEqual(
+            [r["until"] for r in self.service._store.audit_all()],
+            ["2026-10-11T15:00:00Z", "2026-10-11T15:00:00Z", "2026-10-11T16:00:00Z"])
+
+    def test_兩個模型的冷卻互不影響(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T16:00:00Z", "model": "mimo-v2.6-flash-free"})
+        self.assertEqual(self.model_cooldowns("opencode-zen"), {
+            "big-pickle": {"until": "2026-10-11T15:00:00Z"},
+            "mimo-v2.6-flash-free": {"until": "2026-10-11T16:00:00Z"},
+        })
+
+    def test_整把與模型並存(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T16:00:00Z", "model": "big-pickle"})
+        self.cooldown("opencode-zen", "2026-10-11T15:00:00Z")
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(item["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T16:00:00Z"}})
+        # 反向：先有整把再登錄模型，整把不被縮短或刪除
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T14:00:00Z", "model": "mimo-v2.6-flash-free"})
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(item["model_cooldowns"], {
+            "big-pickle": {"until": "2026-10-11T16:00:00Z"},
+            "mimo-v2.6-flash-free": {"until": "2026-10-11T14:00:00Z"},
+        })
+
+    def test_model不在allow回400(self):
+        # 不是 403 model_not_allowed（那是 resolve 的政策拒絕碼）
+        err = self.assert_api_error(400, "bad_request", self.cooldown_raw, "opencode-zen",
+                                    {"until": "2026-10-11T15:00:00Z",
+                                     "model": "muse-spark-1.3"})
+        self.assertNotIn("detail", err.body())
+        self.assertEqual(self.model_cooldowns("opencode-zen"), {})
+
+    def test_model帶前綴回400(self):
+        for model in ("opencode/big-pickle",
+                      "opencode/glm-5.3-flash-free",   # 被 *-free 涵蓋，只有前綴規則擋得到
+                      "claude-code/anything"):
+            with self.subTest(model=model):
+                err = self.assert_api_error(
+                    400, "bad_request", self.cooldown_raw, "opencode-zen",
+                    {"until": "2026-10-11T15:00:00Z", "model": model})
+                self.assertNotIn("detail", err.body())
+                self.assertEqual(self.model_cooldowns("opencode-zen"), {})
+
+    def test_model大小寫不符回400(self):
+        # _covered 是大小寫敏感的 fnmatch；Gateway 不正規化
+        self.assert_api_error(400, "bad_request", self.cooldown_raw, "opencode-zen",
+                              {"until": "2026-10-11T15:00:00Z", "model": "Big-Pickle"})
+        self.assertEqual(self.model_cooldowns("opencode-zen"), {})
+
+    def test_model是萬用字元回400(self):
+        for model in ("*-free", "big?pickle", "[b]ig-pickle"):
+            with self.subTest(model=model):
+                self.assert_api_error(400, "bad_request", self.cooldown_raw, "opencode-zen",
+                                      {"until": "2026-10-11T15:00:00Z", "model": model})
+                self.assertEqual(self.model_cooldowns("opencode-zen"), {})
+
+    def test_model超過200字元回400(self):
+        ok = "m" * 200
+        too_long = "m" * 201
+        err = self.assert_api_error(
+            400, "bad_request", self.cooldown_raw, "claude-personal",
+            {"until": "2026-10-11T15:00:00Z", "model": too_long})
+        self.assertNotIn("detail", err.body())
+        self.assertEqual(self.model_cooldowns("claude-personal"), {})
+        self.cooldown_raw("claude-personal",
+                          {"until": "2026-10-11T15:00:00Z", "model": ok})
+        self.assertEqual(self.model_cooldowns("claude-personal"),
+                         {ok: {"until": "2026-10-11T15:00:00Z"}})
+
+    def test_model是null時記整把(self):
+        self.cooldown_raw("opencode-zen", {"until": "2026-10-11T15:00:00Z", "model": None})
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(item["model_cooldowns"], {})
+        self.assertIsNone(self.service._store.audit_all()[0]["model"])
+
+    def test_model形狀不對回400(self):
+        for model in ("", 123, ["x"], {"m": 1}, True):
+            with self.subTest(model=model):
+                err = self.assert_api_error(
+                    400, "bad_request", self.cooldown_raw, "opencode-zen",
+                    {"until": "2026-10-11T15:00:00Z", "model": model})
+                self.assertNotIn("detail", err.body())
+                self.assertEqual(self.model_cooldowns("opencode-zen"), {})
+                self.assertEqual(
+                    _by_id(self.list_items())["opencode-zen"]["model_cooldowns"], {})
+
+    def test_未知欄位仍忽略(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle",
+            "window": "5h", "resets_at": "x", "extra": 1,
+        })
+        self.assertEqual(self.model_cooldowns("opencode-zen"),
+                         {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
+
+    def test_未知id先於model的400(self):
+        # 查無 404 先於 model 的 400（沿用現行程式的順序）
+        self.assert_api_error(
+            404, "not_found", self.cooldown_raw, "ghost",
+            {"until": "2026-10-11T15:00:00Z", "model": "opencode/big-pickle"})
+
+    def test_壞的until先於壞的model(self):
+        self.assert_api_error(
+            400, "invalid_until", self.cooldown_raw, "opencode-zen",
+            {"until": "not-a-time", "model": "opencode/big-pickle"})
+        self.assertEqual(self.model_cooldowns("opencode-zen"), {})
+        self.assert_api_error(
+            400, "until_out_of_range", self.cooldown_raw, "opencode-zen",
+            {"until": "2026-10-10T23:59:59Z", "model": "opencode/big-pickle"})
+
+    def test_模型冷卻跨重啟(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.service.close()
+        reopened = RegistryService(self.db_path, self.policy, self.keys, self.clock)
+        try:
+            item = _by_id(reopened.list_subscriptions()["subscriptions"])["opencode-zen"]
+            self.assertEqual(item["model_cooldowns"],
+                             {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
+        finally:
+            reopened.close()
+
+    def test_store層的模型冷卻(self):
+        # 2.1 的 store 層：UPSERT 只在較晚時更新、查詢回該把全部列
+        store = self.service._store
+        with store.txn() as cur:
+            store.cooldown_set_model(cur, "opencode-zen", "big-pickle",
+                                     "2026-10-11T15:00:00Z")
+            self.assertEqual(
+                store.cooldown_get_model(cur, "opencode-zen", "big-pickle")["until"],
+                "2026-10-11T15:00:00Z")
+            store.cooldown_set_model(cur, "opencode-zen", "big-pickle",
+                                     "2026-10-11T14:00:00Z")   # 較早，不覆蓋
+            self.assertEqual(
+                store.cooldown_get_model(cur, "opencode-zen", "big-pickle")["until"],
+                "2026-10-11T15:00:00Z")
+            store.cooldown_set_model(cur, "opencode-zen", "mimo-v2.6-flash-free",
+                                     "2026-10-11T16:00:00Z")
+            rows = store.model_cooldowns_of(cur, "opencode-zen")
+            self.assertEqual([(r["model"], r["until"]) for r in rows],
+                             [("big-pickle", "2026-10-11T15:00:00Z"),
+                              ("mimo-v2.6-flash-free", "2026-10-11T16:00:00Z")])
+            self.assertEqual(store.model_cooldowns_of(cur, "ollama-cloud"), [])
+            self.assertIsNone(
+                store.cooldown_get_model(cur, "opencode-zen", "not-a-model"))
+            # 整把那張表一行都沒動
+            self.assertIsNone(store.cooldown_get(cur, "opencode-zen"))
+
+    def test_稽核記模型冷卻(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "mimo-v2.6-flash-free"})
+        rows = self.service._store.audit_all()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["action"], "cooldown")
+        self.assertEqual(row["model"], "mimo-v2.6-flash-free")
+        self.assertEqual(row["until"], "2026-10-11T15:00:00Z")
+        self.assertIsNone(row["agent"])
+        self.assertNotIn("window", row)
+        # 沒有 cooldown_release 這種 action
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T16:00:00Z", "model": "big-pickle"})
+        self.assertEqual(
+            [r["action"] for r in self.service._store.audit_all()],
+            ["cooldown", "cooldown"])
+
+
+class ModelCooldownListTest(RegistryCase):
+    """spec「list」／「共通 JSON schema」的 model_cooldowns（design 決定 5）。"""
+
+    def test_list列出各模型與整把冷卻(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T16:00:00Z", "model": "mimo-v2.6-flash-free"})
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertTrue(item["available"])
+        self.assertIsNone(item["cooldown"])
+        self.assertEqual(item["model_cooldowns"], {
+            "big-pickle": {"until": "2026-10-11T15:00:00Z"},
+            "mimo-v2.6-flash-free": {"until": "2026-10-11T16:00:00Z"},
+        })
+        # 推過期：只剩還沒過的那一個
+        self.clock.set(_dt.datetime(2026, 10, 11, 15, 0, 0, tzinfo=UTC))
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["model_cooldowns"],
+                         {"mimo-v2.6-flash-free": {"until": "2026-10-11T16:00:00Z"}})
+        # 再登錄整把 → 兩個欄位同時出現
+        self.clock.set(_dt.datetime(2026, 10, 11, 14, 0, 0, tzinfo=UTC))
+        self.cooldown("opencode-zen", "2026-10-11T17:00:00Z")
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T17:00:00Z"})
+        self.assertEqual(item["model_cooldowns"], {
+            "big-pickle": {"until": "2026-10-11T15:00:00Z"},
+            "mimo-v2.6-flash-free": {"until": "2026-10-11T16:00:00Z"},
+        })
+        self.assertFalse(item["available"])   # 只受整把影響
+
+    def test_模型冷卻的形狀(self):
+        # 沒有時是 {}（欄位恆在）
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["model_cooldowns"], {})
+        self.assertIn("model_cooldowns", item)
+        # 兩個都過期 → {}
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.clock.set(_dt.datetime(2026, 10, 11, 15, 0, 0, tzinfo=UTC))
+        self.assertEqual(_by_id(self.list_items())["opencode-zen"]["model_cooldowns"], {})
+
+    def test_模型冷卻不改available(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertTrue(item["available"])
+        self.assertIsNone(item["cooldown"])
+        self.assertEqual(item["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
+        self.assertEqual(item["schema"], 1)   # 不 bump
+
+    def test_模型id可含斜線與冒號(self):
+        self.cooldown_raw("ollama-cloud", {
+            "until": "2026-10-11T15:00:00Z", "model": "a:b/c"})
+        self.cooldown_raw("openrouter", {
+            "until": "2026-10-11T16:00:00Z", "model": "openrouter/free"})
+        items = _by_id(self.list_items())
+        self.assertEqual(items["ollama-cloud"]["model_cooldowns"],
+                         {"a:b/c": {"until": "2026-10-11T15:00:00Z"}})
+        self.assertEqual(items["openrouter"]["model_cooldowns"],
+                         {"openrouter/free": {"until": "2026-10-11T16:00:00Z"}})
+        # 不影響 models 的內容
+        self.assertEqual(items["openrouter"]["models"]["allow"],
+                         ["*:free", "openrouter/free"])
+
+    def test_get也帶模型冷卻但沒有usage(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        item = self.get("opencode-zen", "opencode")
+        self.assertEqual(item["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
+        self.assertNotIn("usage", item)
+        self.assertNotIn("available_again_at", item)
+
+
 class AuditTest(RegistryCase):
     def test_get留下紀錄(self):
         self.get("claude-personal", "claude-code")
@@ -587,16 +865,19 @@ class ResolveTest(RegistryCase):
         self.assertNotIn("env", err.body())
 
     def test_釘住的那把冷卻中(self):
-        # 兩把的假政策：釘住的 personal 冷卻中，不代換成 company
+        # 兩把的假政策：釘住的 personal 冷卻中，仍回 200＋附冷卻資訊（不代換成 company）
         service = self._service_with_policy(self._policy_with_company())
         try:
             service.register_cooldown(
                 "claude-personal", {"until": "2026-10-11T15:00:00Z"})
-            err = self.assert_api_error(
-                409, "cooling", service.resolve, "claude-code", "anthropic",
-                subscription="claude-personal")
-            self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
-            self.assertNotIn("env", err.body())
+            payload = service.resolve("claude-code", "anthropic",
+                                      subscription="claude-personal")
+            self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+            self.assertEqual(payload["meta"]["cooldown"],
+                             {"until": "2026-10-11T15:00:00Z"})
+            self.assertEqual(payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"],
+                             CANARY["claude-personal"])
+            self.assertNotIn("error", payload)
         finally:
             service.close()
 
@@ -659,21 +940,28 @@ class ResolveTest(RegistryCase):
         payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
         self.assertEqual(
             sorted(payload["meta"]),
-            ["agent", "endpoint", "kind", "model", "models", "priority",
-             "provider", "subscription", "usage"],
+            ["agent", "cooldown", "endpoint", "kind", "model", "model_cooldowns",
+             "models", "priority", "provider", "subscription", "usage"],
         )
-        self.assertNotIn("cooldown", payload["meta"])
+        self.assertIsNone(payload["meta"]["cooldown"])
+        self.assertEqual(payload["meta"]["model_cooldowns"], {})
         self.assertNotIn("available", payload["meta"])
         self.assertNotIn("available_again_at", payload["meta"])
 
     def test_值不外洩(self):
         # 憑證樣式掃描稽核、list 回覆與 DB；endpoint 的值只掃憑證樣式（providers 已擋）
+        # 模型冷卻走同一條紀律（task 5.2）：list／get／稽核／SQLite 都不帶 key 的值
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
         self.resolve("opencode", "opencode-zen", model="big-pickle")
         self.resolve("claude-code", "anthropic")
+        get_item = dict(self.get("opencode-zen", "opencode"))
+        get_item.pop("key")
         rows = self.service._store.audit_all()
         blobs = [
             json.dumps(rows, ensure_ascii=False),
             json.dumps(self.list_items(), ensure_ascii=False),
+            json.dumps(get_item, ensure_ascii=False),
         ]
         for blob in blobs:
             for value in CANARY.values():
@@ -687,19 +975,26 @@ class ResolveTest(RegistryCase):
     # --- resolve 的選把規則的 Scenario ---
 
     def test_唯一一把冷卻中(self):
-        # #50：出廠政策 anthropic 只剩 claude-personal，冷卻中沒有別把可換
+        # #50：出廠政策 anthropic 只剩 claude-personal；冷卻只是提示，仍回 200＋附資訊
         self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
-        err = self.assert_api_error(409, "cooling", self.resolve, "claude-code", "anthropic")
-        self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")
-        self.assertNotIn("env", err.body())
+        payload = self.resolve("claude-code", "anthropic")
+        self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+        self.assertEqual(payload["meta"]["cooldown"],
+                         {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"],
+                         CANARY["claude-personal"])
 
     def test_同provider兩把一把冷卻中(self):
+        # 冷卻不影響選把：仍選 priority 較小的 personal（10），不換成 company（20）
         service = self._service_with_policy(self._policy_with_company())
         try:
             service.register_cooldown(
                 "claude-personal", {"until": "2026-10-11T15:00:00Z"})
             payload = service.resolve("claude-code", "anthropic")
-            self.assertEqual(payload["meta"]["subscription"], "claude-company")  # priority 20
+            self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+            self.assertEqual(payload["meta"]["priority"], 10)
+            self.assertEqual(payload["meta"]["cooldown"],
+                             {"until": "2026-10-11T15:00:00Z"})
         finally:
             service.close()
 
@@ -710,10 +1005,13 @@ class ResolveTest(RegistryCase):
                 "claude-personal", {"until": "2026-10-11T16:00:00Z"})
             service.register_cooldown(
                 "claude-company", {"until": "2026-10-11T15:00:00Z"})
-            err = self.assert_api_error(
-                409, "cooling", service.resolve, "claude-code", "anthropic")
-            self.assertEqual(err.body()["until"], "2026-10-11T15:00:00Z")  # 最早恢復時刻
-            self.assertNotIn("env", err.body())
+            payload = service.resolve("claude-code", "anthropic")
+            # 200、選 priority 最小者（personal 10），附它自己的冷卻（不是最早的）
+            self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+            self.assertEqual(payload["meta"]["cooldown"],
+                             {"until": "2026-10-11T16:00:00Z"})
+            self.assertTrue(payload["env"])
+            self.assertNotIn("error", payload)
         finally:
             service.close()
 
@@ -825,6 +1123,152 @@ class ResolveTest(RegistryCase):
             self.assertEqual(payload["meta"]["model"], "m")
         finally:
             service.close()
+
+    # --- 冷卻只是提示（design 決定 2、3） ---
+
+    def test_A模型冷卻時指定A仍給key並附冷卻資訊(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "mimo-v2.6-flash-free"})
+        payload = self.resolve("opencode", "opencode-zen",
+                               model="mimo-v2.6-flash-free")
+        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["meta"]["subscription"], "opencode-zen")
+        self.assertEqual(payload["meta"]["model"], "mimo-v2.6-flash-free")
+        self.assertEqual(payload["env"]["OPENCODE_MODEL"], "mimo-v2.6-flash-free")
+        self.assertIsNone(payload["meta"]["cooldown"])
+        self.assertEqual(
+            payload["meta"]["model_cooldowns"],
+            {"mimo-v2.6-flash-free": {"until": "2026-10-11T15:00:00Z"}})
+
+    def test_A模型冷卻時指定B模型仍選得到同一把(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "mimo-v2.6-flash-free"})
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.assertEqual(payload["meta"]["subscription"], "opencode-zen")
+        self.assertEqual(payload["meta"]["model"], "big-pickle")
+        self.assertEqual(payload["env"]["OPENCODE_MODEL"], "big-pickle")
+        # 換模型不會讓 A 的冷卻資訊消失
+        self.assertEqual(
+            payload["meta"]["model_cooldowns"],
+            {"mimo-v2.6-flash-free": {"until": "2026-10-11T15:00:00Z"}})
+
+    def test_整把冷卻時resolve仍給key並附資訊(self):
+        self.cooldown("opencode-zen", "2026-10-11T15:00:00Z")
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T16:00:00Z", "model": "big-pickle"})
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.assertEqual(payload["meta"]["subscription"], "opencode-zen")
+        self.assertEqual(payload["meta"]["cooldown"],
+                         {"until": "2026-10-11T15:00:00Z"})
+        # 整把與模型兩層都附，互不覆蓋
+        self.assertEqual(payload["meta"]["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T16:00:00Z"}})
+        self.assertEqual(payload["env"]["OPENCODE_MODEL"], "big-pickle")
+
+    def test_不帶model的登錄仍記整把(self):
+        self.cooldown("opencode-zen", "2026-10-11T15:00:00Z")
+        item = _by_id(self.list_items())["opencode-zen"]
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        self.assertFalse(item["available"])
+        self.assertEqual(item["model_cooldowns"], {})
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        self.assertEqual(payload["meta"]["cooldown"],
+                         {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(payload["meta"]["model_cooldowns"], {})
+        # 稽核的 model 欄是 null
+        row = self.service._store.audit_all()[0]
+        self.assertEqual(row["action"], "cooldown")
+        self.assertIsNone(row["model"])
+
+    def test_冷卻不影響選把的priority(self):
+        self._patch_two_api_key_subscriptions()
+        obj = {
+            "subscriptions": {
+                "claude-personal": _sub_like(10, "m", ["*"]),
+                "claude-company": _sub_like(20, "m", ["*"]),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            service.register_cooldown(
+                "claude-personal", {"until": "2026-10-11T15:00:00Z"})
+            payload = service.resolve("claude-code", "fake-api")
+            # priority 較小者冷卻中仍選它，不是選沒冷卻的較低 priority
+            self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+            self.assertEqual(payload["meta"]["priority"], 10)
+            self.assertEqual(payload["meta"]["cooldown"],
+                             {"until": "2026-10-11T15:00:00Z"})
+        finally:
+            service.close()
+
+    def test_同priority時冷卻不是排序鍵(self):
+        self._patch_two_api_key_subscriptions()
+        obj = {
+            "subscriptions": {
+                "claude-personal": _sub_like(10, "m", ["*"]),
+                "claude-company": _sub_like(10, "m", ["*"]),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with_policy(obj)
+        try:
+            # id 較小者（claude-company）冷卻中 → 仍選它（排序只看 priority／id）
+            service.register_cooldown(
+                "claude-company", {"until": "2026-10-11T15:00:00Z"})
+            payload = service.resolve("claude-code", "fake-api")
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")
+            self.assertEqual(payload["meta"]["cooldown"],
+                             {"until": "2026-10-11T15:00:00Z"})
+        finally:
+            service.close()
+
+    def test_不指定model時default冷卻仍200(self):
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "mimo-v2.6-flash-free"})
+        payload = self.resolve("opencode", "opencode-zen")
+        self.assertEqual(payload["meta"]["model"], "mimo-v2.6-flash-free")
+        self.assertEqual(
+            payload["meta"]["model_cooldowns"],
+            {"mimo-v2.6-flash-free": {"until": "2026-10-11T15:00:00Z"}})
+
+    def test_沒有模型可對時仍200(self):
+        # claude-subscription＋default null：meta.model 為 null，模型冷卻只是資訊
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        obj["subscriptions"]["claude-personal"]["models"]["default"] = None
+        service = self._service_with_policy(obj)
+        try:
+            service.register_cooldown("claude-personal", {
+                "until": "2026-10-11T15:00:00Z", "model": "claude-sonnet-5-5"})
+            payload = service.resolve("claude-code", "anthropic")
+            self.assertIsNone(payload["meta"]["model"])
+            self.assertIsNone(payload["meta"]["cooldown"])
+            self.assertEqual(payload["meta"]["model_cooldowns"],
+                             {"claude-sonnet-5-5": {"until": "2026-10-11T15:00:00Z"}})
+            self.assertTrue(payload["env"])
+        finally:
+            service.close()
+
+    def test_模型未知時冷卻只是資訊(self):
+        # 釘住的那把：整把沒冷卻、只有某模型冷卻、model 省略（推導出的模型不是它）
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        payload = self.resolve("opencode", "opencode-zen",
+                               model="mimo-v2.6-flash-free")
+        self.assertEqual(payload["meta"]["model"], "mimo-v2.6-flash-free")
+        self.assertEqual(payload["meta"]["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
+
+    def test_meta含冷卻且不含available(self):
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
+        meta = payload["meta"]
+        self.assertIn("cooldown", meta)
+        self.assertIn("model_cooldowns", meta)
+        self.assertIsNone(meta["cooldown"])
+        self.assertEqual(meta["model_cooldowns"], {})
+        self.assertNotIn("available", meta)
+        self.assertNotIn("available_again_at", meta)
+        self.assertEqual(payload["schema"], 1)
 
     def test_釘住的key未部署(self):
         self.keys_path.write_text(
@@ -1086,7 +1530,74 @@ CREATE TABLE IF NOT EXISTS audit (
         finally:
             reopened.close()
 
+    def test_舊DB沒有新表也能啟動(self):
+        # 2.2：v5 的 DB（只有 cooldowns＋audit）→ 新 lgwd 起得來、新表被建立、舊冷卻照舊
+        self.service.close()
+        Path(self.db_path).unlink()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executescript(self._V5_SCHEMA)
+            conn.execute(
+                "INSERT INTO cooldowns (subscription, until)"
+                " VALUES ('claude-personal', '2026-10-11T15:00:00Z')")
+            conn.execute(
+                "INSERT INTO audit (ts, subscription, action, agent)"
+                " VALUES ('2026-10-11T00:00:00Z', 'claude-personal', 'get', 'claude-code')")
+            conn.commit()
+        finally:
+            conn.close()
 
+        reopened = RegistryService(self.db_path, self.policy, self.keys, self.clock)
+        try:
+            # 新表被建立（三欄）
+            conn = sqlite3.connect(self.db_path)
+            try:
+                columns = [row[1] for row in
+                           conn.execute("PRAGMA table_info(model_cooldowns)")]
+            finally:
+                conn.close()
+            self.assertEqual(columns, ["subscription", "model", "until"])
+            # 舊的整把冷卻照舊生效；模型冷卻表是空的
+            item = _by_id(reopened.list_subscriptions()["subscriptions"])["claude-personal"]
+            self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+            self.assertFalse(item["available"])
+            self.assertEqual(item["model_cooldowns"], {})
+            # 舊稽核照舊讀得到，新欄位為 null
+            rows = reopened._store.audit_all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["action"], "get")
+            self.assertIsNone(rows[0]["provider"])
+            self.assertIsNone(rows[0]["model"])
+            # 新程式可以寫入模型冷卻
+            reopened.register_cooldown("opencode-zen", {
+                "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+            rows = reopened._store.audit_all()
+            self.assertEqual(rows[-1]["model"], "big-pickle")
+        finally:
+            reopened.close()
+
+    def test_退版讀新DB不受影響(self):
+        # 2.2：新 DB 有模型列 → 用舊程式的 SQL 讀，仍是一把一列、舊欄位照舊
+        self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.cooldown_raw("opencode-zen", {
+            "until": "2026-10-11T16:00:00Z", "model": "mimo-v2.6-flash-free"})
+        conn = sqlite3.connect(self.db_path)
+        try:
+            legacy_cooldowns = conn.execute(
+                "SELECT subscription, until FROM cooldowns").fetchall()
+            legacy_audit = conn.execute(
+                "SELECT seq, ts, subscription, action, agent, until"
+                " FROM audit ORDER BY seq").fetchall()
+        finally:
+            conn.close()
+        # 整把仍是一把一列（模型列在另一張表，舊程式看不到）
+        self.assertEqual(legacy_cooldowns,
+                         [("claude-personal", "2026-10-11T15:00:00Z")])
+        self.assertEqual([row[3] for row in legacy_audit],
+                         ["cooldown", "cooldown", "cooldown"])
+        self.assertEqual(legacy_audit[1][5], "2026-10-11T15:00:00Z")
 
 SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly"}
 
@@ -1135,7 +1646,7 @@ class ListUsageTest(UsageRegistryCase):
         self.assertEqual(item["schema"], 1)
         self.assertEqual(set(item) - {"usage", "available_again_at"},
                          {"schema", "id", "provider", "kind", "agents", "priority", "models",
-                          "endpoint", "cooldown", "available"})
+                          "endpoint", "cooldown", "model_cooldowns", "available"})
 
     def test_第一次查詢_not_fetched_yet_下一次看到新值(self):
         first = self.item("ollama-cloud")["usage"]
@@ -1276,13 +1787,16 @@ class ListUsageTest(UsageRegistryCase):
 
 
 class ResolveUsageTest(UsageRegistryCase):
-    def test_meta帶usage_不帶cooldown_available_available_again_at(self):
+    def test_meta帶usage與冷卻_不含available與available_again_at(self):
         payload = self.resolve("opencode", "ollama-cloud")
         meta = payload["meta"]
         self.assertEqual(set(meta["usage"]), SHAPE)
         self.assertEqual(meta["usage"]["reason"], "not_fetched_yet")
-        for name in ("cooldown", "available", "available_again_at"):
+        for name in ("available", "available_again_at"):
             self.assertNotIn(name, meta)
+        # 冷卻資訊是提示，恆在
+        self.assertIn("cooldown", meta)
+        self.assertIn("model_cooldowns", meta)
         self.settle()
         self.assertEqual(self.resolve("opencode", "ollama-cloud")["meta"]["usage"],
                          self.item("ollama-cloud")["usage"])
@@ -1303,7 +1817,7 @@ class ResolveUsageTest(UsageRegistryCase):
 
     def test_非200不組裝usage也不觸發(self):
         # 400 bad_request／404／403 agent_not_allowed／403 model_not_allowed／409 no_candidate／
-        # 409 cooling／409 not_deployed／400 no_model：取用量實作都不能被呼叫
+        # 409 not_deployed／400 no_model：取用量實作都不能被呼叫
         cases = [
             (400, "bad_request", dict(agent="opencode", provider=None)),
             (404, "not_found", dict(agent="opencode", provider="nope")),
@@ -1325,10 +1839,6 @@ class ResolveUsageTest(UsageRegistryCase):
         err = self.assert_api_error(400, "no_model", self.resolve, "opencode", "ollama-cloud")
         self.assertNotIn("usage", err.body())
         self.build()
-        # 409 cooling
-        self.cooldown("ollama-cloud", "2026-10-11T15:00:00Z")
-        err = self.assert_api_error(409, "cooling", self.resolve, "opencode", "ollama-cloud")
-        self.assertNotIn("usage", err.body())
         # 409 not_deployed
         self.keys_path.write_text(key_text({**CANARY, "ollama-cloud": ""}), encoding="utf-8")
         self.keys.reload()
@@ -1337,6 +1847,17 @@ class ResolveUsageTest(UsageRegistryCase):
         self.settle()
         self.assertEqual(self.ollama.calls, 0)
         self.assertEqual(self.claude.calls, 0)
+        # 冷卻不是 409（不再是「非 200」的一員）：整把冷卻仍回 200、照常組裝 usage。
+        # 放在最後，因為 200 會真的觸發一次取用量。
+        self.keys_path.write_text(key_text(CANARY), encoding="utf-8")
+        self.keys.reload()
+        self.cooldown("ollama-cloud", "2026-10-11T15:00:00Z")
+        payload = self.resolve("opencode", "ollama-cloud")
+        self.assertEqual(payload["meta"]["cooldown"],
+                         {"until": "2026-10-11T15:00:00Z"})
+        self.assertTrue(payload["env"])
+        self.assertIn("usage", payload["meta"])
+        self.settle()
 
     def test_用量為0仍選它_不自動冷卻(self):
         self.ollama.outcome = FetchResult(windows=windows(

@@ -8,6 +8,7 @@
     client.resolve("claude-code", "anthropic", subscription="claude-personal")
     client.get("claude-personal", "claude-code")
     client.cooldown("claude-personal", "2026-10-12T03:00:00Z")
+    client.cooldown("opencode-zen", "2026-10-12T03:00:00Z", model="big-pickle")
 
 - list() → GET /v1/subscriptions
 - resolve(agent, provider, model, subscription, exclude) → GET /v1/resolve
@@ -16,13 +17,18 @@
   編成 %2B，server 的 parse_qs 才不會解成空白）
 - get(id, agent) → GET /v1/subscriptions/{id}?agent={agent}（過渡期；resolve 的
   並存夥伴，移除在 d 單）
-- cooldown(id, until) → POST /v1/subscriptions/{id}/cooldown，body {"until": RFC 3339 UTC}；成功 204。
+- cooldown(id, until, model=None) → POST /v1/subscriptions/{id}/cooldown，body
+  {"until": RFC 3339 UTC}（有給 model 時多一個 "model"）；成功 204。model 是供應商
+  自己的模型 id（不帶 agent 前綴）；沒有 model 即整把冷卻。
 - 沒有應用層認證（design 決定 5a），所以不帶任何認證標頭。
 - 回 Result：ok、status、data、error、unreachable。連不上或逾時回 unreachable=True、
   不丟例外；400／403／404／409 照實回狀態碼與 error。error 可能是：
   - 服務回的碼：bad_request｜invalid_until｜until_out_of_range｜
     agent_not_allowed｜model_not_allowed｜no_model｜not_found｜not_deployed｜
-    cooling｜no_candidate｜body_too_large；
+    no_candidate｜body_too_large；
+  - cooling：**只有舊版 Gateway 會回**（legacy；新 Gateway 不再因冷卻拒絕，200 的
+    meta 帶 cooldown／model_cooldowns 當提示）。本 client 對它照實回狀態碼與 until，
+    呼叫方要保留判讀；
   - resolve 的非 2xx 回覆把 body 裡 error 以外的欄位（until、missing）放進
     Result.data（錯誤回覆沒有 env；過渡期 get 的錯誤不進 data，與舊行為同款）；
   - 客戶端判讀的：unreachable（連不上或逾時）｜bad_response（回覆不是 JSON 物件）。
@@ -150,9 +156,15 @@ class Client:
         )
         return self._send("GET", path, None)
 
-    def cooldown(self, id: str, until: str) -> Result:
-        """登錄冷卻；until 是何時能再用（RFC 3339 UTC 字串）；成功 204。"""
+    def cooldown(self, id: str, until: str, model: str | None = None) -> Result:
+        """登錄冷卻；until 是何時能再用（RFC 3339 UTC 字串）；成功 204。
+
+        model 選填（供應商自己的模型 id、不帶 agent 前綴）：有給時只冷卻那個模型，
+        沒給即整把。
+        """
         body: dict = {"until": until}
+        if model is not None:
+            body["model"] = model
         path = "/v1/subscriptions/{0}/cooldown".format(
             urllib.parse.quote(str(id), safe="")
         )

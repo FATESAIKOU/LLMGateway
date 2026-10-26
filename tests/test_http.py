@@ -34,6 +34,7 @@ ITEM = {
     "endpoint": None,
     "key": "fake-key-in-get-reply",
     "cooldown": None,
+    "model_cooldowns": {},
     "available": True,
 }
 LIST = {
@@ -215,7 +216,6 @@ class ApiTest(ServerCase):
             (errors.model_not_allowed(), 403, "model_not_allowed"),
             (errors.not_found(), 404, "not_found"),
             (errors.not_deployed(), 409, "not_deployed"),
-            (errors.cooling("2026-10-11T15:00:00Z"), 409, "cooling"),
             (errors.no_candidate(), 409, "no_candidate"),
         ]
         for exc, code, err in cases:
@@ -293,6 +293,26 @@ class ApiTest(ServerCase):
         self.assertEqual(status, 204)
         self.assertEqual(self.fake.calls[-1][2], {})
 
+    def test_cooldown帶model原樣傳到service(self):
+        # HTTP 層不對 model 做任何特別處理（整個 body 照傳，未知欄位由 service 忽略）
+        body = {"until": "2026-10-11T15:00:00Z", "model": "big-pickle",
+                "window": "5h", "extra": 1}
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/opencode-zen/cooldown", body)
+        self.assertEqual(status, 204)
+        self.assertEqual(payload, b"")
+        self.assertEqual(self.fake.calls[-1],
+                         ("register_cooldown", "opencode-zen", body))
+
+    def test_cooldown_DELETE仍404(self):
+        # 沒有提前解除：DELETE 沒有路由（路由仍是四個）
+        status, payload = self.call(
+            "DELETE", "/v1/subscriptions/opencode-zen/cooldown",
+            {"until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.assertEqual(status, 404)
+        self.assertEqual(self.json_of(payload)["error"], "not_found")
+        self.assertFalse(self.fake.calls)
+
     def test_cooldown錯誤對應(self):
         cases = [
             (errors.invalid_until(), 400, "invalid_until"),
@@ -337,6 +357,7 @@ class ApiTest(ServerCase):
             ("POST", "/v1/subscriptions/claude-personal"),
             ("GET", "/v1/subscriptions/claude-personal/cooldown"),
             ("PUT", "/v1/subscriptions/claude-personal/cooldown"),
+            ("DELETE", "/v1/subscriptions/claude-personal/cooldown"),
             ("POST", "/v1/resolve"), ("DELETE", "/v1/resolve"),
             ("GET", "/v1/resolve/"),
         ]
@@ -511,6 +532,35 @@ class RealServiceHttpTest(ServerCase):
             {"until": "2026-10-11T00:00:00Z"}
         )
         self.assertEqual(status, 204)
+
+    def test_http_cooldown帶model端到端(self):
+        # task 6.1／design 23：body 的 model 原樣到 service，list 看得到
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/opencode-zen/cooldown",
+            {"until": "2026-10-11T15:00:00Z", "model": "big-pickle"})
+        self.assertEqual(status, 204)
+        self.assertEqual(payload, b"")
+        status, payload = self.call("GET", "/v1/subscriptions")
+        self.assertEqual(status, 200)
+        items = {i["id"]: i for i in self.json_of(payload)["subscriptions"]}
+        self.assertEqual(items["opencode-zen"]["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
+        self.assertIsNone(items["opencode-zen"]["cooldown"])
+        self.assertTrue(items["opencode-zen"]["available"])
+        # 模型不在 allow → 400 bad_request（不是 403）
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/opencode-zen/cooldown",
+            {"until": "2026-10-11T15:00:00Z", "model": "muse-spark-1.3"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(payload)["error"], "bad_request")
+        # 冷卻不再擋 resolve：同一個模型仍 200，meta 附冷卻資訊
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&model=big-pickle")
+        self.assertEqual(status, 200)
+        meta = self.json_of(payload)["meta"]
+        self.assertEqual(meta["model"], "big-pickle")
+        self.assertEqual(meta["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T15:00:00Z"}})
 
 
 class ResolveHttpTest(ServerCase):
