@@ -205,7 +205,11 @@ class TimerCase(unittest.TestCase):
 
     def test_逾時就殺掉子行程_狀態記timeout(self):
         self.set_mode("hang")
-        timer = self.new_timer(interval=0.05, timeout=0.3, env=self.env())
+        # 逾時要留給 bash 啟動＋寫出 pid 的時間：負載高時（load average 約 5）
+        # 0.3 秒常常在 pid 檔寫出來前就 SIGKILL，`last_child_pid()` 拿到 None
+        # 而偶發失敗（#64）。2 秒仍遠小於下面「時間上限」的斷言（10 秒），
+        # 卡的還是同一條「時間到就殺子行程」的路徑，斷言沒有放寬。
+        timer = self.new_timer(interval=0.05, timeout=2.0, env=self.env())
         started = time.monotonic()
         ok, reason = timer.run_once()
         self.assertFalse(ok)
