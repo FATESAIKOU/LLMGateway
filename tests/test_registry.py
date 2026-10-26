@@ -1665,13 +1665,16 @@ class UsageRegistryCase(RegistryCase):
         self.ollama = FakeFetcher(base=self.clock.now())
         self.claude = FakeFetcher(enabled=False, base=self.clock.now())
         self.claude.source = "fake-claude"
+        self.openrouter = FakeFetcher(base=self.clock.now())
+        self.openrouter.source = "fake-openrouter"
         self.build()
         self.addCleanup(self.usage.stop)
 
     def build(self, policy=None, **settings):
         self.usage = UsageService(
             self.clock,
-            fetchers={"ollama-cloud": self.ollama, "claude-personal": self.claude},
+            fetchers={"ollama-cloud": self.ollama, "claude-personal": self.claude,
+                      "openrouter": self.openrouter},
             settings=settings,
             key_of=lambda s: self.keys.get(s), deployed=self.keys.deployed)
         self.service.close()
@@ -1694,7 +1697,8 @@ class ListUsageTest(UsageRegistryCase):
         self.assertEqual(self.item("opencode-zen")["usage"],
                          {"status": "not_applicable", "source": None, "fetched_at": None,
                           "stale": None, "reason": None, "session": None, "weekly": None})
-        self.assertEqual(self.item("openrouter")["usage"]["status"], "not_applicable")
+        self.settle()
+        self.assertEqual(self.item("openrouter")["usage"]["status"], "ok")
         self.assertEqual(self.item("opencode-go")["usage"]["status"], "not_applicable")
 
     def test_schema仍為1且既有欄位不變(self):
@@ -1983,7 +1987,7 @@ class RealFetcherTtlTest(RegistryCase):
         path.write_text(json.dumps(obj), encoding="utf-8")
         policy = load_policy(str(path))
         fetchers = {name: lgwd_providers.provider_for(name).make_usage_fetcher(UsageDeps())
-                    for name in ("claude-personal", "ollama-cloud")}
+                    for name in ("claude-personal", "ollama-cloud", "openrouter")}
         return UsageService(self.clock, fetchers=fetchers, settings=policy.usage)
 
     def test_沒有usage段_真的無段_Ollama120_Claude1800(self):
@@ -1991,19 +1995,25 @@ class RealFetcherTtlTest(RegistryCase):
         service = self.usage_for(drop_usage=True)
         self.assertEqual(service._ttl["ollama-cloud"], 120)
         self.assertEqual(service._ttl["claude-personal"], 1800)
+        self.assertEqual(service._ttl["openrouter"], 120)
         self.assertFalse(service._enabled["claude-personal"])
         self.assertTrue(service._enabled["ollama-cloud"])
+        self.assertTrue(service._enabled["openrouter"])
 
     def test_明確disabled_Claude1800(self):
         service = self.usage_for(**{"claude-personal": {"enabled": False}})
         self.assertEqual(service._ttl["claude-personal"], 1800)
+        self.assertEqual(service._ttl["openrouter"], 120)
         self.assertFalse(service._enabled["claude-personal"])
         self.assertTrue(service._enabled["ollama-cloud"])
+        self.assertTrue(service._enabled["openrouter"])
 
     def test_出廠政策開啟_Claude不是disabled(self):
         service = self.usage_for()
         self.assertTrue(service._enabled["claude-personal"])
+        self.assertTrue(service._enabled["openrouter"])
         self.assertEqual(service._ttl["claude-personal"], 1800)
+        self.assertEqual(service._ttl["openrouter"], 120)
 
     def test_出廠政策開啟_已部署key_list_not_fetched_yet_觸發一次(self):
         # C3 行為：出廠政策（enabled: true）＋已部署的 key → list 回 not_fetched_yet

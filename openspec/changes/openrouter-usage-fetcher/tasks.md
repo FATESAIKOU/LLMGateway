@@ -1,0 +1,4 @@
+- [x] 新增 lgwd/usage_openrouter.py
+- [x] OpenRouterProvider.make_usage_fetcher 掛點
+- [x] openspec change validate --strict 綠
+- [ ] 歸檔時：更新主 spec Purpose 與「用量不外洩秘密」外連範圍（本 change 的 MODIFIED 已帶外連範圍）；TTL／下限已補在 OpenRouter Requirement。

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 class UsageDeps:
     """組裝取用量實作時的外部相依（#60）；全部可注入，測試用假的。"""
     http_get: object = None        # (url, headers, timeout) -> (status, headers, body)；None＝標準函式庫
+    clock: object = None           # 可替換時鐘（#85 中-3）；None＝SystemClock
     claude_cwd: str | None = None  # Claude 取用量的固定工作目錄（Config.usage_claude_cwd）
     claude_command: str = "claude"
     claude_work_dir: str | None = None
@@ -99,6 +100,10 @@ class OpenRouterProvider(CredentialProvider):
     kind = "api-key"
     endpoint = "https://openrouter.ai/api"
     opencode_provider_id = "openrouter"
+
+    def make_usage_fetcher(self, deps: "UsageDeps"):
+        from .usage_openrouter import OpenRouterUsageFetcher
+        return OpenRouterUsageFetcher(http_get=deps.http_get, clock=deps.clock)
 
 
 class OllamaCloudProvider(CredentialProvider):
