@@ -6,7 +6,7 @@
 
 ## 1. 前置（不是程式；擋住整個實作）
 
-- [x] 1.1 本人裁定（2026-10-26，經 PMO 轉達）：「冷卻只是讓叫人方省麻煩、知道下次何時再叫；他真要再叫，Gateway 也擋不了，也沒必要擋。」本版設計已照此改寫：拿掉 A1（提前解除）、A2（為冷卻做呼叫方身分）、resolve 的 409 `cooling`；A5 改成登錄時 400。**不需要再等裁定**。驗證：本 change 的 design 與 spec 已反映。
+- [x] 1.1 本人裁定（2026-10-26，經 PMO 轉達）：「冷卻只是讓叫人方省麻煩、知道下次何時再叫；他真要再叫，Gateway 也擋不了，也沒必要擋。」本版設計已照此改寫：拿掉提前解除（`DELETE`／`cooldown_release`）、為冷卻做的呼叫方身分、resolve 的 409 `cooling`；只留「登錄時驗證模型 id → 400」。**不需要再等裁定**。驗證：本 change 的 design 與 spec 已反映。
 - [ ] 1.2 設計經**非作者**審查通過（工單 #76 的規則）。審查要對照本版的 spec delta（7 條 MODIFIED、沒有 ADDED）與 design 的決定 1～8。驗證：審查意見全部結案，或列成 1.3。
 - [ ] 1.3 把審查沒收的意見寫回 design（決定與否決選項都要留），不默默改。驗證：`openspec validate model-cooldown --strict`。
 
@@ -17,7 +17,7 @@
 
 ## 3. 登錄冷卻加 `model`（spec「登錄冷卻」；design 決定 1）
 
-- [ ] 3.1 `lgwd/registry.py` 的 `register_cooldown`：body 多認選填 `model`——有給時驗形狀（非空字串，否則 400 `bad_request`）、拒絕萬用字元（`*`／`?`／`[`，400 `bad_request`）、驗 `models.allow` 涵蓋（用既有的 `_covered`，不涵蓋 400 `bad_request`——**不是** 403），只寫（把、模型）那一筆；沒給時走現行整把路徑，行為完全不變。驗證順序照舊（未知 id 404 → 缺 until 400 → until 格式／範圍 400 → model 400）。兩層互不刪除、互不縮短。稽核的 `model` 欄記有效值（沒給時 null）。驗證：`python -m pytest tests/test_registry.py -q -k "cooldown or 冷卻 or 登錄"`（新增：只冷卻一個模型、同一模型取較晚、兩模型互不影響、整把與模型並存、model 不在 allow 回 400、帶前綴回 400、萬用字元回 400、形狀不對回 400；既有 `test_未知欄位忽略`、`invalid_until`、`until_out_of_range`、8 天邊界、時差正規化照舊綠）。
+- [ ] 3.1 `lgwd/registry.py` 的 `register_cooldown`：body 多認選填 `model`——有給（且不是 `null`）時驗形狀（非空字串，否則 400 `bad_request`）、**長度 ≤ 200 字元**（超過 400）、拒絕 agent 前綴（以 `opencode/`／`claude-code/` 開頭，400）、拒絕萬用字元（`*`／`?`／`[`，400）、驗 `models.allow` 涵蓋（用既有的 `_covered`，不涵蓋 400 `bad_request`——**不是** 403），只寫（把、模型）那一筆；`"model": null` 等於沒給，走整把路徑；沒給時行為完全不變。驗證順序照舊（未知 id 404 → 缺 until 400 → until 格式／範圍 400 → model 400）。兩層互不刪除、互不縮短。稽核的 `model` 欄記有效值（沒給時 null）。驗證：`python -m pytest tests/test_registry.py -q -k "cooldown or 冷卻 or 登錄"`（新增：只冷卻一個模型、同一模型取較晚、兩模型互不影響、整把與模型並存、model 不在 allow 回 400、帶前綴回 400（含 `opencode/glm-5.3-flash-free` 這個被 `*-free` 涵蓋的案例）、`claude-code/…` 回 400、大小寫不符（`Big-Pickle`）回 400、超過 200 字元回 400、`model: null` 記整把、形狀不對回 400；既有 `test_未知欄位忽略`、`invalid_until`、`until_out_of_range`、8 天邊界、時差正規化照舊綠）。
 - [ ] 3.2 稽核：登錄冷卻的紀錄帶 `model`（沒給時 null），`until` 仍是有效值；`agent` 仍為 null；沒有 `cooldown_release` 這種 action。驗證：`python -m pytest tests/test_registry.py -q -k "稽核 or audit"`。
 
 ## 4. resolve 不再擋（spec「resolve」「resolve 的選把規則」；design 決定 2、3、4）
@@ -40,15 +40,20 @@
 
 - [ ] 7.1 `docs/deploy.md`：第 0 節的服務描述補一句「冷卻只是提示，resolve 不因冷卻拒絕」（`docs/deploy.md:17`）；第 4 節的 client 範例加一行 `c.cooldown("claude-personal", "2026-10-18T15:00:00Z", model="…")`（`docs/deploy.md:256`）；升級順序補「sidecar 先、Gateway 後（或同一窗）」（design「部署」）。驗證：`git diff --stat -- docs/deploy.md` 只動該檔；人工讀過。
 - [ ] 7.2 `docs/model-rotation.md`（若已存在）：不動。模型冷卻與輪換表無關（design 不做「計入節流」的推導）。驗證：`git status --short` 不含該檔。
+- [ ] 7.3 **主 spec 的 Purpose 與程式 docstring 的舊語意**（`openspec/specs/subscription-registry/spec.md:4` 的 Purpose 仍是「登錄冷卻（只收何時能再用 `until`）」「記冷卻、挑把」；本 change 的 delta 只有 MODIFIED Requirement、沒有 Purpose，而歸檔**不會**用 delta 的 Purpose 改既有 spec 的 Purpose——spec 已存在時它會 `warn "delta Purpose ignored"`（`dist/core/specs-apply.js:197-212`：「A delta Purpose only seeds a spec that does not exist yet」）。所以這件事只能在歸檔之後手改）：
+  - **歸檔之後，在歸檔的那個 commit 裡手改主 spec 的 Purpose**（不在實作 PR 裡手改，也不要期待 `openspec archive` 會自己改）：把「只收 `until`」改成「收 `until` 與選填 `model`」、把「記冷卻、挑把」改成「記冷卻（提示）、照常挑把並附冷卻資訊」。
+  - 改程式 docstring 的舊說法：`lgwd/registry.py:6`（「meta 不含 cooldown」）、`:8`（「非冷卻 → priority」）、`:11-12`、`lgwd/store.py:3-7`（「只剩兩張表」→ 三張）、`lgw/client.py:19`。驗證：`git grep -n "meta 不含 cooldown\|非冷卻\|只剩兩張表" -- lgwd lgw` 為空；`openspec validate model-cooldown --strict` 綠。
+  - Purpose 的驗證（在歸檔那個 commit 之後）：`grep -n "只收何時能再用" openspec/specs/subscription-registry/spec.md` 為空，且 `grep -n "選填 .model." openspec/specs/subscription-registry/spec.md` 命中 Purpose 那一行。
 
 ## 8. 實作 PR 的驗收（不跑全套）
 
 - [ ] 8.1 逐步列出的測試檔全部通過，貼原樣輸出與 exit code：`python -m pytest tests/test_registry.py tests/test_http.py tests/test_client.py -q`（單一測試超過 5 分鐘就停下回報）。規格對照：`openspec validate model-cooldown --strict`。
 - [ ] 8.2 改壞驗證的結果寫進 PR（4.3 的三項，加上：拿掉 `model` 的 allow 檢查 → 「model 不在 allow」轉紅；把 `available` 改成只看部署 → 「模型冷卻不改 available」轉紅；把 `model_cooldowns` 塞進 `cooldown` → 形狀迴歸轉紅）。沒轉紅的列出來。
-- [ ] 8.3 自查：`git status` 只有本 change 的檔案與程式；`openspec validate model-cooldown --strict` 綠；`git diff` 沒有動到 `openspec/specs/`（主 spec 只能經歸檔更新）；`git grep -n "cooling" -- lgwd` 為空（生產者已刪）。
-- [ ] 8.4 部署順序自查：release note 寫明「MyLinuxPool sidecar 先、Gateway 後（或同一窗）」，並註明舊 sidecar + 新 Gateway 的過渡代價（design 決定 4）。
+- [ ] 8.3 自查：`git status` 只有本 change 的檔案與程式；`openspec validate model-cooldown --strict` 綠；`git diff` 沒有動到 `openspec/specs/`（**這條只限實作 PR**：主 spec 在實作 PR 裡不動；歸檔那一步不在這個 PR 內，歸檔的那個 commit 會手改主 spec 的 Purpose，見 7.3）；`git grep -n "cooling" -- lgwd` 為空（生產者已刪）。
+- [ ] 8.4 部署順序自查：release note 寫明「MyLinuxPool sidecar 先、Gateway 後（或同一窗）」，並註明舊 sidecar + 新 Gateway 的代價——開啟時多一次啟動與一次 429、同 provider 多把都在冷卻時會來回換；單一把 provider 的換把結果不變（design 決定 4）。
+- [ ] 8.5 **部署後驗收（等本人部署；不是 PR 的一部分）**：在**測試用的那把**登錄一筆模型冷卻（`POST /v1/subscriptions/{id}/cooldown` 帶 `model`），確認 `list` 的 `model_cooldowns` 出現那一筆、`cooldown` 與 `available` 不受影響，把原樣輸出貼到 #76。**正式環境要不要寫一筆提示、要寫在哪一把，由 PMO／本人決定**，實作者不自行決定。驗證：#76 有一則帶輸出的留言。
 
 ## 9. 交 MyLinuxPool 的請求（**不在本 PR**；經 PMO 轉，見 design 決定 7）
 
-- [ ] 9.1 把 design 決定 7 的八條整理成一張請求（給 PMO 轉 MyLinuxPool 的 PM）：開隊員前看 list 的 `model_cooldowns` 避開冷卻模型／挑同把其他模型、429 時送實際啟動的 `model`、Claude 不送 `model`、`DriverState` 加選填 `model`、免費模型 fallback 600 秒起加倍（上限 3600）、400 不退回整把重送、保留對舊 Gateway 409 的判讀、不要用 `model_cooldowns` 判斷部署、換把前先試同一把的其他模型。驗證：訊息在 Angareion 的對應頻道留痕，回報到 #76。
+- [ ] 9.1 把 design 決定 7 的九條整理成一張請求（給 PMO 轉 MyLinuxPool 的 PM）：開隊員前看 list 的 `model_cooldowns` 避開冷卻模型／挑同把其他模型、429 時送實際啟動的 `model`（沒有模型時送 `null` 或省略都可以，Gateway 兩者都當沒給）、Claude 不送 `model`、`DriverState` 加選填 `model`、免費模型 fallback 600 秒起加倍（上限 3600）、**`bad_request` 維持不重送而 `invalid_until`／`until_out_of_range` 重送時要帶同一個 `model`**、保留對舊 Gateway 409 的判讀、不要用 `model_cooldowns` 判斷部署、換把前先試同一把的其他模型、**resolve 回 200 但 `meta` 的冷卻還在未來時，建議順序依冷卻的種類分開：整把冷卻（`meta.cooldown.until` 在未來）時「換把（用 `exclude=<所有冷卻中的把>` 重新 resolve，或從 `list` 挑一把沒冷卻的、用 `subscription=` 指定）→ 沒有其他可用的把時才等到那個時刻」（這時換模型沒有用），只有選中的模型冷卻（`meta.model_cooldowns[meta.model].until` 在未來）時「換同把的其他模型 → 換把 → 都沒有其他可用的把時才等」，兩種都不要直接開**。驗證：訊息在 Angareion 的對應頻道留痕，回報到 #76。
 - [ ] 9.2 追蹤對端是否接受 fallback 數字（判斷點 B4）；不接受就以對端的窗口資訊為準，並把結論寫回 #76 的留言。驗證：#76 有一則結論留言。

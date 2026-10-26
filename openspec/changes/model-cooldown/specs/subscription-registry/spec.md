@@ -1,4 +1,4 @@
-> 本 delta 對 `openspec/specs/subscription-registry/spec.md`。MODIFIED 的每一條都是完整重貼原條文再改（歸檔時直接套用）。**本版沒有 ADDED 條**：提前解除（舊 A1）與為冷卻做的呼叫方身分（舊 A2）已由本人 2026-10-26 的裁定拿掉。
+> 本 delta 對 `openspec/specs/subscription-registry/spec.md`。MODIFIED 的每一條都是完整重貼原條文再改（歸檔時直接套用）。**本版沒有 ADDED 條**：提前解除（`DELETE` 端點與 `cooldown_release` 稽核）與為冷卻做的呼叫方身分已由本人 2026-10-26 的裁定拿掉。
 >
 > 語意基準：**冷卻只是提示，不是閘門**。登錄冷卻只記錄「這個模型／這把到什麼時候再叫比較省事」；resolve 不因冷卻回 409，照常選把、給 key，並把冷卻資訊附在 `meta`；要不要等、換哪個模型由呼叫方決定。
 
@@ -104,8 +104,9 @@
 - `until` 為必填的 RFC 3339 UTC 字串（何時能再用）；缺少回 400 `bad_request`（`missing` 含 `until`）；
 - `until` 不是 RFC 3339 字串（或型別不對）時回 400 `invalid_until`，不登錄；
 - `until` 在過去或超過 8 天以後 MUST 回 400 `until_out_of_range`，不登錄（模型冷卻用同一個上限）；
-- `model` 選填：有給時 MUST 只冷卻那個模型，沒有時冷卻整把（現行語意）；
-- `model` 有給時 MUST 是非空字串，而且是供應商自己的模型 id（不帶 agent 專用前綴，語意同 resolve 的 `model`）；不是非空字串、含 fnmatch 萬用字元（`*`、`?`、`[`），或不被該把 `models.allow` 的樣式（fnmatch）涵蓋，MUST 回 400 `bad_request`（**不是** 403 `model_not_allowed`——那是 resolve 的政策拒絕碼），不登錄；
+- `model` 選填：有給時 MUST 只冷卻那個模型，沒有時冷卻整把（現行語意）；**`"model": null` MUST 視為沒給**（記整把），與空字串／數字／陣列不是同一類（後三者是「有給但形狀錯」）；
+- `model` 有給（且不是 null）時 MUST 是非空字串，而且是供應商自己的模型 id（不帶 agent 專用前綴，語意同 resolve 的 `model`）；不是非空字串、長度超過 **200 字元**、以 `<agent>/` 開頭（agent ∈ `AGENTS`，即 `opencode/`、`claude-code/`；這個形狀 MUST 被擋，因為 allow 的 `*` 會匹配 `/`，只靠 allow 涵蓋檢查擋不到）、含 fnmatch 萬用字元（`*`、`?`、`[`），或不被該把 `models.allow` 的樣式（fnmatch）涵蓋，MUST 回 400 `bad_request`（**不是** 403 `model_not_allowed`——那是 resolve 的政策拒絕碼），不登錄；Gateway MUST NOT 正規化 `model`（不去前綴、不改大小寫）；
+- 驗證順序 MUST 與現行程式一致、不重排：未知 subscription id → 404 `not_found`，**先於** `until`／`model` 的 400；缺 `until` → 400 `bad_request`；`until` 格式／範圍 → 400；最後才是 `model`（null 除外，見上）→ 400。**body 解析失敗、body 不是物件、超過 1 MB 的 413 `body_too_large`，仍由 HTTP 層先回**（它們不是這個端點的 service 層驗證，所以「404 先於 400」不涵蓋它們）。這個順序與「錯誤回覆」的通則（輸入形狀 400 先於查無 404）不同，是刻意沿用現況（404 是現行程式的第一道檢查）；
 - 同一（把、模型）重複登錄時取較晚的 `until`；整把與模型兩層獨立，登錄其中一層 MUST NOT 刪除或縮短另一層既有的冷卻；
 - 未知欄位 MUST 忽略；
 - 過了 `until` 自動解除，不需要另一個動作（整把與每個模型各自解除）；
@@ -148,6 +149,30 @@
 - **WHEN** 以 `model=opencode/big-pickle` 登錄 `opencode-zen`
 - **THEN** 回 400 `bad_request`（Gateway 不正規化前綴，與 resolve 同一條規則）
 
+#### Scenario: model 帶前綴而且被 allow 樣式涵蓋
+- **WHEN** 以 `model=opencode/glm-5.3-flash-free` 登錄 `opencode-zen`（allow 是 `["*-free", "big-pickle"]`，而 fnmatch 的 `*` 會匹配 `/`，所以它「被涵蓋」）
+- **THEN** 回 400 `bad_request`，冷卻不變——前綴規則必須自己擋下這一種，allow 涵蓋檢查擋不到
+
+#### Scenario: model 太長
+- **WHEN** 以 201 個字元的 `model` 登錄 `claude-personal`（allow 是 `["*"]`），以及以 200 個字元的 `model` 登錄同一把
+- **THEN** 前者回 400 `bad_request`、冷卻不變；後者回 204
+
+#### Scenario: model 大小寫不符
+- **WHEN** 以 `model=Big-Pickle` 登錄 `opencode-zen`（allow 的樣式是 `big-pickle`，`_covered` 用大小寫敏感的 fnmatch）
+- **THEN** 回 400 `bad_request`，冷卻不變（Gateway 不做大小寫正規化）
+
+#### Scenario: model 是 null
+- **WHEN** 以 `{"until": "2026-10-11T15:00:00Z", "model": null}` 登錄 `opencode-zen`
+- **THEN** 回 204，且記的是整把冷卻（`cooldown` 有值、`model_cooldowns` 為 `{}`）——`null` 等於沒給
+
+#### Scenario: 未知的 subscription 與壞的 model
+- **WHEN** 以 `model=opencode/big-pickle`（形狀會 400）登錄一個不存在的 subscription id
+- **THEN** 回 404 `not_found`（查無先於形狀錯誤，與現行程式一致）
+
+#### Scenario: 壞的 until 與壞的 model
+- **WHEN** 以不是 RFC 3339 的 `until` 搭配 `model=opencode/big-pickle` 登錄一個存在的 subscription
+- **THEN** 回 400 `invalid_until`（`until` 的驗證先於 `model`），冷卻不變
+
 #### Scenario: model 是萬用字元
 - **WHEN** 以 `model=*-free` 登錄 `opencode-zen`
 - **THEN** 回 400 `bad_request`，冷卻不變（它不是供應商 id，存進去永遠命不中）
@@ -183,7 +208,7 @@
 ### Requirement: 錯誤回覆
 
 所有錯誤 SHALL 以 `{"error": "<碼>"}` 的 JSON 回覆，訊息不得回顯請求裡的值；resolve 的錯誤回覆 MUST NOT 含 `env`。完整碼表：
-- 400 `bad_request`：JSON 解析失敗、body 不是物件、缺必填（帶 `missing: [...]`）；登錄冷卻的 `model` 不是非空字串、含萬用字元，或不被該把 `models.allow` 涵蓋；resolve 的輸入形狀錯（缺 `agent`／`provider`、`agent` 不是 `claude-code`／`opencode`、`subscription` 與 `provider` 不一致、`subscription` 與 `exclude` 同時給、同一 query 參數重複）；
+- 400 `bad_request`：JSON 解析失敗、body 不是物件、缺必填（帶 `missing: [...]`）；登錄冷卻的 `model` 不是非空字串（`null` 除外——那是「沒給」）、超過 200 字元、以 `<agent>/` 開頭（`opencode/`、`claude-code/`）、含萬用字元，或不被該把 `models.allow` 涵蓋；resolve 的輸入形狀錯（缺 `agent`／`provider`、`agent` 不是 `claude-code`／`opencode`、`subscription` 與 `provider` 不一致、`subscription` 與 `exclude` 同時給、同一 query 參數重複）；
 - 400 `invalid_until`：`until` 不是 RFC 3339 字串（或型別不對）；
 - 400 `until_out_of_range`：`until` 在過去或超過 8 天以後；
 - 400 `no_model`：resolve 的 `model` 省略且沒有候選能推導模型（不代選）；
@@ -199,7 +224,7 @@
 
 客戶端（`lgw.client`）另外判讀兩種結果，不是服務回的碼：`unreachable`（連不上或逾時，呼叫方不會拿到例外）、`bad_response`（回覆不是 JSON 物件）。
 
-多個錯誤同時成立時 SHALL 回優先序最前者：輸入形狀（400 `bad_request`）先於查無（404 `not_found`）先於政策拒絕（403，與 400 `no_model`）先於候選狀態（409 `no_candidate`／`not_deployed`）——與「resolve 的選把規則」的步驟同一軸。`exclude` 後沒有候選 MUST 回 409 `no_candidate`，不選回被排除的那把。
+多個錯誤同時成立時 SHALL 回優先序最前者：輸入形狀（400 `bad_request`）先於查無（404 `not_found`）先於政策拒絕（403，與 400 `no_model`）先於候選狀態（409 `no_candidate`／`not_deployed`）——與「resolve 的選把規則」的步驟同一軸。**登錄冷卻不在這條通則內**：它的順序沿用現行程式（查無 404 先於 `until`／`model` 的 400，見「登錄冷卻」），因為那是既有行為、不是本 change 要改的語意。`exclude` 後沒有候選 MUST 回 409 `no_candidate`，不選回被排除的那把。
 
 #### Scenario: 候選全部冷卻中
 - **WHEN** resolve 的所有候選都在冷卻中
