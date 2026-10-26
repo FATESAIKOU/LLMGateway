@@ -14,7 +14,7 @@
     "opencode-go": {
       "priority": 15,
       "agents": ["opencode"],
-      "models": {"allow": ["*-free"], "default": "iceman-contributor-free"}
+      "models": {"allow": ["*-free"], "default": "beam-free"}
     },
     "openrouter": {
       "priority": 20,

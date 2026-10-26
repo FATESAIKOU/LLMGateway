@@ -97,7 +97,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         expected = {
             "claude-personal": "claude-sonnet-5-5",
             "opencode-zen": "mimo-v2.6-flash-free",
-            "opencode-go": "iceman-contributor-free",
+            "opencode-go": "beam-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
@@ -138,7 +138,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         go = policy.subscriptions["opencode-go"]
         self.assertEqual(go.models_allow, ("*-free",))
-        self.assertTrue(_covered(go, "iceman-contributor-free"))  # default
+        self.assertTrue(_covered(go, "iceman-contributor-free"))  # 仍被 *-free 涵蓋的範例（非 default）
         self.assertTrue(_covered(go, "beam-free"))  # 另一個 Go 免費模型
         self.assertFalse(_covered(go, "kimi-k3"))  # 付費的 id
 

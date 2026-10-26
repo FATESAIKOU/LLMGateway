@@ -615,7 +615,7 @@ class ResolveHttpTest(ServerCase):
         self.assertEqual(data["meta"]["subscription"], "opencode-go")
         self.assertEqual(data["meta"]["endpoint"],
                          "https://opencode.ai/inference/go/openai/v1")
-        self.assertEqual(data["meta"]["model"], "iceman-contributor-free")
+        self.assertEqual(data["meta"]["model"], "beam-free")
         self.assertEqual(data["env"]["OPENCODE_PROVIDER_ID"], "opencode-go")
         self.assertEqual(data["env"]["OPENCODE_API_KEY"], "fake-zen")
         # anthropic 只剩 personal：預設挑它，model 取政策預設
