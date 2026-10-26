@@ -15,12 +15,13 @@ import fnmatch
 import json
 from dataclasses import dataclass, field
 
-SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "openrouter", "ollama-cloud")
+SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "opencode-go",
+                 "openrouter", "ollama-cloud")
 AGENTS = ("claude-code", "opencode")
 
 # 條款與設計的否定約束（固定字串的錯誤訊息）
 _CLAUDE_ONLY = ("claude-personal", "claude-company")
-_ZEN_ONLY = ("opencode-zen",)
+_OPENCODE_ONLY = ("opencode-zen", "opencode-go")
 
 
 _OPENROUTER_ALLOW = ("*:free", "openrouter/free")
@@ -140,7 +141,7 @@ def load_policy(path: str) -> Policy:
     """驗證規則（不合法丟 PolicyError，訊息說明哪裡錯、不含檔案字串）：
     - subscriptions 的鍵只能是 SUBSCRIPTIONS；
     - claude-personal／claude-company 的 agents 只能剛好是 ["claude-code"]（條款）；
-    - opencode-zen 的 agents 只能剛好是 ["opencode"]（沒有官方的 Claude Code 接法）；
+    - opencode-zen／opencode-go 的 agents 只能剛好是 ["opencode"]（沒有官方的 Claude Code 接法）；
     - openrouter 的 agents 只能剛好是 ["opencode"]（免費模型只經過 opencode；design 決定 3）；
     - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
     - 非 null 的 models.default 必須被同一筆的 models.allow 樣式涵蓋（fnmatch；fail-closed）；
@@ -166,9 +167,9 @@ def load_policy(path: str) -> Policy:
     for name in _CLAUDE_ONLY:
         if name in parsed_subs and parsed_subs[name].agents != ("claude-code",):
             raise PolicyError("claude subscriptions allow claude-code only")
-    for name in _ZEN_ONLY:
+    for name in _OPENCODE_ONLY:
         if name in parsed_subs and parsed_subs[name].agents != ("opencode",):
-            raise PolicyError("opencode-zen must only allow opencode")
+            raise PolicyError(f"{name} must only allow opencode")
     if "openrouter" in parsed_subs and parsed_subs["openrouter"].agents != ("opencode",):
         # 免費模型只經過 opencode（v5 既有 MUST，本 change 補上檢查；design 決定 3）。
         raise PolicyError("openrouter must only allow opencode")

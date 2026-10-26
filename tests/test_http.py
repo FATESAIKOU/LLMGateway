@@ -519,6 +519,7 @@ class ResolveHttpTest(ServerCase):
     REPO_ROOT = Path(__file__).resolve().parent.parent
     FAKE_KEYS = {"claude-personal": "fake-personal", "claude-company": "fake-company",
                  "openrouter": "fake-openrouter", "opencode-zen": "fake-zen",
+                 "opencode-go": "fake-zen",
                  "ollama-cloud": "fake-ollama"}
 
     def setUp(self):
@@ -556,6 +557,17 @@ class ResolveHttpTest(ServerCase):
             "GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
         self.assertEqual(status, 200)
         self.assertEqual(self.json_of(payload)["meta"]["model"], "mimo-v2.6-flash-free")
+        # #77：opencode-go 走自己的 endpoint 與 provider id，key 與 zen 共用
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-go")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data["meta"]["subscription"], "opencode-go")
+        self.assertEqual(data["meta"]["endpoint"],
+                         "https://opencode.ai/inference/go/openai/v1")
+        self.assertEqual(data["meta"]["model"], "iceman-contributor-free")
+        self.assertEqual(data["env"]["OPENCODE_PROVIDER_ID"], "opencode-go")
+        self.assertEqual(data["env"]["OPENCODE_API_KEY"], "fake-zen")
         # anthropic 只剩 personal：預設挑它，model 取政策預設
         status, payload = self.call(
             "GET", "/v1/resolve?agent=claude-code&provider=anthropic")

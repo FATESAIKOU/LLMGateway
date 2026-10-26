@@ -2,6 +2,8 @@
 
 key 檔是 `KEY=VALUE` 一行一把：空行略過，# 開頭為註解，鍵名固定見 KEY_NAMES，
 重複鍵亦視為格式錯誤。值為空字串視同沒部署。
+KEY_NAMES 允許多個訂閱對到同一個鍵名（例 opencode-zen／opencode-go 共用
+OPENCODE_ZEN_API_KEY）；key 檔裡仍只寫一行，不是重複鍵。
 鍵名與值兩側空白忽略，值內部空白保留；行內註解不處理，一律視為值的一部分。
 任何 repr、錯誤訊息、log 都 MUST NOT 含值：錯誤訊息只寫行號與種類，不回顯該行內容。
 """
@@ -16,6 +18,7 @@ KEY_NAMES = {
     "claude-company": "CLAUDE_COMPANY_OAUTH_TOKEN",
     "openrouter": "OPENROUTER_API_KEY",
     "opencode-zen": "OPENCODE_ZEN_API_KEY",
+    "opencode-go": "OPENCODE_ZEN_API_KEY",
     "ollama-cloud": "OLLAMA_API_KEY",
 }
 

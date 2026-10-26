@@ -2,7 +2,7 @@
 與 provider 有關的欄位（provider、kind、endpoint）。政策檔只管 priority、agents、models。
 
 - anthropic：Claude 訂閱（claude-subscription），endpoint 為 null（由 agent 直連）；
-- openrouter、ollama-cloud、opencode-zen：api-key，各帶自己的 endpoint。
+- openrouter、ollama-cloud、opencode-zen、opencode-go：api-key，各帶自己的 endpoint。
 - 把（provider、kind、agent）＋key＋model 組成 resolve 的 env 由 build_env（design 決定 2）；
   opencode 只回片段（OPENCODE_* 四鍵），OPENCODE_CONFIG_CONTENT 由 sidecar 組。
 - endpoint 是中介資料（會進 meta 與稽核），不得內嵌憑證：validate_endpoints() 在
@@ -119,12 +119,20 @@ class OpenCodeZenProvider(CredentialProvider):
     opencode_provider_id = "opencode"
 
 
+class OpenCodeGoProvider(CredentialProvider):
+    provider = "opencode-go"
+    kind = "api-key"
+    endpoint = "https://opencode.ai/inference/go/openai/v1"
+    opencode_provider_id = "opencode-go"
+
+
 # subscription id → provider。id 是設計固定值，不是介面的一部分。
 PROVIDERS: dict[str, CredentialProvider] = {
     "claude-personal": AnthropicProvider(),
     "claude-company": AnthropicProvider(),
     "openrouter": OpenRouterProvider(),
     "opencode-zen": OpenCodeZenProvider(),
+    "opencode-go": OpenCodeGoProvider(),
     "ollama-cloud": OllamaCloudProvider(),
 }
 

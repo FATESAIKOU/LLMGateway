@@ -11,6 +11,11 @@
       "agents": ["opencode"],
       "models": {"allow": ["*-free", "big-pickle"], "default": "mimo-v2.6-flash-free"}
     },
+    "opencode-go": {
+      "priority": 15,
+      "agents": ["opencode"],
+      "models": {"allow": ["*-free"], "default": "iceman-contributor-free"}
+    },
     "openrouter": {
       "priority": 20,
       "agents": ["opencode"],

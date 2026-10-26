@@ -46,8 +46,11 @@ exit 1
 
 def key_text(prefix: str = "test-keysync-api") -> str:
     lines = ["# 測試用假 key（不是真值）"]
+    by_name: dict[str, str] = {}
     for sub, name in KEY_NAMES.items():
-        lines.append(f"{name}={prefix}-{sub}")
+        by_name.setdefault(name, f"{prefix}-{sub}")
+    for name, value in by_name.items():
+        lines.append(f"{name}={value}")
     return "\n".join(lines) + "\n"
 
 

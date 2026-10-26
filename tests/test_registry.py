@@ -33,14 +33,20 @@ CANARY = {
     "claude-company": "canary-registry-company-0002",
     "openrouter": "canary-registry-openrouter-0003",
     "opencode-zen": "canary-registry-zen-0004",
+    # #77：opencode-go 與 zen 共用同一個鍵名，值只有一份
+    "opencode-go": "canary-registry-zen-0004",
     "ollama-cloud": "canary-registry-ollama-0005",
 }
 
 
 def key_text(values: dict[str, str]) -> str:
-    lines = ["# 測試用假 key"]
+    """組 key 檔；同一個鍵名只寫一行（opencode-zen／opencode-go 共用 Zen 的鍵名）。"""
+    by_name: dict[str, str] = {}
     for sub, value in values.items():
-        lines.append(f"{KEY_NAMES[sub]}={value}")
+        by_name.setdefault(KEY_NAMES[sub], value)
+    lines = ["# 測試用假 key"]
+    for name, value in by_name.items():
+        lines.append(f"{name}={value}")
     return "\n".join(lines) + "\n"
 
 
@@ -116,6 +122,8 @@ class JsonSchemaTest(RegistryCase):
             "claude-personal": ("anthropic", "claude-subscription", None),
             "openrouter": ("openrouter", "api-key", "https://openrouter.ai/api"),
             "opencode-zen": ("opencode-zen", "api-key", "https://opencode.ai/zen/v1"),
+            "opencode-go": ("opencode-go", "api-key",
+                            "https://opencode.ai/inference/go/openai/v1"),
             "ollama-cloud": ("ollama-cloud", "api-key", "https://ollama.com"),
         }
         items = _by_id(self.list_items())
@@ -134,12 +142,14 @@ class JsonSchemaTest(RegistryCase):
             "openrouter": "https://openrouter.ai/api",
             "ollama-cloud": "https://ollama.com",
             "opencode-zen": "https://opencode.ai/zen/v1",
+            "opencode-go": "https://opencode.ai/inference/go/openai/v1",
         }
         agents = {
             "claude-personal": "claude-code",
             "openrouter": "opencode",
             "ollama-cloud": "opencode",
             "opencode-zen": "opencode",
+            "opencode-go": "opencode",
         }
         listed = _by_id(self.list_items())
         self.assertEqual(set(listed), set(expected))
@@ -152,13 +162,16 @@ class JsonSchemaTest(RegistryCase):
     def test_能不能用(self):
         items = _by_id(self.list_items())
         self.assertTrue(items["claude-personal"]["available"])
-        # key 沒部署 → false
+        # key 沒部署 → false；opencode-go 與 zen 共用同一個鍵名，一起變 false
         self.keys_path.write_text(
-            key_text({k: v for k, v in CANARY.items() if k != "opencode-zen"}),
+            key_text({k: v for k, v in CANARY.items()
+                      if k not in ("opencode-zen", "opencode-go")}),
             encoding="utf-8",
         )
         self.keys.reload()
-        self.assertFalse(_by_id(self.list_items())["opencode-zen"]["available"])
+        items = _by_id(self.list_items())
+        self.assertFalse(items["opencode-zen"]["available"])
+        self.assertFalse(items["opencode-go"]["available"])
         # 有未來的 until → false
         self.cooldown("claude-personal", "2026-10-11T15:00:00Z")
         self.assertFalse(_by_id(self.list_items())["claude-personal"]["available"])
@@ -172,6 +185,11 @@ class JsonSchemaTest(RegistryCase):
             items["opencode-zen"]["models"]["default"],
             "mimo-v2.6-flash-free",
         )
+        self.assertEqual(items["opencode-go"]["models"]["allow"], ["*-free"])
+        self.assertEqual(
+            items["opencode-go"]["models"]["default"],
+            "iceman-contributor-free",
+        )
 
     def test_get與list照出廠值帶出models_default(self):
         # get 與 list 的回覆逐筆帶出出廠的 models.default（#50 起 claude-personal
@@ -179,12 +197,14 @@ class JsonSchemaTest(RegistryCase):
         expected = {
             "claude-personal": "claude-sonnet-5-5",
             "opencode-zen": "mimo-v2.6-flash-free",
+            "opencode-go": "iceman-contributor-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
         agents = {
             "claude-personal": "claude-code",
             "opencode-zen": "opencode",
+            "opencode-go": "opencode",
             "openrouter": "opencode",
             "ollama-cloud": "opencode",
         }
@@ -278,7 +298,8 @@ class ListTest(RegistryCase):
         self.assertEqual(priorities, sorted(priorities))
         self.assertEqual(
             [item["id"] for item in items],
-            ["opencode-zen", "openrouter", "ollama-cloud", "claude-personal"],
+            ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud",
+             "claude-personal"],
         )
 
     def test_冷卻反映在list(self):
@@ -347,6 +368,8 @@ class GetTest(RegistryCase):
         self.assertEqual(item["models"]["default"], "openrouter/free")
         self.assertEqual(item["models"]["allow"], ["*:free", "openrouter/free"])
         self.assertEqual(self.get("opencode-zen", "opencode")["key"], CANARY["opencode-zen"])
+        # #77：opencode-go 與 zen 共用同一個鍵名，get 回同一個值
+        self.assertEqual(self.get("opencode-go", "opencode")["key"], CANARY["opencode-zen"])
         self.assertEqual(self.get("ollama-cloud", "claude-code")["key"], CANARY["ollama-cloud"])
 
     def test_ClaudeCode不能拿openrouter(self):
@@ -563,6 +586,7 @@ class ResolveTest(RegistryCase):
             "claude-company": _FakeApiKeyProvider(),
             "openrouter": original["openrouter"],
             "opencode-zen": original["opencode-zen"],
+            "opencode-go": original["opencode-go"],
             "ollama-cloud": original["ollama-cloud"],
         }
         self.addCleanup(setattr, lgwd_providers, "PROVIDERS", original)
@@ -733,6 +757,37 @@ class ResolveTest(RegistryCase):
     def test_供應商自己的模型id(self):
         payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
         self.assertEqual(payload["meta"]["model"], "big-pickle")  # 供應商 id，不帶 opencode/ 前綴
+
+    def test_opencode_go的env是go的endpoint與provider_id(self):
+        # #77：Go 走自己的 provider id 與 endpoint；key 與 zen 共用同一個值
+        payload = self.resolve("opencode", "opencode-go",
+                               model="iceman-contributor-free")
+        self.assertEqual(payload["meta"]["subscription"], "opencode-go")
+        self.assertEqual(payload["meta"]["provider"], "opencode-go")
+        self.assertEqual(payload["meta"]["endpoint"],
+                         "https://opencode.ai/inference/go/openai/v1")
+        env = payload["env"]
+        self.assertEqual(env["OPENCODE_PROVIDER_ID"], "opencode-go")
+        self.assertEqual(env["OPENCODE_API_KEY"], CANARY["opencode-zen"])
+        self.assertEqual(env["OPENCODE_MODEL"], "iceman-contributor-free")
+        self.assertEqual(env["OPENCODE_SMALL_MODEL"], "iceman-contributor-free")
+        self.assertNotIn("OPENCODE_CONFIG_CONTENT", payload)
+
+    def test_opencode_go的預設模型(self):
+        payload = self.resolve("opencode", "opencode-go")
+        self.assertEqual(payload["meta"]["model"], "iceman-contributor-free")
+
+    def test_opencode_go_allow以外的模型被拒(self):
+        # kimi-k3 不符合 *-free（Issue #77 的驗收）
+        err = self.assert_api_error(
+            403, "model_not_allowed", self.resolve,
+            "opencode", "opencode-go", model="kimi-k3")
+        self.assertNotIn("env", err.body())
+
+    def test_opencode_go只給opencode(self):
+        err = self.assert_api_error(
+            403, "agent_not_allowed", self.resolve, "claude-code", "opencode-go")
+        self.assertNotIn("env", err.body())
 
     def test_未知provider(self):
         self.assert_api_error(404, "not_found", self.resolve, "opencode", "NoSuchProvider")
@@ -1129,6 +1184,7 @@ class ListUsageTest(UsageRegistryCase):
                          {"status": "not_applicable", "source": None, "fetched_at": None,
                           "stale": None, "reason": None, "session": None, "weekly": None})
         self.assertEqual(self.item("openrouter")["usage"]["status"], "not_applicable")
+        self.assertEqual(self.item("opencode-go")["usage"]["status"], "not_applicable")
 
     def test_schema仍為1且既有欄位不變(self):
         item = self.item("ollama-cloud")
