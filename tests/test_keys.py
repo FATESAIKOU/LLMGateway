@@ -57,7 +57,7 @@ class KeyStoreBasicTests(unittest.TestCase):
         self.assertEqual(
             set(KEY_NAMES),
             {"claude-personal", "claude-company", "openrouter", "opencode-zen",
-             "opencode-go", "ollama-cloud"},
+             "opencode-go", "groq", "ollama-cloud"},
         )
 
     def test_opencode_go_共用zen的鍵名(self):
@@ -69,6 +69,42 @@ class KeyStoreBasicTests(unittest.TestCase):
         self.assertEqual(store.get("opencode-go"), CANARY)
         self.assertTrue(store.deployed("opencode-zen"))
         self.assertTrue(store.deployed("opencode-go"))
+
+
+class GroqKeyTests(unittest.TestCase):
+    """#88：groq 用自己的鍵名 GROQ_API_KEY，值紀律與其他把相同（值不進 repr／錯誤）。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.path = str(Path(self.tmpdir.name) / "keys.env")
+
+    def test_鍵名與讀值(self):
+        self.assertEqual(KEY_NAMES["groq"], "GROQ_API_KEY")
+        _write(self.path, f"GROQ_API_KEY={CANARY}\n")
+        store = KeyStore(self.path)
+        self.assertEqual(store.get("groq"), CANARY)
+        self.assertTrue(store.deployed("groq"))
+        # 沒有共用的鍵名：只寫 GROQ 不會讓其他把變成已部署
+        self.assertIsNone(store.get("openrouter"))
+        self.assertFalse(store.deployed("opencode-zen"))
+
+    def test_值不進repr與錯誤訊息(self):
+        _write(self.path, f"GROQ_API_KEY={CANARY}\n")
+        store = KeyStore(self.path)
+        self.assertEqual(repr(store), "<KeyStore>")
+        self.assertNotIn(CANARY, repr(store))
+        # 重複鍵：錯誤訊息只有行號與種類，不含值
+        _write(self.path, f"GROQ_API_KEY={CANARY}\nGROQ_API_KEY={OTHER}\n")
+        try:
+            store.reload()
+        except KeyFileError as exc:
+            self.assertNotIn(CANARY, str(exc))
+            self.assertNotIn(OTHER, str(exc))
+        else:
+            self.fail("expected KeyFileError")
+        self.assertNotIn(CANARY, store.last_reload_error or "")
+        self.assertNotIn(OTHER, store.last_reload_error or "")
 
 
 class KeyStoreReloadTests(unittest.TestCase):

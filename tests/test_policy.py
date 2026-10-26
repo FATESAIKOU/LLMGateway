@@ -54,7 +54,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
     def test_default_policy_loads(self):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         order = [s.name for s in policy.in_priority_order()]
-        self.assertEqual(order, ["opencode-zen", "opencode-go", "openrouter",
+        self.assertEqual(order, ["opencode-zen", "opencode-go", "openrouter", "groq",
                                  "ollama-cloud", "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
@@ -71,9 +71,9 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         self.assertEqual(set(policy.subscriptions),
                          {"claude-personal", "opencode-zen", "opencode-go",
-                          "openrouter", "ollama-cloud"})
+                          "openrouter", "groq", "ollama-cloud"})
         self.assertEqual([s.name for s in policy.in_priority_order()],
-                         ["opencode-zen", "opencode-go", "openrouter",
+                         ["opencode-zen", "opencode-go", "openrouter", "groq",
                           "ollama-cloud", "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].models_default,
                          "claude-sonnet-5-5")
@@ -88,10 +88,10 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertIn("openrouter/free", or_sub.models_allow)
         self.assertEqual(len(or_sub.models_allow), 2)
 
-    def test_出廠五筆訂閱的models_default(self):
-        # 出廠政策檔逐筆釘住：五筆各自有 default（#50 起 claude-personal 預設
-        # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go）。非 null 的
-        # default 必須被同一筆的 allow 樣式涵蓋（allow 是 fnmatch 樣式；
+    def test_出廠六筆訂閱的models_default(self):
+        # 出廠政策檔逐筆釘住：六筆各自有 default（#50 起 claude-personal 預設
+        # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go；#88 加 groq）。
+        # 非 null 的 default 必須被同一筆的 allow 樣式涵蓋（allow 是 fnmatch 樣式；
         # lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         expected = {
@@ -99,6 +99,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
             "opencode-zen": "mimo-v2.6-flash-free",
             "opencode-go": "beam-free",
             "openrouter": "openrouter/free",
+            "groq": "openai/gpt-oss-120b",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
         self.assertEqual(set(policy.subscriptions), set(expected))
@@ -141,6 +142,27 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(_covered(go, "iceman-contributor-free"))  # 仍被 *-free 涵蓋的範例（非 default）
         self.assertTrue(_covered(go, "beam-free"))  # 另一個 Go 免費模型
         self.assertFalse(_covered(go, "kimi-k3"))  # 付費的 id
+
+    def test_groq_allow只放免費層的模型(self):
+        # #88：groq 的 allow 寫死免費層可用的 id（官方 Free Plan 的 rate limits 表：
+        # 2026-10-27 讀 console.groq.com/docs/rate-limits），不放 "*" 也不放寬樣式；
+        # 免費層表上沒有的 id（例如企業方案才有的 llama-3.1-8b-instant）不被涵蓋。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        groq = policy.subscriptions["groq"]
+        self.assertEqual(groq.agents, ("opencode",))
+        self.assertEqual(
+            groq.models_allow,
+            ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"),
+        )
+        for pattern in groq.models_allow:
+            self.assertNotIn("*", pattern)  # 不放 "*"／萬用字元
+            self.assertNotIn("?", pattern)
+        self.assertEqual(groq.models_default, "openai/gpt-oss-120b")
+        self.assertTrue(_covered(groq, "openai/gpt-oss-120b"))  # default
+        self.assertTrue(_covered(groq, "openai/gpt-oss-20b"))
+        self.assertTrue(_covered(groq, "qwen/qwen3.8-27b"))
+        self.assertFalse(_covered(groq, "llama-3.1-8b-instant"))  # Free Plan 表上沒有
+        self.assertFalse(_covered(groq, "meta-models/muse-spark-open"))
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -197,6 +219,25 @@ class PolicyValidationTests(unittest.TestCase):
         obj["subscriptions"]["opencode-go"] = _sub(15, ("opencode",))
         policy = self._reload(obj)
         self.assertEqual(policy.subscriptions["opencode-go"].agents, ("opencode",))
+
+    def test_groq_must_only_allow_opencode(self):
+        # #88：groq 的端點是 OpenAI 相容的，claude-code 接不進去；agents 不是剛好
+        # ["opencode"] 的政策檔一律拒收（比照 zen／go）
+        for agents in (["opencode", "claude-code"], ["claude-code"], []):
+            with self.subTest(agents=agents):
+                with self.assertRaises(PolicyError):
+                    obj = _good_policy()
+                    obj["subscriptions"]["groq"] = _sub(25, agents)
+                    self._reload(obj)
+
+    def test_groq_agents剛好opencode可載入(self):
+        obj = _good_policy()
+        obj["subscriptions"]["groq"] = _sub(
+            25, ("opencode",), ("openai/gpt-oss-120b",), "openai/gpt-oss-120b")
+        policy = self._reload(obj)
+        self.assertEqual(policy.subscriptions["groq"].agents, ("opencode",))
+        self.assertEqual(policy.subscriptions["groq"].models_default,
+                         "openai/gpt-oss-120b")
 
     def test_openrouter_only_free_models(self):
         for allow in (["*"], ["*:free", "*"], ["openrouter/free"], ["*:free", "openrouter/free", "*"]):

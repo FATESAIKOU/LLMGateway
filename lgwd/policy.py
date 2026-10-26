@@ -16,15 +16,24 @@ import json
 from dataclasses import dataclass, field
 
 SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "opencode-go",
-                 "openrouter", "ollama-cloud")
+                 "groq", "openrouter", "ollama-cloud")
 AGENTS = ("claude-code", "opencode")
 
 # 條款與設計的否定約束（固定字串的錯誤訊息）
 _CLAUDE_ONLY = ("claude-personal", "claude-company")
-_OPENCODE_ONLY = ("opencode-zen", "opencode-go")
+_OPENCODE_ONLY = ("opencode-zen", "opencode-go", "groq")
 
 
 _OPENROUTER_ALLOW = ("*:free", "openrouter/free")
+
+# groq（#88）：只有**免費層**可用的模型寫進政策檔的 models.allow，不放 "*" 也不放
+# 寬樣式。出廠清單（policy/default.json）取自官方 Free Plan 的 rate limits 表
+# （https://console.groq.com/docs/rate-limits，2026-10-27 讀）裡可做 chat／coding 的
+# 那幾個 id。這條是政策檔的資料面約定，policy 不另外驗 allow 的形狀（與其他
+# provider 一致）。
+# 免費層的**訓練政策頁查不到**（console.groq.com/docs/your-data 只寫「預設不保留」
+# 與 ZDR，沒有 training 字樣；docs/research/free-model-capacity.md §3.6）：因此這把
+# 只給 public repo 與假資料的工作，不碰真資料。要改這個限制得先查到官方的訓練條款。
 
 
 class PolicyError(ValueError):
@@ -142,7 +151,8 @@ def load_policy(path: str) -> Policy:
     """驗證規則（不合法丟 PolicyError，訊息說明哪裡錯、不含檔案字串）：
     - subscriptions 的鍵只能是 SUBSCRIPTIONS；
     - claude-personal／claude-company 的 agents 只能剛好是 ["claude-code"]（條款）；
-    - opencode-zen／opencode-go 的 agents 只能剛好是 ["opencode"]（沒有官方的 Claude Code 接法）；
+    - opencode-zen／opencode-go／groq 的 agents 只能剛好是 ["opencode"]（沒有官方的
+      Claude Code 接法；groq 的端點是 OpenAI 相容，見 providers.py）；
     - openrouter 的 agents 只能剛好是 ["opencode"]（免費模型只經過 opencode；design 決定 3）；
     - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
     - 非 null 的 models.default 必須被同一筆的 models.allow 樣式涵蓋（fnmatch；fail-closed）；
