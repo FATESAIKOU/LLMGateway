@@ -14,7 +14,7 @@
 
 ## 0. 全貌與架構
 
-服務只做這幾件事：list、resolve、get（過渡期，之後由 d 單移除）、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
+服務只做這幾件事：list、resolve、get（過渡期，之後由 d 單移除）、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。冷卻只是提示，resolve 不因冷卻拒絕（冷卻資訊在 `meta`／`list` 的 `cooldown`、`model_cooldowns`；要不要等、換哪個模型由呼叫方決定）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
 
 - `lgwd` 只綁放服務那台的 `127.0.0.1:<API 埠>`（預設 8480），不綁任何對外或容器網路的介面。
 - 隧道守護 `llmgateway-tunnel.service` 用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：
@@ -253,7 +253,9 @@ from lgw import client
 c = client.Client("http://127.0.0.1:4710")
 c.list()                                              # 取得可用訂閱（不含 key）
 c.get("claude-personal", "claude-code")               # 取得 key 明文（需指定 agent）
-c.cooldown("claude-personal", "2026-10-18T15:00:00Z") # 登錄冷卻
+c.cooldown("claude-personal", "2026-10-18T15:00:00Z") # 登錄冷卻（整把）
+c.cooldown("opencode-zen", "2026-10-18T15:00:00Z",    # 只冷卻一個模型
+           model="mimo-v2.6-flash-free")
 ```
 
 ---
@@ -298,6 +300,10 @@ llmgwctl upgrade --tag lgw-vX.Y.Z [--repo <repo>]
 4. 安裝新 unit 檔並執行 `systemctl daemon-reload`。
 5. 重啟 `llmgateway.service`。
 6. **失敗自動回滾**：升級過程中任何步驟失敗，立即自動回復至上一版本（`previous`）。
+
+> [!IMPORTANT]
+> **跨 repo 的升級順序：MyLinuxPool 的 sidecar 先上，Gateway 後上（或同一個維護窗一起上）。**
+> 舊 sidecar ＋ 新 Gateway 的代價：開啟時多一次啟動與一次 429；同一個 provider 有多把且都在冷卻時會來回換（每輪一次啟動加一次 429）。單一把 provider 的換把結果不變（`exclude` 之後沒有候選 → `409 no_candidate`）。新 sidecar ＋ 舊 Gateway 只是退回現行行為（舊 Gateway 仍會回 `409 cooling`），不會更糟。
 
 ### 5.4 手動版本回滾（`rollback`）
 

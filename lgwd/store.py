@@ -1,10 +1,12 @@
 """SQLite 細節（design 決定 5b、8、10 與 v5 的決定 8 取代；spec subscription-registry、key-vault）。只用標準函式庫。
 
-只剩兩張表：
-- cooldowns：subscription → until（何時能再用；重複登錄取較晚的）；
+三張表：
+- cooldowns：subscription → until（整把何時能再用；重複登錄取較晚的）；
+- model_cooldowns：(subscription, model) → until（單一模型何時能再用；與整把各自獨立、
+  重複登錄取較晚的；本版沒有解除，過期列讀時視為無效）；
 - audit：只追加。get（過渡期）記（時刻、subscription id、agent）；resolve 記（時刻、
   subscription id、agent、provider、model—— provider／model 是中介資料）；登錄冷卻記
-  （時刻、subscription id、until）。
+  （時刻、subscription id、until、model——model 是選填的模型 id）。
 絕不存 key 的值，也不記客戶端（沒有應用層認證）。
 
 單一連線＋RLock；會改變狀態的動作一律經 txn()（BEGIN IMMEDIATE）。
@@ -21,6 +23,12 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS cooldowns (
     subscription TEXT PRIMARY KEY,
     until TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_cooldowns (
+    subscription TEXT NOT NULL,
+    model TEXT NOT NULL,
+    until TEXT NOT NULL,
+    PRIMARY KEY (subscription, model)
 );
 CREATE TABLE IF NOT EXISTS audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +101,36 @@ class Store:
             " WHERE excluded.until > cooldowns.until",
             (subscription, until),
         )
+
+    # --- 模型冷卻（與整把各自獨立） ---
+    def cooldown_get_model(
+        self, cur: sqlite3.Cursor, subscription: str, model: str
+    ) -> sqlite3.Row | None:
+        return cur.execute(
+            "SELECT * FROM model_cooldowns WHERE subscription = ? AND model = ?",
+            (subscription, model),
+        ).fetchone()
+
+    def cooldown_set_model(
+        self, cur: sqlite3.Cursor, subscription: str, model: str, until: str
+    ) -> None:
+        """寫入；同一（把、模型）取較晚的 until（與整把同一條 SQL 形狀）。"""
+        cur.execute(
+            "INSERT INTO model_cooldowns (subscription, model, until) VALUES (?, ?, ?)"
+            " ON CONFLICT(subscription, model) DO UPDATE SET until = excluded.until"
+            " WHERE excluded.until > model_cooldowns.until",
+            (subscription, model, until),
+        )
+
+    def model_cooldowns_of(
+        self, cur: sqlite3.Cursor, subscription: str
+    ) -> list[sqlite3.Row]:
+        """該把全部的模型冷卻列（含過期的；呼叫方自己判有效）。依 model 排序。"""
+        return cur.execute(
+            "SELECT subscription, model, until FROM model_cooldowns"
+            " WHERE subscription = ? ORDER BY model",
+            (subscription,),
+        ).fetchall()
 
     # --- 稽核（只追加） ---
     def audit_add(
