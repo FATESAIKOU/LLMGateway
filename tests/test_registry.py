@@ -188,7 +188,7 @@ class JsonSchemaTest(RegistryCase):
         self.assertEqual(items["opencode-go"]["models"]["allow"], ["*-free"])
         self.assertEqual(
             items["opencode-go"]["models"]["default"],
-            "iceman-contributor-free",
+            "beam-free",
         )
 
     def test_get與list照出廠值帶出models_default(self):
@@ -197,7 +197,7 @@ class JsonSchemaTest(RegistryCase):
         expected = {
             "claude-personal": "claude-sonnet-5-5",
             "opencode-zen": "mimo-v2.6-flash-free",
-            "opencode-go": "iceman-contributor-free",
+            "opencode-go": "beam-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
@@ -1073,7 +1073,7 @@ class ResolveTest(RegistryCase):
 
     def test_opencode_go的預設模型(self):
         payload = self.resolve("opencode", "opencode-go")
-        self.assertEqual(payload["meta"]["model"], "iceman-contributor-free")
+        self.assertEqual(payload["meta"]["model"], "beam-free")
 
     def test_opencode_go_allow以外的模型被拒(self):
         # kimi-k3 不符合 *-free（Issue #77 的驗收）

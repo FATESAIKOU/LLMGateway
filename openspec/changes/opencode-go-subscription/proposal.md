@@ -2,14 +2,14 @@
 
 ## Why
 
-本人要把 OpenCode Go 的免費模型登錄成 Gateway 的另一把 subscription `opencode-go`，和 OpenCode Zen 用同一把 key（本人 2026-10-26 經 PMO 定案：priority 15、`agents` 只有 `opencode`、`models.allow` 為 `["*-free"]`、`models.default` 為 `iceman-contributor-free`；不加新鍵名）。現行 spec 的 endpoint 與 `OPENCODE_PROVIDER_ID` 對照只列到 `opencode-zen`，不寫進 spec 就沒有可對照的介面約定。
+本人要把 OpenCode Go 的免費模型登錄成 Gateway 的另一把 subscription `opencode-go`，和 OpenCode Zen 用同一把 key（本人 2026-10-26 經 PMO 定案：priority 15、`agents` 只有 `opencode`、`models.allow` 為 `["*-free"]`、`models.default` 為 `beam-free`；不加新鍵名）。現行 spec 的 endpoint 與 `OPENCODE_PROVIDER_ID` 對照只列到 `opencode-zen`，不寫進 spec 就沒有可對照的介面約定。備註：`iceman-contributor-free` 原先被寫成 default，但它已經不在 Go 的線上清單、實測沒有回應（2026-10-26），故 default 改為 `beam-free`。
 
 ## What Changes
 
 - `lgwd/policy.py` 的 `SUBSCRIPTIONS` 白名單加 `opencode-go`；與 `opencode-zen` 同一條檢查，`agents` 不是剛好 `["opencode"]` 就丢 `PolicyError`。
 - `lgwd/providers.py` 加 `OpenCodeGoProvider`：`provider`／`opencode_provider_id` 都是 `opencode-go`，`kind` 為 `api-key`，`endpoint` 為 `https://opencode.ai/inference/go/openai/v1`。
 - `lgwd/keys.py` 的 `KEY_NAMES` 讓 `opencode-go` 對到 `OPENCODE_ZEN_API_KEY`（共用鍵名；key 檔仍只寫一行）。
-- `policy/default.json` 加這一筆（priority 15、`agents` `["opencode"]`、`allow` `["*-free"]`、`default` `iceman-contributor-free`）。
+- `policy/default.json` 加這一筆（priority 15、`agents` `["opencode"]`、`allow` `["*-free"]`、`default` `beam-free`）。
 - spec `subscription-registry`：MODIFIED「endpoint 的語意」與「env 的組成」，把 Go 的 endpoint 與 provider id 補進既有清單。
 
 ## What Does Not Change

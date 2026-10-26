@@ -3,7 +3,7 @@
 ## 1. 政策白名單與檢查
 
 - [x] 1.1 `lgwd/policy.py`：`SUBSCRIPTIONS` 加 `opencode-go`；把 `_ZEN_ONLY` 改成 `_OPENCODE_ONLY = ("opencode-zen", "opencode-go")`，`agents` 不是剛好 `["opencode"]` 就丢 `PolicyError`（訊息仍只帶固定訂閱 id）。驗證：`tests/test_policy.py`（出廠政策可載入、順序含 go、`agents` 為 `["opencode", "claude-code"]`／`["claude-code"]`／`[]` 都拒收、剛好 `["opencode"]` 可載入）。
-- [x] 1.2 `policy/default.json`：加 `opencode-go`（priority 15、`agents` `["opencode"]`、`allow` `["*-free"]`、`default` `iceman-contributor-free`）。驗證：`tests/test_policy.py` 逐筆釘住 default 與 allow 涵蓋；`kimi-k3` 不被涵蓋。
+- [x] 1.2 `policy/default.json`：加 `opencode-go`（priority 15、`agents` `["opencode"]`、`allow` `["*-free"]`、`default` `beam-free`）。驗證：`tests/test_policy.py` 逐筆釘住 default 與 allow 涵蓋；`kimi-k3` 不被涵蓋。備註：`iceman-contributor-free` 原先被寫成 default，但它已經不在 Go 的線上清單、實測沒有回應（2026-10-26），故 default 改為 `beam-free`。
 
 ## 2. provider 與 key
 

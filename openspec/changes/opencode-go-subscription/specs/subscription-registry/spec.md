@@ -50,5 +50,5 @@ opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回
 - **THEN** 兩次 `env` 的 `OPENCODE_PROVIDER_ID` 都是 `opencode`、`OPENCODE_API_KEY` 相同，`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL` 各自是該模型；`env` 不含 `OPENCODE_CONFIG_CONTENT`
 
 #### Scenario: opencode-go 的片段
-- **WHEN** 以 `agent=opencode&provider=opencode-go&model=iceman-contributor-free` resolve
-- **THEN** `env` 的 `OPENCODE_PROVIDER_ID` 為 `opencode-go`、`OPENCODE_API_KEY` 為 Zen 那把 key 的值（兩把共用同一個鍵名），`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL` 為 `iceman-contributor-free`
+- **WHEN** 以 `agent=opencode&provider=opencode-go&model=beam-free` resolve
+- **THEN** `env` 的 `OPENCODE_PROVIDER_ID` 為 `opencode-go`、`OPENCODE_API_KEY` 為 Zen 那把 key 的值（兩把共用同一個鍵名），`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL` 為 `beam-free`
