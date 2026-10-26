@@ -607,6 +607,37 @@ class UsageGatewayTest(unittest.TestCase):
         with self.assertRaises(PolicyError):
             self.gateway(usage={"claude-personal": {"enable": True}})
 
+    def test_make_policy的預設政策明確關閉Claude(self):
+        # 出廠政策檔（policy/default.json）已開啟 Claude（#60 階段 C）；
+        # 測試輔助 make_policy 必須明確關掉，否則 list 一列就在背景 spawn `claude`。
+        # 直接讀政策檔，不經 load_policy：這裡守的是測試輔助的內容，
+        # 不是政策解析器（後者由 test_policy.py 守）。
+        data = json.loads(Path(self.make_policy()).read_text(encoding="utf-8"))
+        self.assertIsNotNone(data.get("usage"), "make_policy 要寫出 usage，不能留 null")
+        self.assertIs(data["usage"].get("claude-personal", {}).get("enabled"), False)
+
+    def test_測試期間不會exec真的claude(self):
+        # 行為守衛：假 claude 放在 PATH 最前面，list 觸發背景取用量後等它跑完；
+        # 記號檔不存在表示沒有 exec 任何 claude。把 make_policy 的明確禁用拿掉，
+        # 出廠政策會開啟 Claude，這支就會轉紅。
+        fakebin = self.root / "fakebin"
+        fakebin.mkdir()
+        marker = fakebin / "called"
+        fake = fakebin / "claude"
+        fake.write_text("#!/bin/sh\necho called > '%s'\nexit 1\n" % marker,
+                        encoding="utf-8")
+        fake.chmod(0o755)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(fakebin) + os.pathsep + old_path
+        try:
+            gw, base = self.gateway()          # 不傳 usage：走 make_policy 的預設
+            self.items(base)                   # list 會觸發背景取用量
+            self.assertTrue(gw._usage.wait_idle(30), "背景取用量沒有在時限內結束")
+            self.assertEqual(gw._usage._guard.procs, set())
+            self.assertFalse(marker.exists(), "make_policy 的預設政策 exec 了 claude")
+        finally:
+            os.environ["PATH"] = old_path
+
 
 if __name__ == "__main__":
     unittest.main()

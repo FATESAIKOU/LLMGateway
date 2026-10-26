@@ -116,8 +116,6 @@ def _parse_usage(data: object, subs: dict) -> dict[str, UsageSetting]:
     本身不是 object、鍵不在政策的 subscriptions、值不是 object、有 enabled／ttl_seconds
     以外的鍵（打錯的鍵不能靜默忽略）、enabled 不是布林、ttl_seconds 不是正整數，一律拒收。
     """
-    if data is None:
-        return {}
     if not isinstance(data, dict):
         raise PolicyError("policy.usage must be an object")
     out: dict[str, UsageSetting] = {}

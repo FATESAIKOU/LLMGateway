@@ -273,7 +273,7 @@ Ollama 取用量 SHALL 對寫死在程式裡的 `https://ollama.com/api/balance`
 - **THEN** 第二次請求帶的是新 key
 
 ### Requirement: Claude 取用量
-Claude 取用量 SHALL 執行**未修改的原版 Claude Code** 並讀其 statusline 的 `rate_limits`（`five_hour`／`seven_day`）；Gateway MUST NOT 自己用訂閱 token 對 Anthropic 的 API 或沒有文件的 usage endpoint 發請求，MUST NOT 收集或轉手 session token。**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前需完成 10.1／10.2 與 C1，未完成時 `usage` 會是 `unknown`／`upstream_error`。只用管道 1（statusline）；取不到就是 `unknown`，MUST NOT 再找別條路。管道 2（`-p` 下的 `/usage`）於 2026-10-25 階段 B 探測 (b) 實測不可用（只回 session cost、沒有窗口），不採用。子行程規則：
+Claude 取用量 SHALL 執行**未修改的原版 Claude Code** 並讀其 statusline 的 `rate_limits`（`five_hour`／`seven_day`）；Gateway MUST NOT 自己用訂閱 token 對 Anthropic 的 API 或沒有文件的 usage endpoint 發請求，MUST NOT 收集或轉手 session token。**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前需完成 10.1／10.2 與 C1（階段 C 的前置，即原版 Claude Code、trust 固定目錄、服務的 PATH 與 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`），未完成時 `usage` 會是 `unknown`／`upstream_error`。只用管道 1（statusline）；取不到就是 `unknown`，MUST NOT 再找別條路。管道 2（`-p` 下的 `/usage`）於 2026-10-25 階段 B 探測 (b) 實測不可用（只回 session cost、沒有窗口），不採用。子行程規則：
 - token MUST 只以子行程環境變數 `CLAUDE_CODE_OAUTH_TOKEN` 傳入，MUST NOT 出現在 argv、檔案；
 - 子行程環境用白名單，MUST NOT 繼承服務的環境；
 - 子行程 stdout／stderr MUST NOT 進 log，只留 `rate_limits` 的四個數字欄位；解析失敗（欄位缺、型別不對、非 Pro／Max）→ `unknown`（`parse_error`／`no_windows`），MUST NOT 補 0；
