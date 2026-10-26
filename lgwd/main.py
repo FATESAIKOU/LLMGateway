@@ -20,8 +20,7 @@ import os
 import signal
 import sys
 import threading
-from dataclasses import dataclass
-
+from dataclasses import dataclass, replace as _dc_replace
 from .clock import Clock, SystemClock
 from .http import make_api_server
 from .keys import KeyFileError, KeyStore
@@ -225,7 +224,9 @@ class Gateway:
 
     def _make_usage(self, policy, usage_deps: UsageDeps | None) -> UsageService:
         """依 providers 的取用量掛點組裝 UsageService（#60）；啟動時掃 Claude 取用量的舊殘留。"""
-        deps = usage_deps or UsageDeps(claude_cwd=self._config.usage_claude_cwd)
+        deps = usage_deps or UsageDeps(claude_cwd=self._config.usage_claude_cwd, clock=self._clock)
+        if getattr(deps, "clock", None) is None:
+            deps = _dc_replace(deps, clock=self._clock)
         fetchers = {}
         for name in policy.subscriptions:
             fetcher = provider_for(name).make_usage_fetcher(deps)

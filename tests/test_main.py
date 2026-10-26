@@ -27,7 +27,7 @@ from lgwd.main import Config, Gateway, load_config
 from lgwd.policy import PolicyError
 from lgwd.providers import UsageDeps
 from tests.usage_fakes import refuse_http
-
+from tests.subprocess_policy import usage_all_disabled
 REPO = Path(__file__).resolve().parent.parent
 FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
              ("claude-personal", "claude-company", "openrouter",
@@ -37,10 +37,9 @@ FAKE_KEYS["opencode-go"] = FAKE_KEYS["opencode-zen"]
 
 
 def write_policy(root):
-    """出廠政策＋關掉 Ollama 與 Claude 取用量：起真 lgwd 子行程的測試不對外連線（#60）。"""
+    """出廠政策＋關掉所有有取用量實作的 provider：起真 lgwd 子行程的測試不對外連線（#60、#85）。"""
     policy = json.loads((REPO / "policy" / "default.json").read_text(encoding="utf-8"))
-    policy["usage"] = {"ollama-cloud": {"enabled": False},
-                        "claude-personal": {"enabled": False}}
+    policy["usage"] = usage_all_disabled()
     (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
 
 
@@ -479,7 +478,8 @@ class UsageGatewayTest(unittest.TestCase):
         if usage is None:
             # 出廠政策已開啟 Claude（#60 階段 C）；不談 Claude 的測試一律明確關閉，
             # 免得 list 一列就 spawn 真的 `claude`（測試要自足）。
-            usage = {"claude-personal": {"enabled": False}}
+            usage = {"claude-personal": {"enabled": False},
+                     "openrouter": {"enabled": False}}
         obj["usage"] = usage
         path = self.root / "policy.json"
         path.write_text(json.dumps(obj), encoding="utf-8")
@@ -642,6 +642,46 @@ class UsageGatewayTest(unittest.TestCase):
             self.assertFalse(marker.exists(), "make_policy 的預設政策 exec 了 claude")
         finally:
             os.environ["PATH"] = old_path
+
+
+class SubprocessPolicyGuardTest(unittest.TestCase):
+    """起真 lgwd 子行程的測試寫出的政策檔，必須關掉所有有 usage fetcher 的 provider。"""
+    def _fetcher_providers(self):
+        import json
+        from lgwd import providers as P
+        policy = json.loads((REPO / "policy" / "default.json").read_text(encoding="utf-8"))
+        subs = set(policy["subscriptions"])
+        return [name for name, p in P.PROVIDERS.items()
+                if name in subs and p.make_usage_fetcher(P.UsageDeps()) is not None]
+
+    def test_helper_關掉所有fetcher(self):
+        from tests.subprocess_policy import usage_all_disabled
+        got = usage_all_disabled()
+        for sub in self._fetcher_providers():
+            self.assertIn(sub, got, f"helper 沒有 {sub}")
+            self.assertFalse(got[sub].get("enabled", True), f"helper 未關掉 {sub}")
+        # helper 不該多出非 fetcher 的鍵
+        for key in got:
+            self.assertIn(key, self._fetcher_providers(), f"helper 多出 {key}")
+
+    def test_write_policy_用helper(self):
+        from tests.subprocess_policy import usage_all_disabled
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write_policy(root)
+            policy = json.loads((root / "policy.json").read_text(encoding="utf-8"))
+            self.assertEqual(policy.get("usage"), usage_all_disabled())
+
+    def test_keysync_setUp_用helper(self):
+        from tests.subprocess_policy import usage_all_disabled
+        from tests.test_keysync_api import KeysyncApiTest
+        t = KeysyncApiTest()
+        t.setUp()
+        try:
+            policy = json.loads(open(t.policy, encoding="utf-8").read())
+            self.assertEqual(policy.get("usage"), usage_all_disabled())
+        finally:
+            t.doCleanups()
 
 
 if __name__ == "__main__":

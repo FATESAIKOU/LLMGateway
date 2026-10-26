@@ -22,7 +22,7 @@ import unittest
 import urllib.request
 
 from lgwd.keys import KEY_NAMES
-
+from tests.subprocess_policy import usage_all_disabled
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PASSWORD = "FakeKeysyncApiPassword_ForTests_0011"  # 假值，只在測試裡用
 PASSWORD_ENV = "LLMGW_KEYS_PASSWORD"
@@ -84,9 +84,9 @@ class KeysyncApiTest(unittest.TestCase):
         self.policy = os.path.join(self.root, "policy.json")
         with open(os.path.join(REPO, "policy", "default.json"), encoding="utf-8") as fh:
             policy_text = fh.read()
-        # 起真 lgwd 子行程：關掉 Ollama 取用量，免得測試對外連線（#60）
+        # 起真 lgwd 子行程：關掉所有有取用量實作的 provider，免得測試對外連線（#60、#85）
         policy_obj = json.loads(policy_text)
-        policy_obj["usage"] = {"ollama-cloud": {"enabled": False}}
+        policy_obj["usage"] = usage_all_disabled()
         with open(self.policy, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(policy_obj))
         self.cred = os.path.join(self.root, "cred")
