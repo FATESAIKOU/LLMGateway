@@ -31,7 +31,7 @@ from tests.subprocess_policy import usage_all_disabled
 REPO = Path(__file__).resolve().parent.parent
 FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
              ("claude-personal", "claude-company", "openrouter",
-              "opencode-zen", "opencode-go", "ollama-cloud")}
+              "opencode-zen", "opencode-go", "groq", "ollama-cloud")}
 # #77：opencode-go 與 zen 共用同一個鍵名（key 檔只有一行）
 FAKE_KEYS["opencode-go"] = FAKE_KEYS["opencode-zen"]
 
@@ -158,7 +158,7 @@ class ApiTest(MainCase):
         status, raw = http_get(self.base + "/v1/subscriptions")
         self.assertEqual(status, 200)  # 不做應用層認證
         data = json.loads(raw)
-        self.assertEqual(len(data["subscriptions"]), 5)
+        self.assertEqual(len(data["subscriptions"]), 6)
         blob = raw.decode()
         for value in FAKE_KEYS.values():
             self.assertNotIn(value, blob)

@@ -2,7 +2,7 @@
 與 provider 有關的欄位（provider、kind、endpoint）。政策檔只管 priority、agents、models。
 
 - anthropic：Claude 訂閱（claude-subscription），endpoint 為 null（由 agent 直連）；
-- openrouter、ollama-cloud、opencode-zen、opencode-go：api-key，各帶自己的 endpoint。
+- openrouter、ollama-cloud、opencode-zen、opencode-go、groq：api-key，各帶自己的 endpoint。
 - 把（provider、kind、agent）＋key＋model 組成 resolve 的 env 由 build_env（design 決定 2）；
   opencode 只回片段（OPENCODE_* 四鍵），OPENCODE_CONFIG_CONTENT 由 sidecar 組。
 - endpoint 是中介資料（會進 meta 與稽核），不得內嵌憑證：validate_endpoints() 在
@@ -131,6 +131,22 @@ class OpenCodeGoProvider(CredentialProvider):
     opencode_provider_id = "opencode-go"
 
 
+class GroqProvider(CredentialProvider):
+    """Groq（#88）：OpenAI 相容的 root 位址；沒有官方的 Claude Code 接法。
+
+    endpoint 出處：官方文件 `https://console.groq.com/docs/openai`「change the
+    `base_url` to `https://api.groq.com/openai/v1`」（2026-10-27 讀）。
+    opencode 端官方支援（`https://console.groq.com/docs/coding-with-groq/opencode`），
+    provider id 用 opencode 內建的 `groq`。
+    不含 usage fetcher：Groq 沒有公布查剩餘配額的端點（官方 rate-limits 頁只有
+    回應標頭 `x-ratelimit-*`，沒有查詢端點），沿用預設的 not_applicable。
+    """
+    provider = "groq"
+    kind = "api-key"
+    endpoint = "https://api.groq.com/openai/v1"
+    opencode_provider_id = "groq"
+
+
 # subscription id → provider。id 是設計固定值，不是介面的一部分。
 PROVIDERS: dict[str, CredentialProvider] = {
     "claude-personal": AnthropicProvider(),
@@ -138,6 +154,7 @@ PROVIDERS: dict[str, CredentialProvider] = {
     "openrouter": OpenRouterProvider(),
     "opencode-zen": OpenCodeZenProvider(),
     "opencode-go": OpenCodeGoProvider(),
+    "groq": GroqProvider(),
     "ollama-cloud": OllamaCloudProvider(),
 }
 

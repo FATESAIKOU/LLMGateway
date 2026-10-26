@@ -569,7 +569,7 @@ class ResolveHttpTest(ServerCase):
     REPO_ROOT = Path(__file__).resolve().parent.parent
     FAKE_KEYS = {"claude-personal": "fake-personal", "claude-company": "fake-company",
                  "openrouter": "fake-openrouter", "opencode-zen": "fake-zen",
-                 "opencode-go": "fake-zen",
+                 "opencode-go": "fake-zen", "groq": "fake-groq",
                  "ollama-cloud": "fake-ollama"}
 
     def setUp(self):
@@ -582,6 +582,7 @@ class ResolveHttpTest(ServerCase):
             "CLAUDE_COMPANY_OAUTH_TOKEN=fake-company\n"
             "OPENROUTER_API_KEY=fake-openrouter\n"
             "OPENCODE_ZEN_API_KEY=fake-zen\n"
+            "GROQ_API_KEY=fake-groq\n"
             "OLLAMA_API_KEY=fake-ollama\n"
         )
         keys_path.write_text(canary, encoding="utf-8")
@@ -618,6 +619,17 @@ class ResolveHttpTest(ServerCase):
         self.assertEqual(data["meta"]["model"], "beam-free")
         self.assertEqual(data["env"]["OPENCODE_PROVIDER_ID"], "opencode-go")
         self.assertEqual(data["env"]["OPENCODE_API_KEY"], "fake-zen")
+        # #88：groq 走自己的 endpoint 與 provider id，key 是自己的 GROQ_API_KEY
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=groq")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data["meta"]["subscription"], "groq")
+        self.assertEqual(data["meta"]["endpoint"], "https://api.groq.com/openai/v1")
+        self.assertEqual(data["meta"]["model"], "openai/gpt-oss-120b")
+        self.assertEqual(data["env"]["OPENCODE_PROVIDER_ID"], "groq")
+        self.assertEqual(data["env"]["OPENCODE_API_KEY"], "fake-groq")
+        self.assertEqual(data["env"]["OPENCODE_MODEL"], "openai/gpt-oss-120b")
         # anthropic 只剩 personal：預設挑它，model 取政策預設
         status, payload = self.call(
             "GET", "/v1/resolve?agent=claude-code&provider=anthropic")

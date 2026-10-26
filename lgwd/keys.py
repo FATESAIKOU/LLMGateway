@@ -19,6 +19,7 @@ KEY_NAMES = {
     "openrouter": "OPENROUTER_API_KEY",
     "opencode-zen": "OPENCODE_ZEN_API_KEY",
     "opencode-go": "OPENCODE_ZEN_API_KEY",
+    "groq": "GROQ_API_KEY",
     "ollama-cloud": "OLLAMA_API_KEY",
 }
 
