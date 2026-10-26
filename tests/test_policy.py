@@ -277,6 +277,10 @@ class PolicyValidationTests(unittest.TestCase):
         policy = self._reload()
         self.assertEqual(policy.usage, {})
 
+    def test_usage為null時拒收(self):
+        with self.assertRaises(PolicyError):
+            self._usage(None)
+
     def test_usage合法(self):
         policy = self._usage({"claude-personal": {"enabled": True},
                               "openrouter": {"enabled": False, "ttl_seconds": 600}})
