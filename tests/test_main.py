@@ -31,7 +31,9 @@ from tests.usage_fakes import refuse_http
 REPO = Path(__file__).resolve().parent.parent
 FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
              ("claude-personal", "claude-company", "openrouter",
-              "opencode-zen", "ollama-cloud")}
+              "opencode-zen", "opencode-go", "ollama-cloud")}
+# #77：opencode-go 與 zen 共用同一個鍵名（key 檔只有一行）
+FAKE_KEYS["opencode-go"] = FAKE_KEYS["opencode-zen"]
 
 
 def write_policy(root):
@@ -44,9 +46,12 @@ def write_policy(root):
 
 def key_text(values):
     lines = ["# 測試用假 key"]
+    by_name: dict[str, str] = {}
     for sub, name in KEY_NAMES.items():
         if sub in values:
-            lines.append(f"{name}={values[sub]}")
+            by_name.setdefault(name, values[sub])
+    for name, value in by_name.items():
+        lines.append(f"{name}={value}")
     return "\n".join(lines) + "\n"
 
 
@@ -154,7 +159,7 @@ class ApiTest(MainCase):
         status, raw = http_get(self.base + "/v1/subscriptions")
         self.assertEqual(status, 200)  # 不做應用層認證
         data = json.loads(raw)
-        self.assertEqual(len(data["subscriptions"]), 4)
+        self.assertEqual(len(data["subscriptions"]), 5)
         blob = raw.decode()
         for value in FAKE_KEYS.values():
             self.assertNotIn(value, blob)

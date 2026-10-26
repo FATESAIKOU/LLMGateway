@@ -56,8 +56,19 @@ class KeyStoreBasicTests(unittest.TestCase):
     def test_key_names_cover_all_subscriptions(self):
         self.assertEqual(
             set(KEY_NAMES),
-            {"claude-personal", "claude-company", "openrouter", "opencode-zen", "ollama-cloud"},
+            {"claude-personal", "claude-company", "openrouter", "opencode-zen",
+             "opencode-go", "ollama-cloud"},
         )
+
+    def test_opencode_go_共用zen的鍵名(self):
+        # #77：Go 與 Zen 共用 OPENCODE_ZEN_API_KEY；key 檔只寫一行，兩個訂閱都讀到
+        self.assertEqual(KEY_NAMES["opencode-go"], "OPENCODE_ZEN_API_KEY")
+        _write(self.path, f"OPENCODE_ZEN_API_KEY={CANARY}\n")
+        store = KeyStore(self.path)
+        self.assertEqual(store.get("opencode-zen"), CANARY)
+        self.assertEqual(store.get("opencode-go"), CANARY)
+        self.assertTrue(store.deployed("opencode-zen"))
+        self.assertTrue(store.deployed("opencode-go"))
 
 
 class KeyStoreReloadTests(unittest.TestCase):

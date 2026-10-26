@@ -34,14 +34,18 @@ KEY_NAMES = {
     "claude-company": "CLAUDE_COMPANY_OAUTH_TOKEN",
     "openrouter": "OPENROUTER_API_KEY",
     "opencode-zen": "OPENCODE_ZEN_API_KEY",
+    "opencode-go": "OPENCODE_ZEN_API_KEY",
     "ollama-cloud": "OLLAMA_API_KEY",
 }
 
 
 def key_text(prefix: str) -> str:
     lines = ["# 測試用假 key（不是真值）"]
+    by_name: dict[str, str] = {}
     for sub, name in KEY_NAMES.items():
-        lines.append(f"{name}={prefix}-{sub}")
+        by_name.setdefault(name, f"{prefix}-{sub}")
+    for name, value in by_name.items():
+        lines.append(f"{name}={value}")
     return "\n".join(lines) + "\n"
 
 

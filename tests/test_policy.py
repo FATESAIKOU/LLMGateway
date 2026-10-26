@@ -54,7 +54,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
     def test_default_policy_loads(self):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         order = [s.name for s in policy.in_priority_order()]
-        self.assertEqual(order, ["opencode-zen", "openrouter",
+        self.assertEqual(order, ["opencode-zen", "opencode-go", "openrouter",
                                  "ollama-cloud", "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
@@ -70,9 +70,11 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         # #50：拔掉公司 Claude 訂閱；claude-personal 排在 Ollama 之後並預設 Sonnet
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         self.assertEqual(set(policy.subscriptions),
-                         {"claude-personal", "opencode-zen", "openrouter", "ollama-cloud"})
+                         {"claude-personal", "opencode-zen", "opencode-go",
+                          "openrouter", "ollama-cloud"})
         self.assertEqual([s.name for s in policy.in_priority_order()],
-                         ["opencode-zen", "openrouter", "ollama-cloud", "claude-personal"])
+                         ["opencode-zen", "opencode-go", "openrouter",
+                          "ollama-cloud", "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].models_default,
                          "claude-sonnet-5-5")
 
@@ -86,15 +88,16 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertIn("openrouter/free", or_sub.models_allow)
         self.assertEqual(len(or_sub.models_allow), 2)
 
-    def test_出廠四筆訂閱的models_default(self):
-        # 出廠政策檔逐筆釘住：四筆各自有 default（#50 起 claude-personal 預設
-        # claude-sonnet-5-5，claude-company 已移除）。非 null 的
+    def test_出廠五筆訂閱的models_default(self):
+        # 出廠政策檔逐筆釘住：五筆各自有 default（#50 起 claude-personal 預設
+        # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go）。非 null 的
         # default 必須被同一筆的 allow 樣式涵蓋（allow 是 fnmatch 樣式；
         # lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         expected = {
             "claude-personal": "claude-sonnet-5-5",
             "opencode-zen": "mimo-v2.6-flash-free",
+            "opencode-go": "iceman-contributor-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
         }
@@ -128,6 +131,16 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(_covered(zen, "big-pickle"))
         self.assertTrue(_covered(zen, "spark-2-free"))  # 其他 *-free 的 id
         self.assertFalse(_covered(zen, "muse-spark-1.3"))  # 付費的 id
+
+    def test_go_allow涵蓋default與免費模型(self):
+        # #77：opencode-go 的 allow 是 ["*-free"]；default 與 Go 現行免費模型被
+        # 涵蓋，allow 以外的（付費的 kimi-k3）不被涵蓋。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        go = policy.subscriptions["opencode-go"]
+        self.assertEqual(go.models_allow, ("*-free",))
+        self.assertTrue(_covered(go, "iceman-contributor-free"))  # default
+        self.assertTrue(_covered(go, "beam-free"))  # 另一個 Go 免費模型
+        self.assertFalse(_covered(go, "kimi-k3"))  # 付費的 id
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -169,6 +182,21 @@ class PolicyValidationTests(unittest.TestCase):
             obj = _good_policy()
             obj["subscriptions"]["opencode-zen"] = _sub(10, ("opencode", "claude-code"))
             self._reload(obj)
+
+    def test_go_must_only_allow_opencode(self):
+        # #77：opencode-go 和 zen 一樣，agents 不是剛好 ["opencode"] 就拒收
+        for agents in (["opencode", "claude-code"], ["claude-code"], []):
+            with self.subTest(agents=agents):
+                with self.assertRaises(PolicyError):
+                    obj = _good_policy()
+                    obj["subscriptions"]["opencode-go"] = _sub(15, agents)
+                    self._reload(obj)
+
+    def test_go_agents剛好opencode可載入(self):
+        obj = _good_policy()
+        obj["subscriptions"]["opencode-go"] = _sub(15, ("opencode",))
+        policy = self._reload(obj)
+        self.assertEqual(policy.subscriptions["opencode-go"].agents, ("opencode",))
 
     def test_openrouter_only_free_models(self):
         for allow in (["*"], ["*:free", "*"], ["openrouter/free"], ["*:free", "openrouter/free", "*"]):
