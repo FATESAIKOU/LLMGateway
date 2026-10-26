@@ -67,7 +67,10 @@ def _has_wildcard(pattern: str) -> bool:
 
 
 def _covered(patterns: tuple[str, ...], model: str) -> bool:
-    """model 被任一 allow 樣式涵蓋（與政策 loader 同一個 fnmatch）。"""
+    """model 被任一 allow 樣式涵蓋（與政策 loader 同一個 fnmatch）。
+
+    fnmatch 的 `*` 會匹配 `/` 等副作用與分開控制做法見 docs/deploy.md 5.8。
+    """
     return any(fnmatch.fnmatchcase(model, pattern) for pattern in patterns)
 
 

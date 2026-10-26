@@ -359,6 +359,16 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 - **`available_again_at`**：`cooldown.until`（未來）與「用完（`remaining_percent` ≤ 0）的窗口之 `resets_at`」中最晚者；`available` 不因用量為 0 而變 false，選把規則也不變。
 - 退版（`install.sh --tag` 回前一版）安全：欄位是新增的，舊消費端忽略即可。
 
+### 5.8 政策檔的 `models.allow`（fnmatch 樣式）
+
+`policy/default.json` 裡每個 subscription 的 `models.allow` 是一組 **fnmatch 樣式**（`*`、`?`、`[...]`）。比對用的是 `fnmatch.fnmatchcase`：載入政策時，`models.default` 的涵蓋檢查在 `lgwd/policy.py` 約第 98 行的 inline fnmatch；resolve 時 model 是否被 allow 涵蓋的比對在 `lgwd/registry.py` 的 `_covered`。有三件事要特別注意：
+
+- **fnmatch 的 `*` 會匹配任何字元，包含 `/`**。所以 `*-free` 這種樣式不只匹配 `beam-free`，也會匹配 `opencode/anything-free` 之類帶斜線的 id。
+- **`*-free` 同時涵蓋 zen 與 go 兩把**：出廠政策檔裡，`opencode-zen` 的 `models.allow` 是 `["*-free","big-pickle"]`，`opencode-go` 是 `["*-free"]`，兩邊都用同一個萬用字元。結果是 `beam-free` 之類的 id 在兩把都會被放行；上游只要新增 `*-free` 模型，兩把也會**自動**同時放行，不需要改政策檔。
+- **想讓兩把分開控制，就得寫死清單**：把 `*-free` 換成每把各自的一份明列清單，例如 zen 的 `models.allow` 用 `["mimo-v2.6-flash-free", "glm-5.3-flash-free", "big-pickle"]`、go 的用 `["beam-free"]`，兩把才不會互相牽動。兩份清單裡不能放同一個 id，否則照樣會互相放行；改完 `models.allow` 之後，`models.default` 必須仍被涵蓋（見上方載入時驗證）。政策檔是 JSON，不能加註解，所以這個副作用與「要分開控制就寫死清單」的做法記在這裡。
+
+`models.default`（非 null）載入時必須被同一筆的 `models.allow` 樣式涵蓋，否則 lgwd 不啟動（fail-closed）。
+
 ## 6. 故障排除
 
 ### 6.1 不需要設定 `XDG_RUNTIME_DIR` 或 `DBUS`

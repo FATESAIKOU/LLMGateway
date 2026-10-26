@@ -91,6 +91,7 @@ def _parse_subscription(name: str, spec: object) -> SubscriptionPolicy:
     default = models.get("default")
     if default is not None and (not isinstance(default, str) or not default):
         raise PolicyError("subscription models.default must be a non-empty string or null")
+    # fnmatch 的 `*` 會匹配 `/`，`*-free` 會同時涵蓋 zen 與 go；副作用與分開控制做法見 docs/deploy.md 5.8。
     if default is not None and not any(
         fnmatch.fnmatchcase(default, pattern) for pattern in allow
     ):
