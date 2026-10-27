@@ -884,6 +884,8 @@ class RolesHttpTest(ServerCase):
             ("/v1/roles/impl?agent=opencode&data=private", 400, "bad_request"),
             ("/v1/roles/impl", 400, "bad_request"),
             ("/v1/roles/boss?agent=opencode", 404, "not_found"),
+            # #104：400 先於 404——未知角色＋壞 agent 仍回 400
+            ("/v1/roles/boss?agent=clade-code", 400, "bad_request"),
             ("/v1/roles/pmo?agent=opencode", 404, "not_found"),
             ("/v1/roles/impl?agent=opencode&agent=claude-code", 400, "bad_request"),
             ("/v1/roles/impl?agent=opencode&data=public&data=real", 400, "bad_request"),

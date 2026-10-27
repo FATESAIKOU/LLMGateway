@@ -501,6 +501,34 @@ class RoleCandidatesTest(RegistryCase):
         self.assertEqual(self.ids(payload),
                          ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud"])
 
+    def test_available照key部署與冷卻(self):
+        # #104：available＝key 已部署且整把沒冷卻；未部署只在該欄照實呈現，
+        # 成員與 rank 都不變（spec role-allocation「照實呈現」）
+        payload = self.role("impl", "opencode", "public")
+        self.assertEqual(
+            [(row["id"], row["rank"], row["available"]) for row in payload["candidates"]],
+            [("opencode-zen", 1, True), ("opencode-go", 2, True),
+             ("openrouter", 3, True), ("ollama-cloud", 4, True)])
+        for row in payload["candidates"]:
+            self.assertIsNone(row["cooldown"])
+        # ollama-cloud 的 key 未部署：仍在候選、rank 不變，只有 available 變 False
+        self.keys_path.write_text(
+            key_text({k: v for k, v in CANARY.items() if k != "ollama-cloud"}),
+            encoding="utf-8")
+        self.keys.reload()
+        payload = self.role("impl", "opencode", "public")
+        self.assertEqual(self.ids(payload),
+                         ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud"])
+        self.assertEqual([row["rank"] for row in payload["candidates"]], [1, 2, 3, 4])
+        rows = {row["id"]: row for row in payload["candidates"]}
+        self.assertFalse(rows["ollama-cloud"]["available"])
+        self.assertIsNone(rows["ollama-cloud"]["cooldown"])
+        self.assertTrue(rows["opencode-zen"]["available"])
+        # real 只剩 ollama-cloud：未部署也不影響成員
+        real = self.role("impl", "opencode", "real")
+        self.assertEqual(self.ids(real), ["ollama-cloud"])
+        self.assertFalse(real["candidates"][0]["available"])
+
     # --- 隱私 gate ---
 
     def test_隱私不足時不降級(self):
@@ -616,6 +644,16 @@ class RoleCandidatesTest(RegistryCase):
                 err = self.assert_api_error(
                     400, "bad_request", self.service.role_candidates, "impl", agent)
                 self.assertNotIn("missing", err.body())
+
+    def test_未知角色時壞agent與壞data仍回400(self):
+        # #104：400（輸入形狀）先於 404（角色查無）——順序對調時這幾條會變 404
+        for agent, data in (("clade-code", None), ("clade-code", "private"),
+                            ("opencode", "private")):
+            with self.subTest(agent=agent, data=data):
+                err = self.assert_api_error(
+                    400, "bad_request", self.service.role_candidates,
+                    "boss", agent, data)
+                self.assertNotIn("candidates", err.body())
 
     def test_data不合法(self):
         for data in ("private", "PUBLIC", "", " real"):
