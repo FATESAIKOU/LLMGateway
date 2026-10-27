@@ -1,11 +1,13 @@
-"""lgwctl usage 的測試：list＋roles 依 id 合併、not_applicable 的標示、冷卻旁列、
-rank 順序、roles 404 與參數／連線失敗；輸出不含 key。
+"""lgwctl usage 的測試：list＋roles 依 id 合併、not_applicable 的標示、舊資料（stale）
+標示、冷卻旁列、rank 順序與缺 rank 的欄位對齊、roles 404 的專屬文案與參數／連線失敗；
+輸出不含 key。
 
 假 service 只綁 127.0.0.1 的隨機埠（in-process HTTP），不連外網、不碰真機。
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import socket
 import threading
@@ -104,12 +106,15 @@ class FakeService:
         self.requests = []
         self.roles_status = 200
         self.roles_error = "not_found"
+        # 個別測試可以換掉回覆內容（不共用模組層的清單）。
+        self.subscriptions = SUBSCRIPTIONS
+        self.candidates = IMPL_CANDIDATES
 
     def handle(self, method, path, query, body, authorization):
         self.requests.append((method, path, query, body, authorization))
         if method == "GET" and path == "/v1/subscriptions":
             return 200, {"schema": 1,
-                         "subscriptions": [dict(item) for item in SUBSCRIPTIONS]}
+                         "subscriptions": [dict(item) for item in self.subscriptions]}
         if method == "GET" and path.startswith("/v1/roles/"):
             role = urllib.parse.unquote(path.rsplit("/", 1)[1])
             if self.roles_status != 200:
@@ -122,7 +127,7 @@ class FakeService:
             data = query.get("data", [None])[0] or "real"
             return 200, {
                 "schema": 1, "role": role, "data": data, "agent": agent,
-                "candidates": [dict(item) for item in IMPL_CANDIDATES],
+                "candidates": [dict(item) for item in self.candidates],
             }
         return 404, {"error": "not_found"}
 
@@ -235,6 +240,65 @@ class UsageTests(unittest.TestCase):
         self.assertIn("not_found", err)
         self.assertNotIn("Traceback", out + err)
         self.assertEqual(out, "")
+
+    def test_roles_404_has_its_own_message(self):
+        # 專屬 404 文案：通用訊息（roles 失敗（status=...））也含 404／not_found，
+        # 只斷言那兩個字鎖不住這條分支，所以這裡斷言文案本身、且通用訊息不得出現。
+        self.fake.roles_status = 404
+        self.fake.roles_error = "not_found"
+        rc, out, err = self.box.run_cli(
+            ["usage", "--role", "PMO", "--agent", "claude-code"])
+        self.assertEqual(rc, 1)
+        self.assertIn("沒有分配設定", err)
+        self.assertNotIn("roles 失敗（status=", err)
+        self.assertNotIn("Traceback", out + err)
+        self.assertEqual(out, "")
+
+    def test_stale_usage_is_marked(self):
+        # usage.stale=True 時要標「（舊資料）」；而且只標在那一筆。
+        rows = copy.deepcopy(SUBSCRIPTIONS)
+        rows[0]["usage"]["stale"] = True
+        self.fake.subscriptions = rows
+        rc, out, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, out + err)
+        line = next(line for line in out.splitlines()
+                    if line.startswith("claude-personal |"))
+        self.assertIn("session 76.5%", line)
+        self.assertIn("（舊資料）", line)
+        self.assertEqual((out + err).count("（舊資料）"), 1)
+
+    def test_ok_without_window_values_is_explained(self):
+        # status=ok 但兩個窗口都沒有數值：說出缺什麼，不與 unknown 的「未知」混在一起。
+        rows = copy.deepcopy(SUBSCRIPTIONS)
+        rows[3]["usage"] = {
+            "status": "ok", "source": "openrouter-credits", "stale": False,
+            "reason": None, "session": None, "weekly": None,
+        }
+        self.fake.subscriptions = rows
+        rc, out, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, out + err)
+        line = next(line for line in out.splitlines()
+                    if line.startswith("openrouter |"))
+        self.assertIn("未知（沒有窗口數值）", line)
+
+    def test_rank_missing_keeps_columns_aligned(self):
+        # 候選缺 rank 時仍留一欄（-），後面的欄位不往前錯位。
+        self.fake.candidates = [dict(item) for item in IMPL_CANDIDATES]
+        del self.fake.candidates[1]["rank"]
+        rc, out, err = self.box.run_cli(
+            ["usage", "--role", "impl", "--agent", "opencode", "--data", "public"])
+        self.assertEqual(rc, 0, out + err)
+        header = next(line for line in out.splitlines() if line.startswith("rank |"))
+        self.assertEqual(header.count("|"), 4)
+        # 每一列的欄數都跟表頭一致（4 個分隔線＝5 欄）
+        data_lines = [line for line in out.splitlines()[1:] if line.strip()]
+        self.assertTrue(data_lines)
+        for line in data_lines:
+            self.assertEqual(line.count("|"), 4, line)
+        self.assertIn("- | ollama-cloud", out)
+        line = next(line for line in data_lines
+                    if line.startswith("- | ollama-cloud"))
+        self.assertIn("未知（no_key）", line)
 
     def test_role_requires_agent(self):
         rc, out, err = self.box.run_cli(["usage", "--role", "impl"])

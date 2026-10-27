@@ -51,7 +51,10 @@ def _usage_text(usage) -> str:
                 text += f"（reset {reset}）"
             parts.append(text)
         if not parts:
-            return "未知"
+            # status=ok 卻沒有窗口數值：說出是哪一種缺，不與 unknown 的「未知」混在一起。
+            reason = usage.get("reason")
+            detail = f"沒有窗口數值；{reason}" if reason else "沒有窗口數值"
+            return f"未知（{detail}）"
         text = "；".join(parts)
         if usage.get("stale"):
             text += "（舊資料）"
@@ -107,7 +110,12 @@ def _print_table(rows, listed: dict, out, with_rank: bool) -> None:
     else:
         out("id | provider | 額度 | 冷卻")
     for row in rows:
-        rank = row.get("rank") if with_rank else None
+        rank = None
+        if with_rank:
+            # rank 缺值時仍留一欄（印 ``-``），否則後面的欄位會往前錯位。
+            rank = row.get("rank")
+            if rank is None:
+                rank = "-"
         out(_render_row(row, listed, rank))
 
 
