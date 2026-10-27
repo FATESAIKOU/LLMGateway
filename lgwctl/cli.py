@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import check, install, status, sync, upgrade
+from . import check, install, status, sync, upgrade, usage
 from .layout import DEFAULT_REPO, Layout
 from .report import Report
 
@@ -25,7 +25,7 @@ MIGRATE_COMMANDS = ("prepare-migration", "cutover", "confirm", "rollback-to-user
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="llmgwctl",
-        description="LLMGateway 管理指令（install／check／status／upgrade／rollback／sync）。"
+        description="LLMGateway 管理指令（install／check／status／upgrade／rollback／sync／usage）。"
                     " cwd 要在當版目錄（/opt/llmgateway/current）。"
                     f" 遷移子指令 {', '.join(MIGRATE_COMMANDS)} 由 lgwctl/migrate.py 提供。",
     )
@@ -49,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rollback", help="切回上一版、restart、跑 check")
 
     sub.add_parser("sync", help="手動跑一次 key 拉取（等同 key-sync）")
+
+    p_usage = sub.add_parser("usage", help="看各訂閱的額度與冷卻（可依角色列候選）")
+    p_usage.add_argument("--role", default=None,
+                         help="角色（PMO／PM／impl／rev／qa）；要搭配 --agent")
+    p_usage.add_argument("--agent", default=None,
+                         help="agent 種類（claude-code／opencode）")
+    p_usage.add_argument("--data", default=None,
+                         help="資料等級（public／general／real）；只在有 --role 時用")
     return parser
 
 
@@ -88,4 +96,6 @@ def main(argv=None, env=None) -> int:
         return upgrade.rollback(layout, report=report)
     if args.command == "sync":
         return sync.run(layout, report=report)
+    if args.command == "usage":
+        return usage.run(layout, role=args.role, agent=args.agent, data=args.data)
     raise AssertionError(f"unhandled command: {args.command}")
