@@ -51,10 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("sync", help="手動跑一次 key 拉取（等同 key-sync）")
 
     p_usage = sub.add_parser("usage", help="看各訂閱的額度與冷卻（可依角色列候選）")
+    # help 不寫死角色／agent 清單（政策檔改動就過時）；列舉的來源留給政策檔與端點。
     p_usage.add_argument("--role", default=None,
-                         help="角色（PMO／PM／impl／rev／qa）；要搭配 --agent")
+                         help="角色名（要搭配 --agent）；可用角色見政策檔 roles 段，"
+                              "查詢見 GET /v1/roles/{role}")
     p_usage.add_argument("--agent", default=None,
-                         help="agent 種類（claude-code／opencode）")
+                         help="agent 種類（有 --role 時必填）；可用值見政策檔的 "
+                              "subscriptions[].agents")
     p_usage.add_argument("--data", default=None,
                          help="資料等級（public／general／real）；只在有 --role 時用")
     return parser

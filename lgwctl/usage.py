@@ -140,6 +140,9 @@ def run(layout, *, role=None, agent=None, data=None, out=None, err=None,
     if role is not None and not agent:
         err("llmgwctl: --role 要搭配 --agent（roles 端點需要 agent）")
         return 2
+    if role is None and agent is not None:
+        err("llmgwctl: --agent 只在有 --role 時有意義")
+        return 2
     if data is not None and role is None:
         err("llmgwctl: --data 只在有 --role 時有意義")
         return 2

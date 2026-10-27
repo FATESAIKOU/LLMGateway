@@ -312,6 +312,14 @@ class UsageTests(unittest.TestCase):
         self.assertIn("--data", err)
         self.assertEqual(self.fake.requests, [])
 
+    def test_agent_requires_role(self):
+        # 與 --data 一致：單獨給 --agent 也要擋（rc 2），不靜默忽略、不打服務。
+        rc, out, err = self.box.run_cli(["usage", "--agent", "opencode"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--agent", err)
+        self.assertIn("只在有 --role", err)
+        self.assertEqual(self.fake.requests, [])
+
     def test_unreachable_is_readable_and_nonzero(self):
         # 找一個現在沒人聽的埠（綁完就關），避免連到任何服務
         sock = socket.socket()
