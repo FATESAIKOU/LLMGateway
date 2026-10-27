@@ -7,9 +7,9 @@
 
 ## 2. 端點與呈現
 
-- [ ] 2.1 `lgwd/registry.py`：`role_candidates(role, agent, data)`，回 `{id, provider, rank, privacy, available, cooldown, model_cooldowns}`，不含 key、`usage`、`available_again_at`，不觸發取用量；`rank` 篩選後連續。驗證：`tests/test_registry.py`（spec 各 scenario，含「隱私不足時不降級」與其對照）。
-- [ ] 2.2 `lgwd/http.py`：加 `GET /v1/roles/{role}`；`agent` 非法 400、角色未知／不在 `roles` 段 404；query 解析規則同 `resolve`，已知參數集合加上 `data`（另立含 `data` 的集合，不共用 `_RESOLVE_PARAMS`）。驗證：`tests/test_http.py`。
-- [ ] 2.3 `lgw/client.py`：`roles(role, agent, data=None)`。驗證：`tests/test_client.py`。
+- [x] 2.1 `lgwd/registry.py`：`role_candidates(role, agent, data)`，回 `{id, provider, rank, privacy, available, cooldown, model_cooldowns}`，不含 key、`usage`、`available_again_at`，不觸發取用量；`rank` 篩選後連續。驗證：`tests/test_registry.py`（spec 各 scenario，含「隱私不足時不降級」與其對照）。
+- [x] 2.2 `lgwd/http.py`：加 `GET /v1/roles/{role}`；`agent` 非法 400、角色未知／不在 `roles` 段 404；query 解析規則同 `resolve`，已知參數集合加上 `data`（另立含 `data` 的集合，不共用 `_RESOLVE_PARAMS`）。驗證：`tests/test_http.py`。
+- [x] 2.3 `lgw/client.py`：`roles(role, agent, data=None)`。驗證：`tests/test_client.py`。
 - [ ] 2.4 `lgwctl/cli.py`：新增 `usage` 子命令，`list`＋`roles` 依 id 合併排版（`not_applicable` 標「無額度 API」）。驗證：`lgwctl` 對應測試。
 
 ## 3. 文件與對端

@@ -61,6 +61,17 @@ RESOLVE = {
         "OPENCODE_SMALL_MODEL": "mimo-v2.6-flash-free",
     },
 }
+ROLES = {
+    "schema": 1,
+    "role": "impl",
+    "data": "public",
+    "agent": "opencode",
+    "candidates": [
+        {"id": "opencode-zen", "provider": "opencode-zen", "rank": 1,
+         "privacy": "public", "available": True, "cooldown": None,
+         "model_cooldowns": {}},
+    ],
+}
 
 
 class FakeService:
@@ -85,6 +96,10 @@ class FakeService:
     def resolve(self, agent, provider, model=None, subscription=None, exclude=None):
         return self._finish("resolve", json.loads(json.dumps(RESOLVE)),
                             agent, provider, model, subscription, exclude)
+
+    def role_candidates(self, role, agent, data=None):
+        return self._finish("role_candidates", json.loads(json.dumps(ROLES)),
+                            role, agent, data)
 
     def register_cooldown(self, sub_id, body):
         return self._finish("register_cooldown", None, sub_id, body)
@@ -231,6 +246,78 @@ class ApiTest(ServerCase):
                 self.assertNotIn("detail", data)
                 if exc.extra.get("until"):
                     self.assertEqual(data["until"], exc.extra["until"])
+
+    # --- roles ---
+    def test_roles_ok(self):
+        status, payload = self.call(
+            "GET", "/v1/roles/impl?agent=opencode&data=public")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload), ROLES)
+        self.assertEqual(self.fake.calls[-1],
+                         ("role_candidates", "impl", "opencode", "public"))
+        blob = json.dumps(self.json_of(payload))
+        self.assertNotIn('"key"', blob)
+        self.assertNotIn("usage", blob)
+        self.assertNotIn("available_again_at", blob)
+
+    def test_roles_data省略與空值(self):
+        # data 省略 → 不帶（服務取最嚴）
+        status, _ = self.call("GET", "/v1/roles/impl?agent=opencode")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1], ("role_candidates", "impl", "opencode", None))
+        # 空白值＝沒給（與 resolve 的 query 規則相同）
+        status, _ = self.call("GET", "/v1/roles/impl?agent=opencode&data=")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1], ("role_candidates", "impl", "opencode", None))
+
+    def test_roles_query規則(self):
+        # 未知參數忽略（重複也不算錯）
+        status, _ = self.call(
+            "GET", "/v1/roles/impl?agent=opencode&flag=1&x=2&x=3")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1], ("role_candidates", "impl", "opencode", None))
+        # 已知參數重複出現 → 400（含空白的那一次）
+        for query in ("agent=opencode&agent=claude-code&data=public",
+                      "agent=opencode&data=public&data=real",
+                      "agent=&agent=opencode"):
+            with self.subTest(query=query):
+                status, payload = self.call("GET", "/v1/roles/impl?" + query)
+                self.assertEqual(status, 400)
+                self.assertEqual(self.json_of(payload)["error"], "bad_request")
+
+    def test_roles_role解碼(self):
+        status, _ = self.call("GET", "/v1/roles/a%2Fb?agent=opencode")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1][1], "a/b")
+
+    def test_roles錯誤對應(self):
+        cases = [
+            (errors.bad_request(missing=["agent"]), 400, "bad_request"),
+            (errors.bad_request(), 400, "bad_request"),
+            (errors.not_found(), 404, "not_found"),
+        ]
+        for exc, code, err in cases:
+            with self.subTest(code=err):
+                self.fake.raise_for["role_candidates"] = exc
+                status, payload = self.call(
+                    "GET", "/v1/roles/impl?agent=opencode&data=real")
+                self.assertEqual(status, code)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], err)
+                self.assertNotIn("detail", data)
+                self.assertNotIn("candidates", data)
+                if exc.extra.get("missing"):
+                    self.assertEqual(data["missing"], exc.extra["missing"])
+
+    def test_roles非GET與缺role404(self):
+        for method, path in (("POST", "/v1/roles/impl"), ("PUT", "/v1/roles/impl"),
+                             ("DELETE", "/v1/roles/impl"), ("GET", "/v1/roles"),
+                             ("GET", "/v1/roles/")):
+            with self.subTest(method=method, path=path):
+                status, payload = self.call(method, path, {"x": 1})
+                self.assertEqual(status, 404)
+                self.assertEqual(self.json_of(payload)["error"], "not_found")
+        self.assertFalse(self.fake.calls)  # 完全沒進 service
 
     # --- get ---
     def test_get_ok(self):
@@ -727,6 +814,96 @@ class ResolveHttpTest(ServerCase):
                 status, payload = self.call("GET", "/v1/resolve?" + query)
                 self.assertEqual(status, 400)
                 self.assertEqual(self.json_of(payload)["error"], "bad_request")
+
+
+class RolesHttpTest(ServerCase):
+    """GET /v1/roles/{role} 經 HTTP 的端到端（真 RegistryService＋假 key＋FakeClock）。"""
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        keys_path = root / "keys.env"
+        keys_path.write_text(
+            "# 測試用假 key\n"
+            "CLAUDE_PERSONAL_OAUTH_TOKEN=fake-personal\n"
+            "OPENCODE_ZEN_API_KEY=fake-zen\n"
+            "OLLAMA_API_KEY=fake-ollama\n", encoding="utf-8")
+        self.service = RegistryService(
+            str(root / "llm.db"),
+            load_policy(str(self.REPO_ROOT / "policy" / "default.json")),
+            KeyStore(str(keys_path)), FakeClock(),
+        )
+        self.base = self.serve(self.service)
+
+    def tearDown(self):
+        super().tearDown()
+        self.service.close()
+        self.tmp.cleanup()
+
+    def json_of(self, payload):
+        return json.loads(payload.decode())
+
+    def test_roles端到端_候選與資格外洩(self):
+        status, payload = self.call(
+            "GET", "/v1/roles/impl?agent=opencode&data=real")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual((data["schema"], data["role"], data["data"], data["agent"]),
+                         (1, "impl", "real", "opencode"))
+        self.assertEqual([row["id"] for row in data["candidates"]], ["ollama-cloud"])
+        row = data["candidates"][0]
+        self.assertEqual(row["provider"], "ollama-cloud")
+        self.assertEqual(row["rank"], 1)
+        self.assertEqual(set(row), {"id", "provider", "rank", "privacy", "available",
+                                    "cooldown", "model_cooldowns"})
+        blob = json.dumps(data, ensure_ascii=False)
+        for absent in ('"key"', "usage", "available_again_at", "fake-ollama"):
+            self.assertNotIn(absent, blob)
+
+    def test_roles端到端_缺省data(self):
+        status, payload = self.call("GET", "/v1/roles/qa?agent=opencode")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data["data"], "real")
+        self.assertEqual([row["id"] for row in data["candidates"]], ["ollama-cloud"])
+        # PMO 的 floor 是 real：請求 public 也回 real
+        status, payload = self.call(
+            "GET", "/v1/roles/PMO?agent=claude-code&data=public")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data["data"], "real")
+        self.assertEqual([row["id"] for row in data["candidates"]],
+                         ["claude-personal", "ollama-cloud"])
+        self.assertEqual(data["candidates"][0]["provider"], "anthropic")
+
+    def test_roles端到端_錯誤(self):
+        cases = [
+            ("/v1/roles/impl?agent=clade-code", 400, "bad_request"),
+            ("/v1/roles/impl?agent=opencode&data=private", 400, "bad_request"),
+            ("/v1/roles/impl", 400, "bad_request"),
+            ("/v1/roles/boss?agent=opencode", 404, "not_found"),
+            ("/v1/roles/pmo?agent=opencode", 404, "not_found"),
+            ("/v1/roles/impl?agent=opencode&agent=claude-code", 400, "bad_request"),
+            ("/v1/roles/impl?agent=opencode&data=public&data=real", 400, "bad_request"),
+        ]
+        for path, code, err in cases:
+            with self.subTest(path=path):
+                status, payload = self.call("GET", path)
+                self.assertEqual(status, code)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], err)
+                self.assertNotIn("candidates", data)
+                self.assertNotIn("detail", data)
+        # 缺 agent 帶 missing
+        status, payload = self.call("GET", "/v1/roles/impl")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(payload)["missing"], ["agent"])
+
+    def test_roles端到端_不記稽核(self):
+        self.call("GET", "/v1/roles/impl?agent=opencode&data=public")
+        self.assertEqual(self.service._store.audit_all(), [])
 
 
 class UsageHttpTest(ServerCase):

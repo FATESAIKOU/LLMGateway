@@ -394,6 +394,276 @@ class GetTest(RegistryCase):
         self.assertNotIn("key", err.body())
 
 
+class RoleCandidatesTest(RegistryCase):
+    """spec role-allocation「角色候選端點」的 Scenario（#100 tasks 2.1）。"""
+
+    def role(self, role, agent, data=None):
+        return self.service.role_candidates(role, agent, data)
+
+    def ids(self, payload):
+        return [row["id"] for row in payload["candidates"]]
+
+    def _service_with(self, obj, usage=None):
+        path = self.root / "policy-roles.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        return RegistryService(self.db_path, load_policy(str(path)),
+                               self.keys, self.clock, usage=usage)
+
+    def _default_policy_obj(self):
+        return json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+
+    def _restrictive_policy(self):
+        """qa 的 order 只有 privacy < real 的 opencode 訂閱（spec「隱私不足時不降級」）。"""
+        return {
+            "subscriptions": {
+                "opencode-zen": _privacy_sub(10, "public"),
+                "opencode-go": _privacy_sub(15, "general"),
+                "openrouter": _privacy_sub(20, "public",
+                                           allow=("*:free", "openrouter/free")),
+            },
+            "roles": {"qa": {"floor": "public",
+                             "order": ["opencode-zen", "opencode-go", "openrouter"]}},
+            "until_max_ahead_seconds": 691200,
+        }
+
+    # --- 候選與順序 ---
+
+    def test_impl取真資料候選(self):
+        payload = self.role("impl", "opencode", "real")
+        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["role"], "impl")
+        self.assertEqual(payload["data"], "real")
+        self.assertEqual(payload["agent"], "opencode")
+        # order: zen(public) → go(general) → openrouter(public) → ollama(real)
+        # → claude-personal(real；只給 claude-code)
+        self.assertEqual(self.ids(payload), ["ollama-cloud"])
+        self.assertEqual([row["rank"] for row in payload["candidates"]], [1])
+        blob = json.dumps(payload, ensure_ascii=False)
+        for absent in ("opencode-zen", "opencode-go", "openrouter",
+                       "claude-personal", "groq"):
+            self.assertNotIn(absent, blob)
+
+    def test_impl取public候選順序照order(self):
+        payload = self.role("impl", "opencode", "public")
+        self.assertEqual(self.ids(payload),
+                         ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud"])
+        self.assertEqual([row["rank"] for row in payload["candidates"]], [1, 2, 3, 4])
+        self.assertEqual([row["privacy"] for row in payload["candidates"]],
+                         ["public", "general", "public", "real"])
+        # groq 不在任何 order；claude-personal 不給 opencode
+        self.assertNotIn("groq", self.ids(payload))
+        self.assertNotIn("claude-personal", self.ids(payload))
+
+    def test_PMO想用較低等級(self):
+        payload = self.role("PMO", "claude-code", "public")
+        self.assertEqual(payload["data"], "real")  # floor 較嚴
+        self.assertEqual(self.ids(payload), ["claude-personal", "ollama-cloud"])
+
+    def test_缺省data取最嚴(self):
+        payload = self.role("qa", "opencode")
+        self.assertEqual(payload["data"], "real")
+        self.assertEqual(self.ids(payload), ["ollama-cloud"])
+
+    def test_rank在篩選後連續(self):
+        obj = {
+            "subscriptions": {
+                "opencode-zen": _privacy_sub(10, "public"),
+                "ollama-cloud": _privacy_sub(30, "real"),
+                "opencode-go": _privacy_sub(15, "general"),
+            },
+            "roles": {"qa": {"floor": "public",
+                             "order": ["opencode-zen", "ollama-cloud", "opencode-go"]}},
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with(obj)
+        try:
+            real = service.role_candidates("qa", "opencode", "real")
+            self.assertEqual([(r["id"], r["rank"]) for r in real["candidates"]],
+                             [("ollama-cloud", 1)])
+            general = service.role_candidates("qa", "opencode", "general")
+            self.assertEqual([(r["id"], r["rank"]) for r in general["candidates"]],
+                             [("ollama-cloud", 1), ("opencode-go", 2)])
+        finally:
+            service.close()
+
+    def test_冷卻不改候選(self):
+        self.cooldown("opencode-zen", "2026-10-11T15:00:00Z")
+        self.cooldown_raw("opencode-zen",
+                          {"until": "2026-10-11T16:00:00Z", "model": "big-pickle"})
+        payload = self.role("impl", "opencode", "public")
+        zen = payload["candidates"][0]
+        self.assertEqual(zen["id"], "opencode-zen")
+        self.assertEqual(zen["rank"], 1)  # 成員與順序不變
+        self.assertEqual(zen["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(zen["model_cooldowns"],
+                         {"big-pickle": {"until": "2026-10-11T16:00:00Z"}})
+        self.assertFalse(zen["available"])
+        self.assertEqual(self.ids(payload),
+                         ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud"])
+
+    # --- 隱私 gate ---
+
+    def test_隱私不足時不降級(self):
+        service = self._service_with(self._restrictive_policy())
+        try:
+            payload = service.role_candidates("qa", "opencode", "real")
+            self.assertEqual(payload["data"], "real")
+            self.assertEqual(payload["candidates"], [])
+            blob = json.dumps(payload, ensure_ascii=False)
+            for absent in ("opencode-zen", "opencode-go", "openrouter"):
+                self.assertNotIn(absent, blob)
+        finally:
+            service.close()
+
+    def test_低等級時高隱私訂閱仍可出現(self):
+        # 同一份 policy（zen public、go general、ollama real）：過濾方向是「不低於」
+        obj = {
+            "subscriptions": {
+                "opencode-zen": _privacy_sub(10, "public"),
+                "opencode-go": _privacy_sub(15, "general"),
+                "ollama-cloud": _privacy_sub(30, "real"),
+            },
+            "roles": {"qa": {"floor": "public",
+                             "order": ["opencode-zen", "opencode-go", "ollama-cloud"]}},
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with(obj)
+        try:
+            public = service.role_candidates("qa", "opencode", "public")
+            self.assertEqual(self.ids(public),
+                             ["opencode-zen", "opencode-go", "ollama-cloud"])
+            general = service.role_candidates("qa", "opencode", "general")
+            self.assertEqual(self.ids(general), ["opencode-go", "ollama-cloud"])
+        finally:
+            service.close()
+
+    def test_缺省privacy視為public(self):
+        obj = {
+            "subscriptions": {
+                # 沒有 privacy 鍵 → public（fail-closed）
+                "ollama-cloud": {
+                    "priority": 30,
+                    "agents": ["opencode"],
+                    "models": {"allow": ["*"], "default": None},
+                },
+                "opencode-go": _privacy_sub(15, "general"),
+            },
+            "roles": {"impl": {"floor": "public",
+                               "order": ["ollama-cloud", "opencode-go"]}},
+            "until_max_ahead_seconds": 691200,
+        }
+        service = self._service_with(obj)
+        try:
+            public = service.role_candidates("impl", "opencode", "public")
+            self.assertEqual(
+                [(r["id"], r["privacy"]) for r in public["candidates"]],
+                [("ollama-cloud", "public"), ("opencode-go", "general")])
+            general = service.role_candidates("impl", "opencode", "general")
+            self.assertEqual(self.ids(general), ["opencode-go"])
+        finally:
+            service.close()
+
+    # --- row 形狀 ---
+
+    def test_row帶provider且不等於id(self):
+        payload = self.role("PMO", "claude-code")
+        rows = {row["id"]: row for row in payload["candidates"]}
+        self.assertEqual(rows["claude-personal"]["provider"], "anthropic")
+        self.assertEqual(rows["claude-personal"]["id"], "claude-personal")
+        self.assertEqual(rows["ollama-cloud"]["provider"], "ollama-cloud")
+        self.assertEqual(set(rows["claude-personal"]),
+                         {"id", "provider", "rank", "privacy", "available",
+                          "cooldown", "model_cooldowns"})
+
+    def test_不含key與額度(self):
+        class ExplodingUsage:
+            def usage_for(self, subscription):
+                raise AssertionError("roles 不應觸發取用量")
+
+            def source_of(self, subscription):
+                raise AssertionError("roles 不應觸發取用量")
+
+        service = self._service_with(self._default_policy_obj(), usage=ExplodingUsage())
+        try:
+            payload = service.role_candidates("impl", "opencode", "public")
+        finally:
+            service.close()
+        self.assertTrue(payload["candidates"])
+        for row in payload["candidates"]:
+            self.assertEqual(set(row),
+                             {"id", "provider", "rank", "privacy", "available",
+                              "cooldown", "model_cooldowns"})
+        blob = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn('"key"', blob)
+        self.assertNotIn("usage", blob)
+        self.assertNotIn("available_again_at", blob)
+        self.assertNotIn("API_KEY", blob)
+        for value in CANARY.values():
+            self.assertNotIn(value, blob)
+
+    # --- 錯誤 ---
+
+    def test_缺或空agent回400(self):
+        for agent in (None, ""):
+            with self.subTest(agent=agent):
+                err = self.assert_api_error(
+                    400, "bad_request", self.service.role_candidates, "impl", agent)
+                self.assertEqual(err.body()["missing"], ["agent"])
+
+    def test_agent種類不合法(self):
+        for agent in ("clade-code", "claude", "OpenCode"):
+            with self.subTest(agent=agent):
+                err = self.assert_api_error(
+                    400, "bad_request", self.service.role_candidates, "impl", agent)
+                self.assertNotIn("missing", err.body())
+
+    def test_data不合法(self):
+        for data in ("private", "PUBLIC", "", " real"):
+            with self.subTest(data=data):
+                err = self.assert_api_error(
+                    400, "bad_request", self.service.role_candidates,
+                    "impl", "opencode", data)
+                self.assertNotIn("candidates", err.body())
+
+    def test_角色未知或不在roles段回404(self):
+        # 五個之外
+        self.assert_api_error(404, "not_found", self.service.role_candidates,
+                              "boss", "opencode")
+        self.assert_api_error(404, "not_found", self.service.role_candidates,
+                              "pmo", "opencode")
+        # 五個之內但政策檔沒寫
+        obj = self._default_policy_obj()
+        obj["roles"] = {"impl": obj["roles"]["impl"]}
+        service = self._service_with(obj)
+        try:
+            self.assert_api_error(404, "not_found", service.role_candidates,
+                                  "PMO", "claude-code")
+        finally:
+            service.close()
+
+    def test_沒有roles段回404(self):
+        obj = self._default_policy_obj()
+        del obj["roles"]
+        service = self._service_with(obj)
+        try:
+            for role in ("impl", "PMO", "qa"):
+                with self.subTest(role=role):
+                    self.assert_api_error(404, "not_found",
+                                          service.role_candidates, role, "opencode")
+        finally:
+            service.close()
+
+
+def _privacy_sub(priority, privacy, agents=("opencode",), allow=("*",)):
+    """假政策的訂閱：指定 privacy（測試用；default null 不參與 roles）。"""
+    return {
+        "priority": priority,
+        "privacy": privacy,
+        "agents": list(agents),
+        "models": {"allow": list(allow), "default": None},
+    }
+
+
 class CooldownTest(RegistryCase):
     def test_帶恢復時刻(self):
         self.cooldown("claude-personal", "2026-10-11T15:00:00Z")

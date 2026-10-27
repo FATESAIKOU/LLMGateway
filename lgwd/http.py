@@ -1,15 +1,17 @@
 """HTTP 層（design 決定 6、5a）。由 test 實作。
 
-- make_api_server(service, host, port) → ThreadingHTTPServer。只有四個路由：
+- make_api_server(service, host, port) → ThreadingHTTPServer。只有五個路由：
   GET  /v1/subscriptions                      → service.list_subscriptions()
   GET  /v1/subscriptions/{id}?agent=<種類>     → service.get_subscription(id, agent)
   POST /v1/subscriptions/{id}/cooldown        → service.register_cooldown(id, body)（204）
   GET  /v1/resolve?agent=&provider=[&model=&subscription=&exclude=]
                                               → service.resolve(...)（design 決定 1～3）
+  GET  /v1/roles/{role}?agent=[&data=]        → service.role_candidates(role, agent, data)
+                                              （#100；spec role-allocation）
   其他路徑與方法一律 404。沒有應用層認證（本人選 (a)）；存取控制只靠 SSH。
 - JSON 解析失敗或 body 不是物件 → 400；ApiError → 對應狀態碼＋body()；204 不帶 body。
 - body 超過 1 MB 直接回 413，不讀 body。
-- resolve 的 query 用 parse_qs 的 form 解碼（design 決定 1）：空白值＝沒給
+- resolve 與 roles 的 query 用 parse_qs 的 form 解碼（design 決定 1）：空白值＝沒給
   （`subscription=x&exclude=` 因此是合法釘住）；已知參數重複出現 → 400；
   未知參數忽略；`+` 由呼叫端編成 %2B，server 只負責解碼。
 - get 與 resolve 的 200 加 Cache-Control: no-store、Pragma: no-cache（回覆含憑證值，
@@ -33,6 +35,11 @@ _MAX_BODY_BYTES = 1024 * 1024
 
 # resolve 認得的 query 參數；不在這張表的忽略。
 _RESOLVE_PARAMS = ("agent", "provider", "model", "subscription", "exclude")
+
+# roles 認得的 query 參數：resolve 的已知參數集合再加上 data（#100；spec
+# role-allocation）。另立一份、不共用 _RESOLVE_PARAMS 本身；重複與空值的規則
+# 與 resolve 相同。
+_ROLES_PARAMS = _RESOLVE_PARAMS + ("data",)
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> dict:
@@ -84,7 +91,7 @@ def _send_empty(handler: BaseHTTPRequestHandler, status: int) -> None:
 
 
 def _match_route(method: str, path: str):
-    """回 ("list",) ｜ ("get", id) ｜ ("cooldown", id) ｜ ("resolve",) ｜ None。"""
+    """回 ("list",) ｜ ("get", id) ｜ ("cooldown", id) ｜ ("resolve",) ｜ ("roles", role) ｜ None。"""
     if path == "/v1/subscriptions":
         return ("list",) if method == "GET" else None
     if path == "/v1/resolve":
@@ -94,6 +101,10 @@ def _match_route(method: str, path: str):
     if (method == "GET" and len(parts) == 4
             and parts[1] == "v1" and parts[2] == "subscriptions" and parts[3]):
         return ("get", unquote(parts[3]))
+    # ["", "v1", "roles", "{role}"]
+    if (method == "GET" and len(parts) == 4
+            and parts[1] == "v1" and parts[2] == "roles" and parts[3]):
+        return ("roles", unquote(parts[3]))
     # ["", "v1", "subscriptions", "{id}", "cooldown"]
     if (method == "POST" and len(parts) == 5
             and parts[1] == "v1" and parts[2] == "subscriptions" and parts[3]
@@ -102,21 +113,31 @@ def _match_route(method: str, path: str):
     return None
 
 
-def _resolve_query(query: str) -> dict:
-    """resolve 的 query 規則（design 決定 1）：parse_qs 的 form 解碼。
+def _query(query: str, known: tuple[str, ...]) -> dict:
+    """parse_qs 的 form 解碼＋已知參數的共用規則（resolve 與 roles）。
 
     空白值＝沒給；已知參數重複出現（含空白的那一次）→ 400；未知參數忽略。
     回 {name: 第一個非空值}，只含給了非空值的已知參數。
     """
     groups = parse_qs(query, keep_blank_values=True)
-    for name in _RESOLVE_PARAMS:
+    for name in known:
         if len(groups.get(name, ())) > 1:
             raise bad_request()
     return {
         name: values[0]
         for name, values in groups.items()
-        if name in _RESOLVE_PARAMS and values[0]
+        if name in known and values[0]
     }
+
+
+def _resolve_query(query: str) -> dict:
+    """resolve 的 query 規則（design 決定 1）：parse_qs 的 form 解碼。"""
+    return _query(query, _RESOLVE_PARAMS)
+
+
+def _roles_query(query: str) -> dict:
+    """roles 的 query 規則：與 resolve 相同，已知參數再加上 data（#100）。"""
+    return _query(query, _ROLES_PARAMS)
 
 
 def _api_handler(service):
@@ -160,6 +181,11 @@ def _api_handler(service):
                         subscription=q.get("subscription"),
                         exclude=q.get("exclude"),
                     )
+                    status = 200
+                elif route[0] == "roles":
+                    q = _roles_query(split.query)
+                    payload = service.role_candidates(
+                        route[1], q.get("agent"), q.get("data"))
                     status = 200
                 elif route[0] == "get":
                     # 過渡期、刻意不動（與 resolve 的 query 規則不同）：d 單移除 get 前不要順手統一。

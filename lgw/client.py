@@ -1,4 +1,4 @@
-"""四個呼叫的客戶端（design 決定 6；tasks 2.1）：list、resolve、get（過渡期）、登錄冷卻。
+"""五個呼叫的客戶端（design 決定 6；tasks 2.1、2.3）：list、resolve、get（過渡期）、登錄冷卻、roles。
 
 用法：
 
@@ -6,6 +6,7 @@
     client.list()
     client.resolve("opencode", "opencode-zen", model="big-pickle")
     client.resolve("claude-code", "anthropic", subscription="claude-personal")
+    client.roles("impl", "opencode", data="public")
     client.get("claude-personal", "claude-code")
     client.cooldown("claude-personal", "2026-10-12T03:00:00Z")
     client.cooldown("opencode-zen", "2026-10-12T03:00:00Z", model="big-pickle")
@@ -15,6 +16,8 @@
   （model／subscription 是供應商 id 與釘住的 id；exclude 由 client 用 ",".join
   合併；每個 query 值都用 urllib.parse.quote(value, safe="") 編碼——`+` 因此
   編成 %2B，server 的 parse_qs 才不會解成空白）
+- roles(role, agent, data=None) → GET /v1/roles/{role}?agent={agent}[&data={data}]
+  （#100；spec role-allocation。data 省略時不帶參數，由服務取最嚴）
 - get(id, agent) → GET /v1/subscriptions/{id}?agent={agent}（過渡期；resolve 的
   並存夥伴，移除在 d 單）
 - cooldown(id, until, model=None) → POST /v1/subscriptions/{id}/cooldown，body
@@ -147,6 +150,23 @@ class Client:
             for name, value in params
         )
         return self._send("GET", "/v1/resolve?" + query, None, error_data=True)
+
+    def roles(self, role: str, agent: str, data: str | None = None) -> Result:
+        """取某角色在指定 agent 下的候選（依 rank；不含 key 與額度）。
+
+        data 省略時不帶參數（服務取最嚴）；role 依服務的固定字串，不自行正規化。
+        """
+        params = [("agent", str(agent))]
+        if data is not None:
+            params.append(("data", str(data)))
+        query = "&".join(
+            "{0}={1}".format(name, urllib.parse.quote(value, safe=""))
+            for name, value in params
+        )
+        path = "/v1/roles/{0}?{1}".format(
+            urllib.parse.quote(str(role), safe=""), query
+        )
+        return self._send("GET", path, None, error_data=True)
 
     def get(self, id: str, agent: str) -> Result:
         """取一把 key；agent 不符 403、未部署 409、不存在 404。"""
