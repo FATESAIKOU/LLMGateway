@@ -189,7 +189,7 @@ class JsonSchemaTest(RegistryCase):
             items["opencode-zen"]["models"]["default"],
             "mimo-v2.6-flash-free",
         )
-        self.assertEqual(items["opencode-go"]["models"]["allow"], ["*-free"])
+        self.assertEqual(items["opencode-go"]["models"]["allow"], ["beam-free"])
         self.assertEqual(
             items["opencode-go"]["models"]["default"],
             "beam-free",
@@ -515,6 +515,13 @@ class ModelCooldownTest(RegistryCase):
                          {"mimo-v2.6-flash-free": {"until": "2026-10-11T15:00:00Z"}})
         self.assertIsNone(item["cooldown"])   # 整把沒被動到
         self.assertTrue(item["available"])    # 模型冷卻不改 available
+
+    def test_opencode_go的iceman登錄冷卻被拒(self):
+        # #95：iceman-contributor-free 不再涵蓋，登錄冷卻 model 也應被拒（400 bad_request）
+        err = self.assert_api_error(
+            400, "bad_request", self.cooldown_raw, "opencode-go",
+            {"until": "2026-10-11T15:00:00Z", "model": "iceman-contributor-free"})
+        self.assertEqual(self.model_cooldowns("opencode-go"), {})
 
     def test_同一模型重複登錄取較晚的(self):
         self.cooldown_raw("opencode-zen", {
@@ -1073,8 +1080,9 @@ class ResolveTest(RegistryCase):
 
     def test_opencode_go的env是go的endpoint與provider_id(self):
         # #77：Go 走自己的 provider id 與 endpoint；key 與 zen 共用同一個值
+        # #95：iceman-contributor-free 不再 allow，改用 beam-free
         payload = self.resolve("opencode", "opencode-go",
-                               model="iceman-contributor-free")
+                               model="beam-free")
         self.assertEqual(payload["meta"]["subscription"], "opencode-go")
         self.assertEqual(payload["meta"]["provider"], "opencode-go")
         self.assertEqual(payload["meta"]["endpoint"],
@@ -1082,9 +1090,16 @@ class ResolveTest(RegistryCase):
         env = payload["env"]
         self.assertEqual(env["OPENCODE_PROVIDER_ID"], "opencode-go")
         self.assertEqual(env["OPENCODE_API_KEY"], CANARY["opencode-zen"])
-        self.assertEqual(env["OPENCODE_MODEL"], "iceman-contributor-free")
-        self.assertEqual(env["OPENCODE_SMALL_MODEL"], "iceman-contributor-free")
+        self.assertEqual(env["OPENCODE_MODEL"], "beam-free")
+        self.assertEqual(env["OPENCODE_SMALL_MODEL"], "beam-free")
         self.assertNotIn("OPENCODE_CONFIG_CONTENT", payload)
+
+    def test_opencode_go的iceman模型被拒(self):
+        # #95：iceman-contributor-free 不再涵蓋（以授權訓練 prompt 換免費、不進輪替）
+        err = self.assert_api_error(
+            403, "model_not_allowed", self.resolve,
+            "opencode", "opencode-go", model="iceman-contributor-free")
+        self.assertNotIn("env", err.body())
 
     def test_opencode_go的預設模型(self):
         payload = self.resolve("opencode", "opencode-go")
