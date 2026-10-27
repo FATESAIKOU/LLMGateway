@@ -2,6 +2,11 @@
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；另帶 usage／available_again_at（#60）；
 - get_subscription(id, agent)：一筆的共通 JSON，含 key（agent 必填、要在該筆的 agents 裡、key 要已部署）；
+- role_candidates(role, agent, data)：角色的候選投影（#100；spec role-allocation）。照政策
+  roles.<role>.order 篩 agents 與 privacy（不低於 data 與 floor 取較嚴者），回
+  {schema, role, data, agent, candidates}；每筆 {id, provider, rank, privacy, available,
+  cooldown, model_cooldowns}，不含 key／usage／available_again_at、不觸發取用量。
+  冷卻、用量與 available 不影響成員與順序（Gateway 不代選）。
 - resolve(agent, provider[, model, subscription, exclude])：照政策選把後回
   {schema, env_schema, meta, env}（meta 含 cooldown／model_cooldowns，是提示；不含
   available／available_again_at，帶 usage；env 依 agent 組成）。
@@ -39,7 +44,7 @@ from .errors import (
     until_out_of_range,
 )
 from .keys import KeyStore
-from .policy import AGENTS, Policy, SubscriptionPolicy
+from .policy import AGENTS, PRIVACY_LEVELS, ROLES, Policy, SubscriptionPolicy
 from .providers import CredentialProvider, provider_for
 from .store import Store
 from .usage import UsageService, available_again_at, internal_usage
@@ -72,6 +77,11 @@ def _covered(patterns: tuple[str, ...], model: str) -> bool:
     fnmatch 的 `*` 會匹配 `/` 等副作用與分開控制做法見 docs/deploy.md 5.8。
     """
     return any(fnmatch.fnmatchcase(model, pattern) for pattern in patterns)
+
+
+def _stricter_privacy(left: str, right: str) -> str:
+    """兩個隱私等級取較嚴者（public < general < real；spec role-allocation）。"""
+    return left if PRIVACY_LEVELS.index(left) >= PRIVACY_LEVELS.index(right) else right
 
 
 def _derive_model(sub: SubscriptionPolicy, kind: str) -> tuple[bool, str | None]:
@@ -127,6 +137,57 @@ class RegistryService:
             item["available_again_at"] = again
             item["usage"] = usage
         return {"schema": SCHEMA_VERSION, "subscriptions": subs}
+
+    def role_candidates(self, role: str, agent: str | None,
+                        data: str | None = None) -> dict:
+        """GET /v1/roles/{role}：角色的候選投影（spec role-allocation）。
+
+        生效等級＝data（缺省 real，最嚴）與該角色 floor 取較嚴者；candidates 依
+        roles.<role>.order，只含 agents 含 agent 且 privacy 不低於生效等級的訂閱，
+        rank 為篩選後的 1..n。冷卻、用量與 available 不影響成員與順序（Gateway 不代選）。
+
+        驗證 precedence 同 resolve：輸入形狀 400（缺 agent／未知 agent／未知 data）
+        → 查無 404（角色不在五個之內，或不在政策檔的 roles 段）。不含 key、usage、
+        available_again_at，也不觸發取用量。
+        """
+        if not isinstance(agent, str) or not agent:
+            raise bad_request(missing=["agent"])
+        if agent not in AGENTS:
+            raise bad_request()
+        if data is not None and data not in PRIVACY_LEVELS:
+            raise bad_request()
+        role_policy = self._policy.roles.get(role)
+        if role not in ROLES or role_policy is None:
+            raise not_found()
+        level = _stricter_privacy(data or "real", role_policy.floor)
+
+        now = self._clock.now()
+        candidates = []
+        with self._store.txn() as cur:
+            for name in role_policy.order:
+                sub = self._policy.subscriptions[name]
+                if agent not in sub.agents:
+                    continue
+                if PRIVACY_LEVELS.index(sub.privacy) < PRIVACY_LEVELS.index(level):
+                    # privacy 低於生效等級：篩掉，不降級（floor 也不會被請求放寬）
+                    continue
+                cooldown = self._cooldown(cur, name, now)
+                candidates.append({
+                    "id": name,
+                    "provider": provider_for(name).provider,
+                    "rank": len(candidates) + 1,
+                    "privacy": sub.privacy,
+                    "available": self._keys.deployed(name) and cooldown is None,
+                    "cooldown": cooldown,
+                    "model_cooldowns": self._model_cooldowns(cur, name, now),
+                })
+        return {
+            "schema": SCHEMA_VERSION,
+            "role": role,
+            "data": level,
+            "agent": agent,
+            "candidates": candidates,
+        }
 
     def resolve(
         self,

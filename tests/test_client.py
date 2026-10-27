@@ -72,6 +72,22 @@ class FakeService:
                          "model": model or "m2"},
                 "env": {"OPENCODE_API_KEY": CANARY},
             }
+        if method == "GET" and path.startswith("/v1/roles/"):
+            role = urllib.parse.unquote(path.rsplit("/", 1)[1])
+            agent = query.get("agent", [None])[0]
+            data = query.get("data", [None])[0]
+            if role == "gone":
+                return 404, {"error": "not_found"}
+            if not agent:
+                return 400, {"error": "bad_request", "missing": ["agent"]}
+            return 200, {
+                "schema": 1, "role": role, "data": data or "real", "agent": agent,
+                "candidates": [
+                    {"id": "opencode-zen", "provider": "opencode-zen", "rank": 1,
+                     "privacy": "public", "available": True, "cooldown": None,
+                     "model_cooldowns": {}},
+                ],
+            }
         if method == "GET" and path.startswith("/v1/subscriptions/"):
             sub_id = urllib.parse.unquote(path.rsplit("/", 1)[1])
             if sub_id == "gone":
@@ -242,6 +258,48 @@ class ResolveTest(ClientCase):
 
     def test_resolve_400帶missing(self):
         res = self.client.resolve("", "opencode-zen")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 400)
+        self.assertEqual(res.error, "bad_request")
+        self.assertEqual(res.data, {"missing": ["agent"]})
+
+
+class RolesTest(ClientCase):
+    """#100 tasks 2.3：roles(role, agent, data=None) 的 request 形狀與 Result 語意。"""
+
+    def test_roles_ok(self):
+        res = self.client.roles("impl", "opencode")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.data["schema"], 1)
+        self.assertEqual(res.data["role"], "impl")
+        self.assertEqual(res.data["data"], "real")  # 沒帶 data：服務取最嚴
+        self.assertEqual(res.data["candidates"][0]["id"], "opencode-zen")
+        self.assertNotIn("key", res.data["candidates"][0])
+        self.assertNotIn("usage", res.data["candidates"][0])
+        self.assertNotIn("available_again_at", res.data["candidates"][0])
+        method, path, query, body, auth = self.fake.requests[-1]
+        self.assertEqual((method, path), ("GET", "/v1/roles/impl"))
+        self.assertEqual(query, {"agent": ["opencode"]})  # data 省略時不帶
+        self.assertEqual(body, {})
+        self.assertIsNone(auth)  # 不帶任何認證標頭
+
+    def test_roles帶data(self):
+        res = self.client.roles("qa", "opencode", data="public")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.data["data"], "public")
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query, {"agent": ["opencode"], "data": ["public"]})
+
+    def test_roles_404(self):
+        res = self.client.roles("gone", "opencode")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, 404)
+        self.assertEqual(res.error, "not_found")
+        self.assertFalse(res.unreachable)
+
+    def test_roles_400帶missing(self):
+        res = self.client.roles("impl", "")
         self.assertFalse(res.ok)
         self.assertEqual(res.status, 400)
         self.assertEqual(res.error, "bad_request")
