@@ -1,5 +1,13 @@
 # 模型輪換表
 
+## 與訂閱分配的分工
+
+- 這張表只管「哪個模型好」：能力、比例、額度標記與排序。它**不自動改**政策，也不決定哪個角色能用哪把訂閱。
+- 角色×訂閱分配管「哪個角色、什麼資料等級可以用哪把訂閱、順序」：Gateway 政策檔的 `privacy`（每把訂閱的資料等級）與 `roles`（`floor`、`order`），由 `GET /v1/roles/{role}?agent=[&data=]` 讀出（`lgwctl usage --role …` 是它的呈現）。
+- 兩者互不覆蓋：輪換表不列角色，分配表不列模型；改一張不等於改另一張。
+- 挑模型時先由 `roles` 取候選訂閱（依 `rank`，資料等級不夠的已被 Gateway 篩掉、不會降級），再在這張表裡挑該把訂閱可用的模型。
+- 分配表的規則與設計見 `openspec/changes/role-subscription-allocation/`，不在此重抄。
+
 這張表是 PMO／PM 挑模型的參考，**不自動改** `policy/default.json`；政策變更仍走獨立 PR。
 
 由 `/model-rotation-survey` 每週手動更新（PMO 週例執行，有變化才開 PR，本人 comment 後再套用）。涵蓋四家：OpenRouter／Zen 免費、Ollama Cloud（付費）、Claude（訂閱，只能用在原版 Claude Code）。
