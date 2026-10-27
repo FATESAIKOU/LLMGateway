@@ -19,6 +19,12 @@ SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "opencode-
                  "groq", "openrouter", "ollama-cloud")
 AGENTS = ("claude-code", "opencode")
 
+# 隱私等級（public < general < real）；缺省 public（fail-closed）。
+PRIVACY_LEVELS = ("public", "general", "real")
+
+# 角色鍵（政策檔 roles 段的鍵只能是這五個）。
+ROLES = ("PMO", "PM", "impl", "rev", "qa")
+
 # 條款與設計的否定約束（固定字串的錯誤訊息）
 _CLAUDE_ONLY = ("claude-personal", "claude-company")
 _OPENCODE_ONLY = ("opencode-zen", "opencode-go", "groq")
@@ -47,6 +53,7 @@ class SubscriptionPolicy:
     agents: tuple[str, ...]
     models_allow: tuple[str, ...]      # fnmatch 樣式，例如 "*" 或 "*:free"
     models_default: str | None
+    privacy: str = "public"
 
 
 @dataclass(frozen=True)
@@ -57,10 +64,18 @@ class UsageSetting:
 
 
 @dataclass(frozen=True)
+class RolePolicy:
+    """政策檔 `roles` 段裡一個角色的分配（floor、order）。"""
+    floor: str
+    order: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Policy:
     subscriptions: dict[str, SubscriptionPolicy]
     until_max_ahead_seconds: int
     usage: dict[str, UsageSetting] = field(default_factory=dict)
+    roles: dict[str, RolePolicy] = field(default_factory=dict)
 
     def in_priority_order(self) -> tuple[SubscriptionPolicy, ...]:
         """依 priority 排序（數字小的先；同分照 id）。list 用。"""
@@ -78,12 +93,21 @@ def _is_priority(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _parse_privacy(name: str, spec: dict) -> str:
+    """共用的 privacy 驗證（訊息只有一份）。缺省 public；非法丟 PolicyError。"""
+    privacy = spec.get("privacy", "public")
+    if privacy not in PRIVACY_LEVELS:
+        raise PolicyError(f"subscription {name} privacy must be one of public, general, real")
+    return privacy
+
+
 def _parse_subscription(name: str, spec: object) -> SubscriptionPolicy:
     if not isinstance(spec, dict):
         raise PolicyError("subscription must be an object")
     priority = spec.get("priority")
     if not _is_priority(priority):
         raise PolicyError("subscription priority must be a non-negative integer")
+    privacy = _parse_privacy(name, spec)
     agents = spec.get("agents")
     if not isinstance(agents, list) or not agents or any(a not in AGENTS for a in agents):
         raise PolicyError("subscription agents invalid")
@@ -115,6 +139,7 @@ def _parse_subscription(name: str, spec: object) -> SubscriptionPolicy:
         agents=tuple(agents),
         models_allow=tuple(allow),
         models_default=default,
+        privacy=privacy,
     )
 
 
@@ -147,6 +172,55 @@ def _parse_usage(data: object, subs: dict) -> dict[str, UsageSetting]:
     return out
 
 
+_ROLES_KEYS = ("floor", "order")
+
+
+def _parse_roles(data: object, subs: dict[str, SubscriptionPolicy]) -> dict[str, RolePolicy]:
+    """頂層 `roles`（選填）：{role: {floor, order}}；fail-closed。
+
+    驗證順序：角色鍵 → floor → order（privacy／訂閱 id 已在更早的步驟驗過）。
+    角色鍵只能是 ROLES；物件只能有 floor／order；floor 必填且合法（無預設）；
+    order 非空、不重複、每個 id 存在於 subs。
+    """
+    if not isinstance(data, dict):
+        raise PolicyError("policy.roles must be an object")
+    # 第 3 步：角色鍵（先於 floor／order，與 dict 順序無關）
+    for role in data:
+        if role not in ROLES:
+            raise PolicyError("policy.roles has unknown role")
+    # entry 必須是 object
+    for role, spec in data.items():
+        if not isinstance(spec, dict):
+            raise PolicyError("policy.roles entry must be an object")
+    # 多餘鍵（先於 floor）
+    for role, spec in data.items():
+        if any(key not in _ROLES_KEYS for key in spec):
+            raise PolicyError("policy.roles entry has unknown key")
+    # 第 4 步：floor（必填、合法，無預設）
+    for role, spec in data.items():
+        if "floor" not in spec:
+            raise PolicyError("policy.roles floor is required")
+        if spec.get("floor") not in PRIVACY_LEVELS:
+            raise PolicyError("policy.roles floor must be one of public, general, real")
+    # 第 5 步：order
+    out: dict[str, RolePolicy] = {}
+    for role, spec in data.items():
+        if "order" not in spec:
+            raise PolicyError("policy.roles order is required")
+        order = spec.get("order")
+        if not isinstance(order, list) or not order:
+            raise PolicyError("policy.roles order must be a non-empty list")
+        if any(not isinstance(x, str) or not x for x in order):
+            raise PolicyError("policy.roles order must be a list of subscription ids")
+        if len(set(order)) != len(order):
+            raise PolicyError("policy.roles order must not repeat")
+        for rid in order:
+            if rid not in subs:
+                raise PolicyError("policy.roles order has unknown subscription")
+        out[role] = RolePolicy(floor=spec.get("floor"), order=tuple(order))
+    return out
+
+
 def load_policy(path: str) -> Policy:
     """驗證規則（不合法丟 PolicyError，訊息說明哪裡錯、不含檔案字串）：
     - subscriptions 的鍵只能是 SUBSCRIPTIONS；
@@ -171,6 +245,11 @@ def load_policy(path: str) -> Policy:
     subs = data.get("subscriptions")
     if not isinstance(subs, dict):
         raise PolicyError("policy.subscriptions must be an object")
+    # 驗證順序第 1 步：privacy（先於訂閱 id；值永不進例外）
+    for name, spec in subs.items():
+        if isinstance(spec, dict):
+            _parse_privacy(name, spec)
+    # 驗證順序第 2 步：訂閱 id
     for name in subs:
         if name not in SUBSCRIPTIONS:
             raise PolicyError("policy.subscriptions has unknown key")
@@ -190,8 +269,10 @@ def load_policy(path: str) -> Policy:
     if not _positive_int(max_ahead):
         raise PolicyError("policy.until_max_ahead_seconds must be a positive integer")
     usage = _parse_usage(data.get("usage"), parsed_subs) if "usage" in data else {}
+    roles = _parse_roles(data.get("roles"), parsed_subs) if "roles" in data else {}
     return Policy(
         subscriptions=parsed_subs,
         until_max_ahead_seconds=max_ahead,
         usage=usage,
+        roles=roles,
     )

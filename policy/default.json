@@ -3,26 +3,31 @@
   "subscriptions": {
     "claude-personal": {
       "priority": 40,
+      "privacy": "real",
       "agents": ["claude-code"],
       "models": {"allow": ["*"], "default": "claude-sonnet-5-5"}
     },
     "opencode-zen": {
       "priority": 10,
+      "privacy": "public",
       "agents": ["opencode"],
       "models": {"allow": ["*-free", "big-pickle"], "default": "mimo-v2.6-flash-free"}
     },
     "opencode-go": {
       "priority": 15,
+      "privacy": "general",
       "agents": ["opencode"],
       "models": {"allow": ["beam-free"], "default": "beam-free"}
     },
     "openrouter": {
       "priority": 20,
+      "privacy": "public",
       "agents": ["opencode"],
       "models": {"allow": ["*:free", "openrouter/free"], "default": "openrouter/free"}
     },
     "groq": {
       "priority": 25,
+      "privacy": "public",
       "agents": ["opencode"],
       "models": {
         "allow": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
@@ -31,9 +36,17 @@
     },
     "ollama-cloud": {
       "priority": 30,
+      "privacy": "real",
       "agents": ["claude-code", "opencode"],
       "models": {"allow": ["*"], "default": "deepseek-v4.1-flash"}
     }
+  },
+  "roles": {
+    "PMO": {"floor": "real", "order": ["claude-personal", "ollama-cloud"]},
+    "PM": {"floor": "real", "order": ["claude-personal", "ollama-cloud"]},
+    "impl": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud", "claude-personal"]},
+    "rev": {"floor": "public", "order": ["openrouter", "opencode-zen", "opencode-go", "ollama-cloud", "claude-personal"]},
+    "qa": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud"]}
   },
   "usage": {"claude-personal": {"enabled": true}},
   "until_max_ahead_seconds": 691200

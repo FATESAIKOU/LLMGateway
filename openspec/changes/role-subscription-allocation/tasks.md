@@ -2,8 +2,8 @@
 
 ## 1. 政策
 
-- [ ] 1.1 `lgwd/policy.py`：`SubscriptionPolicy` 加 `privacy`（缺省 `public`）；`Policy` 加 `roles`；`_parse_roles` fail-closed，驗證順序 `privacy` → 訂閱 id → 角色鍵 → `floor`（必填、合法，無預設）→ `order`（非空、不重複、id 存在）；角色物件有 `floor`／`order` 以外的鍵即拒收。驗證：`tests/test_policy.py`（含 `floor` 缺漏、部分角色表）。
-- [ ] 1.2 `policy/default.json`：加各訂閱 `privacy` 與 `roles`（內容見 design 的提議表，等本人核定）。groq 保留但不進任何 `order`。驗證：出廠政策可載入；`real` 等級的候選不含 zen／openrouter／groq。
+- [x] 1.1 `lgwd/policy.py`：`SubscriptionPolicy` 加 `privacy`（缺省 `public`）；`Policy` 加 `roles`；`_parse_roles` fail-closed，驗證順序 `privacy` → 訂閱 id → 角色鍵 → `floor`（必填、合法，無預設）→ `order`（非空、不重複、id 存在）；角色物件有 `floor`／`order` 以外的鍵即拒收。驗證：`tests/test_policy.py`（含 `floor` 缺漏、部分角色表）。
+- [x] 1.2 `policy/default.json`：加各訂閱 `privacy` 與 `roles`（內容見 design 的提議表，等本人核定）。groq 保留但不進任何 `order`。驗證：出廠政策可載入；`real` 等級的候選不含 zen／openrouter／groq。
 
 ## 2. 端點與呈現
 
