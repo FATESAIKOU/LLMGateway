@@ -54,7 +54,7 @@
 - **THEN** 回 200、`candidates` 為 `[]`，回應中沒有那些訂閱的 id
 
 #### Scenario: 低等級時高隱私訂閱仍可出現
-- **WHEN** 同一份政策，`GET /v1/roles/qa?agent=opencode&data=public`
+- **WHEN** `roles.qa.order` 含 `privacy` 為 `public`、`general`、`real` 且 `agents` 含 `opencode` 的訂閱，呼叫 `GET /v1/roles/qa?agent=opencode&data=public`
 - **THEN** `candidates` 含 `privacy` 為 `public`、`general`、`real` 且 `agents` 含 `opencode` 的訂閱，證明過濾方向是「不低於」
 
 #### Scenario: row 帶 provider 且不等於 id
