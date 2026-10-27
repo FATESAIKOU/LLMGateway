@@ -470,5 +470,163 @@ class ValidateEndpointsTests(unittest.TestCase):
             self.fail("endpoint with credentials must be rejected")
 
 
+class RoleAndPrivacyPolicyTests(PolicyValidationTests):
+    pass
+    def test_privacy缺省為public(self):
+        policy = self._reload()
+        for sub in policy.subscriptions.values():
+            self.assertEqual(sub.privacy, "public")
+
+    def test_roles缺省為空(self):
+        policy = self._reload()
+        self.assertEqual(policy.roles, {})
+
+    def test_部分角色表可載入(self):
+        obj = _good_policy()
+        obj["roles"] = {"impl": {"floor": "public", "order": ["openrouter"]}}
+        policy = self._reload(obj)
+        self.assertEqual(set(policy.roles), {"impl"})
+
+    def test_floor缺漏拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"order": ["openrouter"]}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_角色物件多餘鍵拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": "real", "order": ["openrouter"], "x": 1}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_order空拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": "real", "order": []}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_order重複拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": "real", "order": ["openrouter", "openrouter"]}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_order_id不存在拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": "real", "order": ["nope"]}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_privacy非法拒收(self):
+        obj = _good_policy()
+        obj["subscriptions"]["openrouter"]["privacy"] = "private"
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_floor值非法_private拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": "private", "order": ["openrouter"]}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_floor值非法_null拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": None, "order": ["openrouter"]}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_roles非object拒收(self):
+        obj = _good_policy()
+        obj["roles"] = ["PMO"]
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_entry非object拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": "x"}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_order缺拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": "real"}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_order元素非字串拒收(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"floor": "real", "order": [1]}}
+        with self.assertRaises(PolicyError):
+            self._reload(obj)
+
+    def test_出廠政策privacy與roles整張表(self):
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        self.assertEqual(
+            {name: policy.subscriptions[name].privacy for name in policy.subscriptions},
+            {
+                "claude-personal": "real",
+                "opencode-zen": "public",
+                "opencode-go": "general",
+                "openrouter": "public",
+                "groq": "public",
+                "ollama-cloud": "real",
+            },
+        )
+        self.assertEqual(
+            {role: (rp.floor, rp.order) for role, rp in policy.roles.items()},
+            {
+                "PMO": ("real", ("claude-personal", "ollama-cloud")),
+                "PM": ("real", ("claude-personal", "ollama-cloud")),
+                "impl": ("public", ("opencode-zen", "opencode-go", "openrouter",
+                                    "ollama-cloud", "claude-personal")),
+                "rev": ("public", ("openrouter", "opencode-zen", "opencode-go",
+                                   "ollama-cloud", "claude-personal")),
+                "qa": ("public", ("opencode-zen", "opencode-go", "openrouter",
+                                  "ollama-cloud")),
+            },
+        )
+        # groq 不在任何 order
+        self.assertFalse(any("groq" in r.order for r in policy.roles.values()))
+        # real floor 角色的 order 只含 real 訂閱
+        real_subs = {name for name, s in policy.subscriptions.items()
+                     if s.privacy == "real"}
+        for role, rp in policy.roles.items():
+            if rp.floor != "real":
+                continue
+            for sid in rp.order:
+                self.assertIn(sid, real_subs, (role, sid))
+
+    def test_驗證順序_privacy先於訂閱id(self):
+        obj = _good_policy()
+        obj["subscriptions"]["claude-personal"]["privacy"] = "private"
+        obj["subscriptions"]["nope"] = _sub(10, ("opencode",))
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertIn("privacy", str(ctx.exception))
+
+    def test_驗證順序_訂閱id先於角色鍵(self):
+        obj = _good_policy()
+        obj["subscriptions"]["nope"] = _sub(10, ("opencode",))
+        obj["roles"] = {"foo": {"floor": "public", "order": ["openrouter"]}}
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertIn("unknown key", str(ctx.exception))
+
+    def test_驗證順序_角色鍵先於floor(self):
+        obj = _good_policy()
+        obj["roles"] = {"foo": {"floor": "public", "order": ["openrouter"]},
+                        "PMO": {"order": ["openrouter"]}}
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertIn("unknown role", str(ctx.exception))
+
+    def test_驗證順序_floor先於order(self):
+        obj = _good_policy()
+        obj["roles"] = {"PMO": {"order": ["openrouter"]}}
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertIn("floor is required", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
