@@ -7,8 +7,8 @@
 ## 1. 前置（不是程式；擋住整個實作）
 
 - [x] 1.1 本人裁定（2026-10-26，經 PMO 轉達）：「冷卻只是讓叫人方省麻煩、知道下次何時再叫；他真要再叫，Gateway 也擋不了，也沒必要擋。」本版設計已照此改寫：拿掉提前解除（`DELETE`／`cooldown_release`）、為冷卻做的呼叫方身分、resolve 的 409 `cooling`；只留「登錄時驗證模型 id → 400」。**不需要再等裁定**。驗證：本 change 的 design 與 spec 已反映。
-- [ ] 1.2 設計經**非作者**審查通過（工單 #76 的規則）。審查要對照本版的 spec delta（7 條 MODIFIED、沒有 ADDED）與 design 的決定 1～8。驗證：審查意見全部結案，或列成 1.3。
-- [ ] 1.3 把審查沒收的意見寫回 design（決定與否決選項都要留），不默默改。驗證：`openspec validate model-cooldown --strict`。
+- [x] 1.2 設計經**非作者**審查通過（工單 #76 的規則）。審查要對照本版的 spec delta（7 條 MODIFIED、沒有 ADDED）與 design 的決定 1～8。驗證：審查意見全部結案，或列成 1.3。（Opus 非作者審查三輪，修正 3 後結論「可以」；紀錄在 #76 工作期間的 .work/archive-76/DESIGN-REREVIEW.md，不進 repo）
+- [x] 1.3 把審查沒收的意見寫回 design（決定與否決選項都要留），不默默改。驗證：`openspec validate model-cooldown --strict`。
 
 ## 2. 儲存（spec「登錄冷卻」「稽核紀錄」；design 決定 6）
 
@@ -51,7 +51,7 @@
 - [x] 8.2 改壞驗證的結果寫進 PR（4.3 的三項，加上：拿掉 `model` 的 allow 檢查 → 「model 不在 allow」轉紅；把 `available` 改成只看部署 → 「模型冷卻不改 available」轉紅；把 `model_cooldowns` 塞進 `cooldown` → 形狀迴歸轉紅）。沒轉紅的列出來。
 - [x] 8.3 自查：`git status` 只有本 change 的檔案與程式；`openspec validate model-cooldown --strict` 綠；`git diff` 沒有動到 `openspec/specs/`（**這條只限實作 PR**：主 spec 在實作 PR 裡不動；歸檔那一步不在這個 PR 內，歸檔的那個 commit 會手改主 spec 的 Purpose，見 7.3）；`git grep -n "cooling" -- lgwd` 為空（生產者已刪）。
 - [x] 8.4 部署順序自查：release note 寫明「MyLinuxPool sidecar 先、Gateway 後（或同一窗）」，並註明舊 sidecar + 新 Gateway 的代價——開啟時多一次啟動與一次 429、同 provider 多把都在冷卻時會來回換；單一把 provider 的換把結果不變（design 決定 4）。
-- [ ] 8.5 **部署後驗收（等本人部署；不是 PR 的一部分）**：在**測試用的那把**登錄一筆模型冷卻（`POST /v1/subscriptions/{id}/cooldown` 帶 `model`），確認 `list` 的 `model_cooldowns` 出現那一筆、`cooldown` 與 `available` 不受影響，把原樣輸出貼到 #76。**正式環境要不要寫一筆提示、要寫在哪一把，由 PMO／本人決定**，實作者不自行決定。驗證：#76 有一則帶輸出的留言。
+- [x] 8.5 **部署後驗收（等本人部署；不是 PR 的一部分）**：在**測試用的那把**登錄一筆模型冷卻（`POST /v1/subscriptions/{id}/cooldown` 帶 `model`），確認 `list` 的 `model_cooldowns` 出現那一筆、`cooldown` 與 `available` 不受影響，把原樣輸出貼到 #76。**正式環境要不要寫一筆提示、要寫在哪一把，由 PMO／本人決定**，實作者不自行決定。驗證：#76 有一則帶輸出的留言。（2026-10-27 部署 lgw-v0.5.0 後驗過，輸出貼在 #76 留言 https://github.com/FATESAIKOU/LLMGateway/issues/76#issuecomment-6433929542）
 
 ## 9. 交 MyLinuxPool 的請求（**不在本 PR**；經 PMO 轉，見 design 決定 7）
 
