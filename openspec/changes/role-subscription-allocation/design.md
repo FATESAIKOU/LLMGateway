@@ -36,7 +36,7 @@
 ### 2.1 這個 gate 能保證什麼（不 overclaim）
 
 - **第一層（本 change）**：`roles` 端點讓分配表與隱私等級**可被程式讀取，由 sidecar 遵守（advisory）**。Gateway 不擋 `resolve`／`get` 的釘住（`lgwd/registry.py:341-349`、`:203-208` 不看 privacy）；舊 sidecar、有 bug 的挑法、任何能打 loopback 的 client 仍能釘低等級訂閱。MLP 請求書明列「不得繞過 `roles` 直接釘低等級訂閱」。
-- **第二層（不在本 change，判斷點 7）**：在發憑證的邊界加選填 `data` 到 `resolve`，釘住的訂閱 `privacy` 低於生效等級就回 403。缺省取捨：缺省當 `real` → 舊 sidecar 不帶參數也被收窄，行為改變；缺省不濾 → 舊 client 繞過仍在。建議：另開 c／d，缺省不濾（不破壞相容），新 sidecar 一律帶 `data`；全部 sidecar 升級後再議是否改缺省。
+- **第二層（不在本 change，判斷點 6）**：在發憑證的邊界加選填 `data` 到 `resolve`，釘住的訂閱 `privacy` 低於生效等級就回 403。缺省取捨：缺省當 `real` → 舊 sidecar 不帶參數也被收窄，行為改變；缺省不濾 → 舊 client 繞過仍在。建議：另開 c／d，缺省不濾（不破壞相容），新 sidecar 一律帶 `data`；全部 sidecar 升級後再議是否改缺省。
 
 ## 3. sidecar 怎麼挑、冷卻怎麼跳
 
@@ -48,7 +48,7 @@
 
 1. 帶 `role`、`data`、`agent` 取 `roles` 候選，再 `list` 合併 `usage`／`models`。
 2. 依 `rank`：`cooldown` 整把或 `available=false` → 跳；`usage` 有窗口 `remaining_percent`＝0 → 視同整把不可用，直到 `resets_at`；`usage.status` 為 `unknown`（含 `reason: no_key`）／`not_applicable` → 照試（有 key 才 resolve 得到）。
-3. 同一把內：要用的模型（`default` 或上一步選定的）在 `model_cooldowns` → 換 `models.allow` 內**字面 id**、沒冷卻的另一個模型；都冷卻 → 下一把。`allow` 的萬用字元（如 zen 的 `*-free`）**本 change 不展開**（Gateway 只列已冷卻模型，沒有全集）；代價是 zen 只會試 `default` 與字面 id。要展開需政策加 `models.known`（判斷點 8）。
+3. 同一把內：要用的模型（`default` 或上一步選定的）在 `model_cooldowns` → 換 `models.allow` 內**字面 id**、沒冷卻的另一個模型；都冷卻 → 下一把。`allow` 的萬用字元（如 zen 的 `*-free`）**本 change 不展開**（Gateway 只列已冷卻模型，沒有全集）；代價是 zen 只會試 `default` 與字面 id。要展開需政策加 `models.known`（判斷點 7）。
 4. `resolve(agent, provider=<row.provider>, subscription=<id>, model=<m>)` 取憑證（照舊：冷卻不擋、`meta` 附冷卻）。**Claude 不送 `model`**（帳號級窗口，送了只冷卻單一模型、整把仍被選中；`.work/reports/93-request.md:26`）。
 5. 200 後看 `meta.cooldown`／`meta.model_cooldowns[meta.model]` 是否在未來：整把在未來 → 換把；只有該模型 → 先換同把其他模型、再換把；都不行才等（#93 需求 9，不直接開）。
 6. 429：登錄冷卻（opencode 送 model、Claude 不送），回步驟 3（先用剛登記的冷卻更新本地狀態）對**同一把先試其他未冷卻模型**（#93 需求 8／9(b)）；都沒有才往下一個 rank，並重取 `roles`。
@@ -66,15 +66,14 @@
 ## 5. 本人的判斷點
 
 1. **放哪**：Gateway 真相＋handbook 引用，還是只放 handbook。
-2. **claude-personal 定 `real`**：是否接受例外（safety flag）與 30 天保留的殘餘風險；Gateway 看不出該開關。並確認隊員透過 sidecar 用個人訂閱符合條款（`docs/research/claude-failover.md` §4）。不接受則改 `general`，PMO／PM 只剩 ollama-cloud。
+2. **claude-personal 定 `real`**：是否接受例外（safety flag）與 30 天保留的殘餘風險；Gateway 看不出該開關。隊員經 sidecar 用個人訂閱**合規**：sidecar 開的是原版 Claude Code；opencode 上不使用 Claude 訂閱（`docs/research/claude-failover.md` §4）。不接受則改 `general`，PMO／PM 只剩 ollama-cloud。
 3. **opencode-go 定 `general`**（只限 `beam-free`）。
-4. **是否解禁 groq**：現行不進輪替；解禁需另立工單並指定等級。
-5. **PMO／PM 的 floor 是 `real`**。
-6. **缺省 `data=real`**：沒帶就最嚴。
-7. **要不要程式保證 gate**：只做 advisory（本 change），或另開單給 `resolve` 加 `data`（§2.1，建議缺省不濾）。
-8. **萬用字元模型是否展開**：不展開（現況），或另開單加 `models.known`。
+4. **PMO／PM 的 floor 是 `real`**。
+5. **缺省 `data=real`**：沒帶就最嚴。
+6. **要不要程式保證 gate**：只做 advisory（本 change），或另開單給 `resolve` 加 `data`（§2.1，建議缺省不濾）。
+7. **萬用字元模型是否展開**：不展開（現況），或另開單加 `models.known`。
 
 ## 6. 未查／未實作
 
-- 主機的用量與 429 稽核未查（不連主機）；隊員用個人 Claude 訂閱是否合條款未驗（判斷點 2）。
+- 主機的用量與 429 稽核未查（不連主機）；隊員經 sidecar 用個人訂閱合規（sidecar 開的是原版 Claude Code、opencode 上不使用 Claude 訂閱），見判斷點 2 與 `docs/research/claude-failover.md` §4。
 - 端點、載入驗證、`lgwctl usage` 未實作，tasks 為待辦。
