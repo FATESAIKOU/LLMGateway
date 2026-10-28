@@ -80,9 +80,11 @@ class RegistryCase(unittest.TestCase):
     def get(self, subscription, agent):
         return self.service.get_subscription(subscription, agent)
 
-    def resolve(self, agent, provider, model=None, subscription=None, exclude=None):
+    def resolve(self, agent, provider, model=None, subscription=None, exclude=None,
+                data=None):
         return self.service.resolve(agent, provider, model=model,
-                                    subscription=subscription, exclude=exclude)
+                                    subscription=subscription, exclude=exclude,
+                                    data=data)
 
     def cooldown(self, subscription, until):
         return self.service.register_cooldown(subscription, {"until": until})
@@ -590,6 +592,33 @@ class RoleCandidatesTest(RegistryCase):
             self.assertEqual(self.ids(general), ["opencode-go"])
         finally:
             service.close()
+
+    # --- 與 resolve 的一致性（#102） ---
+
+    def test_roles的候選用回覆的data_resolve不被隱私擋(self):
+        """roles 篩過的候選一定過 resolve 的隱私步驟（#102）。
+
+        對每個角色×agent×請求等級取 roles 回覆，逐個 candidate 以「回覆的 data＋
+        釘住 id＋該筆 provider」resolve：MUST NOT 回 403 privacy_not_allowed。出廠
+        政策六把的 key 都已部署（RegistryCase 的假 key 檔）且 models.default 非
+        null，所以一律 200。這條把「resolve 不會比 roles 更寬」釘住。
+        """
+        for role in ("PMO", "PM", "impl", "rev", "qa"):
+            for agent in ("claude-code", "opencode"):
+                for requested in (None, "public", "general", "real"):
+                    with self.subTest(role=role, agent=agent, data=requested):
+                        payload = self.role(role, agent, requested)
+                        level = payload["data"]
+                        self.assertIn(level, ("public", "general", "real"))
+                        for row in payload["candidates"]:
+                            with self.subTest(sub=row["id"]):
+                                resolved = self.resolve(
+                                    agent, row["provider"],
+                                    subscription=row["id"], data=level)
+                                self.assertEqual(
+                                    resolved["meta"]["subscription"], row["id"])
+                                self.assertEqual(resolved["meta"]["data"], level)
+                                self.assertTrue(resolved["env"])
 
     # --- row 形狀 ---
 
@@ -1199,6 +1228,19 @@ class ResolveTest(RegistryCase):
         }
         self.addCleanup(setattr, lgwd_providers, "PROVIDERS", original)
 
+    def _two_privacy_policy(self, first, second):
+        """同一個假 provider 的兩把（privacy 可指定）：測隱私篩選與排序（#102）。
+
+        claude 兩把的 agents 仍是 claude-code（policy loader 的 claude-only 條款）。
+        """
+        return {
+            "subscriptions": {
+                "claude-personal": _privacy_sub(10, first, agents=("claude-code",)),
+                "claude-company": _privacy_sub(20, second, agents=("claude-code",)),
+            },
+            "until_max_ahead_seconds": 691200,
+        }
+
     # --- resolve 需求的 Scenario ---
 
     def test_同一把的兩個免費模型(self):
@@ -1294,13 +1336,133 @@ class ResolveTest(RegistryCase):
         payload = self.resolve("opencode", "opencode-zen", model="big-pickle")
         self.assertEqual(
             sorted(payload["meta"]),
-            ["agent", "cooldown", "endpoint", "kind", "model", "model_cooldowns",
-             "models", "priority", "provider", "subscription", "usage"],
+            ["agent", "cooldown", "data", "endpoint", "kind", "model",
+             "model_cooldowns", "models", "priority", "provider", "subscription",
+             "usage"],
         )
         self.assertIsNone(payload["meta"]["cooldown"])
         self.assertEqual(payload["meta"]["model_cooldowns"], {})
+        self.assertIsNone(payload["meta"]["data"])  # 沒宣告時 null
         self.assertNotIn("available", payload["meta"])
         self.assertNotIn("available_again_at", payload["meta"])
+
+    # --- data（#102：宣告了才擋；缺省不濾） ---
+
+    def test_data不在三個等級回400(self):
+        # 形狀錯（不新增碼）：不是 403、也不是 404（data 不是資源）
+        for value in ("private", "PUBLIC", " general", "reel"):
+            with self.subTest(data=value):
+                err = self.assert_api_error(
+                    400, "bad_request", self.resolve,
+                    "opencode", "opencode-zen", data=value)
+                self.assertNotIn("env", err.body())
+                self.assertNotIn("missing", err.body())
+
+    def test_缺省不帶data不過濾(self):
+        # 缺省 B：不帶 data 完全不看 privacy，行為與加參數前相同
+        for kwargs in ({}, {"data": None}):
+            with self.subTest(kwargs=kwargs):
+                payload = self.resolve("opencode", "opencode-zen",
+                                       model="big-pickle", **kwargs)
+                self.assertEqual(payload["meta"]["subscription"], "opencode-zen")
+                self.assertIsNone(payload["meta"]["data"])
+        # 同樣的請求帶了 data 就參與
+        payload = self.resolve("opencode", "opencode-zen", model="big-pickle",
+                               data="public")
+        self.assertEqual(payload["meta"]["data"], "public")
+
+    def test_meta帶宣告的等級原樣(self):
+        # resolve 沒有 role／floor：meta.data 是請求值原樣，不是「生效等級」
+        for value in ("public", "general", "real"):
+            with self.subTest(data=value):
+                payload = self.resolve("opencode", "ollama-cloud", data=value)
+                self.assertEqual(payload["meta"]["data"], value)
+        payload = self.resolve("opencode", "ollama-cloud")
+        self.assertIsNone(payload["meta"]["data"])
+
+    def test_釘住的低等級訂閱被擋(self):
+        # 要擋的洞：釘住 privacy 不足的那把（zen 是 public）
+        for value in ("general", "real"):
+            with self.subTest(data=value):
+                err = self.assert_api_error(
+                    403, "privacy_not_allowed", self.resolve,
+                    "opencode", "opencode-zen", model="big-pickle", data=value)
+                self.assertNotIn("env", err.body())
+                self.assertNotIn("detail", err.body())
+
+    def test_釘住且agent不允許加隱私不足先回agent(self):
+        # 步驟 3（agent）先於步驟 3.5（privacy）
+        err = self.assert_api_error(
+            403, "agent_not_allowed", self.resolve,
+            "claude-code", "opencode-zen", subscription="opencode-zen", data="real")
+        self.assertNotIn("env", err.body())
+
+    def test_隱私403先於model403(self):
+        # 步驟 3.5（403 privacy）先於步驟 4（403 model_not_allowed）
+        err = self.assert_api_error(
+            403, "privacy_not_allowed", self.resolve,
+            "opencode", "opencode-zen", model="muse-spark-1.3", data="real")
+        self.assertNotIn("env", err.body())
+
+    def test_隱私403先於not_deployed的409(self):
+        # 釘住 zen、key 未部署：3.5 的 403 先於步驟 6 的 409 not_deployed
+        self.keys_path.write_text(
+            key_text({k: v for k, v in CANARY.items()
+                      if k not in ("opencode-zen", "opencode-go")}),
+            encoding="utf-8")
+        self.keys.reload()
+        err = self.assert_api_error(
+            403, "privacy_not_allowed", self.resolve,
+            "opencode", "opencode-zen", subscription="opencode-zen", data="real")
+        self.assertNotIn("env", err.body())
+        # 沒帶 data 才輪到 409（隱私步驟不參與，缺省行為不變）
+        self.assert_api_error(
+            409, "not_deployed", self.resolve,
+            "opencode", "opencode-zen", subscription="opencode-zen")
+
+    def test_未釘住時低等級候選被篩掉(self):
+        self._patch_two_api_key_subscriptions()
+        service = self._service_with_policy(
+            self._two_privacy_policy("public", "real"))
+        try:
+            payload = service.resolve("claude-code", "fake-api", model="m",
+                                      data="real")
+            self.assertEqual(payload["meta"]["subscription"], "claude-company")
+            # 沒帶 data：兩把都在候選，照 priority 選 personal
+            payload = service.resolve("claude-code", "fake-api", model="m")
+            self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+        finally:
+            service.close()
+
+    def test_全部候選隱私不足回403(self):
+        self._patch_two_api_key_subscriptions()
+        service = self._service_with_policy(
+            self._two_privacy_policy("public", "public"))
+        try:
+            err = self.assert_api_error(
+                403, "privacy_not_allowed", service.resolve,
+                "claude-code", "fake-api", model="m", data="real")
+            self.assertNotIn("env", err.body())
+            # exclude 也不會把它救成 409：3.5 先於步驟 5
+            self.assert_api_error(
+                403, "privacy_not_allowed", service.resolve,
+                "claude-code", "fake-api", model="m", exclude="claude-personal",
+                data="real")
+        finally:
+            service.close()
+
+    def test_隱私不改priority排序(self):
+        # data 只篩不改序：public 時兩把都合格，仍選 priority 較小的 personal
+        self._patch_two_api_key_subscriptions()
+        service = self._service_with_policy(
+            self._two_privacy_policy("public", "real"))
+        try:
+            payload = service.resolve("claude-code", "fake-api", model="m",
+                                      data="public")
+            self.assertEqual(payload["meta"]["subscription"], "claude-personal")
+            self.assertEqual(payload["meta"]["priority"], 10)
+        finally:
+            service.close()
 
     def test_值不外洩(self):
         # 憑證樣式掃描稽核、list 回覆與 DB；endpoint 的值只掃憑證樣式（providers 已擋）

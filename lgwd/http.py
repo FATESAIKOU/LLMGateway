@@ -4,7 +4,7 @@
   GET  /v1/subscriptions                      → service.list_subscriptions()
   GET  /v1/subscriptions/{id}?agent=<種類>     → service.get_subscription(id, agent)
   POST /v1/subscriptions/{id}/cooldown        → service.register_cooldown(id, body)（204）
-  GET  /v1/resolve?agent=&provider=[&model=&subscription=&exclude=]
+  GET  /v1/resolve?agent=&provider=[&model=&subscription=&exclude=&data=]
                                               → service.resolve(...)（design 決定 1～3）
   GET  /v1/roles/{role}?agent=[&data=]        → service.role_candidates(role, agent, data)
                                               （#100；spec role-allocation）
@@ -34,12 +34,11 @@ _LOG = logging.getLogger("lgwd.http")
 _MAX_BODY_BYTES = 1024 * 1024
 
 # resolve 認得的 query 參數；不在這張表的忽略。
-_RESOLVE_PARAMS = ("agent", "provider", "model", "subscription", "exclude")
+_RESOLVE_PARAMS = ("agent", "provider", "model", "subscription", "exclude", "data")
 
-# roles 認得的 query 參數：resolve 的已知參數集合再加上 data（#100；spec
-# role-allocation）。另立一份、不共用 _RESOLVE_PARAMS 本身；重複與空值的規則
-# 與 resolve 相同。
-_ROLES_PARAMS = _RESOLVE_PARAMS + ("data",)
+# roles 認得的 query 參數與 resolve 的相同（#100 時另立含 data 的集合；#102 起 data
+# 進了 _RESOLVE_PARAMS 而重複，改成同一份別名；spec role-allocation）。
+_ROLES_PARAMS = _RESOLVE_PARAMS
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> dict:
@@ -131,12 +130,15 @@ def _query(query: str, known: tuple[str, ...]) -> dict:
 
 
 def _resolve_query(query: str) -> dict:
-    """resolve 的 query 規則（design 決定 1）：parse_qs 的 form 解碼。"""
+    """resolve 的 query 規則（design 決定 1）：parse_qs 的 form 解碼。
+
+    data 的值合法性由 service 驗（與 agent、model 同層），HTTP 層只管形狀。
+    """
     return _query(query, _RESOLVE_PARAMS)
 
 
 def _roles_query(query: str) -> dict:
-    """roles 的 query 規則：與 resolve 相同，已知參數再加上 data（#100）。"""
+    """roles 的 query 規則：與 resolve 相同（#100 起 data 也在已知參數集合）。"""
     return _query(query, _ROLES_PARAMS)
 
 
@@ -180,6 +182,7 @@ def _api_handler(service):
                         model=q.get("model"),
                         subscription=q.get("subscription"),
                         exclude=q.get("exclude"),
+                        data=q.get("data"),
                     )
                     status = 200
                 elif route[0] == "roles":

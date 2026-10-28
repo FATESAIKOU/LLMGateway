@@ -7,14 +7,16 @@
   {schema, role, data, agent, candidates}；每筆 {id, provider, rank, privacy, available,
   cooldown, model_cooldowns}，不含 key／usage／available_again_at、不觸發取用量。
   冷卻、用量與 available 不影響成員與順序（Gateway 不代選）。
-- resolve(agent, provider[, model, subscription, exclude])：照政策選把後回
+- resolve(agent, provider[, model, subscription, exclude, data])：照政策選把後回
   {schema, env_schema, meta, env}（meta 含 cooldown／model_cooldowns，是提示；不含
-  available／available_again_at，帶 usage；env 依 agent 組成）。
+  available／available_again_at，帶 usage；另帶 data＝請求值原樣、沒給時 null；env
+  依 agent 組成）。資料等級只有呼叫方宣告了（data 有給）才參與，缺省完全不過濾
+  （#102；第二層：宣告了就在發憑證的邊界擋）。
   選把集中在這裡（design 決定 3）：純規則在 _pick（釘住先限縮成那把 → provider＋
-  agent＋allow 涵蓋／能推導模型 → exclude），resolve 再接已部署 → priority→id；
-  **冷卻不參與選把**（不排除、也不是排序鍵）；錯誤 precedence＝輸入形狀 400 →
-  查無 404 → 政策 403／no_model → 候選狀態 409。
-  每次成功 resolve 記一筆只追加的稽核（provider／model 是中介資料）。
+  agent → privacy 不低於 data → allow 涵蓋／能推導模型 → exclude），resolve 再接
+  已部署 → priority→id；**冷卻不參與選把**（不排除、也不是排序鍵），隱私也不參與
+  排序；錯誤 precedence＝輸入形狀 400 → 查無 404 → 政策 403／no_model → 候選狀態 409。
+  每次成功 resolve 記一筆只追加的稽核（provider／model 是中介資料；不記 data）。
 - register_cooldown(id, body)：登錄冷卻，body {"until": RFC 3339 UTC[, "model": 模型 id]}
   （過去或超過上限拒絕；同一筆重複登錄取較晚的 until；到時自動解除）。有 model 時只
   冷卻那個模型，沒有（或 null）時冷卻整把；整把與模型兩層各自獨立、互不刪除。
@@ -41,6 +43,7 @@ from .errors import (
     no_model,
     not_deployed,
     not_found,
+    privacy_not_allowed,
     until_out_of_range,
 )
 from .keys import KeyStore
@@ -196,6 +199,7 @@ class RegistryService:
         model: str | None = None,
         subscription: str | None = None,
         exclude: str | None = None,
+        data: str | None = None,
     ) -> dict:
         """GET /v1/resolve：選把後回 {schema, env_schema, meta, env}。
 
@@ -203,11 +207,16 @@ class RegistryService:
         id 清單（不在政策檔的 id 忽略），只在沒有釘住時套用。錯誤照 design 決定 3
         的步驟與 precedence 斷在最前面的一層。成功才記一筆 resolve 稽核。
 
+        data 是選填的資料等級宣告（#102）：不在三個等級之內是形狀錯 400；有給時
+        候選限於 privacy 不低於它，一個都不剩回 403 privacy_not_allowed（步驟 3.5，
+        先於 exclude 的 409 與 key 未部署的 409）。data 沒給＝完全不看 privacy（行為
+        與這個參數加入前相同）；它不參與 priority／id 排序，也沒有 role 的 floor。
+
         冷卻只是提示：不參與候選，也不參與排序（design 決定 2）；選中的那把的
         cooldown／model_cooldowns 只在 meta 裡附上（design 決定 3）。
         """
         # 形狀驗證與步驟 1～5（純規則）在 _pick；這裡只做 key、挑選、附資訊與回覆。
-        candidates = self._pick(agent, provider, model, subscription, exclude)
+        candidates = self._pick(agent, provider, model, subscription, exclude, data)
 
         # 步驟 6：key 未部署的候選排除；全部未部署 → 409。
         # 每把只在這裡讀一次 key（None＝未部署），後面沿用同一份值：deployed() 與
@@ -246,6 +255,7 @@ class RegistryService:
             },
             "endpoint": provider_info.endpoint,
             "priority": selected.priority,
+            "data": data,
             "cooldown": cooldown,
             "model_cooldowns": model_cooldowns,
             "usage": self._safe_usage(selected.name),
@@ -380,6 +390,7 @@ class RegistryService:
         model: str | None,
         subscription: str | None,
         exclude: str | None,
+        data: str | None = None,
     ) -> list[tuple[SubscriptionPolicy, CredentialProvider, str | None]]:
         """形狀驗證與步驟 1～5（純規則）：回候選 [(sub, provider_info, model)]。
 
@@ -394,6 +405,9 @@ class RegistryService:
         if missing:
             raise bad_request(missing=missing)
         if agent not in AGENTS:
+            raise bad_request()
+        if data is not None and data not in PRIVACY_LEVELS:
+            # 與 roles 同一條規則：#102 起 data 有給但不在等級表內是形狀錯，不是 403。
             raise bad_request()
         if subscription is not None and exclude:
             # 釘住與排除是兩個互斥的意圖；此檢查先於 id 存在與 provider 一致。
@@ -422,6 +436,18 @@ class RegistryService:
         candidates = [(sub, info) for sub, info in candidates if agent in sub.agents]
         if not candidates:
             raise agent_not_allowed()
+
+        # 步驟 3.5：有宣告 data 時，候選限於 privacy 不低於它；一個都不剩 → 403。
+        # 在步驟 4（model）之前（agent → privacy → model 的 403 順序），也在步驟 5
+        # 的 exclude 409 與 resolve 步驟 6 的 key 未部署 409 之前：隱私不足時回 403，
+        # 不會被 exclude 救成 409，也不會因為剛好沒部署 key 變成 409。沒給 data 時
+        # 完全不過濾（#102 的缺省 B：不帶＝不擋，與加參數前相同）。
+        if data is not None:
+            level = PRIVACY_LEVELS.index(data)
+            candidates = [(sub, info) for sub, info in candidates
+                          if PRIVACY_LEVELS.index(sub.privacy) >= level]
+            if not candidates:
+                raise privacy_not_allowed()
 
         # 步驟 4：model 守門（403）／能推導模型（400）；在 priority 之前過濾，
         # 避免「最高 priority 的候選推不出、下一個可以」直接 400（design 決定 3）。
