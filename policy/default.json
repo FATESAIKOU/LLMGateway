@@ -25,15 +25,6 @@
       "agents": ["opencode"],
       "models": {"allow": ["*:free", "openrouter/free"], "default": "openrouter/free"}
     },
-    "groq": {
-      "priority": 25,
-      "privacy": "public",
-      "agents": ["opencode"],
-      "models": {
-        "allow": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
-        "default": "openai/gpt-oss-120b"
-      }
-    },
     "ollama-cloud": {
       "priority": 30,
       "privacy": "real",
