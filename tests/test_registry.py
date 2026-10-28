@@ -599,7 +599,7 @@ class FactoryAntigravityTest(RegistryCase):
         self.assertNotIn("key", err.body())
 
 
-
+class ListTest(RegistryCase):
     def test_不含秘密(self):
         items = self.list_items()
         blob = json.dumps(items, ensure_ascii=False)
