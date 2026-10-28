@@ -15,8 +15,8 @@
 ## 3. 文件與對端
 
 - [x] 3.1 `docs/model-rotation.md` 開頭加一段「與訂閱分配的分工」；MyPMO handbook 改為引用 Gateway 的 `roles`（由 PMO 另行修改）。
-- [ ] 3.2 寫給 MyLinuxPool 的請求書（對照 design §3.3 (a)–(g)，含 200 但冷卻在未來的分支（#93 需求 9；判讀見 design §3.2.5，驗證靠 spec 的 Gateway 側 scenario）、「不得繞過 `roles` 釘低等級訂閱」、404 fallback、`usage` 0% 規則），經 PMO 轉。
-- [ ] 3.3 `openspec validate role-subscription-allocation --strict`，核准後 archive。
+- [x] 3.2 寫給 MyLinuxPool 的請求書（對照 design §3.3 (a)–(g)，含 200 但冷卻在未來的分支（#93 需求 9；判讀見 design §3.2.5，驗證靠 spec 的 Gateway 側 scenario）、「不得繞過 `roles` 釘低等級訂閱」、404 fallback、`usage` 0% 規則），經 PMO 轉。
+- [x] 3.3 `openspec validate role-subscription-allocation --strict`，核准後 archive。
 
 ## 4. 本人決定後才開的後續單（不在本 change）
 
