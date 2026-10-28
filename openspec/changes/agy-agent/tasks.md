@@ -3,6 +3,7 @@
 ## 0. 前置（不滿足就不開工）
 
 - [ ] 0.1 本人已裁定 design §6 的第 1（訂閱 id／provider）、5（「不需 key」機制）、6（`get` 的回覆）項；本檔 2.x 的內容才成立。未裁定前維持「設計待修」，不開 PR 1。
+- [ ] 0.3 PR 2（3.x，動出廠 policy/default.json 與部署）的前置：design §6 的第 2（`priority`）、3（`privacy`）、4（模型 id）、7（只給 Mac 的 A／B）項已由本人裁定；3.1 要寫入的值都是這幾項的結果，不得由作者代選。
 - [ ] 0.2 `openspec/changes/resolve-data/`（#117）已歸檔：本 change 的 `resolve`／`resolve 的選把規則`／`錯誤回覆`／role-allocation 的「角色候選端點」以它的文字為基底，先後順序顛倒會整段覆蓋（proposal Impact）。驗證：`openspec list`／`ls openspec/changes` 沒有 `resolve-data`。
 
 ## 1. 設計（本單，只寫介面）
