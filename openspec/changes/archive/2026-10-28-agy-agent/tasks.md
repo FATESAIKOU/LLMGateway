@@ -2,9 +2,9 @@
 
 ## 0. 前置（不滿足就不開工）
 
-- [ ] 0.1 本人已裁定 design §6 的第 1（訂閱 id／provider）、5（「不需 key」機制）、6（`get` 的回覆）項；本檔 2.x 的內容才成立。未裁定前維持「設計待修」，不開 PR 1。
-- [ ] 0.3 PR 2（3.x，動出廠 policy/default.json 與部署）的前置：design §6 的第 2（`priority`）、3（`privacy`）、4（模型 id）、7（只給 Mac 的 A／B）項已由本人裁定；3.1 要寫入的值都是這幾項的結果，不得由作者代選。
-- [ ] 0.2 `openspec/changes/resolve-data/`（#117）已歸檔：本 change 的 `resolve`／`resolve 的選把規則`／`錯誤回覆`／role-allocation 的「角色候選端點」以它的文字為基底，先後順序顛倒會整段覆蓋（proposal Impact）。驗證：`openspec list`／`ls openspec/changes` 沒有 `resolve-data`。
+- [x] 0.1 本人已裁定 design §6 的第 1（訂閱 id／provider）、5（「不需 key」機制）、6（`get` 的回覆）項；本檔 2.x 的內容才成立。未裁定前維持「設計待修」，不開 PR 1。
+- [x] 0.3 PR 2（3.x，動出廠 policy/default.json 與部署）的前置：design §6 的第 2（`priority`）、3（`privacy`）、4（模型 id）、7（只給 Mac 的 A／B）項已由本人裁定；3.1 要寫入的值都是這幾項的結果，不得由作者代選。
+- [x] 0.2 `openspec/changes/resolve-data/`（#117）已歸檔：本 change 的 `resolve`／`resolve 的選把規則`／`錯誤回覆`／role-allocation 的「角色候選端點」以它的文字為基底，先後順序顛倒會整段覆蓋（proposal Impact）。驗證：`openspec list`／`ls openspec/changes` 沒有 `resolve-data`。
 
 ## 1. 設計（本單，只寫介面）
 
@@ -18,7 +18,7 @@
 - [x] 2.3 `lgwd/registry.py`：加一個部署判斷（`kind == "local-login"` → 已部署，否則 `self._keys.deployed`）並用在 `role_candidates`（`:183`）、`resolve` 步驟 6（`:224-228`，對 local-login 不讀 key）、`_usage_fields`（`:381`）、`_item`（`:484`）；`get_subscription` 對 local-login 在讀 key 之前回 409 `not_deployed`；模組與方法 docstring 同步。驗證：`tests/test_registry.py`（list 的 `available` true、`available_again_at` 只由冷卻算、resolve 200、get 409、roles 的 `available` true，且都沒有 `KeyFileError`）。
 - [x] 2.4 `lgwd/errors.py` 的碼表說明：400 的 agent 前綴加 `agy/`、409 `not_deployed` 補「沒有憑證的訂閱（`local-login`）的 get 一律回這個碼」。`lgw/client.py` 的 docstring 補 `agy` 的範例與同樣的說明（不改程式）。驗證：`tests/test_http.py`（`agent=agy` 的 200；未知 agent 仍 400）。
 - [x] 2.5 測試：`tests/test_registry.py` 的 provider 三欄表、list 順序、agy 的 resolve／get／roles；冷卻前綴收緊的案例（以 `model=agy/<id>` 登錄冷卻回 400 `bad_request`，即使 `allow` 的樣式涵蓋得了，對照 `tests/test_registry.py` 既有的 `opencode/` 案例）；`tests/test_keys.py` 的 `KEY_NAMES` 集合**不變**（正好證明沒有新增鍵名），把 `:55` 的測試名改成不暗示「所有訂閱都在 `KEY_NAMES`」（只改名、不改斷言），並加一條「list／resolve 對 `antigravity` 不會呼叫 `keys.deployed`／`keys.get`（不丟 `KeyFileError`）」；再加一條斷言 `provider_for("antigravity").make_usage_fetcher(deps)` 為 None（守住 design §2.1 的不變式，`main.py:240`／`:245` 的兩個呼叫點才不會被觸發）；`tests/test_http.py` 的 query 傳遞。驗收指令：`python3 -m pytest tests/test_policy.py tests/test_registry.py tests/test_http.py tests/test_keys.py -q`。
-- [ ] 2.6 改壞驗證（副本 `.work/mut/`）：(a) 拿掉 kind `local-login` 的部署判斷 → list／resolve 的 agy 測試轉紅；(b) `build_env` 拿掉 agy 的 `{}` → env 洩漏 `ANTHROPIC_*` 的測試轉紅；(c) 拿掉 `_AGY_ONLY` → policy 條款測試轉紅；(d) 把 `SUBSCRIPTIONS` 的 `antigravity` 拿掉 → 政策載入測試轉紅（H1 的守門）。原 worktree 不動。
+- [x] 2.6 改壞驗證（副本 `.work/mut/`）：(a) 拿掉 kind `local-login` 的部署判斷 → list／resolve 的 agy 測試轉紅；(b) `build_env` 拿掉 agy 的 `{}` → env 洩漏 `ANTHROPIC_*` 的測試轉紅；(c) 拿掉 `_AGY_ONLY` → policy 條款測試轉紅；(d) 把 `SUBSCRIPTIONS` 的 `antigravity` 拿掉 → 政策載入測試轉紅（H1 的守門）。原 worktree 不動。
 
 ## 3. PR 2：打開介面（只動政策資料與文件）
 
