@@ -158,7 +158,7 @@ class ApiTest(MainCase):
         status, raw = http_get(self.base + "/v1/subscriptions")
         self.assertEqual(status, 200)  # 不做應用層認證
         data = json.loads(raw)
-        self.assertEqual(len(data["subscriptions"]), 6)
+        self.assertEqual(len(data["subscriptions"]), 7)
         blob = raw.decode()
         for value in FAKE_KEYS.values():
             self.assertNotIn(value, blob)

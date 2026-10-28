@@ -1128,5 +1128,95 @@ class LocalLoginHttpTest(ServerCase):
         self.assertEqual(self.json_of(payload)["error"], "bad_request")
 
 
+class FactoryAntigravityHttpTest(ServerCase):
+    """#107 PR 2（tasks 3.1／3.2）：出廠政策的 antigravity 經 HTTP 的端到端。"""
+
+    MODELS = (
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-high",
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-high",
+        "claude-opus-5-5-low",
+        "claude-opus-5-5-medium",
+        "claude-opus-5-5-high",
+        "claude-sonnet-5-5-low",
+        "claude-sonnet-5-5-medium",
+        "claude-sonnet-5-5-high",
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        keys_path = root / "keys.env"
+        keys_path.write_text(
+            "# 測試用假 key（antigravity 沒有憑證，所以沒有它的鍵）\n"
+            "OPENCODE_ZEN_API_KEY=fake-zen\n", encoding="utf-8")
+        policy_path = str(Path(__file__).resolve().parent.parent / "policy" / "default.json")
+        self.service = RegistryService(
+            str(root / "llm.db"), load_policy(policy_path),
+            KeyStore(str(keys_path)), FakeClock())
+        self.base = self.serve(self.service)
+
+    def tearDown(self):
+        super().tearDown()
+        self.service.close()
+        self.tmp.cleanup()
+
+    def json_of(self, payload):
+        return json.loads(payload.decode())
+
+    def test_resolve12個模型id回200(self):
+        for model in self.MODELS:
+            with self.subTest(model=model):
+                status, payload = self.call(
+                    "GET", "/v1/resolve?agent=agy&provider=google&model=" + model)
+                self.assertEqual(status, 200)
+                data = self.json_of(payload)
+                self.assertEqual(data["env"], {})
+                self.assertEqual(data["env_schema"], 1)
+                meta = data["meta"]
+                self.assertEqual(meta["subscription"], "antigravity")
+                self.assertEqual(meta["agent"], "agy")
+                self.assertEqual(meta["provider"], "google")
+                self.assertEqual(meta["kind"], "local-login")
+                self.assertEqual(meta["model"], model)
+                self.assertIsNone(meta["endpoint"])
+
+    def test_resolve不帶model回預設(self):
+        status, payload = self.call("GET", "/v1/resolve?agent=agy&provider=google")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data["meta"]["model"], "gemini-3.8-flash-low")
+        self.assertEqual(data["env"], {})
+
+    def test_model不在清單回403(self):
+        for model in ("gemini-9-fake", "google/gemini-3.8-flash-low"):
+            with self.subTest(model=model):
+                status, payload = self.call(
+                    "GET", "/v1/resolve?agent=agy&provider=google&model=" + model)
+                self.assertEqual(status, 403)
+                data = self.json_of(payload)
+                self.assertEqual(data["error"], "model_not_allowed")
+                self.assertNotIn("env", data)
+
+    def test_list的available與usage(self):
+        status, payload = self.call("GET", "/v1/subscriptions")
+        self.assertEqual(status, 200)
+        item = {i["id"]: i for i in self.json_of(payload)["subscriptions"]}[
+            "antigravity"]
+        self.assertTrue(item["available"])
+        self.assertIsNone(item["available_again_at"])
+        self.assertEqual(item["usage"]["status"], "not_applicable")
+        self.assertNotIn("key", item)
+
+    def test_get回409_not_deployed(self):
+        status, payload = self.call(
+            "GET", "/v1/subscriptions/antigravity?agent=agy")
+        self.assertEqual(status, 409)
+        self.assertEqual(self.json_of(payload), {"error": "not_deployed"})
+
+
 if __name__ == "__main__":
     unittest.main()

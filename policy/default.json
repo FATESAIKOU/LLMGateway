@@ -39,6 +39,28 @@
       "privacy": "real",
       "agents": ["claude-code", "opencode"],
       "models": {"allow": ["*"], "default": "deepseek-v4.1-flash"}
+    },
+    "antigravity": {
+      "priority": 35,
+      "privacy": "public",
+      "agents": ["agy"],
+      "models": {
+        "allow": [
+          "gemini-3.8-flash-low",
+          "gemini-3.8-flash-medium",
+          "gemini-3.8-flash-high",
+          "gemini-4-argon-low",
+          "gemini-4-argon-medium",
+          "gemini-4-argon-high",
+          "claude-opus-5-5-low",
+          "claude-opus-5-5-medium",
+          "claude-opus-5-5-high",
+          "claude-sonnet-5-5-low",
+          "claude-sonnet-5-5-medium",
+          "claude-sonnet-5-5-high"
+        ],
+        "default": "gemini-3.8-flash-low"
+      }
     }
   },
   "roles": {
