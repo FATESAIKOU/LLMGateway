@@ -18,7 +18,7 @@ from lgwd.clock import FakeClock
 from lgwd.errors import ApiError
 from lgwd.keys import KEY_NAMES, KeyStore
 from lgwd.policy import UsageSetting, load_policy
-from lgwd.providers import AnthropicProvider, UsageDeps
+from lgwd.providers import AnthropicProvider, GoogleProvider, UsageDeps, provider_for
 from lgwd.registry import RegistryService
 from lgwd.usage import FetchResult, UsageService, failure
 from tests.usage_fakes import FakeFetcher, windows
@@ -295,6 +295,229 @@ class ModelsDefaultSemanticsTest(RegistryCase):
                           json.dumps(listed, ensure_ascii=False))
         finally:
             service.close()
+
+
+class _GuardAgyKeys:
+    """KeyStore 的替身：對 antigravity 的 get／deployed 記一筆並丟錯，其餘照原樣。
+
+    真正的 KeyStore 也不認得 antigravity（KEY_NAMES 沒有它），呼叫就會丟
+    KeyFileError；這個替身把「有沒有呼叫」變成可斷言的紀錄。
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.agy_calls = []
+
+    def get(self, subscription):
+        if subscription == "antigravity":
+            self.agy_calls.append("get")
+            raise AssertionError("antigravity 沒有憑證，不應讀 key")
+        return self._inner.get(subscription)
+
+    def deployed(self, subscription):
+        if subscription == "antigravity":
+            self.agy_calls.append("deployed")
+            raise AssertionError("antigravity 沒有憑證，不應查部署")
+        return self._inner.deployed(subscription)
+
+
+class LocalLoginTest(RegistryCase):
+    """#107：沒有憑證的訂閱（kind local-login）的 registry 行為。
+
+    PR 1 不動出廠政策，所以用臨時政策檔把 antigravity 加進去；key 檔裡從來沒有它。
+    """
+
+    MODEL = "gemini-test-id"
+
+    def _policy_obj(self, *, include_in_roles=False, allow=("*",)):
+        obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+        obj["subscriptions"]["antigravity"] = {
+            "priority": 35,
+            "privacy": "public",
+            "agents": ["agy"],
+            "models": {"allow": list(allow), "default": self.MODEL},
+        }
+        if include_in_roles:
+            obj["roles"]["impl"]["order"].append("antigravity")
+        return obj
+
+    def _service(self, obj, keys=None):
+        path = self.root / "policy-antigravity.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        return RegistryService(self.db_path, load_policy(str(path)),
+                               keys or self.keys, self.clock)
+
+    def _item(self, service, subscription="antigravity"):
+        return _by_id(service.list_subscriptions()["subscriptions"])[subscription]
+
+    # --- 共通 JSON 與 list ---
+
+    def test_provider三欄與agents(self):
+        service = self._service(self._policy_obj())
+        try:
+            item = self._item(service)
+        finally:
+            service.close()
+        self.assertEqual((item["provider"], item["kind"], item["endpoint"]),
+                         ("google", "local-login", None))
+        self.assertEqual(item["agents"], ["agy"])
+        self.assertEqual(item["models"]["default"], self.MODEL)
+
+    def test_list順序(self):
+        service = self._service(self._policy_obj())
+        try:
+            items = service.list_subscriptions()["subscriptions"]
+        finally:
+            service.close()
+        self.assertEqual(
+            [item["id"] for item in items],
+            ["opencode-zen", "opencode-go", "openrouter", "groq", "ollama-cloud",
+             "antigravity", "claude-personal"],
+        )
+
+    def test_list的available與usage(self):
+        # key 檔裡沒有 antigravity 的鍵、KeyStore 也不認得它，仍是 available
+        service = self._service(self._policy_obj())
+        try:
+            item = self._item(service)
+            self.assertTrue(item["available"])
+            self.assertIsNone(item["available_again_at"])
+            self.assertEqual(item["usage"]["status"], "not_applicable")
+            self.assertNotIn("key", item)
+            # 有未來的整把冷卻 → available false；available_again_at 只由冷卻算
+            service.register_cooldown(
+                "antigravity", {"until": "2026-10-11T15:00:00Z"})
+            item = self._item(service)
+        finally:
+            service.close()
+        self.assertFalse(item["available"])
+        self.assertEqual(item["cooldown"], {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(item["available_again_at"], "2026-10-11T15:00:00Z")
+
+    # --- resolve ---
+
+    def test_resolve的env是空物件(self):
+        service = self._service(self._policy_obj())
+        try:
+            payload = service.resolve("agy", "google", model=self.MODEL)
+        finally:
+            service.close()
+        self.assertEqual(payload["env"], {})
+        self.assertEqual(payload["env_schema"], 1)
+        meta = payload["meta"]
+        self.assertEqual(meta["subscription"], "antigravity")
+        self.assertEqual(meta["provider"], "google")
+        self.assertEqual(meta["kind"], "local-login")
+        self.assertEqual(meta["agent"], "agy")
+        self.assertEqual(meta["model"], self.MODEL)
+        self.assertEqual(meta["endpoint"], None)
+        self.assertEqual(meta["usage"]["status"], "not_applicable")
+
+    def test_resolve不指定model用default(self):
+        service = self._service(self._policy_obj())
+        try:
+            payload = service.resolve("agy", "google")
+        finally:
+            service.close()
+        self.assertEqual(payload["meta"]["model"], self.MODEL)
+        self.assertEqual(payload["env"], {})
+
+    # --- get ---
+
+    def test_get回409且不讀key(self):
+        guarded = _GuardAgyKeys(self.keys)
+        service = self._service(self._policy_obj(), keys=guarded)
+        try:
+            err = self.assert_api_error(
+                409, "not_deployed", service.get_subscription, "antigravity", "agy")
+        finally:
+            service.close()
+        self.assertEqual(err.body(), {"error": "not_deployed"})
+        self.assertEqual(guarded.agy_calls, [])
+
+    def test_get的agent不在agents回403(self):
+        service = self._service(self._policy_obj())
+        try:
+            err = self.assert_api_error(
+                403, "agent_not_allowed", service.get_subscription,
+                "antigravity", "opencode")
+        finally:
+            service.close()
+        self.assertNotIn("key", err.body())
+
+    # --- roles ---
+
+    def test_roles的available為true(self):
+        service = self._service(self._policy_obj(include_in_roles=True))
+        try:
+            payload = service.role_candidates("impl", "agy", "public")
+        finally:
+            service.close()
+        self.assertEqual([row["id"] for row in payload["candidates"]],
+                         ["antigravity"])
+        self.assertEqual(payload["candidates"][0]["rank"], 1)
+        self.assertTrue(payload["candidates"][0]["available"])
+
+    def test_roles不進order時回200空候選(self):
+        service = self._service(self._policy_obj())
+        try:
+            payload = service.role_candidates("impl", "agy", "public")
+        finally:
+            service.close()
+        self.assertEqual(payload["candidates"], [])
+
+    # --- 不碰 key 檔、沒有 usage fetcher ---
+
+    def test_list與resolve與roles不呼叫key(self):
+        guarded = _GuardAgyKeys(self.keys)
+        service = self._service(self._policy_obj(include_in_roles=True), keys=guarded)
+        try:
+            service.list_subscriptions()
+            service.resolve("agy", "google", model=self.MODEL)
+            service.role_candidates("impl", "agy", "public")
+        finally:
+            service.close()
+        self.assertEqual(guarded.agy_calls, [])
+
+    def test_沒有usage_fetcher(self):
+        # design §2.1 的不變式：main.py 的 _usage_key／deployed 才不會被觸發
+        self.assertIsNone(provider_for("antigravity").make_usage_fetcher(UsageDeps()))
+
+    # --- 冷卻的 model 前綴（#107 起的收緊） ---
+
+    def test_冷卻的model帶agy前綴回400(self):
+        # allow 是 ["*"]，涵蓋得了 agy/…；只有 agent 前綴規則擋得到
+        service = self._service(self._policy_obj(allow=("*",)))
+        try:
+            err = self.assert_api_error(
+                400, "bad_request", service.register_cooldown, "antigravity",
+                {"until": "2026-10-11T15:00:00Z",
+                 "model": f"agy/{self.MODEL}"})
+            self.assertEqual(self._item(service)["model_cooldowns"], {})
+            # 對照：裸 id 可以登錄
+            service.register_cooldown(
+                "antigravity", {"until": "2026-10-11T15:00:00Z",
+                                "model": self.MODEL})
+            self.assertEqual(self._item(service)["model_cooldowns"],
+                             {self.MODEL: {"until": "2026-10-11T15:00:00Z"}})
+        finally:
+            service.close()
+        self.assertNotIn("detail", err.body())
+
+    # --- build_env 的兩條判斷（單元層） ---
+
+    def test_build_env的kind方向(self):
+        # 模擬 _AGY_ONLY 被改弱成 antigravity 的 agents 含 claude-code（經政策載入
+        # 不可達）：kind 那條判斷讓它仍回 {}
+        self.assertEqual(
+            GoogleProvider().build_env("claude-code", None, self.MODEL), {})
+
+    def test_build_env的agent方向(self):
+        # 模擬 _AGY_ONLY 被改弱成 agy 進了一筆 api-key row：agent 那條判斷讓它仍回 {}
+        self.assertEqual(
+            provider_for("opencode-zen").build_env(
+                "agy", CANARY["opencode-zen"], self.MODEL),
+            {})
 
 
 class ListTest(RegistryCase):

@@ -263,6 +263,43 @@ class PolicyValidationTests(unittest.TestCase):
         policy = self._reload(obj)
         self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
 
+    def test_antigravity可載入且agents只給agy(self):
+        # #107：沒有憑證的訂閱（kind local-login）。PR 1 不動出廠政策，用臨時政策檔。
+        obj = _good_policy()
+        obj["subscriptions"]["antigravity"] = _sub(
+            35, ("agy",), ("gemini-test-id",), "gemini-test-id")
+        policy = self._reload(obj)
+        self.assertEqual(policy.subscriptions["antigravity"].agents, ("agy",))
+        self.assertEqual(policy.subscriptions["antigravity"].models_default,
+                         "gemini-test-id")
+
+    def test_antigravity的agents必須剛好agy(self):
+        for agents in (["agy", "opencode"], ["claude-code"], ["opencode"], []):
+            with self.subTest(agents=agents):
+                with self.assertRaises(PolicyError) as ctx:
+                    obj = _good_policy()
+                    obj["subscriptions"]["antigravity"] = _sub(
+                        35, agents, ("gemini-test-id",), None)
+                    self._reload(obj)
+                # 例外訊息不含檔案裡的值
+                self.assertNotIn("gemini-test-id", str(ctx.exception))
+
+    def test_其他訂閱的agents含agy拒收(self):
+        # 反向條款：有憑證的 row 不能允許 agy（不然它會用空 env 被選中）
+        obj = _good_policy()
+        obj["subscriptions"]["ollama-cloud"] = _sub(30, ("agy",))
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertIn("agy", str(ctx.exception))
+
+    def test_agy以外的新鍵仍拒收(self):
+        # 白名單仍是固定集合：只有 antigravity 被接受，其他新鍵照樣拒收
+        obj = _good_policy()
+        obj["subscriptions"]["google"] = obj["subscriptions"].pop("openrouter")
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertIn("unknown key", str(ctx.exception))
+
     def test_bad_numbers_rejected(self):
         for mutate in (
             lambda o: o["subscriptions"]["openrouter"].update(priority=-1),

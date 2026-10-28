@@ -212,6 +212,15 @@ class ApiTest(ServerCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.fake.calls[-1][3], "a+b")
 
+    def test_resolve_agy_query原樣傳給service(self):
+        # #107：agent=agy 不被 HTTP 層擋下，值原樣交給 service（是不是 200 由政策決定）
+        status, _ = self.call(
+            "GET", "/v1/resolve?agent=agy&provider=google&model=gemini-test-id")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls[-1],
+                         ("resolve", "agy", "google", "gemini-test-id",
+                          None, None, None))
+
     def test_resolve_data原樣傳到service(self):
         # #102：data 是已知參數，值原樣交給 service 驗（HTTP 層只管形狀）
         for value, expected in (("public", "public"), ("general", "general"),
@@ -1040,6 +1049,83 @@ class UsageHttpTest(ServerCase):
         blob = json.dumps([listed, resolved["meta"]]) + "\n".join(logs.output)
         self.assertNotIn(self.KEY, blob)
         self.assertEqual(resolved["meta"]["usage"]["reason"], "internal")
+
+
+class LocalLoginHttpTest(ServerCase):
+    """#107：agent=agy 經真 RegistryService＋臨時政策檔的端到端（PR 1 不動出廠政策）。"""
+
+    MODEL = "gemini-test-id"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        keys_path = root / "keys.env"
+        keys_path.write_text(
+            "# 測試用假 key（沒有 antigravity：它本來就沒有憑證）\n"
+            "OPENCODE_ZEN_API_KEY=fake-zen\n",
+            encoding="utf-8")
+        with open(Path(__file__).resolve().parent.parent / "policy" / "default.json",
+                  encoding="utf-8") as fh:
+            obj = json.load(fh)
+        obj["subscriptions"]["antigravity"] = {
+            "priority": 35,
+            "privacy": "public",
+            "agents": ["agy"],
+            "models": {"allow": [self.MODEL], "default": self.MODEL},
+        }
+        policy_path = root / "policy.json"
+        policy_path.write_text(json.dumps(obj), encoding="utf-8")
+        self.clock = FakeClock()
+        self.service = RegistryService(
+            str(root / "llm.db"), load_policy(str(policy_path)),
+            KeyStore(str(keys_path)), self.clock)
+        self.base = self.serve(self.service)
+
+    def tearDown(self):
+        super().tearDown()
+        self.service.close()
+        self.tmp.cleanup()
+
+    def json_of(self, payload):
+        return json.loads(payload.decode())
+
+    def test_resolve回200且env為空物件(self):
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=agy&provider=google&model=" + self.MODEL)
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data["env"], {})
+        self.assertEqual(data["env_schema"], 1)
+        meta = data["meta"]
+        self.assertEqual(meta["subscription"], "antigravity")
+        self.assertEqual(meta["provider"], "google")
+        self.assertEqual(meta["kind"], "local-login")
+        self.assertEqual(meta["agent"], "agy")
+        self.assertEqual(meta["model"], self.MODEL)
+        self.assertIsNone(meta["endpoint"])
+        self.assertEqual(meta["usage"]["status"], "not_applicable")
+
+    def test_list的available為true(self):
+        status, payload = self.call("GET", "/v1/subscriptions")
+        self.assertEqual(status, 200)
+        item = {i["id"]: i for i in self.json_of(payload)["subscriptions"]}[
+            "antigravity"]
+        self.assertTrue(item["available"])
+        self.assertIsNone(item["available_again_at"])
+        self.assertEqual(item["usage"]["status"], "not_applicable")
+        self.assertNotIn("key", item)
+
+    def test_get回409且不含key(self):
+        status, payload = self.call(
+            "GET", "/v1/subscriptions/antigravity?agent=agy")
+        self.assertEqual(status, 409)
+        self.assertEqual(self.json_of(payload), {"error": "not_deployed"})
+
+    def test_未知agent仍400(self):
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=agy2&provider=google")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(payload)["error"], "bad_request")
 
 
 if __name__ == "__main__":

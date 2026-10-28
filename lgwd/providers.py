@@ -3,6 +3,8 @@
 
 - anthropic：Claude 訂閱（claude-subscription），endpoint 為 null（由 agent 直連）；
 - openrouter、ollama-cloud、opencode-zen、opencode-go、groq：api-key，各帶自己的 endpoint。
+- google：Antigravity（agy）的訂閱（local-login，#107）；沒有憑證、endpoint 為
+  null，resolve 的 env 恆為 {}，也不提供 usage fetcher。
 - 把（provider、kind、agent）＋key＋model 組成 resolve 的 env 由 build_env（design 決定 2）；
   opencode 只回片段（OPENCODE_* 四鍵），OPENCODE_CONFIG_CONTENT 由 sidecar 組。
 - endpoint 是中介資料（會進 meta 與稽核），不得內嵌憑證：validate_endpoints() 在
@@ -52,8 +54,14 @@ class CredentialProvider:
 
         鍵集＝spec「env 的組成」的清單（env_schema 1）；呼叫方的維運變數（server
         password、permission、instructions 等）一律不在。model 為 null（agent 自己
-        的預設）時不給模型變數。
+        的預設）時不給模型變數。agent 為 agy 或該把的 kind 為 local-login 時回 {}。
         """
+        if agent == "agy" or self.kind == "local-login":
+            # 沒有憑證的訂閱（#107）：env 恆為空物件，不給憑證、端點或模型變數。
+            # 兩條判斷各擋一個方向、缺一不可：只判 agent 時，政策條款被改弱、agy 進了
+            # 某一筆 api-key row 就會落進 claude-code 分支回出 ANTHROPIC_*；只判 kind
+            # 時，antigravity 的 agents 被改弱成含 claude-code 也一樣會落進去。
+            return {}
         if agent == "opencode":
             # 片段：OPENCODE_CONFIG_CONTENT／baseURL 由 sidecar 組（不回）。
             env = {
@@ -147,6 +155,20 @@ class GroqProvider(CredentialProvider):
     opencode_provider_id = "groq"
 
 
+class GoogleProvider(CredentialProvider):
+    """Antigravity（#107）：agy 用呼叫方那一台機器的本機 Google 登入直連。
+
+    kind 為 local-login：沒有憑證（不進 key 檔、不佔 KEY_NAMES）、沒有 endpoint
+    （Gateway 不代理），resolve 的 env 恆為 {}（build_env 的 kind 判斷）。
+    MUST NOT 覆寫 make_usage_fetcher：基底回 None，usage 才一直是 not_applicable，
+    main.py 的 _usage_key／deployed 不會對它讀 key 檔（design §2.1 的隱性不變式）。
+    """
+    provider = "google"
+    kind = "local-login"
+    endpoint = None
+    opencode_provider_id = ""
+
+
 # subscription id → provider。id 是設計固定值，不是介面的一部分。
 PROVIDERS: dict[str, CredentialProvider] = {
     "claude-personal": AnthropicProvider(),
@@ -156,6 +178,7 @@ PROVIDERS: dict[str, CredentialProvider] = {
     "opencode-go": OpenCodeGoProvider(),
     "groq": GroqProvider(),
     "ollama-cloud": OllamaCloudProvider(),
+    "antigravity": GoogleProvider(),
 }
 
 
