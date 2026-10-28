@@ -5,6 +5,7 @@
     client = lgw.client.Client("http://127.0.0.1:4710")  # base URL 由呼叫方給
     client.list()
     client.resolve("opencode", "opencode-zen", model="big-pickle")
+    client.resolve("opencode", "opencode-zen", model="big-pickle", data="public")
     client.resolve("claude-code", "anthropic", subscription="claude-personal")
     client.roles("impl", "opencode", data="public")
     client.get("claude-personal", "claude-code")
@@ -12,10 +13,11 @@
     client.cooldown("opencode-zen", "2026-10-12T03:00:00Z", model="big-pickle")
 
 - list() → GET /v1/subscriptions
-- resolve(agent, provider, model, subscription, exclude) → GET /v1/resolve
+- resolve(agent, provider, model, subscription, exclude, data) → GET /v1/resolve
   （model／subscription 是供應商 id 與釘住的 id；exclude 由 client 用 ",".join
-  合併；每個 query 值都用 urllib.parse.quote(value, safe="") 編碼——`+` 因此
-  編成 %2B，server 的 parse_qs 才不會解成空白）
+  合併；data 是選填的資料等級宣告（public／general／real），省略時不帶參數＝服務
+  不依 privacy 過濾；每個 query 值都用 urllib.parse.quote(value, safe="") 編碼——
+  `+` 因此編成 %2B，server 的 parse_qs 才不會解成空白）
 - roles(role, agent, data=None) → GET /v1/roles/{role}?agent={agent}[&data={data}]
   （#100；spec role-allocation。data 省略時不帶參數，由服務取最嚴）
 - get(id, agent) → GET /v1/subscriptions/{id}?agent={agent}（過渡期；resolve 的
@@ -27,8 +29,8 @@
 - 回 Result：ok、status、data、error、unreachable。連不上或逾時回 unreachable=True、
   不丟例外；400／403／404／409 照實回狀態碼與 error。error 可能是：
   - 服務回的碼：bad_request｜invalid_until｜until_out_of_range｜
-    agent_not_allowed｜model_not_allowed｜no_model｜not_found｜not_deployed｜
-    no_candidate｜body_too_large；
+    agent_not_allowed｜model_not_allowed｜privacy_not_allowed｜no_model｜not_found｜
+    not_deployed｜no_candidate｜body_too_large；
   - cooling：**只有舊版 Gateway 會回**（legacy；新 Gateway 不再因冷卻拒絕，200 的
     meta 帶 cooldown／model_cooldowns 當提示）。本 client 對它照實回狀態碼與 until，
     呼叫方要保留判讀；
@@ -133,10 +135,14 @@ class Client:
 
     def resolve(self, agent: str, provider: str, model: str | None = None,
                 subscription: str | None = None,
-                exclude: list[str] | None = None) -> Result:
+                exclude: list[str] | None = None,
+                data: str | None = None) -> Result:
         """resolve：依 provider＋model（可釘住／排除）取選中的 subscription 與 env。
 
-        model／subscription 省略時不帶參數；exclude 由 client 用逗號合併。
+        model／subscription／data 省略時不帶參數；exclude 由 client 用逗號合併。
+        data 是資料等級宣告（public／general／real）：省略時不帶參數（服務不依
+        privacy 過濾）；空字串也會被帶出，服務端視為沒給（HTTP 層的空白值規則），
+        效果同省略。
         """
         params = [("agent", str(agent)), ("provider", str(provider))]
         if model is not None:
@@ -145,6 +151,8 @@ class Client:
             params.append(("subscription", str(subscription)))
         if exclude:
             params.append(("exclude", ",".join(str(value) for value in exclude)))
+        if data is not None:
+            params.append(("data", str(data)))
         query = "&".join(
             "{0}={1}".format(name, urllib.parse.quote(value, safe=""))
             for name, value in params

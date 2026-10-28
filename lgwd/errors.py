@@ -7,12 +7,14 @@
   登錄冷卻的 model 不是非空字串（null 除外——那是「沒給」）、超過 200 字元、
   以 agent 前綴開頭（opencode/、claude-code/）、含 fnmatch 萬用字元，或不被該把的
   models.allow 涵蓋、
-  resolve 的輸入形狀錯（未知 agent、subscription＋exclude 同時給、subscription 與 provider
-  不一致）、400 no_model：resolve 的 model 省略且沒有候選能推導模型
+  resolve 的輸入形狀錯（未知 agent、data 不在 public／general／real、
+  subscription＋exclude 同時給、subscription 與 provider 不一致）、
+  400 no_model：resolve 的 model 省略且沒有候選能推導模型
 - 400 invalid_until：until 不是 RFC 3339 字串（或型別不對）
 - 400 until_out_of_range：until 在過去或超過 8 天以後
 - 403 agent_not_allowed：agent 不在該筆的 agents 裡（resolve 的選把步驟 3 同用）
 - 403 model_not_allowed：resolve 的 model 不被任何候選的 models.allow 涵蓋
+- 403 privacy_not_allowed：resolve 宣告的 data 高於所有候選的 privacy（步驟 3.5）
 - 404 not_found：不存在的 id 或未知路徑（resolve 的未知 provider／未知 subscription 同用）
 - 409 not_deployed：key 尚未部署
 - 409 no_candidate：resolve 的 exclude 排除後沒有候選（沒有恢復時刻）
@@ -66,6 +68,11 @@ def agent_not_allowed() -> ApiError:
 # 403：resolve 的 model 不被任何候選的 models.allow 涵蓋（政策守門，不代選）
 def model_not_allowed() -> ApiError:
     return ApiError(403, "model_not_allowed")
+
+
+# 403：resolve 宣告的 data 高於所有候選的 privacy（隱私不足；政策拒絕，不代選）
+def privacy_not_allowed() -> ApiError:
+    return ApiError(403, "privacy_not_allowed")
 
 
 # 404：不存在的 id 或未知路徑

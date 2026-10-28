@@ -93,9 +93,10 @@ class FakeService:
     def get_subscription(self, sub_id, agent):
         return self._finish("get_subscription", dict(ITEM), sub_id, agent)
 
-    def resolve(self, agent, provider, model=None, subscription=None, exclude=None):
+    def resolve(self, agent, provider, model=None, subscription=None, exclude=None,
+                data=None):
         return self._finish("resolve", json.loads(json.dumps(RESOLVE)),
-                            agent, provider, model, subscription, exclude)
+                            agent, provider, model, subscription, exclude, data)
 
     def role_candidates(self, role, agent, data=None):
         return self._finish("role_candidates", json.loads(json.dumps(ROLES)),
@@ -172,7 +173,7 @@ class ApiTest(ServerCase):
         self.assertEqual(self.json_of(payload), RESOLVE)
         self.assertEqual(self.fake.calls[-1],
                          ("resolve", "opencode", "opencode-zen", "big-pickle",
-                          None, None))
+                          None, None, None))
 
     def test_resolve_query規則(self):
         # 未知參數忽略
@@ -180,7 +181,8 @@ class ApiTest(ServerCase):
             "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&flag=1&x=")
         self.assertEqual(status, 200)
         self.assertEqual(self.fake.calls[-1],
-                         ("resolve", "opencode", "opencode-zen", None, None, None))
+                         ("resolve", "opencode", "opencode-zen", None, None, None,
+                          None))
         # 空白值＝沒給（subscription=x&exclude= 是合法釘住）
         status, _ = self.call(
             "GET", "/v1/resolve?agent=claude-code&provider=anthropic"
@@ -188,7 +190,7 @@ class ApiTest(ServerCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.fake.calls[-1],
                          ("resolve", "claude-code", "anthropic", None,
-                          "claude-company", None))
+                          "claude-company", None, None))
         # 已知參數重複出現 → 400
         status, payload = self.call(
             "GET", "/v1/resolve?agent=opencode&agent=claude-code&provider=opencode-zen")
@@ -210,6 +212,25 @@ class ApiTest(ServerCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.fake.calls[-1][3], "a+b")
 
+    def test_resolve_data原樣傳到service(self):
+        # #102：data 是已知參數，值原樣交給 service 驗（HTTP 層只管形狀）
+        for value, expected in (("public", "public"), ("general", "general"),
+                                ("real", "real"), ("private", "private"),
+                                ("", None)):
+            with self.subTest(data=value):
+                status, _ = self.call(
+                    "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&data="
+                           + value)
+                self.assertEqual(status, 200)
+                self.assertEqual(self.fake.calls[-1][6], expected)
+        # 重複出現（含空白的那一次）→ 400
+        for query in ("data=public&data=real", "data=&data=public"):
+            with self.subTest(query=query):
+                status, payload = self.call(
+                    "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&" + query)
+                self.assertEqual(status, 400)
+                self.assertEqual(self.json_of(payload)["error"], "bad_request")
+
     def test_resolve_200帶不快取標頭(self):
         req = urllib.request.Request(
             self.base + "/v1/resolve?agent=opencode&provider=opencode-zen")
@@ -229,6 +250,7 @@ class ApiTest(ServerCase):
             (errors.bad_request(), 400, "bad_request"),
             (errors.no_model(), 400, "no_model"),
             (errors.model_not_allowed(), 403, "model_not_allowed"),
+            (errors.privacy_not_allowed(), 403, "privacy_not_allowed"),
             (errors.not_found(), 404, "not_found"),
             (errors.not_deployed(), 409, "not_deployed"),
             (errors.no_candidate(), 409, "no_candidate"),
@@ -738,6 +760,34 @@ class ResolveHttpTest(ServerCase):
         self.assertEqual(status, 409)
         self.assertEqual(self.json_of(payload)["error"], "no_candidate")
 
+    def test_resolve端到端_data(self):
+        # 不帶 data：不濾，行為不變（缺省 B）
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen")
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.json_of(payload)["meta"]["data"])
+        # 宣告超過那把的 privacy（zen 是 public）→ 403，不含 env
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&data=real")
+        self.assertEqual(status, 403)
+        data = self.json_of(payload)
+        self.assertEqual(data["error"], "privacy_not_allowed")
+        self.assertNotIn("env", data)
+        # 宣告得起的等級 → 200，meta.data 是請求值原樣
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&data=public")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload)["meta"]["data"], "public")
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=ollama-cloud&data=real")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload)["meta"]["data"], "real")
+        # 空白 data 視為沒給
+        status, payload = self.call(
+            "GET", "/v1/resolve?agent=opencode&provider=opencode-zen&data=")
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.json_of(payload)["meta"]["data"])
+
     def test_resolve端到端_錯誤precedence(self):
         cases = [
             # 缺必填（missing 列出缺的欄位）
@@ -760,6 +810,13 @@ class ResolveHttpTest(ServerCase):
              403, "model_not_allowed", None),
             ("/v1/resolve?agent=opencode&provider=opencode-zen&model=opencode%2Fbig-pickle",
              403, "model_not_allowed", None),
+            # #102：宣告 data 後的隱私 403；agent 的 403 先於 privacy 的 403
+            ("/v1/resolve?agent=claude-code&provider=opencode-zen"
+             "&subscription=opencode-zen&data=real", 403, "agent_not_allowed", None),
+            ("/v1/resolve?agent=opencode&provider=opencode-zen"
+             "&subscription=opencode-zen&data=real", 403, "privacy_not_allowed", None),
+            ("/v1/resolve?agent=opencode&provider=opencode-zen&data=private",
+             400, "bad_request", None),
         ]
         for path, code, err, extra in cases:
             with self.subTest(path=path):

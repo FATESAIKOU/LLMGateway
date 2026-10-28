@@ -236,6 +236,26 @@ class ResolveTest(ClientCase):
         self.assertEqual(query, {"agent": ["claude-code"], "provider": ["anthropic"],
                                  "subscription": ["claude-company"]})
 
+    def test_resolve帶data(self):
+        # #102：data 有給才進 query（等級字串原樣送出，判讀在服務）
+        res = self.client.resolve("opencode", "opencode-zen",
+                                  model="big-pickle", data="public")
+        self.assertTrue(res.ok)
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query, {"agent": ["opencode"], "provider": ["opencode-zen"],
+                                 "model": ["big-pickle"], "data": ["public"]})
+
+    def test_resolve_data編碼(self):
+        # 與其他 query 值同一條編碼規則（空白不會變成未編碼的字元）
+        self.client.resolve("opencode", "opencode-zen", data="public x")
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertEqual(query["data"], ["public x"])
+
+    def test_resolve_data省略時不帶參數(self):
+        self.client.resolve("opencode", "opencode-zen")
+        _, _, query, _, _ = self.fake.requests[-1]
+        self.assertNotIn("data", query)
+
     def test_resolve_錯誤對照(self):
         cases = [("mna", 403, "model_not_allowed"),
                  ("nom", 400, "no_model"),
@@ -262,6 +282,29 @@ class ResolveTest(ClientCase):
         self.assertEqual(res.status, 400)
         self.assertEqual(res.error, "bad_request")
         self.assertEqual(res.data, {"missing": ["agent"]})
+
+
+class ResolveParamsTest(unittest.TestCase):
+    """resolve 的 query 形狀（不經 server）：data 空字串照帶，服務端視為沒給（#102）。"""
+
+    def _client_with_paths(self):
+        paths = []
+
+        def fake_send(method, path, body, error_data=False):
+            paths.append(path)
+            return Result(ok=True)
+
+        client = Client("http://127.0.0.1:1")
+        client._send = fake_send
+        return client, paths
+
+    def test_data空字串照帶(self):
+        client, paths = self._client_with_paths()
+        client.resolve("opencode", "opencode-zen", data="")
+        self.assertIn("data=", paths[-1])
+        # data=None 與不帶參數等價
+        client.resolve("opencode", "opencode-zen", data=None)
+        self.assertNotIn("data=", paths[-1])
 
 
 class RolesTest(ClientCase):
