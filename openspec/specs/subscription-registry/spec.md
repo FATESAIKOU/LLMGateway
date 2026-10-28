@@ -35,7 +35,7 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - **THEN** `cooldown` 是 `{"until": "…15:00…"}`、`model_cooldowns` 有 A（`until` 為 16:00）；兩個欄位都保留，互不覆蓋
 
 ### Requirement: get
-`GET /v1/subscriptions/{id}?agent=<種類>` SHALL 回該 subscription 的共通 JSON，含 `key`。`agent` 是必填參數，缺少時回 400 `bad_request`（帶 `missing: ["agent"]`）；不在該筆的 `agents` 裡 MUST 回 403 `agent_not_allowed`，不回 key。不存在的 id 回 404 `not_found`；key 沒部署時回 409 `not_deployed`。
+`GET /v1/subscriptions/{id}?agent=<種類>` SHALL 回該 subscription 的共通 JSON，含 `key`。`agent` 是必填參數，缺少時回 400 `bad_request`（帶 `missing: ["agent"]`）；不在該筆的 `agents` 裡 MUST 回 403 `agent_not_allowed`，不回 key。不存在的 id 回 404 `not_found`；key 沒部署時回 409 `not_deployed`。`kind` 為 `local-login` 的訂閱沒有憑證（本 change 的 `antigravity`）MUST 回 409 `not_deployed`、不回 `key`：它沒有可交付的值，MUST NOT 因為「恆已部署」（見「沒有憑證的訂閱」）而回 200。
 
 #### Scenario: Claude Code 拿 Claude 訂閱
 - **WHEN** 以 `agent=claude-code` get `claude-personal`
@@ -48,6 +48,10 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 #### Scenario: 冷卻中仍可 get
 - **WHEN** 某把在冷卻中，有人 get 它
 - **THEN** 照樣回覆（`available` 為 false），由呼叫方決定要不要用
+
+#### Scenario: 沒有憑證的訂閱不發值
+- **WHEN** 以 `agent=agy` get `antigravity`
+- **THEN** 回 409 `not_deployed`，body 只有 `error`，沒有 `key`
 
 ### Requirement: models.default 的語意
 
@@ -77,9 +81,11 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - **THEN** 載入失敗（`PolicyError`），訊息指出是哪一筆
 
 ### Requirement: endpoint 的語意
-`endpoint` SHALL 是 provider 的**根位址**（值以 `lgwd/providers.py` 為準），`kind` 為 `claude-subscription` 時 MUST 為 null（由 agent 直連）。出廠值與形狀：
+`endpoint` SHALL 是 provider 的**根位址**（值以 `lgwd/providers.py` 為準），`kind` 為 `claude-subscription` 或 `local-login` 時 MUST 為 null。出廠值與形狀：
 - `ollama-cloud` 的 `https://ollama.com` 可以直接當 Claude Code 的 `ANTHROPIC_BASE_URL`；`openrouter` 的 `https://openrouter.ai/api` 同屬 Anthropic 相容的 base（本系統只給 opencode，接法由 opencode driver 決定）；兩者的 OpenAI 相容路徑由呼叫方自己組（例如再接 `/v1`）；
-- `opencode-zen` 的 `https://opencode.ai/zen/v1`：OpenAI 相容的 base。
+- `opencode-zen` 的 `https://opencode.ai/zen/v1`：OpenAI 相容的 base；
+- `groq` 的 `https://api.groq.com/openai/v1`：OpenAI 相容的 base；
+- `kind` 為 `local-login`（本 change 的 `antigravity`）：MUST 為 null。agy 用呼叫方那一台機器的本機登入直連上游，Gateway 不代理、不換端點。
 
 呼叫方（agent driver）MUST NOT 假設 `endpoint` 是某種協定的完整路徑；要依 `provider` 組出自己要的接法，或使用 agent 內建的 provider 設定。
 
@@ -95,12 +101,16 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - **WHEN** 讀取 `claude-personal` 的共通 JSON
 - **THEN** `endpoint` 為 null，agent 直連、不使用 base
 
+#### Scenario: agy 沒有 endpoint
+- **WHEN** 讀取 `antigravity` 的共通 JSON
+- **THEN** `endpoint` 為 null、`kind` 為 `local-login`；Gateway 不回任何要交給 agy 的位址
+
 ### Requirement: 共通 JSON schema
 
 每個 subscription SHALL 以同一個 JSON 形狀描述，欄位如下：
 - `schema`：該端點回覆形狀的版本（整數）；
 - `id`：subscription 的名稱；
-- `provider`、`kind`：供應商，與型態（`claude-subscription` 或 api-key 類）；
+- `provider`、`kind`：供應商，與型態（`claude-subscription`、api-key 類，或沒有憑證的 `local-login`）；
 - `agents`：允許使用這一把的 agent 種類清單；
 - `priority`：整數，**數字小的先**；
 - `models`：`{allow, default}`，`allow` 是模型 id 樣式（fnmatch）清單，`default` 是供應商自己的模型 id 或 null（語意見「models.default 的語意」）；
@@ -108,11 +118,13 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - `key`：憑證值，**只在 get 的回覆出現**（過渡期，由 LLMGateway#48 移除）；list 不含；
 - `cooldown`：`{"until": RFC 3339 UTC}` 或 null，不分窗口；過了 `until` 即視為 null（整把的冷卻；各模型的冷卻另見 `model_cooldowns`）；
 - `model_cooldowns`：物件（模型 id → `{"until": RFC 3339 UTC}`），**只列 `until` 還沒過的**（`until` 在過去或以現在為界即不出現）；沒有時是 `{}`；模型 id 可含 `/`、`:` 等字元；
-- `available`：已部署（key 在）而且沒有未來的整把 `until` 時為 true，否則 false；用量為 0% MUST NOT 讓它變 false；模型冷卻（`model_cooldowns`）MUST NOT 讓它變 false；它是「部署＋整把冷卻」的粗提示，不是「保證不會被上游 429」；
+- `available`：已部署（key 在；`kind` 為 `local-login` 時恆已部署）而且沒有未來的整把 `until` 時為 true，否則 false；用量為 0% MUST NOT 讓它變 false；模型冷卻（`model_cooldowns`）MUST NOT 讓它變 false；它是「部署＋整把冷卻」的粗提示，不是「保證不會被上游 429」；
 - `available_again_at`：RFC 3339 UTC 或 null，**只在 list 出現**（合併規則見 spec `usage-reporting`）；
 - `usage`：用量物件，**只在 list 出現**（resolve 的 `meta` 另帶同形狀的 `usage`，見「resolve」；形狀與規則見 spec `usage-reporting`）。
 
-這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。`usage`／`available_again_at` 在 `list_subscriptions` 內逐筆合入，get 的回覆 MUST NOT 帶（get 由 LLMGateway#48 退場，不續命）。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（條款；免費模型只經過 opencode）；政策載入 MUST 拒絕 openrouter 的 `agents` 不是剛好 `["opencode"]` 的政策檔。`endpoint` MUST NOT 內嵌憑證：`endpoint` 不在政策檔，是 `lgwd/providers.py` 的 `CredentialProvider.endpoint` 常數；providers 載入／lgwd 啟動時 MUST 逐筆檢查 `PROVIDERS` 的 endpoint 值，含 `key=`／`token=`／`api_key=`／`access_token=` query 樣式或 userinfo `@` 即拒絕啟動（`PolicyError`；endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。list 新增 `usage`／`available_again_at` 只是新增欄位，`schema` MUST NOT bump（目前仍為 1；消費端忽略不認得的欄位）。`model_cooldowns` 也是新增欄位，同樣 MUST NOT bump `schema`；它同時出現在 list 與 get 的回覆（`usage`／`available_again_at` 仍只在 list），resolve 的 `meta` 帶同一形狀的 `cooldown` 與 `model_cooldowns`（見「resolve」）。`cooldown` 與 `available` 仍是**整把**的語意：`available` MUST NOT 因 `model_cooldowns` 改變（消費端用 `available` 判斷 key 有沒有部署，把模型冷卻算進去會讓一個模型用完看起來像整把沒部署）。
+**訂閱 id 是固定集合**：`id` MUST 是 `lgwd/policy.py` 的 `SUBSCRIPTIONS` 常數裡的值（`claude-personal`、`claude-company`、`opencode-zen`、`opencode-go`、`groq`、`openrouter`、`ollama-cloud`，本 change 加 `antigravity`）。政策檔 `subscriptions` 的鍵不在這個集合裡時 MUST 政策載入失敗（`PolicyError("policy.subscriptions has unknown key")`，`lgwd/policy.py:253-255`）、lgwd 不啟動；所以新增一個訂閱＝改 `SUBSCRIPTIONS`（與 `AGENTS`、`PROVIDERS` 對應的一筆）＋政策檔兩處，兩邊不一致時是「載不起來」而不是「靜默忽略」。
+
+這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。`usage`／`available_again_at` 在 `list_subscriptions` 內逐筆合入，get 的回覆 MUST NOT 帶（get 由 LLMGateway#48 退場，不續命）。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（條款；免費模型只經過 opencode）；`kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`）的 `agents` MUST 只有 `agy`；政策載入 MUST 拒絕這三類訂閱的 `agents` 不是剛好那一個值的政策檔，也 MUST 拒絕其他訂閱的 `agents` 含 `agy`。`endpoint` MUST NOT 內嵌憑證：`endpoint` 不在政策檔，是 `lgwd/providers.py` 的 `CredentialProvider.endpoint` 常數；providers 載入／lgwd 啟動時 MUST 逐筆檢查 `PROVIDERS` 的 endpoint 值，含 `key=`／`token=`／`api_key=`／`access_token=` query 樣式或 userinfo `@` 即拒絕啟動（`PolicyError`；endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。list 新增 `usage`／`available_again_at` 只是新增欄位，`schema` MUST NOT bump（目前仍為 1；消費端忽略不認得的欄位）。`model_cooldowns` 也是新增欄位，同樣 MUST NOT bump `schema`；它同時出現在 list 與 get 的回覆（`usage`／`available_again_at` 仍只在 list），resolve 的 `meta` 帶同一形狀的 `cooldown` 與 `model_cooldowns`（見「resolve」）。`cooldown` 與 `available` 仍是**整把**的語意：`available` MUST NOT 因 `model_cooldowns` 改變（消費端用 `available` 判斷 key 有沒有部署，把模型冷卻算進去會讓一個模型用完看起來像整把沒部署）；`kind` 為 `local-login` 時「部署」由 kind 判定，不是 key。
 
 #### Scenario: list 的形狀
 - **WHEN** 呼叫 list
@@ -162,6 +174,14 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - **WHEN** 某把的 `model_cooldowns` 有 `openrouter/free` 這種含 `/` 的模型 id
 - **THEN** 它是正常的物件鍵，值是 `{"until": "…"}`，不影響其他鍵與 `models` 的內容
 
+#### Scenario: 沒有憑證的訂閱也在 list
+- **WHEN** 呼叫 list，政策檔含 `antigravity`
+- **THEN** 該筆的 `kind` 為 `local-login`、`endpoint` 為 null、`agents` 為 `["agy"]`、`available` 為 true（沒有未來冷卻時）、`usage.status` 為 `not_applicable`、`available_again_at` 為 null，且沒有 `key`
+
+#### Scenario: 沒有憑證的訂閱 agents 改寬
+- **WHEN** 政策檔的 `antigravity.agents` 不是剛好 `["agy"]`
+- **THEN** 政策載入失敗（`PolicyError`），lgwd 不啟動
+
 ### Requirement: 登錄冷卻
 `POST /v1/subscriptions/{id}/cooldown {until[, model]}` SHALL 登錄冷卻：
 - 成功回 204（無 body）；
@@ -169,13 +189,13 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - `until` 不是 RFC 3339 字串（或型別不對）時回 400 `invalid_until`，不登錄；
 - `until` 在過去或超過 8 天以後 MUST 回 400 `until_out_of_range`，不登錄（模型冷卻用同一個上限）；
 - `model` 選填：有給時 MUST 只冷卻那個模型，沒有時冷卻整把（現行語意）；**`"model": null` MUST 視為沒給**（記整把），與空字串／數字／陣列不是同一類（後三者是「有給但形狀錯」）；
-- `model` 有給（且不是 null）時 MUST 是非空字串，而且是供應商自己的模型 id（不帶 agent 專用前綴，語意同 resolve 的 `model`）；不是非空字串、長度超過 **200 字元**、以 `<agent>/` 開頭（agent ∈ `AGENTS`，即 `opencode/`、`claude-code/`；這個形狀 MUST 被擋，因為 allow 的 `*` 會匹配 `/`，只靠 allow 涵蓋檢查擋不到）、含 fnmatch 萬用字元（`*`、`?`、`[`），或不被該把 `models.allow` 的樣式（fnmatch）涵蓋，MUST 回 400 `bad_request`（**不是** 403 `model_not_allowed`——那是 resolve 的政策拒絕碼），不登錄；Gateway MUST NOT 正規化 `model`（不去前綴、不改大小寫）；
+- `model` 有給（且不是 null）時 MUST 是非空字串，而且是供應商自己的模型 id（不帶 agent 專用前綴，語意同 resolve 的 `model`）；不是非空字串、長度超過 **200 字元**、以 `<agent>/` 開頭（agent ∈ `AGENTS`，即 `opencode/`、`claude-code/`、`agy/`；這個形狀 MUST 被擋，因為 allow 的 `*` 會匹配 `/`，只靠 allow 涵蓋檢查擋不到）、含 fnmatch 萬用字元（`*`、`?`、`[`），或不被該把 `models.allow` 的樣式（fnmatch）涵蓋，MUST 回 400 `bad_request`（**不是** 403 `model_not_allowed`——那是 resolve 的政策拒絕碼），不登錄；Gateway MUST NOT 正規化 `model`（不去前綴、不改大小寫）；
 - 驗證順序 MUST 與現行程式一致、不重排：未知 subscription id → 404 `not_found`，**先於** `until`／`model` 的 400；缺 `until` → 400 `bad_request`；`until` 格式／範圍 → 400；最後才是 `model`（null 除外，見上）→ 400。**body 解析失敗、body 不是物件、超過 1 MB 的 413 `body_too_large`，仍由 HTTP 層先回**（它們不是這個端點的 service 層驗證，所以「404 先於 400」不涵蓋它們）。這個順序與「錯誤回覆」的通則（輸入形狀 400 先於查無 404）不同，是刻意沿用現況（404 是現行程式的第一道檢查）；
 - 同一（把、模型）重複登錄時取較晚的 `until`；整把與模型兩層獨立，登錄其中一層 MUST NOT 刪除或縮短另一層既有的冷卻；
 - 未知欄位 MUST 忽略；
 - 過了 `until` 自動解除，不需要另一個動作（整把與每個模型各自解除）；
 - 呼叫方拿不到恢復時間時 SHALL 以呼叫當下＋1 小時為 `until`（約定；`lgw.signals` 只負責把判讀結果轉成這個形狀）；
-- 冷卻只是提示：登錄成功 MUST NOT 讓之後的 resolve 排除這把或這個模型（見「resolve 的選把規則」）；本端點不提供提前解除。
+- 冷卻只是提示：登錄成功 MUST NOT 讓之後的 resolve 排除這把或這個模型（見「resolve 的選把規則」）；本端點不提供提前解除。`kind` 為 `local-login` 的訂閱也可以用（它沒有用量來源，冷卻常是唯一的訊號）。
 
 #### Scenario: 帶恢復時刻
 - **WHEN** 以 `until=15:00` 登錄 `claude-personal`
@@ -212,6 +232,10 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 #### Scenario: model 帶 agent 前綴
 - **WHEN** 以 `model=opencode/big-pickle` 登錄 `opencode-zen`
 - **THEN** 回 400 `bad_request`（Gateway 不正規化前綴，與 resolve 同一條規則）
+
+#### Scenario: model 帶 agy 前綴
+- **WHEN** 以 `model=agy/gemini-3.8-flash-low` 登錄 `antigravity`（`allow` 只有該裸 id）
+- **THEN** 回 400 `bad_request`，冷卻不變——`agy/` 由前綴規則擋下，不只看 allow 涵蓋
 
 #### Scenario: model 帶前綴而且被 allow 樣式涵蓋
 - **WHEN** 以 `model=opencode/glm-5.3-flash-free` 登錄 `opencode-zen`（allow 是 `["*-free", "big-pickle"]`，而 fnmatch 的 `*` 會匹配 `/`，所以它「被涵蓋」）
@@ -272,7 +296,7 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 ### Requirement: 錯誤回覆
 
 所有錯誤 SHALL 以 `{"error": "<碼>"}` 的 JSON 回覆，訊息不得回顯請求裡的值；resolve 的錯誤回覆 MUST NOT 含 `env`。完整碼表：
-- 400 `bad_request`：JSON 解析失敗、body 不是物件、缺必填（帶 `missing: [...]`）；登錄冷卻的 `model` 不是非空字串（`null` 除外——那是「沒給」）、超過 200 字元、以 `<agent>/` 開頭（`opencode/`、`claude-code/`）、含萬用字元，或不被該把 `models.allow` 涵蓋；resolve 的輸入形狀錯（缺 `agent`／`provider`、`agent` 不是 `claude-code`／`opencode`、`data` 有給但不在 `public`／`general`／`real` 之內、`subscription` 與 `provider` 不一致、`subscription` 與 `exclude` 同時給、同一 query 參數重複）；
+- 400 `bad_request`：JSON 解析失敗、body 不是物件、缺必填（帶 `missing: [...]`）；登錄冷卻的 `model` 不是非空字串（`null` 除外——那是「沒給」）、超過 200 字元、以 `<agent>/` 開頭（`opencode/`、`claude-code/`、`agy/`）、含萬用字元，或不被該把 `models.allow` 涵蓋；resolve 的輸入形狀錯（缺 `agent`／`provider`、`agent` 不是 `claude-code`／`opencode`／`agy`、`data` 有給但不在 `public`／`general`／`real` 之內、`subscription` 與 `provider` 不一致、`subscription` 與 `exclude` 同時給、同一 query 參數重複）；
 - 400 `invalid_until`：`until` 不是 RFC 3339 字串（或型別不對）；
 - 400 `until_out_of_range`：`until` 在過去或超過 8 天以後；
 - 400 `no_model`：resolve 的 `model` 省略且沒有候選能推導模型（不代選）；
@@ -280,7 +304,7 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - 403 `model_not_allowed`：resolve 的 model 不被任何候選的 `models.allow` 涵蓋；
 - 403 `privacy_not_allowed`：resolve 宣告的 `data` 高於所有候選的 `privacy`（步驟 3.5；`data` 不在三個等級是 400，不是這個碼）；
 - 404 `not_found`：未知路徑，或不存在的 subscription id（resolve 的未知 provider／未知 `subscription` 同用）；
-- 409 `not_deployed`：key 尚未部署；
+- 409 `not_deployed`：key 尚未部署；`kind` 為 `local-login` 的訂閱沒有憑證，get 一律回這個碼（resolve 不會因它回 409）；
 - 409 `no_candidate`：resolve 的 `exclude` 排除後沒有候選（沒有恢復時刻）；
 - 413 `body_too_large`：body 超過 1 MB；
 - 500 `internal`：伺服器內部非預期錯誤（不帶細節）。
@@ -308,7 +332,7 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - **THEN** 回 409 `no_candidate`，不含 `env`
 
 #### Scenario: 未知 agent 是輸入錯誤
-- **WHEN** resolve 的 `agent` 不是 `claude-code`／`opencode`
+- **WHEN** resolve 的 `agent` 不是 `claude-code`、`opencode` 或 `agy`
 - **THEN** 回 400 `bad_request`
 
 #### Scenario: 輸入形狀錯誤先於查無
@@ -331,17 +355,21 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - **WHEN** 以不被該把 `models.allow` 涵蓋的 `model` 登錄冷卻
 - **THEN** 回 400 `bad_request`（不是 403 `model_not_allowed`），冷卻不變
 
+#### Scenario: 沒有憑證的訂閱不是 not_deployed 的錯誤
+- **WHEN** 以 `agent=agy&provider=google` resolve `antigravity`
+- **THEN** 回 200（不是 409 `not_deployed`）；只有 get 對它回 409
+
 ### Requirement: resolve
 
 `GET /v1/resolve?agent=<種類>&provider=<provider>[&model=<模型 id>][&subscription=<id>][&exclude=<id>[,<id>…]][&data=<public|general|real>]` SHALL 回 `{schema, env_schema, meta, env}`。
 
-`agent` 與 `provider` 必填；缺少時回 400 `bad_request`（`missing` 列出缺的欄位）。`agent` MUST 是 `claude-code` 或 `opencode`，否則 400 `bad_request`（不是 403 `agent_not_allowed`）。`model` 選填，是**供應商自己的模型 id**（可含 `/`、`+`、`:` 等字元）。`subscription` 選填，是釘住某一把 subscription：有給時 MUST 與該把的 `provider` 相同，不一致回 400 `bad_request`；未知 id 回 404 `not_found`。`exclude` 選填，是逗號分隔的 subscription id 清單；不在政策檔的 id SHALL 忽略。`subscription` 與 `exclude` 同時給 MUST 回 400 `bad_request`。`data` 選填，是呼叫方**宣告的資料等級**：有給時 MUST 是 `public`、`general`、`real` 之一，否則 400 `bad_request`（`data` 不是資源，不是 404；等級夠不夠是政策拒絕的 403，見「resolve 的選把規則」）。**沒給 `data` 時 Gateway MUST NOT 依 `privacy` 過濾**（缺省不濾：不帶＝不擋，與這個參數加入前相同；宣告了才一定不降級，翻成缺省擋留給後續的 d）。未知 query 參數 SHALL 忽略；空值視為沒給（`subscription=x&exclude=` 因此是合法釘住），同一參數重複出現回 400 `bad_request`。所有 query 值由呼叫端 percent-encode（`+` 編成 `%2B`），server 以 form 解碼。
+`agent` 與 `provider` 必填；缺少時回 400 `bad_request`（`missing` 列出缺的欄位）。`agent` MUST 是 `claude-code`、`opencode` 或 `agy`，否則 400 `bad_request`（不是 403 `agent_not_allowed`）。`model` 選填，是**供應商自己的模型 id**（可含 `/`、`+`、`:` 等字元）。`subscription` 選填，是釘住某一把 subscription：有給時 MUST 與該把的 `provider` 相同，不一致回 400 `bad_request`；未知 id 回 404 `not_found`。`exclude` 選填，是逗號分隔的 subscription id 清單；不在政策檔的 id SHALL 忽略。`subscription` 與 `exclude` 同時給 MUST 回 400 `bad_request`。`data` 選填，是呼叫方**宣告的資料等級**：有給時 MUST 是 `public`、`general`、`real` 之一，否則 400 `bad_request`（`data` 不是資源，不是 404；等級夠不夠是政策拒絕的 403，見「resolve 的選把規則」）。**沒給 `data` 時 Gateway MUST NOT 依 `privacy` 過濾**（缺省不濾：不帶＝不擋，與這個參數加入前相同；宣告了才一定不降級，翻成缺省擋留給後續的 d）。未知 query 參數 SHALL 忽略；空值視為沒給（`subscription=x&exclude=` 因此是合法釘住），同一參數重複出現回 400 `bad_request`。所有 query 值由呼叫端 percent-encode（`+` 編成 `%2B`），server 以 form 解碼。
 
-`meta` SHALL 含 `subscription`（選中的 subscription id）、`provider`、`kind`、`agent`、`model`（選定的，或 null）、`models`（該把的 `allow` 與 `default`）、`endpoint`、`priority`、`data`（請求的資料等級**原樣**，沒給時 null）、`cooldown`（該把整把的冷卻：`{"until": RFC 3339 UTC}` 或 null，過了 `until` 即視為 null）、`model_cooldowns`（該把各模型的冷卻：物件，模型 id → `{"until": RFC 3339 UTC}`，只列還沒過的，沒有時 `{}`；形狀與 list 的同一欄位相同）。`meta.data` 是「這次宣告了什麼」，**不是生效等級**：resolve 沒有 role／floor，所以它不會被抬高，與 `roles` 回覆的 `data`（請求值與 floor 取較嚴）語意不同。`meta` 另含 `usage`（與 list 同形狀；只讀快取，快取過期時觸發一次背景取用量，回覆不等它；用量讀不到或取用量壞掉時 resolve MUST 仍照常回 200，`env` 與選把結果不受影響）。冷卻資訊是**提示**：resolve 的 200 不代表「沒有冷卻」；呼叫方要判斷「這次的呼叫會不會撞到冷卻」時，看 `meta.cooldown.until` 與（`meta.model` 非 null 時）`meta.model_cooldowns[meta.model].until`，兩者取較晚者。`meta` MUST NOT 含 `available`／`available_again_at`（200 已代表 key 已部署，`available` 恆為 true、不帶資訊；用量窗口的時刻在 `usage`）。resolve 回非 200 時不組裝 `usage`，也不觸發取用量。
+`meta` SHALL 含 `subscription`（選中的 subscription id）、`provider`、`kind`、`agent`、`model`（選定的，或 null）、`models`（該把的 `allow` 與 `default`）、`endpoint`、`priority`、`data`（請求的資料等級**原樣**，沒給時 null）、`cooldown`（該把整把的冷卻：`{"until": RFC 3339 UTC}` 或 null，過了 `until` 即視為 null）、`model_cooldowns`（該把各模型的冷卻：物件，模型 id → `{"until": RFC 3339 UTC}`，只列還沒過的，沒有時 `{}`；形狀與 list 的同一欄位相同）。`meta.data` 是「這次宣告了什麼」，**不是生效等級**：resolve 沒有 role／floor，所以它不會被抬高，與 `roles` 回覆的 `data`（請求值與 floor 取較嚴）語意不同。`meta` 另含 `usage`（與 list 同形狀；只讀快取，快取過期時觸發一次背景取用量，回覆不等它；用量讀不到或取用量壞掉時 resolve MUST 仍照常回 200，`env` 與選把結果不受影響）。冷卻資訊是**提示**：resolve 的 200 不代表「沒有冷卻」；呼叫方要判斷「這次的呼叫會不會撞到冷卻」時，看 `meta.cooldown.until` 與（`meta.model` 非 null 時）`meta.model_cooldowns[meta.model].until`，兩者取較晚者。`meta` MUST NOT 含 `available`／`available_again_at`（200 已代表部署完成：key 在，或 `kind` 為 `local-login` 而恆已部署；`available` 恆為 true、不帶資訊；用量窗口的時刻在 `usage`）。resolve 回非 200 時不組裝 `usage`，也不觸發取用量。
 
-`env` SHALL 是把選定的 provider＋model 用起來的必要環境變數（名稱→值），依 `agent` 組成（見「env 的組成」）。`env` 的**憑證值** MUST NOT 出現在 list 的回覆、稽核紀錄、log 或 `GET /agents` status；model、provider、endpoint 是中介資料，稽核可記——前提是 **`endpoint` MUST NOT 內嵌憑證**（query 的 `key=`／`token=`／`api_key=`／`access_token=`、userinfo 的 `@`；providers 載入／啟動時拒絕，見「共通 JSON schema」）。錯誤回覆 MUST NOT 含 `env`。resolve 的 200 回覆 SHALL 帶 `Cache-Control: no-store` 與 `Pragma: no-cache`（過渡期的 get 亦同）。
+`env` SHALL 是把選定的 provider＋model 用起來的必要環境變數（名稱→值），依 `agent` 組成（見「env 的組成」）。`agent` 為 `agy` 時 `env` MUST 是空物件 `{}`：它用自己的本機登入，Gateway 不給憑證也不給模型變數，模型只走 `meta.model`。`env` 的**憑證值** MUST NOT 出現在 list 的回覆、稽核紀錄、log 或 `GET /agents` status；model、provider、endpoint 是中介資料，稽核可記——前提是 **`endpoint` MUST NOT 內嵌憑證**（query 的 `key=`／`token=`／`api_key=`／`access_token=`、userinfo 的 `@`；providers 載入／啟動時拒絕，見「共通 JSON schema」）。錯誤回覆 MUST NOT 含 `env`。resolve 的 200 回覆 SHALL 帶 `Cache-Control: no-store` 與 `Pragma: no-cache`（過渡期的 get 亦同）。
 
-`schema` SHALL 是**該端點回覆形狀的版本**（resolve 與 list 各自獨立；目前皆為 1），resolve 形狀有**不相容**變更（移除／改名／改語意）時 MUST bump；只**新增** meta 欄位（例如 `usage`、`cooldown`、`model_cooldowns`、`data`）不 bump（消費端忽略不認得的欄位）。`env_schema` SHALL 是 **env 組成（鍵集與鍵的語意）的版本**（目前為 1）；新增／移除 env 鍵或改變鍵的語意時 MUST bump；Gateway MUST NOT 在同一個 `env_schema` 內改變鍵集（個別回應因 model 為 null 而少給模型鍵，不算鍵集變更）。消費端對不認得的更高 `schema`／`env_schema` 的處理（拒收等）見 `archive/2026-10-24-agent-provider-model-interface/design.md` 決定 6，由 sidecar 側規格承接。
+`schema` SHALL 是**該端點回覆形狀的版本**（resolve 與 list 各自獨立；目前皆為 1），resolve 形狀有**不相容**變更（移除／改名／改語意）時 MUST bump；只**新增** meta 欄位（例如 `usage`、`cooldown`、`model_cooldowns`、`data`）不 bump（消費端忽略不認得的欄位）。`env_schema` SHALL 是 **env 組成（鍵集與鍵的語意）的版本**（目前為 1）；新增／移除 env 鍵或改變鍵的語意時 MUST bump；Gateway MUST NOT 在同一個 `env_schema` 內改變鍵集（個別回應因 model 為 null 或 agent 為 `agy` 而少給鍵，不算鍵集變更）。消費端對不認得的更高 `schema`／`env_schema` 的處理（拒收等）見 `archive/2026-10-24-agent-provider-model-interface/design.md` 決定 6，由 sidecar 側規格承接。
 
 #### Scenario: 同一把的兩個免費模型
 - **WHEN** 分別以 `agent=opencode&provider=opencode-zen&model=mimo-v2.6-flash-free` 與 `agent=opencode&provider=opencode-zen&model=big-pickle` resolve
@@ -435,6 +463,14 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 - **WHEN** 對任一個角色與 agent 取 `GET /v1/roles/{role}?agent=<agent>[&data=…]`，逐個 candidate 以**回覆的 `data`**＋`subscription=<該筆 id>`＋`provider=<該筆 provider>` resolve（`roles` 已把 `data` 與 `floor` 取較嚴）
 - **THEN** 每一筆都不得回 403 `privacy_not_allowed`（`resolve` 不會比 `roles` 更寬）；key 已部署且 model 可推導時回 200
 
+#### Scenario: agy 的 resolve
+- **WHEN** 以 `agent=agy&provider=google&model=<該把的裸 id>` resolve
+- **THEN** 回 200，`meta.subscription` 為 `antigravity`、`meta.kind` 為 `local-login`、`meta.agent` 為 `agy`、`meta.model` 為該 id、`env` 為 `{}`；`env_schema` 仍是 1
+
+#### Scenario: agy 的用量是 not_applicable
+- **WHEN** resolve 成功選中 `antigravity`
+- **THEN** `meta.usage.status` 是 `not_applicable`、`source` 與窗口都是 null，不觸發任何取用量
+
 ### Requirement: resolve 的選把規則
 
 resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
@@ -445,7 +481,7 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
 3.5 有給 `data` 時，候選限於 `privacy` **不低於** `data` 的（`public` < `general` < `real`）；一個都不剩 → 403 `privacy_not_allowed`。沒給 `data` 時此步不作用（完全不過濾）。此步排在 3 與 4 之間（編號記 3.5，4～7 不變，與程式註解同一套編號）。
 4. `model` 有給時，候選限於被 `models.allow` 的樣式（fnmatch）涵蓋的；無一涵蓋 → 403 `model_not_allowed`。`model` 省略時，候選限於**能推導模型**的（kind 為 `claude-subscription`，或 `models.default` 非 null，或 `allow` 至少一個不含萬用字元的樣式）；無一能推導 → 400 `no_model`（釘住時就是該把——同 provider 另一把可推導也不代換）。`claude-subscription`＋default null 算能推導（用 agent 預設、合法 200），所以 `no_model` 只落在非 `claude-subscription` 且 default null、`allow` 全萬用字元的形狀（現行政策沒有這種 provider；單元測試用假政策）。
 5. 沒有釘住時，套 `exclude`（不在政策檔的 id 忽略）；沒有候選 → 409 `no_candidate`。
-6. 排除 key 未部署的候選；全部未部署 → 409 `not_deployed`。
+6. 排除未部署的候選：`kind` 為 `local-login` 的訂閱恆算已部署（不讀 key 檔），其餘仍看 key 是否部署；全部未部署 → 409 `not_deployed`。
 7. 挑 `priority` 最小，同分以 id 排序。
 
 步驟 3.5 排在第 5 步的 409 `no_candidate` 與第 6 步的 409 `not_deployed` **之前**：隱私不足時回 403 `privacy_not_allowed`，不會被 `exclude` 救成 409，也不會因為釘住的那把剛好沒部署 key 變成 409。
@@ -534,6 +570,14 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
 - **WHEN** 同 provider 的兩把 priority 分別是 10（`privacy: public`）與 20（`privacy: real`），以 `data=public` resolve
 - **THEN** 兩把都合格，仍選 priority 10 的那把（`privacy` 不參與排序）
 
+#### Scenario: 沒有 key 也能被選中
+- **WHEN** `antigravity` 在 key 檔裡沒有任何鍵、沒有冷卻，以 `agent=agy&provider=google` resolve
+- **THEN** 回 200 並選中它（kind `local-login` 恆算已部署），不是 409 `not_deployed`
+
+#### Scenario: 只給 claude-code 的 provider 不影響 agy
+- **WHEN** 以 `agent=agy&provider=anthropic` resolve
+- **THEN** 回 403 `agent_not_allowed`（provider 存在，但沒有候選允許 `agy`）
+
 ### Requirement: env 的組成
 
 `env` SHALL 依（provider、kind、agent）組成，只含憑證、端點、模型命名（含 opencode 的 provider id）三類變數；MUST NOT 含呼叫方的維運變數（auto-update 開關、server password、`AGORA_CLAUDE_CMD`、身分變數、`permission`、`instructions`——那些由 sidecar 疊）。鍵集＝下列清單（`env` MUST 只含這些鍵；每鍵的型別／空值／出現條件；sidecar 對不在清單上的鍵見「未知鍵」）：
@@ -547,6 +591,13 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤：
 - `OPENCODE_PROVIDER_ID`（opencode、各 provider）：字串＝opencode 的 provider id（`opencode-zen`→`opencode`、`openrouter`→`openrouter`、`ollama-cloud`→`ollama-cloud`，由 LLMGateway 維護；opencode config 內的模型名＝`<OPENCODE_PROVIDER_ID>/<OPENCODE_MODEL>`，由 sidecar 組）；不可空；必然出現。
 - `OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL`（opencode、各 provider）：字串＝選定的 model（供應商 model id；兩鍵同值）；不可空；僅 model 非 null 時出現。
 
+`kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`）**沒有 env**：`env` MUST 是**空物件 `{}`**——沒有任何鍵，也就 MUST NOT 出現 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`／`OPENCODE_*`。agy 用它自己在那台機器的本機登入，Gateway 不給憑證、不給端點、不給模型變數；模型只走 `meta.model`（sidecar 的 agy driver 只從那裡拿）。實作 MUST 同時寫兩條判斷——`agent` 為 `agy` **或** 該把的 `kind` 為 `local-login`，任一成立就回 `{}`，防線不依賴單一條件；兩條各擋一個方向：
+
+- 只判 `agent`：擋的是「agy 進了某一筆 api-key row」的情形（政策條款被改弱，該把的 `kind` 不是 `local-login`）——沒有這一條就會落進 claude-code 分支、回出 `ANTHROPIC_AUTH_TOKEN`（該把的 key）與 `ANTHROPIC_API_KEY: ""` 佔位；
+- 只判 `kind`：擋的是「`antigravity` 的 `agents` 被改弱成含 `claude-code`」的情形（政策條款被改弱，該把仍是 `local-login` 但 agent 不是 `agy`）——沒有這一條就會以 `agent=claude-code` 落進 claude-code 分支，回出 `ANTHROPIC_AUTH_TOKEN`（該把沒有 key，值是 null）與 `ANTHROPIC_API_KEY: ""` 佔位。
+
+`kind` 是 provider 常數、不是政策資料，所以第二條不隨政策檔改變；`agent` 那條則不隨 provider 表改變——兩條合起來，任一邊被改弱都還是回 `{}`。回 `{}` 是「因 agent／kind 而少給鍵」，**不改鍵集、`env_schema` 維持 1**（見「resolve」）。
+
 opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回 `OPENCODE_CONFIG_CONTENT`，也不回 `baseURL`（`endpoint` 是 provider 根位址，依 #28 不抄進 opencode 的 `options.baseURL`）。model 為 null（agent 自己的預設）時 SHALL 不給模型變數。
 
 **未知鍵與消費端規則**：`env` MUST 只含上述鍵（Gateway 在同一個 `env_schema` 內不得改鍵集）；sidecar 對未知鍵、overlay、`OPENCODE_CONFIG_CONTENT` 的組成、`permission`／`instructions` 的擁有、繼承環境不外漏等**消費端義務**見 `archive/2026-10-24-agent-provider-model-interface/design.md` 決定 2 與決定 6，由 MyLinuxPool 的 sidecar 規格承接（本 spec 只定 Gateway 能實作與驗證的部分）。
@@ -558,6 +609,18 @@ opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回
 #### Scenario: opencode 的兩個模型（片段）
 - **WHEN** 同一把 `opencode-zen` 先後 resolve `mimo-v2.6-flash-free` 與 `big-pickle`
 - **THEN** 兩次 `env` 的 `OPENCODE_PROVIDER_ID` 都是 `opencode`、`OPENCODE_API_KEY` 相同，`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL` 各自是該模型；`env` 不含 `OPENCODE_CONFIG_CONTENT`
+
+#### Scenario: agy 的 env 是空物件
+- **WHEN** 以 `agent=agy&provider=google&model=<該把的裸 id>` resolve，選中 `antigravity`（kind `local-login`）
+- **THEN** `env` 是 `{}`：沒有 `ANTHROPIC_*`（含 `ANTHROPIC_API_KEY` 的空字串佔位）、沒有 `OPENCODE_*`、沒有 `CLAUDE_CODE_OAUTH_TOKEN`；`env_schema` 仍是 1
+
+#### Scenario: 條款被改弱也不會回 claude 的 env
+- **WHEN** 單元測試直接以一筆 api-key provider（例如 `opencode-zen`）呼叫 `build_env("agy", <key>, <model>)`——模擬「`_AGY_ONLY` 條款被改弱、agy 進了 api-key row」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
+- **THEN** `env` 仍是 `{}`、不回任何 `ANTHROPIC_*`／`OPENCODE_*`：`kind` 不是 `local-login`，但 `agent` 為 `agy` 那條判斷成立
+
+#### Scenario: 條款被改弱成含 claude-code 也不會回 claude 的 env
+- **WHEN** 單元測試直接以一個 `kind` 為 `local-login` 的 provider（`GoogleProvider`）呼叫 `build_env("claude-code", null, <model>)`——模擬「`_AGY_ONLY` 條款被改弱、`antigravity` 的 `agents` 含 `claude-code`」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
+- **THEN** `env` 仍是 `{}`、不回任何 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`／`OPENCODE_*`：`agent` 不是 `agy`，但 `kind` 為 `local-login` 那條判斷成立
 
 ### Requirement: model 省略時的語意
 
@@ -574,4 +637,38 @@ opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回
 #### Scenario: 推不出模型
 - **WHEN** model 省略、釘住那把的 default 為 null、`models.allow` 全是萬用字元樣式，且該把的 kind 不是 `claude-subscription`（api-key 形狀；現行政策沒有這種 provider，用假政策測）
 - **THEN** 回 400 `no_model`，不代選
+
+### Requirement: 沒有憑證的訂閱（kind `local-login`）
+
+`kind` 為 `local-login` 的 subscription SHALL 表示憑證由呼叫方那一台機器自己保管（本 change 只有 `antigravity`：agy 用 Mac 本機的 Google 登入，Gateway 不搬、不匯出、不代管）。這一類訂閱：
+
+- MUST NOT 出現在 key 檔，MUST NOT 佔 `KEY_NAMES` 的鍵名；Gateway MUST NOT 為它讀、寫、保管或轉發任何憑證；
+- 「已部署」MUST 以 kind 判定（恆已部署），MUST NOT 讀 key 檔：list 的 `available` 因此只受整把冷卻影響，resolve 的第 6 步 MUST NOT 排除它，`available_again_at` MUST 只由冷卻計算；
+- resolve 的 `env` MUST 是空物件 `{}`（見「env 的組成」）；模型只走 `meta.model`；
+- `get` MUST 回 409 `not_deployed`，不回 `key`（見「get」）；
+- `endpoint` MUST 為 null（見「endpoint 的語意」）；
+- `usage` 為 `not_applicable`（沒有取用量實作）；政策檔的 `usage` 段對它不生效；
+- 稽核紀錄照既有規則記 provider／model；沒有憑證值可記，也不因此新增事件或欄位。
+
+Gateway MUST NOT 把這類訂閱當成「key 未部署」而回 409 `not_deployed`（resolve）或 `available: false`（list）。政策載入 MUST 拒絕這類訂閱的 `agents` 不是剛好 `["agy"]` 的政策檔（條款；見「共通 JSON schema」），也 MUST 拒絕其他訂閱的 `agents` 含 `agy`（否則 api-key 的 row 會用空 env 被選中）。
+
+#### Scenario: list 不因沒有 key 顯示未部署
+- **WHEN** key 檔裡沒有任何 `antigravity` 的鍵，呼叫 list
+- **THEN** 該筆 `available` 為 true（沒有未來冷卻時）、`usage.status` 為 `not_applicable`、`available_again_at` 為 null，且沒有 `key`
+
+#### Scenario: resolve 不讀 key
+- **WHEN** 以 `agent=agy&provider=google` resolve `antigravity`，key 檔裡沒有它的鍵
+- **THEN** 回 200，`env` 為 `{}`；Gateway 沒有對 key 檔做它的查詢（不因 `unknown subscription` 丟錯）
+
+#### Scenario: get 沒有值可給
+- **WHEN** 以 `agent=agy` get `antigravity`
+- **THEN** 回 409 `not_deployed`，body 沒有 `key`
+
+#### Scenario: 稽核沒有憑證
+- **WHEN** 一次成功的 agy resolve 之後檢查稽核紀錄
+- **THEN** 有 subscription、agent、provider、model，沒有任何憑證值；事件種類仍是 `resolve`，沒有新增欄位
+
+#### Scenario: 冷卻仍可用
+- **WHEN** 對 `antigravity` 登錄整把冷卻到未來
+- **THEN** 回 204；list 的 `available` 為 false、`cooldown.until` 照實，`available_again_at` 為該時刻；resolve 仍回 200 並附冷卻資訊（冷卻不擋選把）
 
