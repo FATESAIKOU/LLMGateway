@@ -705,10 +705,25 @@ class ResolveHttpTest(ServerCase):
         )
         keys_path.write_text(canary, encoding="utf-8")
         policy_path = str(self.REPO_ROOT / "policy" / "default.json")
+        # #128：groq 已移出出廠政策；HTTP 端的 groq 行為仍要測，用「出廠政策＋
+        # groq」的臨時政策（程式還在）。
+        policy = json.loads(Path(policy_path).read_text(encoding="utf-8"))
+        policy["subscriptions"]["groq"] = {
+            "priority": 25,
+            "privacy": "public",
+            "agents": ["opencode"],
+            "models": {
+                "allow": ["openai/gpt-oss-120b", "openai/gpt-oss-20b",
+                          "qwen/qwen3.8-27b"],
+                "default": "openai/gpt-oss-120b",
+            },
+        }
+        tmp_policy = root / "policy.json"
+        tmp_policy.write_text(json.dumps(policy), encoding="utf-8")
         self.clock = FakeClock()  # 預設 2026-10-11T00:00:00Z
         self.service = RegistryService(
             str(root / "llm.db"),
-            load_policy(policy_path), KeyStore(str(keys_path)), self.clock,
+            load_policy(str(tmp_policy)), KeyStore(str(keys_path)), self.clock,
         )
         self.base = self.serve(self.service)
 

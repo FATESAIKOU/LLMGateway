@@ -127,7 +127,6 @@ class JsonSchemaTest(RegistryCase):
             "opencode-zen": ("opencode-zen", "api-key", "https://opencode.ai/zen/v1"),
             "opencode-go": ("opencode-go", "api-key",
                             "https://opencode.ai/inference/go/openai/v1"),
-            "groq": ("groq", "api-key", "https://api.groq.com/openai/v1"),
             "ollama-cloud": ("ollama-cloud", "api-key", "https://ollama.com"),
             "antigravity": ("google", "local-login", None),
         }
@@ -148,7 +147,6 @@ class JsonSchemaTest(RegistryCase):
             "ollama-cloud": "https://ollama.com",
             "opencode-zen": "https://opencode.ai/zen/v1",
             "opencode-go": "https://opencode.ai/inference/go/openai/v1",
-            "groq": "https://api.groq.com/openai/v1",
             "antigravity": None,
         }
         agents = {
@@ -157,7 +155,6 @@ class JsonSchemaTest(RegistryCase):
             "ollama-cloud": "opencode",
             "opencode-zen": "opencode",
             "opencode-go": "opencode",
-            "groq": "opencode",
             "antigravity": "agy",
         }
         listed = _by_id(self.list_items())
@@ -204,12 +201,6 @@ class JsonSchemaTest(RegistryCase):
             items["opencode-go"]["models"]["default"],
             "beam-free",
         )
-        # #88：groq 的 allow 只放免費層可用的模型（不含 "*"）
-        self.assertEqual(
-            items["groq"]["models"]["allow"],
-            ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
-        )
-        self.assertEqual(items["groq"]["models"]["default"], "openai/gpt-oss-120b")
 
     def test_get與list照出廠值帶出models_default(self):
         # get 與 list 的回覆逐筆帶出出廠的 models.default（#50 起 claude-personal
@@ -218,7 +209,6 @@ class JsonSchemaTest(RegistryCase):
             "claude-personal": "claude-sonnet-5-5",
             "opencode-zen": "mimo-v2.6-flash-free",
             "opencode-go": "beam-free",
-            "groq": "openai/gpt-oss-120b",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
             "antigravity": "gemini-3.8-flash-low",
@@ -227,7 +217,6 @@ class JsonSchemaTest(RegistryCase):
             "claude-personal": "claude-code",
             "opencode-zen": "opencode",
             "opencode-go": "opencode",
-            "groq": "opencode",
             "openrouter": "opencode",
             "ollama-cloud": "opencode",
             "antigravity": "agy",
@@ -387,7 +376,7 @@ class LocalLoginTest(RegistryCase):
             service.close()
         self.assertEqual(
             [item["id"] for item in items],
-            ["opencode-zen", "opencode-go", "openrouter", "groq", "ollama-cloud",
+            ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud",
              "antigravity", "claude-personal"],
         )
 
@@ -614,7 +603,7 @@ class ListTest(RegistryCase):
         self.assertEqual(priorities, sorted(priorities))
         self.assertEqual(
             [item["id"] for item in items],
-            ["opencode-zen", "opencode-go", "openrouter", "groq", "ollama-cloud",
+            ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud",
              "antigravity", "claude-personal"],
         )
 
@@ -686,8 +675,6 @@ class GetTest(RegistryCase):
         self.assertEqual(self.get("opencode-zen", "opencode")["key"], CANARY["opencode-zen"])
         # #77：opencode-go 與 zen 共用同一個鍵名，get 回同一個值
         self.assertEqual(self.get("opencode-go", "opencode")["key"], CANARY["opencode-zen"])
-        # #88：groq 用自己的鍵名
-        self.assertEqual(self.get("groq", "opencode")["key"], CANARY["groq"])
         self.assertEqual(self.get("ollama-cloud", "claude-code")["key"], CANARY["ollama-cloud"])
 
     def test_ClaudeCode不能拿openrouter(self):
@@ -1485,6 +1472,74 @@ class _FakeApiKeyProvider(lgwd_providers.CredentialProvider):
     opencode_provider_id = "fake-api"
 
 
+# #128：groq 已移出出廠政策（不進輪替），但 GroqProvider、policy 白名單與
+# KEY_NAMES 還在；groq 的程式行為仍要測，所以用「出廠政策＋groq」的臨時政策，
+# 不再依賴出廠政策含 groq。
+GROQ_SUBSCRIPTION = {
+    "priority": 25,
+    "privacy": "public",
+    "agents": ["opencode"],
+    "models": {
+        "allow": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
+        "default": "openai/gpt-oss-120b",
+    },
+}
+
+
+def _policy_with_groq():
+    obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+    obj["subscriptions"]["groq"] = json.loads(json.dumps(GROQ_SUBSCRIPTION))
+    return obj
+
+
+class GroqPolicyResolveTest(RegistryCase):
+    """#128：含 groq 的臨時政策下，groq 的 resolve 行為（程式還在）。"""
+
+    def setUp(self):
+        super().setUp()
+        path = self.root / "policy-with-groq.json"
+        path.write_text(json.dumps(_policy_with_groq()), encoding="utf-8")
+        self.service.close()
+        self.service = RegistryService(self.db_path, load_policy(str(path)),
+                                       self.keys, self.clock)
+
+    def test_groq的env是groq的endpoint與provider_id(self):
+        # #88：groq 走自己的 provider id 與 endpoint，key 是自己的 GROQ_API_KEY
+        payload = self.resolve("opencode", "groq", model="openai/gpt-oss-20b")
+        self.assertEqual(payload["meta"]["subscription"], "groq")
+        self.assertEqual(payload["meta"]["provider"], "groq")
+        self.assertEqual(payload["meta"]["endpoint"],
+                         "https://api.groq.com/openai/v1")
+        env = payload["env"]
+        self.assertEqual(env["OPENCODE_PROVIDER_ID"], "groq")
+        self.assertEqual(env["OPENCODE_API_KEY"], CANARY["groq"])
+        # 供應商 id 含 "/"（openai/gpt-oss-20b）照原樣進模型變數，不切前綴
+        self.assertEqual(env["OPENCODE_MODEL"], "openai/gpt-oss-20b")
+        self.assertEqual(env["OPENCODE_SMALL_MODEL"], "openai/gpt-oss-20b")
+        self.assertNotIn("OPENCODE_CONFIG_CONTENT", payload)
+
+    def test_groq的預設模型(self):
+        payload = self.resolve("opencode", "groq")
+        self.assertEqual(payload["meta"]["model"], "openai/gpt-oss-120b")
+
+    def test_groq_allow以外的模型被拒(self):
+        # Free Plan 的 rate limits 表上沒有的 id（企業方案才有的 llama-3.1-8b-instant）
+        err = self.assert_api_error(
+            403, "model_not_allowed", self.resolve,
+            "opencode", "groq", model="llama-3.1-8b-instant")
+        self.assertNotIn("env", err.body())
+
+    def test_groq只給opencode(self):
+        err = self.assert_api_error(
+            403, "agent_not_allowed", self.resolve, "claude-code", "groq")
+        self.assertNotIn("env", err.body())
+
+    def test_groq沒有usage來源(self):
+        # Groq 沒有公布查剩餘配額的端點 → 沿用預設（not_applicable）
+        payload = self.resolve("opencode", "groq")
+        self.assertEqual(payload["meta"]["usage"]["status"], "not_applicable")
+
+
 class ResolveTest(RegistryCase):
     """spec subscription-registry「resolve」的需求（design 決定 1～4；選把集中 registry）。"""
 
@@ -1888,42 +1943,6 @@ class ResolveTest(RegistryCase):
         err = self.assert_api_error(
             403, "agent_not_allowed", self.resolve, "claude-code", "opencode-go")
         self.assertNotIn("env", err.body())
-
-    def test_groq的env是groq的endpoint與provider_id(self):
-        # #88：groq 走自己的 provider id 與 endpoint，key 是自己的 GROQ_API_KEY
-        payload = self.resolve("opencode", "groq", model="openai/gpt-oss-20b")
-        self.assertEqual(payload["meta"]["subscription"], "groq")
-        self.assertEqual(payload["meta"]["provider"], "groq")
-        self.assertEqual(payload["meta"]["endpoint"],
-                         "https://api.groq.com/openai/v1")
-        env = payload["env"]
-        self.assertEqual(env["OPENCODE_PROVIDER_ID"], "groq")
-        self.assertEqual(env["OPENCODE_API_KEY"], CANARY["groq"])
-        # 供應商 id 含 "/"（openai/gpt-oss-20b）照原樣進模型變數，不切前綴
-        self.assertEqual(env["OPENCODE_MODEL"], "openai/gpt-oss-20b")
-        self.assertEqual(env["OPENCODE_SMALL_MODEL"], "openai/gpt-oss-20b")
-        self.assertNotIn("OPENCODE_CONFIG_CONTENT", payload)
-
-    def test_groq的預設模型(self):
-        payload = self.resolve("opencode", "groq")
-        self.assertEqual(payload["meta"]["model"], "openai/gpt-oss-120b")
-
-    def test_groq_allow以外的模型被拒(self):
-        # Free Plan 的 rate limits 表上沒有的 id（企業方案才有的 llama-3.1-8b-instant）
-        err = self.assert_api_error(
-            403, "model_not_allowed", self.resolve,
-            "opencode", "groq", model="llama-3.1-8b-instant")
-        self.assertNotIn("env", err.body())
-
-    def test_groq只給opencode(self):
-        err = self.assert_api_error(
-            403, "agent_not_allowed", self.resolve, "claude-code", "groq")
-        self.assertNotIn("env", err.body())
-
-    def test_groq沒有usage來源(self):
-        # Groq 沒有公布查剩餘配額的端點 → 沿用預設（not_applicable）
-        payload = self.resolve("opencode", "groq")
-        self.assertEqual(payload["meta"]["usage"]["status"], "not_applicable")
 
     def test_未知provider(self):
         self.assert_api_error(404, "not_found", self.resolve, "opencode", "NoSuchProvider")
@@ -2538,7 +2557,6 @@ class ListUsageTest(UsageRegistryCase):
         self.settle()
         self.assertEqual(self.item("openrouter")["usage"]["status"], "ok")
         self.assertEqual(self.item("opencode-go")["usage"]["status"], "not_applicable")
-        self.assertEqual(self.item("groq")["usage"]["status"], "not_applicable")
 
     def test_schema仍為1且既有欄位不變(self):
         item = self.item("ollama-cloud")
