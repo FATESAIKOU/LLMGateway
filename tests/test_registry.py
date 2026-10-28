@@ -129,6 +129,7 @@ class JsonSchemaTest(RegistryCase):
                             "https://opencode.ai/inference/go/openai/v1"),
             "groq": ("groq", "api-key", "https://api.groq.com/openai/v1"),
             "ollama-cloud": ("ollama-cloud", "api-key", "https://ollama.com"),
+            "antigravity": ("google", "local-login", None),
         }
         items = _by_id(self.list_items())
         for sub, (provider, kind, endpoint) in expected.items():
@@ -148,6 +149,7 @@ class JsonSchemaTest(RegistryCase):
             "opencode-zen": "https://opencode.ai/zen/v1",
             "opencode-go": "https://opencode.ai/inference/go/openai/v1",
             "groq": "https://api.groq.com/openai/v1",
+            "antigravity": None,
         }
         agents = {
             "claude-personal": "claude-code",
@@ -156,12 +158,18 @@ class JsonSchemaTest(RegistryCase):
             "opencode-zen": "opencode",
             "opencode-go": "opencode",
             "groq": "opencode",
+            "antigravity": "agy",
         }
         listed = _by_id(self.list_items())
         self.assertEqual(set(listed), set(expected))
         for sub, endpoint in expected.items():
             with self.subTest(subscription=sub):
                 self.assertEqual(listed[sub]["endpoint"], endpoint)
+                if sub == "antigravity":
+                    # local-login：get 一律 409，端點只在 list 看得到（#107）
+                    self.assert_api_error(
+                        409, "not_deployed", self.get, sub, agents[sub])
+                    continue
                 # get 也一樣（含 key 的那條路）
                 self.assertEqual(self.get(sub, agents[sub])["endpoint"], endpoint)
 
@@ -213,6 +221,7 @@ class JsonSchemaTest(RegistryCase):
             "groq": "openai/gpt-oss-120b",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
+            "antigravity": "gemini-3.8-flash-low",
         }
         agents = {
             "claude-personal": "claude-code",
@@ -221,13 +230,20 @@ class JsonSchemaTest(RegistryCase):
             "groq": "opencode",
             "openrouter": "opencode",
             "ollama-cloud": "opencode",
+            "antigravity": "agy",
         }
         listed = _by_id(self.list_items())
         self.assertEqual(set(listed), set(expected))
         for sub, default in expected.items():
             with self.subTest(subscription=sub):
-                for source, payload in (("list", listed[sub]),
-                                        ("get", self.get(sub, agents[sub]))):
+                sources = [("list", listed[sub])]
+                if sub == "antigravity":
+                    # 沒有憑證的訂閱（local-login）：get 沒有值可交付，一律 409（#107）
+                    self.assert_api_error(
+                        409, "not_deployed", self.get, sub, agents[sub])
+                else:
+                    sources.append(("get", self.get(sub, agents[sub])))
+                for source, payload in sources:
                     self.assertIn("default", payload["models"],
                                   f"{sub} 的 {source} 缺 default 欄")
                     self.assertEqual(payload["models"]["default"], default,
@@ -520,6 +536,69 @@ class LocalLoginTest(RegistryCase):
             {})
 
 
+class FactoryAntigravityTest(RegistryCase):
+    """#107 PR 2（tasks 3.1／3.2）：出廠政策裡真的有一筆 antigravity 的端到端。"""
+
+    MODELS = (
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-high",
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-high",
+        "claude-opus-5-5-low",
+        "claude-opus-5-5-medium",
+        "claude-opus-5-5-high",
+        "claude-sonnet-5-5-low",
+        "claude-sonnet-5-5-medium",
+        "claude-sonnet-5-5-high",
+    )
+
+    def test_resolve12個模型id都回200且env空(self):
+        for model in self.MODELS:
+            with self.subTest(model=model):
+                payload = self.resolve("agy", "google", model=model)
+                self.assertEqual(payload["env"], {})
+                self.assertEqual(payload["env_schema"], 1)
+                meta = payload["meta"]
+                self.assertEqual(meta["subscription"], "antigravity")
+                self.assertEqual(meta["agent"], "agy")
+                self.assertEqual(meta["provider"], "google")
+                self.assertEqual(meta["kind"], "local-login")
+                self.assertEqual(meta["model"], model)
+                self.assertIsNone(meta["endpoint"])
+                self.assertEqual(meta["usage"]["status"], "not_applicable")
+
+    def test_resolve不帶model回政策預設(self):
+        payload = self.resolve("agy", "google")
+        self.assertEqual(payload["meta"]["model"], "gemini-3.8-flash-low")
+        self.assertEqual(payload["env"], {})
+
+    def test_model不在清單回403(self):
+        for model in ("gemini-9-fake", "google/gemini-3.8-flash-low",
+                      "gpt-oss-120b"):
+            with self.subTest(model=model):
+                self.assert_api_error(
+                    403, "model_not_allowed", self.resolve, "agy", "google", model)
+
+    def test_list的available與usage(self):
+        item = _by_id(self.list_items())["antigravity"]
+        self.assertEqual((item["provider"], item["kind"], item["endpoint"]),
+                         ("google", "local-login", None))
+        self.assertTrue(item["available"])
+        self.assertIsNone(item["available_again_at"])
+        self.assertEqual(item["usage"]["status"], "not_applicable")
+        self.assertEqual(item["models"]["default"], "gemini-3.8-flash-low")
+        self.assertEqual(item["models"]["allow"], list(self.MODELS))
+        self.assertNotIn("key", item)
+
+    def test_get回409_not_deployed(self):
+        err = self.assert_api_error(
+            409, "not_deployed", self.get, "antigravity", "agy")
+        self.assertEqual(err.body(), {"error": "not_deployed"})
+        self.assertNotIn("key", err.body())
+
+
 class ListTest(RegistryCase):
     def test_不含秘密(self):
         items = self.list_items()
@@ -536,7 +615,7 @@ class ListTest(RegistryCase):
         self.assertEqual(
             [item["id"] for item in items],
             ["opencode-zen", "opencode-go", "openrouter", "groq", "ollama-cloud",
-             "claude-personal"],
+             "antigravity", "claude-personal"],
         )
 
     def test_冷卻反映在list(self):

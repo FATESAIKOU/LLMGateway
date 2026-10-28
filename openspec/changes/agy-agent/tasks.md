@@ -22,9 +22,10 @@
 
 ## 3. PR 2：打開介面（只動政策資料與文件）
 
-- [ ] 3.1 `policy/default.json` 加 `antigravity`：`priority` 35、`agents: ["agy"]`、`privacy: "public"`、`models.allow` 與 `default` 由本人提供（一模型一 row、裸 id）。**這是 design §3 B（同一份政策、靠自律）的落點**：出廠政策所有實例共用，所以 worker 也會看到這把；若本人改判 A，本項改成「新增 Mac 專用政策範例檔、不動 `policy/default.json`」，並另加兩份政策同步的維護項與測試。驗證：`tests/test_policy.py`（出廠 7 筆、順序、default 被 allow 涵蓋、`agents` 條款）；`tests/test_registry.py`、`tests/test_main.py`（list 7 筆、agy 的 resolve／get）。
-- [ ] 3.2 端到端：以出廠政策起 lgwd，`GET /v1/resolve?agent=agy&provider=google&model=<id>` 回 200、`env` 為 `{}`、`meta.agent`／`meta.provider`／`meta.kind`／`meta.model` 符合；`GET /v1/subscriptions` 的該筆 `available` 為 true、`usage.status` 為 `not_applicable`。驗證：`tests/test_http.py` 的 Resolve/List 端到端。
-- [ ] 3.3 文件：README／`docs/deploy.md` 的政策範例補一筆（不含任何憑證）；**`docs/deploy.md` 寫明 advisory 的限度**——這把只在 Mac 能用，但所有實例的 list 都會顯示 `available: true`，worker 誤用會拿到 200＋空 env 之後 503（design §3 B、proposal Impact）；client docstring 完成。驗證：`git diff --check`、`openspec validate agy-agent --strict`。
+- [x] 3.1 `policy/default.json` 加 `antigravity`：`priority` 35、`agents: ["agy"]`、`privacy: "public"`、`models.allow` 與 `default` 由本人提供（一模型一 row、裸 id）。**這是 design §3 B（同一份政策、靠自律）的落點**：出廠政策所有實例共用，所以 worker 也會看到這把；若本人改判 A，本項改成「新增 Mac 專用政策範例檔、不動 `policy/default.json`」，並另加兩份政策同步的維護項與測試。驗證：`tests/test_policy.py`（出廠 7 筆、順序、default 被 allow 涵蓋、`agents` 條款）；`tests/test_registry.py`、`tests/test_main.py`（list 7 筆、agy 的 resolve／get）。
+  - 落地時依本人 2026-10-28 的裁定調整：訂閱 id 是固定集合，出廠政策只能有**一筆** `antigravity`，所以「一模型一 row」在結構上做不到；本人給的 12 個字面裸 id 全放在同一筆的 `models.allow`，`models.default` 是清單第一項 `gemini-3.8-flash-low`。roles 不納入。
+- [x] 3.2 端到端：以出廠政策起 lgwd，`GET /v1/resolve?agent=agy&provider=google&model=<id>` 回 200、`env` 為 `{}`、`meta.agent`／`meta.provider`／`meta.kind`／`meta.model` 符合；`GET /v1/subscriptions` 的該筆 `available` 為 true、`usage.status` 為 `not_applicable`。驗證：`tests/test_http.py` 的 Resolve/List 端到端。
+- [x] 3.3 文件：README／`docs/deploy.md` 的政策範例補一筆（不含任何憑證）；**`docs/deploy.md` 寫明 advisory 的限度**——這把只在 Mac 能用，但所有實例的 list 都會顯示 `available: true`，worker 誤用會拿到 200＋空 env 之後 503（design §3 B、proposal Impact）；client docstring 完成。驗證：`git diff --check`、`openspec validate agy-agent --strict`。
 
 ## 4. PR 3：等本人（選配）
 

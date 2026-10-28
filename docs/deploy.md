@@ -369,6 +369,44 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 
 `models.default`（非 null）載入時必須被同一筆的 `models.allow` 樣式涵蓋，否則 lgwd 不啟動（fail-closed）。
 
+### 5.9 沒有憑證的訂閱（`antigravity`）的政策範例與限度
+
+`antigravity` 是 agy（Antigravity CLI）用的訂閱：**沒有憑證**，agy 自己在 Mac 上用本機登入，Gateway 不代管、不匯出 OAuth 憑證。它的 `kind` 是 `local-login`、`endpoint` 為 `null`，`agents` 只能剛好是 `["agy"]`；`get` 對它一律回 409 `not_deployed`（沒有可交付的值）；模型只走 resolve 的 `meta.model`（裸 id，不能帶 `agy/` 或 `google/` 前綴）。
+
+政策檔的一筆範例如下（只有 id，不含任何憑證）：
+
+```json
+"antigravity": {
+  "priority": 35,
+  "privacy": "public",
+  "agents": ["agy"],
+  "models": {
+    "allow": [
+      "gemini-3.8-flash-low",
+      "gemini-3.8-flash-medium",
+      "gemini-3.8-flash-high",
+      "gemini-4-argon-low",
+      "gemini-4-argon-medium",
+      "gemini-4-argon-high",
+      "claude-opus-5-5-low",
+      "claude-opus-5-5-medium",
+      "claude-opus-5-5-high",
+      "claude-sonnet-5-5-low",
+      "claude-sonnet-5-5-medium",
+      "claude-sonnet-5-5-high"
+    ],
+    "default": "gemini-3.8-flash-low"
+  }
+}
+```
+
+`models.allow` 寫的是**字面 id**（不含萬用字元）：清單外的 id（含帶前綴的）在 resolve 就是 403 `model_not_allowed`，錯誤不會延到 agy 才爆。`models.default` 是 `model` 省略時的推導值，必須被同一筆的 `allow` 涵蓋。
+
+> [!IMPORTANT]
+> **限度（advisory，不是存取控制）：這把只在 Mac 能用，但 Gateway 擋不住誤用。**
+> 出廠政策是所有實例共用的一份（同一份 `policy/default.json`），所以 worker 實例的 `GET /v1/subscriptions` 也會對 `antigravity` 顯示 `available: true`、`usage.status` 為 `not_applicable`——那是「沒有憑證但恆算已部署」，不是「這台可以用」。worker 誤用時會拿到 200 與空的 `env`，直到 agy 在該台找不到而失敗（503）才會發現。Gateway 沒有呼叫方／主機概念，也不做應用層認證（只有 loopback＋SSH 轉發），因此「只給 Mac」只能靠部署與自律（worker 的 sidecar 不要求 agy），不能寫成擋得住。
+
+
 ## 6. 故障排除
 
 ### 6.1 不需要設定 `XDG_RUNTIME_DIR` 或 `DBUS`

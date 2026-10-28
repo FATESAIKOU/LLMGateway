@@ -55,13 +55,14 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         order = [s.name for s in policy.in_priority_order()]
         self.assertEqual(order, ["opencode-zen", "opencode-go", "openrouter", "groq",
-                                 "ollama-cloud", "claude-personal"])
+                                 "ollama-cloud", "antigravity", "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
         self.assertEqual(policy.subscriptions["openrouter"].models_allow,
                          ("*:free", "openrouter/free"))
         self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
         self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
+        self.assertEqual(policy.subscriptions["antigravity"].agents, ("agy",))
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
         self.assertFalse(hasattr(policy, "cooldown_buffer_seconds"))  # 窗口欄位拿掉
         self.assertFalse(hasattr(policy, "resets_at_max_ahead_seconds"))
@@ -71,10 +72,10 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         self.assertEqual(set(policy.subscriptions),
                          {"claude-personal", "opencode-zen", "opencode-go",
-                          "openrouter", "groq", "ollama-cloud"})
+                          "openrouter", "groq", "ollama-cloud", "antigravity"})
         self.assertEqual([s.name for s in policy.in_priority_order()],
                          ["opencode-zen", "opencode-go", "openrouter", "groq",
-                          "ollama-cloud", "claude-personal"])
+                          "ollama-cloud", "antigravity", "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].models_default,
                          "claude-sonnet-5-5")
 
@@ -88,11 +89,11 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertIn("openrouter/free", or_sub.models_allow)
         self.assertEqual(len(or_sub.models_allow), 2)
 
-    def test_出廠六筆訂閱的models_default(self):
-        # 出廠政策檔逐筆釘住：六筆各自有 default（#50 起 claude-personal 預設
-        # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go；#88 加 groq）。
-        # 非 null 的 default 必須被同一筆的 allow 樣式涵蓋（allow 是 fnmatch 樣式；
-        # lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
+    def test_出廠七筆訂閱的models_default(self):
+        # 出廠政策檔逐筆釘住：七筆各自有 default（#50 起 claude-personal 預設
+        # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go；#88 加 groq；
+        # #107 加 antigravity）。非 null 的 default 必須被同一筆的 allow 樣式涵蓋
+        # （allow 是 fnmatch 樣式；lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         expected = {
             "claude-personal": "claude-sonnet-5-5",
@@ -101,6 +102,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
             "openrouter": "openrouter/free",
             "groq": "openai/gpt-oss-120b",
             "ollama-cloud": "deepseek-v4.1-flash",
+            "antigravity": "gemini-3.8-flash-low",
         }
         self.assertEqual(set(policy.subscriptions), set(expected))
         for name, default in expected.items():
@@ -164,6 +166,47 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(_covered(groq, "qwen/qwen3.8-27b"))
         self.assertFalse(_covered(groq, "llama-3.1-8b-instant"))  # Free Plan 表上沒有
         self.assertFalse(_covered(groq, "meta-models/muse-spark-open"))
+
+    def test_antigravity出廠12個字面模型id(self):
+        # #107 本人裁定：本人從 `agy models` 抄的 12 個裸 id，照抄、不增不減不改。
+        # 出廠政策只放字面 id（不含萬用字元）：錯字在 resolve 就是 403，不會延到 agy。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        sub = policy.subscriptions["antigravity"]
+        expected = (
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-high",
+            "gemini-4-argon-low",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+            "claude-opus-5-5-low",
+            "claude-opus-5-5-medium",
+            "claude-opus-5-5-high",
+            "claude-sonnet-5-5-low",
+            "claude-sonnet-5-5-medium",
+            "claude-sonnet-5-5-high",
+        )
+        self.assertEqual(sub.models_allow, expected)
+        self.assertEqual(sub.models_default, "gemini-3.8-flash-low")
+        self.assertEqual(sub.agents, ("agy",))
+        self.assertEqual(sub.priority, 35)
+        self.assertEqual(sub.privacy, "public")
+        for model_id in expected:
+            with self.subTest(model=model_id):
+                self.assertTrue(_covered(sub, model_id))
+                self.assertNotIn("*", model_id)
+                self.assertNotIn("?", model_id)
+        # 不在清單裡的（含前綴與 GPT-OSS）都不被涵蓋
+        self.assertFalse(_covered(sub, "gemini-9-fake"))
+        self.assertFalse(_covered(sub, "google/gemini-3.8-flash-low"))
+        self.assertFalse(_covered(sub, "gpt-oss-120b"))
+
+    def test_roles不含antigravity(self):
+        # #107 本人裁定：roles 不納入（不改 roles 段）。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        for role, rp in policy.roles.items():
+            with self.subTest(role=role):
+                self.assertNotIn("antigravity", rp.order)
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -607,6 +650,7 @@ class RoleAndPrivacyPolicyTests(PolicyValidationTests):
                 "openrouter": "public",
                 "groq": "public",
                 "ollama-cloud": "real",
+                "antigravity": "public",
             },
         )
         self.assertEqual(
