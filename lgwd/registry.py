@@ -2,6 +2,8 @@
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；另帶 usage／available_again_at（#60）；
 - get_subscription(id, agent)：一筆的共通 JSON，含 key（agent 必填、要在該筆的 agents 裡、key 要已部署）；
+- kind 為 local-login 的訂閱（#107）沒有憑證：部署由 kind 判定（恆已部署，不讀 key 檔），
+  get 一律回 409 not_deployed；list／resolve／roles 都不碰它的 key（key 檔不認得它）。
 - role_candidates(role, agent, data)：角色的候選投影（#100；spec role-allocation）。照政策
   roles.<role>.order 篩 agents 與 privacy（不低於 data 與 floor 取較嚴者），回
   {schema, role, data, agent, candidates}；每筆 {id, provider, rank, privacy, available,
@@ -180,7 +182,7 @@ class RegistryService:
                     "provider": provider_for(name).provider,
                     "rank": len(candidates) + 1,
                     "privacy": sub.privacy,
-                    "available": self._keys.deployed(name) and cooldown is None,
+                    "available": self._deployed(name) and cooldown is None,
                     "cooldown": cooldown,
                     "model_cooldowns": self._model_cooldowns(cur, name, now),
                 })
@@ -219,11 +221,17 @@ class RegistryService:
         candidates = self._pick(agent, provider, model, subscription, exclude, data)
 
         # 步驟 6：key 未部署的候選排除；全部未部署 → 409。
+        # kind 為 local-login 的訂閱恆算已部署，這裡 MUST NOT 讀它的 key（key 檔不認得
+        # 它，讀了會丟 KeyFileError）；它的 key 欄位留 None，build_env 照樣回 {}。
         # 每把只在這裡讀一次 key（None＝未部署），後面沿用同一份值：deployed() 與
         # get() 分兩次讀的話，中間換檔會讓 200 帶 null 憑證（TOCTOU）。
-        candidates = [(sub, info, value, self._keys.get(sub.name))
-                      for sub, info, value in candidates]
-        candidates = [item for item in candidates if item[3] is not None]
+        candidates = [
+            (sub, info, value,
+             None if info.kind == "local-login" else self._keys.get(sub.name))
+            for sub, info, value in candidates
+        ]
+        candidates = [item for item in candidates
+                      if item[3] is not None or item[1].kind == "local-login"]
         if not candidates:
             raise not_deployed()
 
@@ -268,7 +276,11 @@ class RegistryService:
         }
 
     def get_subscription(self, subscription: str, agent: str | None) -> dict:
-        """GET /v1/subscriptions/{id}?agent=：一筆的共通 JSON，含 key。"""
+        """GET /v1/subscriptions/{id}?agent=：一筆的共通 JSON，含 key。
+
+        kind 為 local-login 的訂閱沒有憑證，在讀 key 之前就回 409 not_deployed
+        （不回 200 帶 key: null；見 spec「get」）。
+        """
         if not isinstance(agent, str) or not agent:
             raise bad_request(missing=["agent"])
         sub_policy = self._policy.subscriptions.get(subscription)
@@ -276,6 +288,8 @@ class RegistryService:
             raise not_found()
         if agent not in sub_policy.agents:
             raise agent_not_allowed()
+        if self._is_local_login(subscription):
+            raise not_deployed()
         key = self._keys.get(subscription)
         if key is None:
             raise not_deployed()
@@ -358,6 +372,16 @@ class RegistryService:
         return moment
 
     # --- 內部 ---
+    def _is_local_login(self, subscription: str) -> bool:
+        """沒有憑證的訂閱（kind local-login）：部署由 kind 判定，MUST NOT 讀 key 檔。"""
+        return provider_for(subscription).kind == "local-login"
+
+    def _deployed(self, subscription: str) -> bool:
+        """該把是否已部署：local-login 恆為已部署，其餘照 keys.deployed（#107）。"""
+        if self._is_local_login(subscription):
+            return True
+        return self._keys.deployed(subscription)
+
     def _safe_usage(self, subscription: str) -> dict:
         """resolve meta 用：任何錯誤都回 unknown／internal，不拖累 resolve（#60）。"""
         try:
@@ -378,7 +402,7 @@ class RegistryService:
             usage = self._usage.usage_for(item["id"])
             cooldown = item["cooldown"]
             until = from_rfc3339(cooldown["until"]) if cooldown else None
-            return usage, available_again_at(usage, until, now, self._keys.deployed(item["id"]))
+            return usage, available_again_at(usage, until, now, self._deployed(item["id"]))
         except Exception as exc:
             _LOG.warning("usage unavailable for %s: %s", item["id"], type(exc).__name__)
             return internal_usage(self._source_of(item["id"])), None
@@ -481,7 +505,7 @@ class RegistryService:
         provider = provider_for(subscription)
         cooldown = self._cooldown(cur, subscription, now)
         model_cooldowns = self._model_cooldowns(cur, subscription, now)
-        deployed = True if key is not None else self._keys.deployed(subscription)
+        deployed = True if key is not None else self._deployed(subscription)
         item = {
             "schema": SCHEMA_VERSION,
             "id": subscription,

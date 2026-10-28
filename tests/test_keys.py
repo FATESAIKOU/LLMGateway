@@ -53,7 +53,9 @@ class KeyStoreBasicTests(unittest.TestCase):
         with self.assertRaises(KeyFileError):
             KeyStore(str(Path(self.tmpdir.name) / "no-such-file.env"))
 
-    def test_key_names_cover_all_subscriptions(self):
+    def test_key_names_cover_all_subscriptions_with_keys(self):
+        # 集合斷言不變（只改名字）：有憑證的訂閱都在 KEY_NAMES。antigravity 是沒有
+        # 憑證的訂閱（kind local-login），不在這裡、也沒有新增任何鍵名。
         self.assertEqual(
             set(KEY_NAMES),
             {"claude-personal", "claude-company", "openrouter", "opencode-zen",

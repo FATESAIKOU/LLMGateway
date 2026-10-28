@@ -134,7 +134,12 @@
 - `OPENCODE_PROVIDER_ID`（opencode、各 provider）：字串＝opencode 的 provider id（`opencode-zen`→`opencode`、`openrouter`→`openrouter`、`ollama-cloud`→`ollama-cloud`，由 LLMGateway 維護；opencode config 內的模型名＝`<OPENCODE_PROVIDER_ID>/<OPENCODE_MODEL>`，由 sidecar 組）；不可空；必然出現。
 - `OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL`（opencode、各 provider）：字串＝選定的 model（供應商 model id；兩鍵同值）；不可空；僅 model 非 null 時出現。
 
-`kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`）**沒有 env**：`env` MUST 是**空物件 `{}`**——沒有任何鍵，也就 MUST NOT 出現 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`／`OPENCODE_*`。agy 用它自己在那台機器的本機登入，Gateway 不給憑證、不給端點、不給模型變數；模型只走 `meta.model`（sidecar 的 agy driver 只從那裡拿）。實作 MUST 同時寫兩條判斷——`agent` 為 `agy` **或** 該把的 `kind` 為 `local-login`，任一成立就回 `{}`，防線不依賴單一條件：只判 `agent` 時，若政策條款被改弱（agy 進了某一筆 api-key row）就會落進 claude-code 分支、回出 `ANTHROPIC_AUTH_TOKEN`（該把的 key）與 `ANTHROPIC_API_KEY: ""` 佔位；`kind` 是 provider 常數、不是政策資料，多這一條就擋得住。回 `{}` 是「因 agent／kind 而少給鍵」，**不改鍵集、`env_schema` 維持 1**（見「resolve」）。
+`kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`）**沒有 env**：`env` MUST 是**空物件 `{}`**——沒有任何鍵，也就 MUST NOT 出現 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`／`OPENCODE_*`。agy 用它自己在那台機器的本機登入，Gateway 不給憑證、不給端點、不給模型變數；模型只走 `meta.model`（sidecar 的 agy driver 只從那裡拿）。實作 MUST 同時寫兩條判斷——`agent` 為 `agy` **或** 該把的 `kind` 為 `local-login`，任一成立就回 `{}`，防線不依賴單一條件；兩條各擋一個方向：
+
+- 只判 `agent`：擋的是「agy 進了某一筆 api-key row」的情形（政策條款被改弱，該把的 `kind` 不是 `local-login`）——沒有這一條就會落進 claude-code 分支、回出 `ANTHROPIC_AUTH_TOKEN`（該把的 key）與 `ANTHROPIC_API_KEY: ""` 佔位；
+- 只判 `kind`：擋的是「`antigravity` 的 `agents` 被改弱成含 `claude-code`」的情形（政策條款被改弱，該把仍是 `local-login` 但 agent 不是 `agy`）——沒有這一條就會以 `agent=claude-code` 落進 claude-code 分支，回出 `ANTHROPIC_AUTH_TOKEN`（該把沒有 key，值是 null）與 `ANTHROPIC_API_KEY: ""` 佔位。
+
+`kind` 是 provider 常數、不是政策資料，所以第二條不隨政策檔改變；`agent` 那條則不隨 provider 表改變——兩條合起來，任一邊被改弱都還是回 `{}`。回 `{}` 是「因 agent／kind 而少給鍵」，**不改鍵集、`env_schema` 維持 1**（見「resolve」）。
 
 opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回 `OPENCODE_CONFIG_CONTENT`，也不回 `baseURL`（`endpoint` 是 provider 根位址，依 #28 不抄進 opencode 的 `options.baseURL`）。model 為 null（agent 自己的預設）時 SHALL 不給模型變數。
 
@@ -155,6 +160,10 @@ opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回
 #### Scenario: 條款被改弱也不會回 claude 的 env
 - **WHEN** 單元測試直接以一筆 api-key provider（例如 `opencode-zen`）呼叫 `build_env("agy", <key>, <model>)`——模擬「`_AGY_ONLY` 條款被改弱、agy 進了 api-key row」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
 - **THEN** `env` 仍是 `{}`、不回任何 `ANTHROPIC_*`／`OPENCODE_*`：`kind` 不是 `local-login`，但 `agent` 為 `agy` 那條判斷成立
+
+#### Scenario: 條款被改弱成含 claude-code 也不會回 claude 的 env
+- **WHEN** 單元測試直接以一個 `kind` 為 `local-login` 的 provider（`GoogleProvider`）呼叫 `build_env("claude-code", null, <model>)`——模擬「`_AGY_ONLY` 條款被改弱、`antigravity` 的 `agents` 含 `claude-code`」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
+- **THEN** `env` 仍是 `{}`、不回任何 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`／`OPENCODE_*`：`agent` 不是 `agy`，但 `kind` 為 `local-login` 那條判斷成立
 
 ### Requirement: 登錄冷卻
 `POST /v1/subscriptions/{id}/cooldown {until[, model]}` SHALL 登錄冷卻：

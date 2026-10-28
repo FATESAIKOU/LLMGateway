@@ -2,6 +2,8 @@
 
 load_policy(path) 讀 JSON、驗證、回傳 Policy；不合法丟 PolicyError。
 政策檔只管 priority、agents、models（與 provider 有關的欄位在 lgwd/providers.py）。
+訂閱 id 是固定集合（SUBSCRIPTIONS）；其中 antigravity 是沒有憑證的訂閱（provider 的
+kind 為 local-login），只給 agy（#107）。
 PolicyError 的訊息只用固定字串與固定的訂閱 id，不回顯檔案裡的其他字串（值永不進例外）。
 
 載入時機：只在啟動時（lgwd 啟動失敗就不啟動）。v5 沒有熱重載、沒有 SIGHUP，
@@ -16,8 +18,8 @@ import json
 from dataclasses import dataclass, field
 
 SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "opencode-go",
-                 "groq", "openrouter", "ollama-cloud")
-AGENTS = ("claude-code", "opencode")
+                 "groq", "openrouter", "ollama-cloud", "antigravity")
+AGENTS = ("claude-code", "opencode", "agy")
 
 # 隱私等級（public < general < real）；缺省 public（fail-closed）。
 PRIVACY_LEVELS = ("public", "general", "real")
@@ -28,6 +30,9 @@ ROLES = ("PMO", "PM", "impl", "rev", "qa")
 # 條款與設計的否定約束（固定字串的錯誤訊息）
 _CLAUDE_ONLY = ("claude-personal", "claude-company")
 _OPENCODE_ONLY = ("opencode-zen", "opencode-go", "groq")
+# 沒有憑證的訂閱（kind local-login，#107）：agents 只能剛好是 ("agy",)，
+# 其他訂閱的 agents 也 MUST NOT 含 agy（否則 api-key 的 row 會用空 env 被選中）。
+_AGY_ONLY = ("antigravity",)
 
 
 _OPENROUTER_ALLOW = ("*:free", "openrouter/free")
@@ -229,6 +234,8 @@ def load_policy(path: str) -> Policy:
       Claude Code 接法；groq 的端點是 OpenAI 相容，見 providers.py）；
     - openrouter 的 agents 只能剛好是 ["opencode"]（免費模型只經過 opencode；design 決定 3）；
     - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
+    - antigravity（沒有憑證的訂閱）的 agents 只能剛好是 ["agy"]（條款）；其他訂閱的
+      agents 不能含 agy；
     - 非 null 的 models.default 必須被同一筆的 models.allow 樣式涵蓋（fnmatch；fail-closed）；
     - priority 為非負整數；cooldown 的 until 上限為正整數；
     - 選填的頂層 `usage`（#60）：見 _parse_usage，不合法 fail-closed。
@@ -260,6 +267,14 @@ def load_policy(path: str) -> Policy:
     for name in _OPENCODE_ONLY:
         if name in parsed_subs and parsed_subs[name].agents != ("opencode",):
             raise PolicyError(f"{name} must only allow opencode")
+    for name in _AGY_ONLY:
+        if name in parsed_subs and parsed_subs[name].agents != ("agy",):
+            raise PolicyError("antigravity must only allow agy")
+    for name, sub in parsed_subs.items():
+        if name not in _AGY_ONLY and "agy" in sub.agents:
+            # 反向的條款：agy 只准出現在沒有憑證的訂閱；不然 api-key 的 row 會用
+            # 空 env 被選中（spec「共通 JSON schema」）。
+            raise PolicyError("agy is only allowed for antigravity")
     if "openrouter" in parsed_subs and parsed_subs["openrouter"].agents != ("opencode",):
         # 免費模型只經過 opencode（v5 既有 MUST，本 change 補上檢查；design 決定 3）。
         raise PolicyError("openrouter must only allow opencode")

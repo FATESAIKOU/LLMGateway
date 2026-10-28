@@ -7,6 +7,7 @@
     client.resolve("opencode", "opencode-zen", model="big-pickle")
     client.resolve("opencode", "opencode-zen", model="big-pickle", data="public")
     client.resolve("claude-code", "anthropic", subscription="claude-personal")
+    client.resolve("agy", "google", model="<agy models 的裸 id>")
     client.roles("impl", "opencode", data="public")
     client.get("claude-personal", "claude-code")
     client.cooldown("claude-personal", "2026-10-12T03:00:00Z")
@@ -22,6 +23,9 @@
   （#100；spec role-allocation。data 省略時不帶參數，由服務取最嚴）
 - get(id, agent) → GET /v1/subscriptions/{id}?agent={agent}（過渡期；resolve 的
   並存夥伴，移除在 d 單）
+- agy（agent=agy、provider=google）的訂閱沒有憑證（kind local-login）：resolve 的
+  env 是空物件 {}，模型只走 meta.model；get 對它一律回 409 not_deployed（沒有可
+  交付的值），不是 200 帶 null。
 - cooldown(id, until, model=None) → POST /v1/subscriptions/{id}/cooldown，body
   {"until": RFC 3339 UTC}（有給 model 時多一個 "model"）；成功 204。model 是供應商
   自己的模型 id（不帶 agent 前綴）；沒有 model 即整把冷卻。
