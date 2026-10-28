@@ -97,7 +97,7 @@
 - **THEN** 候選與加這筆之前相同（`antigravity` 的 `agents` 不含 `opencode`，也不會被選進來）
 
 ### Requirement: 額度的顯示不新增端點
-額度資料 SHALL 只由 `list` 與 `resolve` 的 `meta` 的 `usage` 提供（形狀與規則見 `usage-reporting`），`roles` 不提供；呈現層以 `id` 合併 `list` 與 `roles`。`usage.status` 為 `not_applicable` 的訂閱（本 change 呈現的 `opencode-zen`、`opencode-go`；`list` 裡的 `groq` 同為 `not_applicable`，只是不進輪替）MUST NOT 被呈現成「剩 100%」或任何數字；呈現層 MUST 標示「無額度 API」，並可附 `cooldown`／`model_cooldowns`。呈現入口為 `lgwctl` 的 `usage` 子命令。
+額度資料 SHALL 只由 `list` 與 `resolve` 的 `meta` 的 `usage` 提供（形狀與規則見 `usage-reporting`），`roles` 不提供；呈現層以 `id` 合併 `list` 與 `roles`。`usage.status` 為 `not_applicable` 的訂閱（本 change 呈現的 `opencode-zen`、`opencode-go`）MUST NOT 被呈現成「剩 100%」或任何數字；呈現層 MUST 標示「無額度 API」，並可附 `cooldown`／`model_cooldowns`。呈現入口為 `lgwctl` 的 `usage` 子命令。
 
 #### Scenario: zen 的額度欄
 - **WHEN** 渲染 `opencode-zen`（`usage.status` 是 `not_applicable`）
