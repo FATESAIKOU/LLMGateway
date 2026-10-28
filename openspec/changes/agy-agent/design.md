@@ -6,7 +6,11 @@
 
 ### 1.1 agent 詞彙：`AGENTS` 加 `agy`
 
-現況 `lgwd/policy.py:20`：`AGENTS = ("claude-code", "opencode")`。改成三個，`agy` 放最後（順序無語意）。所有 `agent not in AGENTS` 的路徑一起變：
+現況 `lgwd/policy.py:20`：`AGENTS = ("claude-code", "opencode")`。改成三個，`agy` 放最後（順序無語意）。
+
+**同一支檔還有第二個白名單，必須一起改：`SUBSCRIPTIONS`（`lgwd/policy.py:18`，訂閱 id 的固定集合）。** 政策載入對 `subscriptions` 的每個鍵逐筆檢查（`lgwd/policy.py:253-255`：`for name in subs:`／`if name not in SUBSCRIPTIONS:`／`raise PolicyError("policy.subscriptions has unknown key")`），`load_policy` 的 docstring 也寫「`subscriptions` 的鍵只能是 `SUBSCRIPTIONS`」（`lgwd/policy.py:226`）。它沒加 `antigravity` 的話：含新 row 的政策檔（含**測試用的臨時政策 JSON**）一律 `PolicyError`、lgwd 不啟動，`_AGY_ONLY` 的條款（§1.3）也永遠走不到（`parsed_subs` 還沒建起來就失敗）；PR 2 把它放進出廠政策則等於 lgwd 起不來。所以 **`AGENTS`、`SUBSCRIPTIONS`、`_AGY_ONLY`、`PROVIDERS` 四處（加上 docstring）必須在同一個 PR 落地**（§5.3 PR 1）。訂閱 id 是固定集合這件事也寫進 spec「共通 JSON schema」，讓日後新增 kind／訂閱的人看得到。`SUBSCRIPTIONS` 的順序沒有語意（政策檔的鍵是物件，順序由 `priority` 決定）。
+
+`AGENTS` 改成三個之後，所有 `agent not in AGENTS` 的路徑一起變：
 
 - 政策驗證 `lgwd/policy.py:112`：`agents` 清單只收 `AGENTS` 的值，新 row 的 `["agy"]` 才合法。
 - resolve `lgwd/registry.py:407`：`agent=agy` 從 400 變成可進入選把；其他未知值仍 400。
@@ -23,7 +27,7 @@
 | B | `antigravity` | `antigravity` | 命名更精確、避開未來 Gemini API key 的 `google`；代價是 MLP 文件與呼叫端要改 |
 | C | `agy` | `google` | id 與 agent 同名，較短 |
 
-建議 A 的理由：sidecar 送 `provider=google` 被 400 的那次（OUT-research-486 §2.5 問題 1、§3.2），只要 Gateway 登錄 `google` 就通了；且 resolve 的 `meta.provider` 必須等於請求值（MLP 的 `modules/sidecar/src/sidecar/sources.py:396-399`，引在報告），兩邊對名字的認知不一致時 sidecar 會把 200 當 503。同名風險（推論）：日後再加 Gemini API key 的 row（`kind=api-key`、provider 也 `google`）時，`_pick` 會把兩把都列為候選再用 `agents` 篩（`lgwd/registry.py:426-438`）——agy 只准 `agy`、API key 只准 `opencode`，不會串；不想共享命名空間就選 B。
+建議 A 的理由：sidecar 那次送 `provider=google` 被拒（OUT-research-486 §2.5 問題 1、§3.2），只要 Gateway 登錄 `google` 就通了；且 resolve 的 `meta.provider` 必須等於請求值（MLP 的 `modules/sidecar/src/sidecar/sources.py:396-399`，引在報告），兩邊對名字的認知不一致時 sidecar 會把 200 當 503。**被拒的碼是 404，不是 400**：`provider=google` 今天沒有任何 subscription，resolve 走到選把第 2 步（`lgwd/registry.py:426-438`，`if not candidates: raise not_found()`）→ 404 `not_found`；proposal Impact 也寫 404。OUT-research-486.md:226 寫「Gateway 若沒有這個 provider 就是 400」，與本 repo 程式不符（MLP 報告的偏差，本設計以程式為準）。同名風險（推論）：日後再加 Gemini API key 的 row（`kind=api-key`、provider 也 `google`）時，`_pick` 會把兩把都列為候選再用 `agents` 篩（`lgwd/registry.py:426-438`）——agy 只准 `agy`、API key 只准 `opencode`，不會串；不想共享命名空間就選 B。
 MLP 帶 `provider`＋`model` 時只打一支 `GET /v1/resolve?agent=agy&provider=google&model=<裸 id>`（OUT-research-486 §2.1 的原樣字串），不帶 `subscription`／`exclude`；`harness:false` 是 sidecar 的 body，不經 Gateway。
 
 `endpoint` MUST 為 `null`（agy 自己連 Google，Gateway 不代理）；`validate_endpoints` 對 `None` 直接跳過（`lgwd/providers.py:180-181`）。`PROVIDERS`（`lgwd/providers.py:151-159`）加一筆 `GoogleProvider`：`provider="google"`、`kind="local-login"`、`endpoint=None`、`opencode_provider_id=""`。
@@ -51,9 +55,11 @@ sidecar 的 agy driver **只從 `meta.model` 拿模型**（MLP 的 `modules/side
 
 ## 2. 「不需 key」的機制
 
-### 2.1 現況四個卡點
+### 2.1 現況卡點（registry 四個呼叫點＋`main.py` 兩個）
 
 `keys.get`／`deployed` 先查 `KEY_NAMES`，未登記就 `KeyFileError("unknown subscription")`（`lgwd/keys.py:81-99`）；resolve 步驟 6 用「`keys.get(...)` 非 None」當已部署（`lgwd/registry.py:224-228`）；list 的 `available`、`available_again_at`、`_item` 都呼叫 `deployed`（`:183`、`:381`、`:484`），`_usage_fields` 的例外會被吞成 `unknown/internal`；`get` 直接讀 key 後回 `key`（`:279-284`）。原樣（`lgwd/registry.py:226-228`）：`candidates = [item for item in candidates if item[3] is not None]`／`if not candidates:`／`raise not_deployed()`。
+
+還有**兩個呼叫點在 `lgwd/main.py`**，registry 那四個之外：`_make_usage` 把 `deployed=lambda name: self._keys.deployed(name)` 交給 `UsageService`（`lgwd/main.py:240`），`_usage_key` 直接 `return self._keys.get(subscription)`（`lgwd/main.py:245`）。今天它們**不會**對 `antigravity` 觸發，因為 `UsageService.usage_for` 對「沒有 fetcher」的訂閱先 `return _not_applicable()`（`lgwd/usage.py:203-205`），根本不進 `_deployed`／`key_of`。這是一條**隱性不變式**：「`GoogleProvider` 永遠不提供 fetcher（`make_usage_fetcher` 回 None），所以 local-login 的訂閱不會被詢問已部署或取 key」。日後有人給 agy 加 fetcher，`keys.deployed("antigravity")`／`keys.get("antigravity")` 會丟 `KeyFileError("unknown subscription")`，在用量執行緒被吞成 `unknown`／`internal`（`:218`）——症狀是「用量壞掉」，不容易追。所以：(1) `GoogleProvider` MUST NOT 覆寫 `make_usage_fetcher`（預設回 None，`lgwd/providers.py` 的基底類別）；(2) tasks 2.5 加一條測試斷言 `provider_for("antigravity").make_usage_fetcher(...)` 為 None（守住不變式，而不是靠沒人改）；(3) 不為了這條去改 `main.py` 的兩個 lambda（那會讓「每個訂閱都有 key」的既有假設擴散）。
 
 ### 2.2 選項
 
@@ -64,7 +70,7 @@ sidecar 的 agy driver **只從 `meta.model` 拿模型**（MLP 的 `modules/side
 ### 2.3 要寫進 spec 的規則（建議）
 
 - kind `local-login` ⇒ 恆已部署：list 的 `available` 只受整把冷卻影響；`available_again_at` 只由冷卻算；resolve 步驟 6 不排除它、不讀 key。
-- resolve 的 `env` 恆 `{}`：`build_env` 在 `agent == "agy"`（或 `kind == "local-login"`）直接回空字典，不落進 `lgwd/providers.py:67-84` 的 `ANTHROPIC_*` 分支。模型只走 `meta.model`。
+- resolve 的 `env` 恆 `{}`：`build_env` 在 **`agent == "agy"` 或 `self.kind == "local-login"`**（兩個判斷都要寫在程式裡，任一成立即回）直接回空字典，不落進 `lgwd/providers.py:67-84` 的 `ANTHROPIC_*` 分支。**兩條判斷都要**是刻意的、防線不依賴單一條件：只判 `agent` 的話，日後有人把 agy 加進某一筆 api-key row（政策條款被改弱的假設情況）就會走 claude-code 分支回 `ANTHROPIC_AUTH_TOKEN`＝該把的 key 加 `ANTHROPIC_API_KEY: ""` 佔位；加了 `kind` 那條，`kind` 是 provider 常數、不是政策資料（§2.2），政策檔再怎麼改都還是回 `{}`。反過來只判 `kind` 的話，日後任何新 agent 拿到 local-login row 也會得到 `{}`（未必是它要的，但方向安全：不給憑證）；再加 `agent` 那條就不會誤給。模型只走 `meta.model`。
 - `get` 回 409 `not_deployed`：沒有可交付的值；不回 200 帶 `"key": null`（會破壞「`key` 是值」的既有形狀）。
 - `KEY_NAMES` 不加它：key 檔與 `get` 永遠沒有它的值，`tests/test_keys.py:59-62` 的集合不變。
 - `env_schema` 維持 1：沒有新增 env 鍵；bump 成 2 會讓現在的 Mac sidecar 直接拒收（MLP 的 `sources.py` 只接受 ≤1，OUT-research-486 §2.2）。
@@ -74,9 +80,11 @@ sidecar 的 agy driver **只從 `meta.model` 拿模型**（MLP 的 `modules/side
 
 Gateway 沒有 caller／host 概念，也不做應用層認證（spec key-vault「不做應用層認證」；只有 loopback＋SSH 轉發），所以**無法強制**，只能 advisory。
 
-- A（建議）**每個實例自己的政策檔**：Mac 的 lgwd 政策含這把，worker 實例的不含（政策檔啟動時讀、換檔要重啟，`lgwd/policy.py:7-9`）。強制點在部署面，PMO 另寫計畫。
-- B 同一份政策，worker 的 sidecar 不要求 agy：零部署差異，但靠自律；誤送時 worker 會拿到 200＋空 env，接著因為沒有 agy 而 503（MLP 的 `modules/sidecar/src/sidecar/drivers/agy.py:452-461` 的 `_ensure_command`，引在報告），不會洩漏任何值。
+- A **每個實例自己的政策檔**：Mac 的 lgwd 政策含這把，worker 實例的不含。機制存在（`--policy`／`LGWD_POLICY`，`lgwd/main.py:47`、`:143`；政策檔只在啟動時讀、換檔要重啟，`lgwd/policy.py:7-9`），但代價是**同一份政策資料要維護兩份完整副本**：政策檔是完整的（`subscriptions` 是物件、沒有 include／patch），Mac 版等於把 `policy/default.json` 整份複製再加一筆，日後任何一筆的 `models.allow`／`priority` 改動都要記得改兩邊；漏改的症狀是「某台少一把」或「某台的模型清單較舊」，是功能性的錯，不是提示性的錯。而它**仍然擋不住**有人把 worker 指到 Mac 那份（Gateway 不認呼叫方）。
+- **B（本設計採用）同一份政策、靠自律**：出廠 `policy/default.json` 含 `antigravity`，所有實例看到同一份菜單；worker 的 sidecar 不要求 agy（工單的裁定就是「worker 不用 agy」），誤送時 worker 會拿到 200＋空 env，接著因為沒有 agy 而 503（MLP 的 `modules/sidecar/src/sidecar/drivers/agy.py:452-461` 的 `_ensure_command`，引在報告），不會洩漏任何值。**已知誤導（列進風險）**：worker 實例的 `GET /v1/subscriptions` 會對 `antigravity` 顯示 `available: true`（沒有憑證但恆算已部署，spec「沒有憑證的訂閱」），`usage.status` 為 `not_applicable`——對不知道「這把只在 Mac」的呼叫端，`available: true` 讀起來像「這台可以用」，實際要等 agy 啟動失敗才知道。文件要寫明這點（tasks 3.3），不能寫成擋得住。
 - C 新增呼叫方區分（`host=`／token）：與「不做應用層認證」衝突、query 可偽造，不建議。
+
+**選 B 的理由**：A 唯一的實質好處是「worker 的菜單不出現這把」，代價是政策資料多一份必然漂移的副本，而兩者都一樣擋不住誤用（advisory 的本質沒變）。B 讓「哪台能用 agy」只剩一個事實來源（工單的裁定＋sidecar 的政策），把風險收斂成一句可檢查的誤導提示。**這一條留給本人當判斷點**（§6 項 7）：要 A 就把 tasks 3.1 改成「新增 Mac 專用政策範例檔、不動 `policy/default.json`」，並另加一條「兩份政策同步」的維護項與測試。
 
 不論 A 或 B，spec 都要寫成「Gateway 不保證呼叫方在哪一台」，不能寫成擋得住。
 
@@ -97,21 +105,23 @@ Gateway 沒有 caller／host 概念，也不做應用層認證（spec key-vault�
 
 ### 5.2 測試影響
 
-`tests/test_policy.py:55-57`、`:73-76`、`:97` 的 6 筆與順序加 `antigravity`；`tests/test_registry.py:315-318`（list 順序）、`:134-142`（provider 三欄表）加一列，並新增 agy 的 resolve／get 409／available／roles；`tests/test_main.py:161` 的 `len(...) == 6` → 7（`FAKE_KEYS` 不變）；`tests/test_keys.py:59-62` 不改（集合不變，正好證明沒有新鍵名）；`tests/test_http.py` 加 `agent=agy` 的 200 與未知 agent 的 400。`test_client`／`test_lgwctl_usage`／`test_usage*`／`test_keysync*`／`subprocess_policy.py` 不改（client／lgwctl 不驗 agent；`GoogleProvider` 沒有 fetcher）。
+`tests/test_policy.py:55-57`、`:73-76`、`:97` 的 6 筆與順序加 `antigravity`（PR 1 先用臨時政策，PR 2 才是出廠檔）；「`subscriptions` 的鍵不在 `SUBSCRIPTIONS` 就拒收」的既有案例要能涵蓋 `antigravity` 已被接受（否則 H1 的缺口不會被測到）。`tests/test_registry.py:315-318`（list 順序）、`:134-142`（provider 三欄表）加一列，並新增 agy 的 resolve／get 409／available／roles；`tests/test_main.py:161` 的 `len(...) == 6` → 7（`FAKE_KEYS` 不變）。`tests/test_keys.py:59-62` 的**集合斷言不改**（集合不變，正好證明沒有新鍵名），但 `:55` 的測試名 `test_key_names_cover_all_subscriptions` 會變成不精確（`antigravity` 是訂閱而不在 `KEY_NAMES`）：改成 `test_key_names_cover_all_subscriptions_with_keys`（或加一行註解說明 local-login 不算在內），**只改名字、不改斷言**。`tests/test_http.py` 加 `agent=agy` 的 200 與未知 agent 的 400。冷卻前綴收緊（§1.1）要有一條測試：以 `model=agy/<id>` 登錄冷卻回 400 `bad_request`（即使 `allow` 的樣式涵蓋得了），見 tasks 2.5——這一條在 PR 1 就會生效，不是 PR 2。`test_client`／`test_lgwctl_usage`／`test_usage*`／`test_keysync*`／`subprocess_policy.py` 不改（client／lgwctl 不驗 agent；`GoogleProvider` 沒有 fetcher，另由 tasks 2.5 的斷言守住）。
 
 ### 5.3 PR 切法（每步一個，main 不會更糟）
 
-1. **PR 1 介面骨架，不改出廠政策**：`AGENTS`＋`_AGY_ONLY`＋`GoogleProvider`＋`local-login` 的部署／`build_env`／`get` 規則＋registry 四個呼叫點；測試用臨時政策 JSON。出廠 6 筆行為不變；唯一可觀察的收緊是冷卻 `agy/…` 變 400。
-2. **PR 2 打開介面，只動政策資料**：`policy/default.json` 加 `antigravity`；list／resolve／get 的 E2E；client 與 errors 的說明。回退容易。
+1. **PR 1 介面骨架，不改出廠政策**：`AGENTS`＋`SUBSCRIPTIONS`（兩個白名單同期加）＋`_AGY_ONLY`＋`GoogleProvider`＋`local-login` 的部署／`build_env`／`get` 規則＋registry 四個呼叫點；測試用臨時政策 JSON。出廠 6 筆行為不變；唯一可觀察的收緊是冷卻 `agy/…` 變 400。**每一步都要讓政策仍可載入**：`SUBSCRIPTIONS` 與 `AGENTS` 分兩個 commit 落地時，中間那一步「政策檔含 `antigravity`」仍然是 `PolicyError`——所以 PR 1 內它們不分岔（同一筆改動或前後相鄰、`policy/default.json` 都還沒那一筆），測試不得在中間狀態跑出「政策載不起來」。
+2. **PR 2 打開介面，只動政策資料**：`policy/default.json` 加 `antigravity`（本設計採 §3 B：同一份政策，worker 也會看到這把）；list／resolve／get 的 E2E；client 與 errors 的說明；`docs/deploy.md` 寫明 advisory 的限度（worker 的 `available: true` 是誤導）。回退容易。
 3. **PR 3 選配、等本人**：roles 的 order、`privacy`、README／docs 的政策範例。不改程式語意。
 
 ## 6. 要本人裁定的
 
-1. 訂閱 id／provider 名（§1.2，建議 `antigravity`／`google`）——作者提議、本人未指示。
-2. `models` 的模型 id 與「一模型一 row」（§1.4）——id 只能由本人從 `agy models` 抄，作者未查證。
-3. `priority`（§1.5，建議 35）——作者提議、本人未指示。
-4. `privacy`（§1.6，建議先 `public`）——與 ToS／資料條款一起裁；作者提議、本人未指示。
-5. 「不需 key」的機制（§2，建議 kind `local-login`＋registry 判斷、不碰 key 檔）——作者提議、本人未指示。
-6. `get` 對它的回覆（§2.3，建議 409 `not_deployed`；另一選項是 200 帶 `key: null`，但要動 schema）。
-7. 「只給 Mac」的表達（§3，建議每個實例自己的政策檔；Gateway 只能 advisory）——部署面由 PMO 另寫。
+**以下每一項都是作者提議、本人未指示**（第 8 項是留白，不替本人決定）。tasks 第 2 節以本節第 1、5、6 項的裁定為前置：本人沒裁定前不開 PR 1。
+
+1. 訂閱 id／provider 名（§1.2，建議 `antigravity`／`google`）。
+2. `models` 的模型 id 與「一模型一 row」（§1.4）——作者提議 A（一模型一 row）；id 只能由本人從 `agy models` 抄，作者未查證、不抄任何 id。
+3. `priority`（§1.5，建議 35）。
+4. `privacy`（§1.6，建議先 `public`）——與 ToS／資料條款一起裁。
+5. 「不需 key」的機制（§2，建議 kind `local-login`＋registry 判斷、不碰 key 檔）。
+6. `get` 對它的回覆（§2.3，建議 409 `not_deployed`；另一選項是 200 帶 `key: null`，但要動 schema）——作者提議 409。
+7. 「只給 Mac」的表達（§3）：本設計**採 B**（同一份政策、靠自律；worker 的 `available: true` 誤導列為已知風險、寫進文件）；另一選項 A（每實例自己的政策檔，tasks 3.1 改成「新增 Mac 專用政策範例檔、不動 `policy/default.json`」、另加兩份同步的維護項）列在這裡供本人改判。部署面由 PMO 另寫。
 8. roles 與 `privacy` 的組合（§4）——不決定。

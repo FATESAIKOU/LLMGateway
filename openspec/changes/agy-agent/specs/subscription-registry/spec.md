@@ -61,6 +61,8 @@
 - `available_again_at`：RFC 3339 UTC 或 null，**只在 list 出現**（合併規則見 spec `usage-reporting`）；
 - `usage`：用量物件，**只在 list 出現**（resolve 的 `meta` 另帶同形狀的 `usage`，見「resolve」；形狀與規則見 spec `usage-reporting`）。
 
+**訂閱 id 是固定集合**：`id` MUST 是 `lgwd/policy.py` 的 `SUBSCRIPTIONS` 常數裡的值（`claude-personal`、`claude-company`、`opencode-zen`、`opencode-go`、`groq`、`openrouter`、`ollama-cloud`，本 change 加 `antigravity`）。政策檔 `subscriptions` 的鍵不在這個集合裡時 MUST 政策載入失敗（`PolicyError("policy.subscriptions has unknown key")`，`lgwd/policy.py:253-255`）、lgwd 不啟動；所以新增一個訂閱＝改 `SUBSCRIPTIONS`（與 `AGENTS`、`PROVIDERS` 對應的一筆）＋政策檔兩處，兩邊不一致時是「載不起來」而不是「靜默忽略」。
+
 這個形狀 MUST NOT 帶任何 agent 專用的環境變數名；把 provider＋model 用起來的環境變數由 resolve 的回覆 `env` 給（「env 的組成」），list 只是菜單。`usage`／`available_again_at` 在 `list_subscriptions` 內逐筆合入，get 的回覆 MUST NOT 帶（get 由 LLMGateway#48 退場，不續命）。Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MUST 只有 `opencode`（條款；免費模型只經過 opencode）；`kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`）的 `agents` MUST 只有 `agy`；政策載入 MUST 拒絕這三類訂閱的 `agents` 不是剛好那一個值的政策檔，也 MUST 拒絕其他訂閱的 `agents` 含 `agy`。`endpoint` MUST NOT 內嵌憑證：`endpoint` 不在政策檔，是 `lgwd/providers.py` 的 `CredentialProvider.endpoint` 常數；providers 載入／lgwd 啟動時 MUST 逐筆檢查 `PROVIDERS` 的 endpoint 值，含 `key=`／`token=`／`api_key=`／`access_token=` query 樣式或 userinfo `@` 即拒絕啟動（`PolicyError`；endpoint 是中介資料、會進稽核與 meta——前提是不含憑證）。`schema` 是該端點回覆形狀的版本；list row 的 `schema` 與 resolve 的 `schema` 各自獨立。list 新增 `usage`／`available_again_at` 只是新增欄位，`schema` MUST NOT bump（目前仍為 1；消費端忽略不認得的欄位）。`model_cooldowns` 也是新增欄位，同樣 MUST NOT bump `schema`；它同時出現在 list 與 get 的回覆（`usage`／`available_again_at` 仍只在 list），resolve 的 `meta` 帶同一形狀的 `cooldown` 與 `model_cooldowns`（見「resolve」）。`cooldown` 與 `available` 仍是**整把**的語意：`available` MUST NOT 因 `model_cooldowns` 改變（消費端用 `available` 判斷 key 有沒有部署，把模型冷卻算進去會讓一個模型用完看起來像整把沒部署）；`kind` 為 `local-login` 時「部署」由 kind 判定，不是 key。
 
 #### Scenario: list 的形狀
@@ -118,6 +120,41 @@
 #### Scenario: 沒有憑證的訂閱 agents 改寬
 - **WHEN** 政策檔的 `antigravity.agents` 不是剛好 `["agy"]`
 - **THEN** 政策載入失敗（`PolicyError`），lgwd 不啟動
+
+### Requirement: env 的組成
+
+`env` SHALL 依（provider、kind、agent）組成，只含憑證、端點、模型命名（含 opencode 的 provider id）三類變數；MUST NOT 含呼叫方的維運變數（auto-update 開關、server password、`AGORA_CLAUDE_CMD`、身分變數、`permission`、`instructions`——那些由 sidecar 疊）。鍵集＝下列清單（`env` MUST 只含這些鍵；每鍵的型別／空值／出現條件；sidecar 對不在清單上的鍵見「未知鍵」）：
+
+- `CLAUDE_CODE_OAUTH_TOKEN`（claude-code＋claude-subscription）：字串＝該把的 key（OAuth token）；不可空；該組合必然出現。
+- `ANTHROPIC_API_KEY`（claude-code＋api-key）：provider 為 anthropic 時字串＝該把的 key、不可空（**現行不可達**：anthropic 恆為 claude-subscription，預留形狀）；其他 provider 時＝**空字串**（刻意佔位，蓋掉子行程環境可能殘留的繼承值）；claude-subscription 時不出現。
+- `ANTHROPIC_AUTH_TOKEN`（claude-code＋api-key、provider 非 anthropic）：字串＝該把的 key；不可空。
+- `ANTHROPIC_BASE_URL`（claude-code＋api-key、provider 非 anthropic）：字串＝該把的 `endpoint`（URL）；僅 `endpoint` 非 null 時出現。
+- `ANTHROPIC_MODEL`／`ANTHROPIC_SMALL_FAST_MODEL`（claude-code 全部組合）：字串＝選定的 model（供應商 model id；兩鍵同值）；不可空；僅 model 非 null 時出現。
+- `OPENCODE_API_KEY`（opencode、各 provider）：字串＝該把的 key；不可空；必然出現。
+- `OPENCODE_PROVIDER_ID`（opencode、各 provider）：字串＝opencode 的 provider id（`opencode-zen`→`opencode`、`openrouter`→`openrouter`、`ollama-cloud`→`ollama-cloud`，由 LLMGateway 維護；opencode config 內的模型名＝`<OPENCODE_PROVIDER_ID>/<OPENCODE_MODEL>`，由 sidecar 組）；不可空；必然出現。
+- `OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL`（opencode、各 provider）：字串＝選定的 model（供應商 model id；兩鍵同值）；不可空；僅 model 非 null 時出現。
+
+`kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`）**沒有 env**：`env` MUST 是**空物件 `{}`**——沒有任何鍵，也就 MUST NOT 出現 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`／`OPENCODE_*`。agy 用它自己在那台機器的本機登入，Gateway 不給憑證、不給端點、不給模型變數；模型只走 `meta.model`（sidecar 的 agy driver 只從那裡拿）。實作 MUST 同時寫兩條判斷——`agent` 為 `agy` **或** 該把的 `kind` 為 `local-login`，任一成立就回 `{}`，防線不依賴單一條件：只判 `agent` 時，若政策條款被改弱（agy 進了某一筆 api-key row）就會落進 claude-code 分支、回出 `ANTHROPIC_AUTH_TOKEN`（該把的 key）與 `ANTHROPIC_API_KEY: ""` 佔位；`kind` 是 provider 常數、不是政策資料，多這一條就擋得住。回 `{}` 是「因 agent／kind 而少給鍵」，**不改鍵集、`env_schema` 維持 1**（見「resolve」）。
+
+opencode 只回**片段**（上述 `OPENCODE_*` 四鍵）：Gateway MUST NOT 回 `OPENCODE_CONFIG_CONTENT`，也不回 `baseURL`（`endpoint` 是 provider 根位址，依 #28 不抄進 opencode 的 `options.baseURL`）。model 為 null（agent 自己的預設）時 SHALL 不給模型變數。
+
+**未知鍵與消費端規則**：`env` MUST 只含上述鍵（Gateway 在同一個 `env_schema` 內不得改鍵集）；sidecar 對未知鍵、overlay、`OPENCODE_CONFIG_CONTENT` 的組成、`permission`／`instructions` 的擁有、繼承環境不外漏等**消費端義務**見 `archive/2026-10-24-agent-provider-model-interface/design.md` 決定 2 與決定 6，由 MyLinuxPool 的 sidecar 規格承接（本 spec 只定 Gateway 能實作與驗證的部分）。
+
+#### Scenario: claude 訂閱不帶模型變數
+- **WHEN** resolve 選中 `claude-personal`（claude-subscription）而 `meta.model` 為 null
+- **THEN** `env` 只有 `CLAUDE_CODE_OAUTH_TOKEN`，沒有 `ANTHROPIC_MODEL`／`ANTHROPIC_SMALL_FAST_MODEL`
+
+#### Scenario: opencode 的兩個模型（片段）
+- **WHEN** 同一把 `opencode-zen` 先後 resolve `mimo-v2.6-flash-free` 與 `big-pickle`
+- **THEN** 兩次 `env` 的 `OPENCODE_PROVIDER_ID` 都是 `opencode`、`OPENCODE_API_KEY` 相同，`OPENCODE_MODEL`／`OPENCODE_SMALL_MODEL` 各自是該模型；`env` 不含 `OPENCODE_CONFIG_CONTENT`
+
+#### Scenario: agy 的 env 是空物件
+- **WHEN** 以 `agent=agy&provider=google&model=<該把的裸 id>` resolve，選中 `antigravity`（kind `local-login`）
+- **THEN** `env` 是 `{}`：沒有 `ANTHROPIC_*`（含 `ANTHROPIC_API_KEY` 的空字串佔位）、沒有 `OPENCODE_*`、沒有 `CLAUDE_CODE_OAUTH_TOKEN`；`env_schema` 仍是 1
+
+#### Scenario: 條款被改弱也不會回 claude 的 env
+- **WHEN** 單元測試直接以一筆 api-key provider（例如 `opencode-zen`）呼叫 `build_env("agy", <key>, <model>)`——模擬「`_AGY_ONLY` 條款被改弱、agy 進了 api-key row」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
+- **THEN** `env` 仍是 `{}`、不回任何 `ANTHROPIC_*`／`OPENCODE_*`：`kind` 不是 `local-login`，但 `agent` 為 `agy` 那條判斷成立
 
 ### Requirement: 登錄冷卻
 `POST /v1/subscriptions/{id}/cooldown {until[, model]}` SHALL 登錄冷卻：
