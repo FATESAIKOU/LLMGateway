@@ -7,6 +7,8 @@ import tempfile
 import time
 import unittest
 
+from tests.proc_util import alive as is_pid_alive   # 殭屍算死（#136）
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TUNNEL = os.path.join(REPO_ROOT, "ops-scripts", "llmgateway-tunnel")
 TUNNEL_UNIT = os.path.join(REPO_ROOT, "deploy", "units", "llmgateway-tunnel.service")
@@ -16,14 +18,6 @@ FAKE_HOST = "rendezvous.invalid"
 FAKE_PORT = "2200"
 FAKE_IDENTITY = "/tmp/does-not-exist/id_fake_tunnel"
 FAKE_KNOWN_HOSTS = "/tmp/does-not-exist/known_hosts_fake"
-
-
-def is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 def wait_until(predicate, timeout=10.0):

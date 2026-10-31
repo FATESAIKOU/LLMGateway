@@ -28,6 +28,7 @@ from lgwd.policy import PolicyError
 from lgwd.providers import UsageDeps
 from tests.usage_fakes import refuse_http
 from tests.subprocess_policy import usage_all_disabled
+from tests.proc_util import alive   # 殭屍算死（#136）
 REPO = Path(__file__).resolve().parent.parent
 FAKE_KEYS = {sub: f"test-main-{sub}-000" for sub in
              ("claude-personal", "claude-company", "openrouter",
@@ -586,9 +587,7 @@ class UsageGatewayTest(unittest.TestCase):
         for proc in procs:
             self.assertIsNotNone(proc.poll())
         for _ in range(100):
-            try:
-                os.kill(grandchild, 0)
-            except ProcessLookupError:
+            if not alive(grandchild):
                 break
             time.sleep(0.05)
         else:

@@ -24,6 +24,7 @@ from lgwd.usage_claude import (
     sweep_work_dir,
     statusline_command,
 )
+from tests.proc_util import alive   # 殭屍算死（#136）
 
 FAKE = str(Path(__file__).resolve().parent / "fakes" / "fake_claude.py")
 TOKEN = "canary-claude-token-0001"
@@ -31,14 +32,6 @@ NOW = 1_800_000_000
 PAYLOAD = json.dumps({"rate_limits": {
     "five_hour": {"used_percentage": 25, "resets_at": NOW + 3600},
     "seven_day": {"used_percentage": 50.5, "resets_at": NOW + 86400}}})
-
-
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
 
 
 class ClaudeCase(unittest.TestCase):
