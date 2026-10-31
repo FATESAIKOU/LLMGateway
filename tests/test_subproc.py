@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from lgwd import subproc
+from tests.proc_util import alive   # 殭屍算死（#136）
 
 
 def _reap(proc):
@@ -73,9 +74,7 @@ class SignalChildTest(unittest.TestCase):
         subproc.signal_child(proc, signal.SIGKILL)
         proc.wait(timeout=10)
         for _ in range(100):
-            try:
-                os.kill(grandchild, 0)
-            except ProcessLookupError:
+            if not alive(grandchild):
                 break
             threading.Event().wait(0.05)
         else:

@@ -35,6 +35,7 @@ from lgwd.keysync import (
 from lgwd.main import Config, Gateway, load_config, make_keysync
 from lgwd.providers import UsageDeps
 from tests.usage_fakes import refuse_http
+from tests.proc_util import alive as is_pid_alive   # 殭屍算死（#136）
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PASSWORD = "FakeKeysyncPassword_ForTests_0007"  # 假值，只在測試裡用
@@ -84,14 +85,6 @@ def key_text(prefix: str = "test-keysync-timer") -> str:
 
 def sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
-
-
-def is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 def wait_until(predicate, timeout=10.0):

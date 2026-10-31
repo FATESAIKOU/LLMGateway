@@ -23,6 +23,7 @@ import urllib.request
 
 from lgwd.keys import KEY_NAMES
 from tests.subprocess_policy import usage_all_disabled
+from tests.proc_util import alive as is_pid_alive   # 殭屍算死（#136）
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PASSWORD = "FakeKeysyncApiPassword_ForTests_0011"  # 假值，只在測試裡用
 PASSWORD_ENV = "LLMGW_KEYS_PASSWORD"
@@ -52,14 +53,6 @@ def key_text(prefix: str = "test-keysync-api") -> str:
     for name, value in by_name.items():
         lines.append(f"{name}={value}")
     return "\n".join(lines) + "\n"
-
-
-def is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 def wait_until(predicate, timeout=10.0):
