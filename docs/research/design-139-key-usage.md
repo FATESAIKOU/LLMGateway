@@ -4,12 +4,16 @@
 
 ## 結論
 
-**在 J-2＝不回絕對數量（A）的前提下，Gateway 不用改，不開 openspec change。**（J-2 待本人回答，見 §4；若本人要 credits／請求數的絕對值，結論翻轉，要開一張 d。）list／resolve 已經帶 `usage`（#60，主 spec
-`openspec/specs/usage-reporting/spec.md`；OpenRouter 在 #85，change `openrouter-usage-fetcher` 尚未歸檔）。
-MyLinuxPool#552 的設計 §3、§10 要的每一項，都能由 sidecar 用「現有欄位＋一張對照表」得到。
-差異全是**名稱與單位**，由 sidecar 的轉接層吸收；為此改 Gateway 會破壞七鍵形狀（主 spec 第 9、28 行「沒有多餘鍵」）而無實益。
+**第 2 輪（2026-11-01，本人補充「每把 key 的用量管子不只一根」）後結論翻轉：現行 `usage` 形狀表達不了，Gateway 要改，改法是在 `usage` 加一個鍵 `pipes`（只加不換），change 為 `openspec/changes/usage-multi-pipes/`（之後另開 d 實作）。**
 
-另有一個**行為上的提醒**（輪詢節奏，見 §3），屬 sidecar 的用法，不是 Gateway 的缺口。
+- 本人已回答 J-2＝百分比就夠、J-1＝sidecar 吸收名稱差異、J-3＝sidecar 自己算 `exhausted`、J-4 交 MyLinuxPool；因此第 1 輪的「名稱不同」差異（§1 G-2～G-4）仍由 sidecar 轉接層吸收（§2），**不**為此改 Gateway。
+- 要改 Gateway 的唯一理由是新需求：一把 key 多根獨立額度桶（各有名稱／所屬模型群、百分比、重置時刻）。主 spec 固定七鍵、只有 `session`／`weekly`（`openspec/specs/usage-reporting/spec.md:9,28`；`lgwd/usage.py:33`），放不下 OpenRouter 的 credits 與 Antigravity 的三組。
+- `session`／`weekly` 原樣保留作相容層；`pipes` 是新增鍵（`pipes` 由 `build_usage` 從 windows 加固定表產生，不另設 compat 層）。
+- **誠實的範圍：本 change 實際新增的管子只有 OpenRouter credits；Antigravity 三組不在 Gateway**（local-login、無憑證、`providers.py:159-165` 禁止覆寫 fetcher；`/usage` 只能在 Mac 跑，Gateway 主機跑不了）。sidecar 的 `UsageWindow`（name／used_percent／scope／applies）與這裡的 pipe 形狀不同；兩邊要不要共用一個形狀待對齊（J-9）。
+- 目前 sidecar 只讀 `session`／`weekly` 與 `available_again_at`，不讀 `pipes`；在另開單消費前，credits 用完對挑 key 沒有效果（J-10）。
+- 細節、對照表（每個 source 幾根管子）、model→管子的比對規則見 change 的 `design.md`；本文件只放缺口分析、判斷點與跨 repo。
+
+第 1 輪的缺口分析（§1）與對照表（§2）仍有效，下文保留。另有一個行為上的提醒（輪詢節奏，§3），屬 sidecar 的用法。
 
 ## 1. 缺口分析
 
@@ -61,26 +65,47 @@ MyLinuxPool#552 的設計 §3、§10 要的每一項，都能由 sidecar 用「�
 | `claude-statusline` | `5h` | `1w` | Gateway 預設關閉（`usage_claude.py:170`）；若與 sidecar 本地 claude 值並存，以較新的 `observed_at` 為準（#552 §10） |
 | `ollama-api-balance` | `session`（原樣） | `weekly`（原樣） | 窗口實際長度本 repo 未驗（見未驗） |
 
+### 2.1 第 2 輪：管子對照（change 實作後；實作前 sidecar 照上表）
+
+`usage.pipes[]` 每根 `{id, models, models_except, remaining_percent, resets_at}`。sidecar 的 `windows[]` 改由 `pipes` 產生：`name`＝`id`（`five_hour`／`seven_day`／`session`／`weekly`／`free_daily`／`credits`）、`used_percent`＝`100 - remaining_percent`、`remaining`／`unit` 仍 None。`exhausted` 改為**逐模型**：模型名符合某管子的 `models` 且不符合 `models_except`，該管子 `remaining_percent ≤ 0` → 該模型用完；沒有管子屬於該模型 → None。`session`／`weekly` 仍在，舊的轉接層不必立刻改。
+
+| source | 管子 id（個數） |
+|---|---|
+| `claude-statusline` | `five_hour`、`seven_day`（2） |
+| `ollama-api-balance` | `session`、`weekly`（2；新方案只有金額＝0） |
+| `openrouter-api-key` | `free_daily`（1）＋`credits`（僅 `limit` 有上限時，共 2） |
+| zen／go／antigravity | 0（`pipes: []`） |
+| antigravity | Gateway 0 根；sidecar 自取，形狀待對齊（J-9），組名未驗 |
+
 ## 3. 輪詢節奏（G-5／G-11）
 
 1. #552 §10 寫「有 agent 時每 10 分鐘 `list` 一次」。每次 list 都回「上一輪取到的值」，同時觸發背景重取；所以收到的 `fetched_at` 約等於**上一次輪詢的時刻**，年齡 ≈ 10 分鐘，離 15 分鐘只剩 5 分鐘。取用量失敗一次（退避從 TTL 起算、連續失敗加倍，`lgwd/usage.py:269-275`）就超過 15 分鐘 → sidecar 依自己的 15 分鐘標過期，這是對的。
 2. 若要「每次輪詢都盡量新」，二擇一（MyLinuxPool／本人決定）：(a) 輪詢縮到 5 分鐘（資料年齡 ≈ 5 分鐘，餘裕 10 分鐘）；(b) 每次 list 後固定 5～10 秒補讀一次（同一端點）。(b) 的成本：每輪多一次 list；Gateway 不會多打上游，因為補讀時年齡 < TTL 不觸發重取。**不要**用 `usage.stale` 當補讀條件：OpenRouter／Ollama TTL 120 秒，10 分鐘輪詢下 `stale` 恆為 true，沒有鑑別力。`stale` 只是 Gateway 的 TTL 訊號，sidecar 不使用它。Gateway 側不為此改（改成「同步等取用量」違反 spec「不等取用量」與 `usage.py` 開頭原則）。
 3. 第一次 list（lgwd 剛啟動或首次被查）：`unknown／not_fetched_yet`，約幾秒後再讀即有值。
 
-## 4. 本人的判斷點
+## 4. 判斷點
 
+### 已回答（本人 2026-11-01，經 PMO）
+J-1＝A（sidecar 吸收名稱差異）；J-2＝A（百分比就夠，不回絕對值）；J-3＝A（sidecar 算 `exhausted`）；J-4 交 MyLinuxPool 選（B1 輪詢 5 分鐘／B2 補讀一次；不選 C）。
+
+### 新的本人判斷點（第 2 輪）
 | # | 問題 | 選項 | 建議 |
 |---|---|---|---|
-| J-1 | 欄位名／單位不同，誰吸收？ | A：sidecar 轉接層（對照表）；B：Gateway 加並行欄位（`observed_at`、`used_percent`、`windows[]`） | **A**。B 要改「七鍵、沒有多餘鍵」的 spec，且 sidecar 已經在讀的 `usage` 不能壞，只能加不能換，等於同一資料兩份；沒有任何 sidecar 功能需要 B |
-| J-2 | **請本人回答**：工單 #139 寫的「額度數字」，是指**百分比**即可，還是要 credits／請求數的**絕對值**（OpenRouter 的 `remaining`／`limit`、`limit_remaining`，Ollama 的金額）？ | A：百分比即可，不回絕對值；B：要絕對值，另加欄位 | **A**。#552 §3 的 `remaining` 是「有數量時才填」；`usage_openrouter.py:6-7` 與 spec 第 62-63 行（欄位白名單）是刻意不放；出廠政策 openrouter 只允許 `*:free`，瓶頸是每日請求數而非 credits。**若選 B：開一張 d，要動 `usage` 的七鍵形狀（主 spec 第 9、28 行「沒有多餘鍵」），本文件的「Gateway 不用改」結論即失效。** |
-| J-3 | `exhausted` 放哪？ | A：sidecar 算；B：Gateway 回 | **A**（見 G-7，語意與 `cooldown` 分開） |
-| J-4 | 輪詢看到舊值（§3-1） | A：sidecar 接受（≤15 分鐘窗內）；B1：輪詢縮到 5 分鐘；B2：每次 list 後固定 5～10 秒補讀一次（§3-2；不以 `stale` 為條件）；C：Gateway 改成同步取 | **B1 或 B2（MyLinuxPool 決定）**，不選 C |
+| J-5 | 形狀怎麼擴？ | A：`usage` 加 `pipes`，保留 `session`／`weekly`（鍵集 7→8）；B：改成 `windows` 陣列並移除舊鍵；C：每個 provider 專屬鍵 | **A**（只加不換；B 破壞 sidecar 現讀，C 形狀隨 provider 增長）。**但要知道：實際受益只有 OpenRouter credits 一根**；若覺得為一根新增通用鍵太大，可選 D：本 change 縮成「只加 credits 專用鍵」或暫不做（取捨：D 形狀不通用，日後 agy 若要進 Gateway 還要再改） |
+| J-6 | Antigravity 的用量誰取？ | A：sidecar（Mac）取，Gateway 不碰；B：Gateway 側另起機制（推送／別台主機） | **A**（`providers.py:159-165`；`/usage` 只能在 Mac 跑）。B 是另一張 c |
+| J-7 | OpenRouter credits 無上限（`limit` null）怎麼表示？ | A：不出 `credits`；B：另加 `unlimited` 旗標 | **A**（最小） |
+| J-9 | 兩邊（Gateway pipe 與 sidecar `UsageWindow`）要不要共用一個管子形狀？ | A：共用、兩邊對齊（讀者只有一套 model→桶比對；代價：sidecar 與 Gateway 都要改，且 agy 的 `scope`／`applies` 要併進來）；B：各自一套、sidecar 轉接（代價：兩套比對邏輯，但互不牽動） | **B**（現在只有一根 credits，不值得為它動 sidecar 的 `UsageWindow`；等 agy 也要進 Gateway 時再議）。**請本人／MyLinuxPool 決定** |
+| J-10 | 要不要在本 change 就讓 resolve／`available_again_at` 看 `pipes`？ | A：不看，另開單讓 sidecar 消費（之前 credits 用完無效果）；B：本 change 讓 resolve 對屬於選中模型的管子用完時排除／標示 | **A**（B 會改選 key 的語意：「某組用完≠整把不能用」，且需要逐模型判斷，範圍變成 c） |
 
-## 作者提議、本人未指示
-
-- 「不開 change、不改 Gateway」本身是作者的結論，本人只裁定了「由 Gateway 查、隨 list／resolve、不新增端點」，這三點現況皆已滿足。
-- 窗口名稱對照表（§2）與 `exhausted` 的算法是作者提議；`source` 加前綴、補讀一次 list 也是提議。
-- 順手發現（不在 #139 範圍）：`openrouter-usage-fetcher` change 還沒歸檔，主 spec 的 Purpose 與 source 清單（第 4、12 行）還沒有 OpenRouter；`tasks.md` 最後一項未勾。歸檔屬 PM 的排程，建議在 #139 結案前做，免得 sidecar 讀 spec 時看不到 `openrouter-api-key`。
+### 作者提議、本人未指示
+- 管子「只有讀到才出現」、不放 null 佔位；`resets_at` 可為 null（credits 恆 null，`limit_reset` 語意未驗，之後另開單）。
+- model→管子的比對在**讀者端**做；限制某模型的是 `remaining_percent` 最小的屬於它的管子。
+- `available_again_at` 不看 `pipes`（見 J-10）。
+- `models_except` 欄位（**目前只有 credits 用**）。
+- credits 異常值只丟棄該管子，不影響 `free_daily`／`status`／退避。
+- `pipes` 由 windows＋固定表在 `build_usage` 產生（比 compat 欄位小，一份資料）。
+- 已刪（審查 W-3）：`window_seconds`、政策檔覆寫 pipes（J-8／C-11 舊）；後者「之後再議」。
+- `openrouter-usage-fetcher` 尚未歸檔，是本 change 的前置。
 
 ## 5. 跨 repo（MyLinuxPool，PM 經 PMO 轉）
 
@@ -90,12 +115,18 @@ MyLinuxPool#552 的設計 §3、§10 要的每一項，都能由 sidecar 用「�
 4. 輪詢節奏（§3）由 MyLinuxPool 決定 J-4。
 5. 與本機 claude 來源重疊時（`claude-statusline`），以 `observed_at` 較新者為準，等時 `exhausted=true` 優先（#552 §10 規則 1、2）。
 6. Gateway 回 `not_applicable`／`unknown` 不要當錯誤；Zen、Go 為 `not_applicable`，`reason` 是固定碼，可顯示。
+7. **（第 2 輪）接 `pipes`**：change 實作後 `usage` 多一個 `pipes` 鍵；可先不動，繼續讀 `session`／`weekly`，之後再改讀 `pipes`。
+8. **（第 2 輪）逐模型 `exhausted`**：用 resolve 的 `meta.model`（或 list 的 `models.allow`）對 `pipes[].models`／`models_except` 做 fnmatch；沒有管子屬於該模型＝None。
+9. **（第 2 輪）Antigravity 由 sidecar 在 Mac 取 `/usage`**；是否與 Gateway 的 pipe 形狀對齊待決（J-9）。sidecar 現有 `UsageWindow` 與 agy 群組設定是它自己的一套。
+10. **（第 2 輪）消費 `pipes` 要另開單**（J-10）：在那之前 credits 用完對挑 key 沒有效果。審查者讀 sidecar 程式：它不驗 `usage` 鍵集（加第 8 鍵不會壞；其測試是否斷言鍵集未驗）。
 
 ## 6. 給實作的契約
 
-無（前提：J-2＝A，不改 Gateway）。若本人選 J-1 的 B 或 J-2 的 B，再由架構師出 change（含契約編號與測試策略）。
+見 `openspec/changes/usage-multi-pipes/tasks.md`（C-1～C-12 與測試策略）。
 
 ## 未驗
+
+- （第 2 輪）OpenRouter `/api/v1/key` 的 `limit`、`limit_reset` 欄位語意、Claude statusline 是否另有依模型分的管子、agy `/usage` 的組名與輸出、sidecar 測試是否斷言 usage 鍵集：皆未驗（審查者讀 sidecar 程式，不驗鍵集）；本輪未打外部 API、未跑測試。
 
 - 未打任何外部 API、未讀憑證；上游欄位語意（OpenRouter `free_model_daily_requests`、Ollama `included.session`）只引用既有程式註解與 spec。
 - Ollama `session`／`weekly` 的實際長度（是否 5h／7d）本 repo 未驗。
