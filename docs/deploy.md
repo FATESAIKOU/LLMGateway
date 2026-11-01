@@ -365,7 +365,7 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 - **fnmatch 的 `*` 會匹配任何字元，包含 `/`**。所以 `*-free` 這種樣式不只匹配 `beam-free`，也會匹配 `opencode/anything-free` 之類帶斜線的 id。
 - **2026-10-27 #95 起 opencode-go 只允許 beam-free（iceman-contributor-free 以授權訓練 prompt 換免費，不進輪替）；opencode-zen 的 `*-free` 不變**：出廠政策檔裡，`opencode-zen` 的 `models.allow` 仍是 `["*-free","big-pickle"]`，`opencode-go` 改為 `["beam-free"]`。Go 不再自動放行上游新增的 `*-free` 模型；zen 維持原有萬用字元行為。
 - **2026-11-01 #149 起 opencode-go 再加上 big-pickle（明列）**：`opencode-go` 的 `models.allow` 改為 `["beam-free","big-pickle"]`，default 維持 `beam-free`；iceman-contributor-free 仍不涵蓋。
-- **想讓兩把分開控制，就得寫死清單**：把 `*-free` 換成每把各自的一份明列清單，例如 zen 的 `models.allow` 用 `["mimo-v2.6-flash-free", "glm-5.3-flash-free", "big-pickle"]`、go 的用 `["beam-free","big-pickle"]`，兩把才不會互相牽動。兩份清單裡不能放同一個 id，否則照樣會互相放行；改完 `models.allow` 之後，`models.default` 必須仍被涵蓋（見上方載入時驗證）。政策檔是 JSON，不能加註解，所以這個副作用與「要分開控制就寫死清單」的做法記在這裡。
+- **想讓兩把分開控制，就得寫死清單**：把 `*-free` 換成每把各自的一份明列清單，例如 zen 的 `models.allow` 用 `["mimo-v2.6-flash-free", "glm-5.3-flash-free", "big-pickle"]`、go 的用 `["beam-free","big-pickle"]`，兩把才不會互相牽動。allow 是每把各自判斷，同一個 id 放在兩份清單裡，代表兩把都可以用它；要分開控制的是「萬用字元會把上游新增的模型一起放進來」這件事。改完 `models.allow` 之後，`models.default` 必須仍被涵蓋（見上方載入時驗證）。政策檔是 JSON，不能加註解，所以這個副作用與「要分開控制就寫死清單」的做法記在這裡。
 
 `models.default`（非 null）載入時必須被同一筆的 `models.allow` 樣式涵蓋，否則 lgwd 不啟動（fail-closed）。
 
