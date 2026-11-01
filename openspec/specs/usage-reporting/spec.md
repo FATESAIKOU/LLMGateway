@@ -1,7 +1,7 @@
 # usage-reporting Specification
 
 ## Purpose
-讓 list 與 resolve 的回覆帶每把 subscription 的用量（`session`／`weekly` 兩個窗口）與「再次能用的時間」。Gateway 自己取用量（Ollama Cloud 取官方 `GET /api/balance`；Claude 訂閱跑原版 Claude Code 讀 statusline 的 `rate_limits`），只在有人查、而且快取過期時才在背景取，結果放記憶體快取。**用量是附加資訊，壞了不能拖累 list／resolve。**
+讓 list 與 resolve 的回覆帶每把 subscription 的用量（`session`／`weekly` 兩個窗口）與「再次能用的時間」。Gateway 自己取用量（Ollama Cloud 取官方 `GET /api/balance`；Claude 訂閱跑原版 Claude Code 讀 statusline 的 `rate_limits`；OpenRouter 取官方 `GET /api/v1/key`，只取 `:free` 模型的每日免費請求數放進 `session`），只在有人查、而且快取過期時才在背景取，結果放記憶體快取。**用量是附加資訊，壞了不能拖累 list／resolve。**
 
 > 本檔的數字（TTL、逾時、退避、6 小時）與政策檔 `usage` 設定段的形狀，除「Claude TTL 下限 30 分鐘」與「被查到才取、不等」（本人 2026-10-25 裁定 C、E1、F）外，都是作者提議（design「作者提議、本人未指示」）。示例中的百分比與時間皆為假值。
 ## Requirements
@@ -9,7 +9,7 @@
 list 的每一筆與 resolve 的 `meta` SHALL 帶一個 `usage` 物件，欄位固定為：`status`、`source`、`fetched_at`、`stale`、`reason`、`session`、`weekly`，每個都 MUST 存在（缺值用 null，不省略）。
 
 - `status`：`ok`（至少一個窗口讀到）、`unknown`（有取用量實作，但這次讀不到，含窗口全部已過期）、`not_applicable`（這個 provider 沒有取用量實作）。
-- `source`：取得來源的固定字串（Ollama Cloud 為 `ollama-api-balance`，Claude 為 `claude-statusline`）；`not_applicable` 時為 null。
+- `source`：取得來源的固定字串（Ollama Cloud 為 `ollama-api-balance`，Claude 為 `claude-statusline`，OpenRouter 為 `openrouter-api-key`）；`not_applicable` 時為 null。
 - `fetched_at`：最近一次**成功**取得的時刻（RFC 3339 UTC），從沒成功過為 null。
 - `stale`：見「stale 與 6 小時」；從沒成功過與 `not_applicable` 為 null。
 - `reason`：固定碼，只能是 `not_fetched_yet`、`disabled`、`no_key`、`upstream_error`、`rate_limited`、`timeout`、`parse_error`、`no_windows`、`stale_expired`、`internal` 或 null；MUST NOT 回顯上游內容。
@@ -28,7 +28,7 @@ list 的每一筆與 resolve 的 `meta` SHALL 帶一個 `usage` 物件，欄位�
 - **THEN** 七個鍵都在，沒有多餘鍵；`session`／`weekly` 即使是 null 也存在
 
 #### Scenario: 沒有用量來源的 provider
-- **WHEN** list 含 `openrouter` 與 `opencode-zen`
+- **WHEN** list 含 `opencode-zen` 與 `opencode-go`
 - **THEN** 兩筆的 `usage` 都是 `status: not_applicable`、`source: null`、`fetched_at: null`、`stale: null`、`reason: null`、`session: null`、`weekly: null`；不觸發任何取用量
 
 #### Scenario: 還沒取過
@@ -208,7 +208,7 @@ list 的每一筆 SHALL 帶 `available_again_at`（RFC 3339 UTC 或 null）。�
 - **THEN** 這次失敗的退避回到從 TTL 起算（不是接續加倍）
 
 ### Requirement: TTL 與下限
-Ollama Cloud 的預設 TTL SHALL 是 120 秒；Claude 的預設 TTL SHALL 是 30 分鐘。政策檔可以調整 TTL，但有下限：Claude（`claude-subscription`）MUST NOT 低於 30 分鐘，Ollama Cloud MUST NOT 低於 60 秒（官方限額 10 次／分鐘、跨 key 與裝置共用，建議每分鐘最多查一次）。設定值低於下限時 MUST 夾到下限並記一筆 log（不含任何 key 值）；可以調高。
+Ollama Cloud 的預設 TTL SHALL 是 120 秒；Claude 的預設 TTL SHALL 是 30 分鐘；OpenRouter 的預設 TTL SHALL 是 120 秒。政策檔可以調整 TTL，但有下限：Claude（`claude-subscription`）MUST NOT 低於 30 分鐘，Ollama Cloud MUST NOT 低於 60 秒（官方限額 10 次／分鐘、跨 key 與裝置共用，建議每分鐘最多查一次），OpenRouter MUST NOT 低於 60 秒。設定值低於下限時 MUST 夾到下限並記一筆 log（不含任何 key 值）；可以調高。
 
 #### Scenario: Claude 設定值低於下限
 - **WHEN** 政策檔把 Claude 的 `ttl_seconds` 設為 300
@@ -224,7 +224,7 @@ Ollama Cloud 的預設 TTL SHALL 是 120 秒；Claude 的預設 TTL SHALL 是 30
 
 #### Scenario: 預設值
 - **WHEN** 政策檔沒有 `usage` 段
-- **THEN** Ollama 的 TTL 為 120 秒、Claude 的 TTL 為 1800 秒
+- **THEN** Ollama 的 TTL 為 120 秒、Claude 的 TTL 為 1800 秒、OpenRouter 的 TTL 為 120 秒
 
 ### Requirement: 政策檔的 usage 設定
 政策檔 MAY 有頂層 `usage` 物件，鍵為 subscription id，值為 `{"enabled": <布林>, "ttl_seconds": <正整數>}`（兩欄都選填）。未設定時：有取用量實作且 `kind` 為 `claude-subscription` 的預設 `enabled: false`，其餘有實作的預設 `enabled: true`。下列情形政策載入 MUST 失敗（`PolicyError`），lgwd 不啟動（fail-closed，與既有政策檔對未知鍵的處理一致）：`usage` 本身不是 object；`usage` 的鍵不是政策檔裡的 subscription；某個值不是 object；值裡有 `enabled`、`ttl_seconds` 以外的未知鍵（例如打錯成 `enable`）；`enabled` 不是布林；`ttl_seconds` 不是正整數。沒有取用量實作的 provider 設了 `usage` 不報錯，仍是 `not_applicable`。
@@ -377,5 +377,20 @@ key／token MUST NOT 出現在 list 與 resolve 的新增欄位、log、稽核�
 
 #### Scenario: 外連範圍
 - **WHEN** 以假 HTTP 層捕捉 lgwd 發出的所有請求
-- **THEN** 只有對 `ollama.com` 的 `/api/balance`；Claude 的外連由原版 Claude Code 自己發出，lgwd 沒有為 Claude 另開連線
+- **THEN** 只有對 `ollama.com` 的 `/api/balance`、`openrouter.ai` 的 `/api/v1/key`；Claude 的外連由原版 Claude Code 自己發出，lgwd 沒有為 Claude 另開連線
+
+### Requirement: OpenRouter 取用量
+OpenRouter 取用量 SHALL 對寫死在程式裡的 `https://openrouter.ai/api/v1/key` 發 `GET`（URL 不來自政策檔、不跟隨轉址到別的主機），以 vault 的 key 當 `Authorization: Bearer`，逾時 5 秒，不重試。key MUST 只放進該次請求的 header，不進 log、例外訊息、回覆。每次取之前 MUST 先 `reload_keys_if_changed()`，使換 key 後用新 key。只取 `data.free_model_daily_requests` 的 `remaining`／`limit` 換算成 `session` 窗口的 `remaining_percent`（`remaining / limit * 100`），`resets_at` 為下一個 UTC 00:00（官方每日免費請求數以 UTC 日為單位重置）；讀不到 `free_model_daily_requests` 時該窗口為 null，全部為 null 時為 `no_windows`。`limit_remaining` 等其他欄位不進 usage。key 沒部署時不觸發。TTL 預設 120 秒、下限 60 秒（與 Ollama Cloud 相同）。此 `session` 窗口只代表 `:free` 模型的每日請求數，不是這把 key 的全部可用量（官方：exempt／BYOK 帳號不受此上限約束）。
+
+#### Scenario: 請求形狀
+- **WHEN** 以假 HTTP 層捕捉一次 OpenRouter 取用量
+- **THEN** 方法為 GET、主機與路徑為 `openrouter.ai` 的 `/api/v1/key`、帶 `Authorization: Bearer <key>`，逾時 5 秒，沒有其他位址的請求
+
+#### Scenario: 逾時
+- **WHEN** 上游超過 5 秒沒回應
+- **THEN** 取用量結束、記失敗碼 `timeout`，不重試
+
+#### Scenario: 轉址不跟隨
+- **WHEN** 上游回 302 指向其他主機
+- **THEN** 不對那個主機發請求；`usage.reason` 為 `upstream_error`
 
