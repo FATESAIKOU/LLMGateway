@@ -1,8 +1,7 @@
 # key-vault Specification
 
 ## Purpose
-把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；正本是 private repo 的加密檔，服務定期自己拉；客戶端經會合點的 SSH 轉發，由 resolve 回覆的 `env` 拿到（過渡期也可用 get，由 LLMGateway#48 移除），其他地方不再放 key。
-
+把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；正本是 private repo 的加密檔，服務定期自己拉；客戶端經會合點的 SSH 轉發，由 resolve 回覆的 `env` 拿到，其他地方不再放 key。
 > v5（2026-10-12）：`key 只保管在一處`以 v5 全文為準；新增`拉取與輪替`。`值不外洩`、`不做應用層認證`、`服務不對外`不變。第二輪（同日，本人）：拉取改 `gh api`，repo 寫死，`gh` 登入是使用前提。
 ## Requirements
 ### Requirement: 拉取與輪替
@@ -10,14 +9,14 @@ key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一�
 
 #### Scenario: 拉到新版
 - **WHEN** 本人更新加密檔並 push（blob `sha` 變了）
-- **THEN** 下一次拉取後那台的 key 檔更新，`lgwd` 重讀後 get 回新值
+- **THEN** 下一次拉取後那台的 key 檔更新，`lgwd` 重讀後 resolve 回的 `env` 是新值
 
 #### Scenario: gh 不能用
 - **WHEN** `gh` 沒登入、token 失效或讀不到 `FATESAIKOU/LLMGateway-keys`
 - **THEN** key-sync 記一行 log、`keys.env` 不動，服務照用舊 key；`install.sh --check` 看得出「gh 不能用」（以服務帳號身分問，並實際驗一次讀得到那個 repo）
 
 ### Requirement: 值不外洩
-key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務的 log、list 的回覆、錯誤訊息。用量取得器（spec `usage-reporting`）讀 key 只在行程內：Ollama 的 key 只放進該次請求的 `Authorization` header，Claude 的 token 只以子行程環境變數 `CLAUDE_CODE_OAUTH_TOKEN` 傳入；兩者都 MUST NOT 進 argv、檔案、log、稽核、例外訊息，也 MUST NOT 出現在 list 與 resolve 新增的 `usage`／`available_again_at` 欄位。取用量新增的外連只到官方 API（直連只有 `ollama.com` 的 `/api/balance`；Claude 的外連由原版 Claude Code 自己發出，Gateway 不另開連線）。值只出現在 resolve 回覆的 `env`（以及過渡期 get 的回覆），以及由 sidecar 開的 agent 的環境。get 是過渡期介面，由 LLMGateway#48 移除。
+key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務的 log、list 的回覆、錯誤訊息。用量取得器（spec `usage-reporting`）讀 key 只在行程內：Ollama 的 key 只放進該次請求的 `Authorization` header，Claude 的 token 只以子行程環境變數 `CLAUDE_CODE_OAUTH_TOKEN` 傳入；兩者都 MUST NOT 進 argv、檔案、log、稽核、例外訊息，也 MUST NOT 出現在 list 與 resolve 新增的 `usage`／`available_again_at` 欄位。取用量新增的外連只到官方 API（直連只有 `ollama.com` 的 `/api/balance`；Claude 的外連由原版 Claude Code 自己發出，Gateway 不另開連線）。值只出現在 resolve 回覆的 `env`，以及由 sidecar 開的 agent 的環境。
 
 #### Scenario: 掃描
 - **WHEN** 以憑證樣式掃描 repo、服務資料庫、服務 log 與 list 的回覆
@@ -32,7 +31,7 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 - **THEN** 只有對 `ollama.com` 的 `/api/balance`
 
 ### Requirement: 不做應用層認證
-服務 SHALL NOT 要求應用層的憑證；能連到服務的就能 list、resolve、get（過渡期）、登錄冷卻。存取控制只靠 SSH：服務只綁 127.0.0.1，只能經會合點的 SSH 轉發連入（本人選定，`archive/2026-10-24-gateway-v0/design.md` 決定 5a）。發現外洩時，以更新加密檔並等一次拉取因應；客戶端不持有 key，不用改。客戶端裝置（例如手機）遺失時，先由 MyLinuxPool 撤掉那把 sshproxy 金鑰，再更新加密檔等一次拉取。
+服務 SHALL NOT 要求應用層的憑證；能連到服務的就能 list、resolve、登錄冷卻。存取控制只靠 SSH：服務只綁 127.0.0.1，只能經會合點的 SSH 轉發連入（本人選定，`archive/2026-10-24-gateway-v0/design.md` 決定 5a）。發現外洩時，以更新加密檔並等一次拉取因應；客戶端不持有 key，不用改。客戶端裝置（例如手機）遺失時，先由 MyLinuxPool 撤掉那把 sshproxy 金鑰，再更新加密檔等一次拉取。
 
 #### Scenario: 經會合點連入
 - **WHEN** 持有會合點 SSH 金鑰的客戶端經轉發呼叫 list
@@ -40,7 +39,7 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 
 #### Scenario: 換 key
 - **WHEN** 本人更新 private repo 的加密檔並等一次拉取
-- **THEN** 之後的 get 回新值，客戶端的設定不用改
+- **THEN** 之後的 resolve 回的 `env` 是新值，客戶端的設定不用改
 
 ### Requirement: 服務不對外
 服務 SHALL 只綁在服務那台的 127.0.0.1；MUST NOT 綁任何對外或容器網路的介面。客戶端只能經會合機（spec `connectivity`）連入。
@@ -54,7 +53,7 @@ key 的正本 SHALL 是 private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `
 
 #### Scenario: 部署
 - **WHEN** 本人更新加密檔並等一次拉取
-- **THEN** 那台的 key 檔更新，服務重讀後 get 回新值，log 裡不出現任何值
+- **THEN** 那台的 key 檔更新，服務重讀後 resolve 回的 `env` 是新值，log 裡不出現任何值
 
 #### Scenario: 權限
 - **WHEN** 檢查那台的 key 檔
@@ -62,5 +61,5 @@ key 的正本 SHALL 是 private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `
 
 #### Scenario: 沒有憑證的訂閱不進 key 檔
 - **WHEN** 檢查 key 檔的鍵名與 `KEY_NAMES`
-- **THEN** 沒有 `antigravity`（也沒有任何 `local-login` 的訂閱）；它的 resolve 仍回 200 與空 `env`，get 回 409 `not_deployed`，兩者都不讀 key 檔的值
+- **THEN** 沒有 `antigravity`（也沒有任何 `local-login` 的訂閱）；它的 resolve 仍回 200 與空 `env`，不讀 key 檔的值
 

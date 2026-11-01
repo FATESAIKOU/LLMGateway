@@ -18,8 +18,7 @@
 ## 4. 規格與文件
 - [x] 4.1 本 change 的 spec delta：`subscription-registry`（REMOVED「get」，MODIFIED 五個 Requirement 內對 get 的敘述）；`connectivity`（MODIFIED「客戶端自備通道」）；`key-vault`（MODIFIED 四個 Requirement：拉取與輪替、值不外洩、不做應用層認證、key 只保管在一處）。MODIFIED 都以主 spec 全文為底，只改 get 相關句子，scenario 逐條保留。
 - [x] 4.2 `docs/deploy.md`：服務介面改為 list、resolve、登錄冷卻。
-- [ ] 4.3 歸檔：**不在本 change 內做**（PM／本人決定時機）。主 spec 的 Purpose 段仍寫「get 是過渡期介面」，歸檔時一併更新。
-
+- [x] 4.3 歸檔：主 spec 的 Purpose 段已於歸檔時更新為「單筆取 key 的 get 已於 #48 移除（現在一律 404），取 key 改用 resolve 回的 `env`」。
 ## 5. 驗證
 - [x] 5.1 `openspec validate remove-subscription-get`、`openspec validate --specs`。
 - [x] 5.2 指定的測試檔全綠（見 .work/REPORT.md）。
