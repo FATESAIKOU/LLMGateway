@@ -191,7 +191,7 @@ class JsonSchemaTest(RegistryCase):
             items["opencode-zen"]["models"]["default"],
             "mimo-v2.6-flash-free",
         )
-        self.assertEqual(items["opencode-go"]["models"]["allow"], ["beam-free"])
+        self.assertEqual(items["opencode-go"]["models"]["allow"], ["beam-free", "big-pickle"])
         self.assertEqual(
             items["opencode-go"]["models"]["default"],
             "beam-free",
@@ -1808,6 +1808,11 @@ class ResolveTest(RegistryCase):
             403, "model_not_allowed", self.resolve,
             "opencode", "opencode-go", model="iceman-contributor-free")
         self.assertNotIn("env", err.body())
+
+    def test_opencode_go的big_pickle被允許(self):
+        # #149：big-pickle 明列入 allow
+        payload = self.resolve("opencode", "opencode-go", model="big-pickle")
+        self.assertEqual(payload["meta"]["model"], "big-pickle")
 
     def test_opencode_go的預設模型(self):
         payload = self.resolve("opencode", "opencode-go")

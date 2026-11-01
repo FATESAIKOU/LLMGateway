@@ -17,7 +17,7 @@
       "priority": 15,
       "privacy": "general",
       "agents": ["opencode"],
-      "models": {"allow": ["beam-free"], "default": "beam-free"}
+      "models": {"allow": ["beam-free", "big-pickle"], "default": "beam-free"}
     },
     "openrouter": {
       "priority": 20,
