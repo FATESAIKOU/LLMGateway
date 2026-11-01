@@ -1,0 +1,105 @@
+#!/bin/bash
+# 把 Mac 本機的暫時 Gateway 從舊版換成新版（回滾也用同一支）。版本與目錄不寫死。
+# 用法：switch <舊程式目錄> <舊 tag> <新程式目錄> <新 tag>
+#       或不給參數：讀設定檔的 SWITCH_OLD_CODE／SWITCH_OLD_TAG／SWITCH_NEW_CODE／SWITCH_NEW_TAG。
+# 順序：① 前置：兩個 checkout 的 HEAD 都是指定的 tag；② 唯讀稽核 llm.db 的 action='get'，不是 0 就不換（rc=3）；
+#       ③ stop；④ start 新版；⑤ 驗收（list 200 ＋ 可選的檢查項）。任一步失敗 → 停損：stop、start 舊版、驗 list。
+# 驗收的可選項（設定檔，留空或 0 就不查）：VERIFY_PIPES（每列 usage 有 pipes）、VERIFY_OLD_GET_ID（舊的 get 回 404／410）、
+#   VERIFY_RESOLVE＋VERIFY_RESOLVE_MODEL（resolve 回 200，且 meta.model 等於指定值）。
+# 結束碼：OK=0；前置不符=1；get 不是 0=3；回滾成功=5；回滾也失敗=6。
+set -u
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+. "$SCRIPT_DIR/lib.sh"
+fb_load_conf || exit 1
+fb_require STATE || exit 1
+unset LGW_FB_CODE LGW_FB_TAG   # 版本只由這裡的參數或 SWITCH_* 決定
+
+if [ $# -eq 4 ]; then
+  OLD_CODE=$1; OLD_TAG=$2; NEW_CODE=$3; NEW_TAG=$4
+elif [ $# -eq 0 ]; then
+  OLD_CODE=$SWITCH_OLD_CODE; OLD_TAG=$SWITCH_OLD_TAG; NEW_CODE=$SWITCH_NEW_CODE; NEW_TAG=$SWITCH_NEW_TAG
+else
+  fb_say "用法：switch <舊程式目錄> <舊 tag> <新程式目錄> <新 tag>（或全部不給，讀設定檔）"; exit 1
+fi
+[ -n "$OLD_CODE" ] && [ -n "$OLD_TAG" ] && [ -n "$NEW_CODE" ] && [ -n "$NEW_TAG" ] || { fb_say "STOP-PRE: 版本參數不全"; exit 1; }
+[ -f "$STATE/llm.db" ] || { fb_say "STOP-PRE: 找不到 ${STATE}/llm.db"; exit 1; }
+fb_check_checkout "$NEW_CODE" "$NEW_TAG" || exit 1
+fb_check_checkout "$OLD_CODE" "$OLD_TAG" || { fb_say "STOP-PRE: 舊版 checkout 不在或不對（回滾需要它）"; exit 1; }
+# 停舊版之前先確認密碼檔可用：start 新版（與回滾的舊版 start）都要讀它，讀不到就會停在半途
+fb_pw_ok || { fb_say "STOP-PRE: 密碼檔不可用（若已加密，請先請本人解密），舊版沒動"; exit 1; }
+
+fb_say "== ① 稽核：Mac 這台的 llm.db，action='get' 筆數（唯讀，ts ≥ ${AUDIT_SINCE}）"
+GETS=$(python3 -I - "$STATE/llm.db" "$AUDIT_SINCE" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+total, first, last = con.execute("SELECT COUNT(*), MIN(ts), MAX(ts) FROM audit").fetchone()
+n, gfirst, glast = con.execute(
+    "SELECT COUNT(*), MIN(ts), MAX(ts) FROM audit WHERE action='get' AND ts >= ?", (sys.argv[2],)).fetchone()
+print("audit 總筆數=%s；最早 %s；最晚 %s" % (total, first, last), file=sys.stderr)
+print("action=get 且 ts >= %s：%s 筆；最早 %s；最晚 %s" % (sys.argv[2], n, gfirst, glast), file=sys.stderr)
+print(n)
+PY
+) || { fb_say "STOP-PRE: 讀不到稽核"; exit 1; }
+if [ "$GETS" != 0 ]; then fb_say "RESULT: STOP-GET（Mac 這台有 ${GETS} 筆 get；不換版本）"; exit 3; fi
+fb_say "GET-AUDIT(Mac): ZERO"
+
+# 驗收：list 200 ＋ 可選項。全部通過回 0。
+verify_new() {
+  local base="http://127.0.0.1:$PORT" fail="" gcode rcode tmpr
+  python3 -I - "$base" "$VERIFY_PIPES" <<'PY' || fail="list/pipes"
+import json, sys, urllib.request
+base, need_pipes = sys.argv[1], sys.argv[2] == "1"
+with urllib.request.urlopen(base + "/v1/subscriptions", timeout=10) as r:
+    code = r.status; d = json.load(r)
+rows = d if isinstance(d, list) else d.get("subscriptions", d.get("items", []))
+print("list %s，%d 列" % (code, len(rows)))
+if code != 200 or not rows:
+    print("FAIL：list 不是 200 或是空的"); sys.exit(1)
+if need_pipes:
+    bad = [x.get("id") for x in rows if not isinstance(((x.get("usage") or {}).get("pipes")), list)]
+    if bad:
+        print("FAIL：沒有 pipes 的列：%s" % bad); sys.exit(1)
+    print("PASS：每列 usage 都有 pipes")
+PY
+  if [ -n "$VERIFY_OLD_GET_ID" ]; then
+    gcode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$base/v1/subscriptions/$VERIFY_OLD_GET_ID" || true)
+    if [ "$gcode" = 404 ] || [ "$gcode" = 410 ]; then fb_say "PASS：舊的 get 回 ${gcode}"; else fb_say "FAIL：舊的 get 回 ${gcode}"; fail="$fail get"; fi
+  fi
+  if [ -n "$VERIFY_RESOLVE" ]; then
+    tmpr=$(mktemp) || return 1
+    rcode=$(curl -s -o "$tmpr" -w '%{http_code}' --max-time 10 "$base/v1/resolve?$VERIFY_RESOLVE" || true)
+    python3 -I - "$rcode" "$tmpr" "$VERIFY_RESOLVE_MODEL" <<'PY' || fail="$fail resolve"
+import json, sys
+code, path, want = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(path)) if code == "200" else {}
+model = (d.get("meta") or {}).get("model")
+print("resolve：%s；env 鍵 %s；meta.model %s" % (code, sorted((d.get("env") or {}).keys()), model))
+if code != "200" or (want and model != want):
+    print("FAIL"); sys.exit(1)
+print("PASS")
+PY
+    rm -f "$tmpr"
+  fi
+  [ -z "$fail" ]
+}
+
+# 停損：停掉目前的、用舊版起、驗 list。回傳前會結束整支腳本。
+rollback() {
+  fb_say "== 停損：$1"
+  bash "$SCRIPT_DIR/stop" >/dev/null 2>&1
+  LGW_FB_CODE=$OLD_CODE LGW_FB_TAG=$OLD_TAG bash "$SCRIPT_DIR/start"; rc=$?
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/v1/subscriptions" || true)
+  if [ "$rc" = 0 ] && [ "$code" = 200 ]; then fb_say "RESULT: ROLLED-BACK（回到 ${OLD_TAG}，list ${code}）"; exit 5; fi
+  fb_say "RESULT: ROLLBACK-FAILED（start rc=${rc}，list ${code}）；${PORT} 可能沒有服務，請回報。密碼檔不可用（若已加密，請先請本人解密）"; exit 6
+}
+
+fb_say "== ② 停 ${OLD_TAG}"
+bash "$SCRIPT_DIR/stop" || { fb_say "STOP: stop 失敗，沒有換版本"; exit 1; }
+
+fb_say "== ③ 起 ${NEW_TAG}"
+LGW_FB_CODE=$NEW_CODE LGW_FB_TAG=$NEW_TAG bash "$SCRIPT_DIR/start" || rollback "start ${NEW_TAG} 失敗"
+
+fb_say "== ④ 驗收"
+verify_new || rollback "驗收失敗"
+fb_say "RESULT: OK（暫時 Gateway 已換成 ${NEW_TAG}）"
+exit 0

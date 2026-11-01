@@ -1,0 +1,115 @@
+#!/bin/bash
+# 在 Mac 本機起 LLMGateway（lgwd），聽 127.0.0.1:${PORT}。設定從 repo 外的設定檔讀（見 mac-fallback.conf.example）。
+# 路線 1：PWFILE 有 PASS_SOURCE → 寫 creds/keys.pass，lgwd 內建的 keysync 拉加密正本解成 keys.env。
+# 路線 2：沒有 PASS_SOURCE → 把 KEY_MAP（與有的 OPTIONAL_KEY_MAP）直接寫進 keys.env，關掉 keysync。
+# 停損：WAIT_SECONDS 內 list 沒有 200、或 keysync 結果不對 → 只停自己記下的 pid、刪 key 檔，exit 2。
+# 結束碼：OK=0；STOP=2；前置不符=1。
+# 用法：start（版本可用 LGW_FB_CODE／LGW_FB_TAG 覆蓋設定檔；switch 就是這樣換版本）
+set -u
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+. "$SCRIPT_DIR/lib.sh"
+fb_load_conf || exit 1
+fb_require PWFILE CODE TAG STATE PASS_SOURCE KEY_MAP || exit 1
+
+[ -f "$PWFILE" ] || { fb_say "STOP-PRE: 找不到密碼檔（若已加密，請先請本人解密）"; exit 1; }
+fb_check_checkout "$CODE" "$TAG" || exit 1
+fb_say "== 程式：${CODE}（${TAG}）"
+if fb_port_busy; then
+  if command -v lsof >/dev/null 2>&1; then
+    fb_say "STOP-PRE: 127.0.0.1:${PORT} 已經有人在聽（隧道還沒停？），不啟動"; fb_listeners
+  else
+    fb_say "STOP-PRE: 無法確認 127.0.0.1:${PORT} 是否空著（找不到 lsof），不啟動"
+  fi
+  exit 1
+fi
+if [ -f "$STATE/lgwd.pid" ] && kill -0 "$(cat "$STATE/lgwd.pid")" 2>/dev/null; then
+  fb_say "STOP-PRE: 已經有一個暫時 lgwd 在跑（pid $(cat "$STATE/lgwd.pid")）"; exit 1
+fi
+
+umask 077
+mkdir -p "$STATE/creds" "$STATE/claude-cwd" && chmod 700 "$STATE" "$STATE/creds"
+fb_names_report
+
+# 每次啟動都刪舊的 sha 與 status：殘留的 sha 會讓 keysync 以為已是最新而不寫檔（空 keys.env 事故）；
+# 舊的 status 會騙過啟動檢查。
+rm -f "$STATE/.keysync.sha" "$STATE/.keysync.status"
+KEYS="$STATE/keys.env"
+
+if fb_has "$PASS_SOURCE"; then
+  ROUTE=1
+  fb_write_mapped "$STATE/creds/keys.pass" "$PASS_SOURCE:LLMGW_KEYS_PASSWORD"
+  [ "$(cut -d= -f1 "$STATE/creds/keys.pass" | tr -d '\n')" = "LLMGW_KEYS_PASSWORD" ] || { rm -f "$STATE/creds/keys.pass"; fb_say "STOP-PRE: keys.pass 寫出來的名稱不對"; exit 1; }
+  # 每次都清空 keys.env，讓它只能由這次的 keysync 寫成
+  : > "$KEYS"; chmod 600 "$KEYS"
+  SYNC_ARGS=(--keysync-script "$CODE/ops-scripts/key-sync" --keysync-interval "$KEYSYNC_INTERVAL")
+  export CREDENTIALS_DIRECTORY="$STATE/creds"
+else
+  ROUTE=2
+  for m in $KEY_MAP; do
+    fb_has "${m%%:*}" || { fb_say "STOP-PRE: 路線 2 缺 ${m%%:*}；密碼檔不可用（若已加密，請先請本人解密）"; exit 1; }
+  done
+  OPT=""
+  for m in $OPTIONAL_KEY_MAP; do fb_has "${m%%:*}" && OPT="$OPT $m"; done
+  fb_write_mapped "$KEYS" $KEY_MAP $OPT
+  fb_say "  keys.env 寫出的名稱：$(cut -d= -f1 "$KEYS" | tr '\n' ' ')"
+  SYNC_ARGS=(--keysync-interval 0)
+fi
+fb_say "== 路線 $ROUTE"
+
+cd "$CODE" || exit 1
+T0=$(date +%s)
+nohup python3 -m lgwd \
+  --db "$STATE/llm.db" --policy "$CODE/policy/default.json" --keys "$KEYS" \
+  --api-host 127.0.0.1 --api-port "$PORT" --usage-claude-cwd "$STATE/claude-cwd" \
+  "${SYNC_ARGS[@]}" >> "$STATE/lgwd.log" 2>&1 &
+PID=$!
+echo "$PID" > "$STATE/lgwd.pid"
+fb_say "== lgwd pid ${PID}（log：$STATE/lgwd.log）"
+
+# 停損：只停自己記下的 pid；刪掉 key 檔
+stop_self() {
+  fb_say "STOP: $1"
+  fb_kill_lgwd "$PID"
+  rm -f "$STATE/lgwd.pid" "$STATE/creds/keys.pass" "$KEYS"
+  fb_say "已停 pid ${PID}，並刪掉 keys.env、keys.pass。log 最後 20 行（遮罩過）："
+  tail -20 "$STATE/lgwd.log" | sed -E 's/[A-Za-z0-9_+\/=-]{32,}/<redacted>/g'
+  exit 2
+}
+
+ok=""; code=""; i=0
+while [ "$i" -lt "$WAIT_SECONDS" ]; do
+  i=$((i + 1))
+  sleep 1
+  kill -0 "$PID" 2>/dev/null || stop_self "lgwd 自己結束了"
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/v1/subscriptions" || true)
+  [ "$code" = 200 ] || continue
+  if [ "$ROUTE" = 2 ]; then ok=1; break; fi
+  # 路線 1：只認這次啟動之後寫的 status，而且 keys.env 不能是空的
+  st=$(fb_keysync_verdict "$STATE/.keysync.status" "$T0")
+  case "$st" in
+    ok) if [ -s "$KEYS" ]; then ok=1; break; else stop_self "keysync 回 ok，但 keys.env 是空的"; fi ;;
+    fail:*) stop_self "keysync 失敗：${st#fail:}" ;;
+  esac
+done
+[ -n "$ok" ] || stop_self "${WAIT_SECONDS} 秒內沒有 200（最後 http=${code}）或沒有這次啟動後的 keysync 結果"
+[ -s "$KEYS" ] || stop_self "keys.env 是空的"
+
+fb_say "== 驗收"
+curl -s --max-time 10 "http://127.0.0.1:$PORT/v1/subscriptions" | python3 -I -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("FAIL：list 回的不是 JSON"); sys.exit(1)
+rows = d if isinstance(d, list) else d.get("subscriptions", d.get("items", []))
+print("list 200，%d 列" % len(rows))
+if not rows:
+    print("FAIL：list 是空的"); sys.exit(1)
+for r in rows: print("  %-16s available=%s" % (r.get("id"), r.get("available")))
+bad = [r.get("id") for r in rows if r.get("available") is not True and not r.get("cooldown")]
+if bad:
+    print("FAIL：沒有冷卻卻不可用的列（key 沒載入？）：%s" % bad); sys.exit(1)
+print("PASS：沒有冷卻的列都 available=True")' || stop_self "驗收沒過（見上面）"
+
+fb_say "RESULT: OK（暫時 Gateway 在 127.0.0.1:${PORT}，${TAG}，pid ${PID}，路線 ${ROUTE}）"
+exit 0

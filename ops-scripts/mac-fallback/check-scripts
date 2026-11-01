@@ -1,0 +1,32 @@
+#!/bin/bash
+# 檢查 mac-fallback 的腳本：(1) bash -n；(2) 「$變數」後面直接接非 ASCII 字元（全形字）→ 失敗。
+# 2026-11-01 的事故：變數後面直接接全形字，set -u 下會被當成變數名的一部分。這裡一律要求寫成 ${VAR}。
+# 用法：check-scripts [檔案…]；不給檔案時檢查同目錄的 start、stop、switch、lib.sh。
+# 結束碼：全部通過=0；有失敗=1。
+set -u
+DIR=$(cd "$(dirname "$0")" && pwd)
+if [ $# -eq 0 ]; then set -- "$DIR/start" "$DIR/stop" "$DIR/switch" "$DIR/lib.sh"; fi
+rc=0
+for f in "$@"; do
+  name=$(basename "$f")
+  if bash -n "$f"; then fb_ok=OK; else fb_ok=FAIL; rc=1; fi
+  echo "bash -n $fb_ok: $name"
+  hits=$(python3 -I - "$f" <<'PY'
+import re, sys
+pat = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9])[^\x00-\x7f]")
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            if pat.search(line):
+                print(n)
+except (OSError, UnicodeDecodeError) as exc:
+    print("ERR " + type(exc).__name__)
+PY
+)
+  if [ -n "$hits" ]; then
+    echo "FAIL 變數後面直接接非 ASCII 字元：$name 第 $(echo "$hits" | tr '\n' ' ')行（改成 \${VAR}）"; rc=1
+  else
+    echo "全形字檢查 OK: $name"
+  fi
+done
+exit $rc
