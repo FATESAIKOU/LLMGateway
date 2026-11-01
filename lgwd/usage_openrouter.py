@@ -123,8 +123,7 @@ def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
         and 0 <= c_rem <= c_limit
     ):
         percent = c_rem / c_limit * 100
-        if math.isfinite(percent) and (0 <= percent <= 100):
-            windows["credits"] = (percent, None)
+        windows["credits"] = (percent, None)
 
     if all(value is None for value in windows.values()):
         return failure(NO_WINDOWS)

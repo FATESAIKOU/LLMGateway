@@ -72,8 +72,12 @@ class OpenRouterFetchTest(unittest.TestCase):
         self.assertEqual(run(FakeHttp(raises=ConnectionRefusedError(f"boom {KEY}"))).reason, "upstream_error")
 
     def test_逾時(self):
-        self.assertEqual(run(FakeHttp(raises=socket.timeout(f"slow {KEY}"))).reason, "timeout")
-        self.assertEqual(run(FakeHttp(raises=TimeoutError())).reason, "timeout")
+        http = FakeHttp(raises=socket.timeout(f"slow {KEY}"))
+        self.assertEqual(run(http).reason, "timeout")
+        self.assertEqual(len(http.requests), 1)
+        http2 = FakeHttp(raises=TimeoutError())
+        self.assertEqual(run(http2).reason, "timeout")
+        self.assertEqual(len(http2.requests), 1)
 
     def test_429帶RetryAfter(self):
         got = run(FakeHttp(status=429, headers={"retry-after": "600"}))

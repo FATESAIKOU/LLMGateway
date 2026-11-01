@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from lgwd import providers as lgwd_providers
 from lgwd.clock import FakeClock
@@ -21,6 +22,8 @@ from lgwd.policy import UsageSetting, load_policy
 from lgwd.providers import AnthropicProvider, GoogleProvider, UsageDeps, provider_for
 from lgwd.registry import RegistryService
 from lgwd.usage import FetchResult, UsageService, failure
+from lgwd.usage_ollama import OllamaUsageFetcher
+from lgwd.usage_openrouter import OpenRouterUsageFetcher
 from tests.usage_fakes import FakeFetcher, windows
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2763,6 +2766,9 @@ class UsageSecretsTest(UsageRegistryCase):
         self.assertNotIn("sk-or-v1", blob)
         self.assertNotIn("limit_remaining", blob)
         self.assertNotIn("free_model_daily_requests", blob)
+        # N-B：pipes 裡確實有 id 為 credits 的一根（list 與 resolve 都要）
+        self.assertTrue(any(p.get("id") == "credits" for p in item["usage"]["pipes"]))
+        self.assertTrue(any(p.get("id") == "credits" for p in res["meta"]["usage"]["pipes"]))
 
 
 class RealFetcherTtlTest(RegistryCase):
@@ -2842,6 +2848,49 @@ class RealFetcherTtlTest(RegistryCase):
 
     def test_Ollama調高有效(self):
         self.assertEqual(self.usage_for(**{"ollama-cloud": {"ttl_seconds": 300}})._ttl["ollama-cloud"], 300)
+
+    def test_OpenRouter設1_夾到60並記log(self):
+        with self.assertLogs("lgwd.usage", level="WARNING") as logs:
+            service = self.usage_for(**{"openrouter": {"ttl_seconds": 1}})
+        self.assertEqual(service._ttl["openrouter"], 60)
+        self.assertEqual(len(logs.output), 1)
+
+    def test_OpenRouter調高有效(self):
+        self.assertEqual(self.usage_for(**{"openrouter": {"ttl_seconds": 300}})._ttl["openrouter"], 300)
+
+
+class ExternalHostsTest(unittest.TestCase):
+    def test_外連範圍(self):
+        clock = FakeClock()
+        requests = []
+
+        def http(url, headers, timeout):
+            requests.append(url)
+            if "ollama.com" in url:
+                body = json.dumps({"included": {
+                    "session": {"remaining_percent": 75,
+                                "resets_at": "2026-10-25T07:00:00Z"},
+                    "weekly": {"remaining_percent": 40,
+                               "resets_at": "2026-10-28T00:00:00Z"}}}).encode()
+            else:
+                body = json.dumps({"data": {
+                    "free_model_daily_requests": {"used": 10, "limit": 50,
+                                                 "remaining": 40}}}).encode()
+            return 200, {}, body
+
+        fetchers = {
+            "ollama-cloud": OllamaUsageFetcher(http_get=http),
+            "openrouter": OpenRouterUsageFetcher(http_get=http, clock=clock),
+        }
+        service = UsageService(clock, fetchers=fetchers, settings={},
+                              key_of=lambda s: "canary", deployed=lambda s: True)
+        service.usage_for("ollama-cloud")
+        self.assertTrue(service.wait_idle())
+        service.usage_for("openrouter")
+        self.assertTrue(service.wait_idle())
+
+        hosts = {urlsplit(u).hostname for u in requests}
+        self.assertEqual(hosts, {"ollama.com", "openrouter.ai"})
 
 
 if __name__ == "__main__":
