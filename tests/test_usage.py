@@ -4,6 +4,7 @@
 """
 
 import datetime as _dt
+import json
 import threading
 import unittest
 from types import SimpleNamespace
@@ -20,7 +21,7 @@ from lgwd.usage import (
     failure,
 )
 
-SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly"}
+SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly", "pipes"}
 
 
 def make(fetcher=None, *, settings=None, deployed=True, sub="sub"):
@@ -40,7 +41,7 @@ class BuildUsageTest(unittest.TestCase):
         e.fetched_at, e.windows, e.last_reason = fetched, wins or windows(), reason
         return e
 
-    def test_七個鍵恆在_ok(self):
+    def test_八個鍵恆在_ok(self):
         u = build_usage("s", self.entry(), at(seconds=10), 120)
         self.assertEqual(set(u), SHAPE)
         self.assertEqual(u["status"], "ok")
@@ -53,7 +54,7 @@ class BuildUsageTest(unittest.TestCase):
     def test_沒取過_not_fetched_yet(self):
         u = build_usage("s", None, BASE, 120)
         self.assertEqual(u, {"status": "unknown", "source": "s", "fetched_at": None, "stale": None,
-                             "reason": "not_fetched_yet", "session": None, "weekly": None})
+                             "reason": "not_fetched_yet", "session": None, "weekly": None, "pipes": []})
 
     def test_從沒成功過_reason帶最近失敗碼(self):
         e = usage_mod._Entry()
@@ -148,7 +149,7 @@ class TriggerTest(unittest.TestCase):
         service = UsageService(FakeClock(BASE))
         self.assertEqual(service.usage_for("openrouter"),
                          {"status": "not_applicable", "source": None, "fetched_at": None,
-                          "stale": None, "reason": None, "session": None, "weekly": None})
+                          "stale": None, "reason": None, "session": None, "weekly": None, "pipes": []})
 
     def test_卡住時不等_回not_fetched_yet_並只觸發一次(self):
         service, fetcher, _, _ = make()
@@ -373,6 +374,271 @@ class StopTest(unittest.TestCase):
     def test_stop可重複呼叫(self):
         service, _, _, _ = make()
         service.stop(); service.stop()
+
+
+class PipesContractTest(unittest.TestCase):
+    def entry(self, fetched=BASE, wins=None, reason=None):
+        e = usage_mod._Entry()
+        e.fetched_at, e.windows, e.last_reason = fetched, wins or windows(), reason
+        return e
+
+    def test_C1_形狀恆為八鍵且pipes為陣列(self):
+        # 任何 usage（含 not_applicable、unknown）鍵集恰為八鍵，pipes 為陣列（無管子＝[]）
+        na = usage_mod._not_applicable()
+        self.assertEqual(set(na), SHAPE)
+        self.assertEqual(na["pipes"], [])
+
+        unk = usage_mod._unknown("s", "upstream_error")
+        self.assertEqual(set(unk), SHAPE)
+        self.assertEqual(unk["pipes"], [])
+
+        internal = usage_mod.internal_usage("s")
+        self.assertEqual(set(internal), SHAPE)
+        self.assertEqual(internal["pipes"], [])
+
+        ok = build_usage("fake-source", self.entry(), at(seconds=10), 120)
+        self.assertEqual(set(ok), SHAPE)
+        self.assertIsInstance(ok["pipes"], list)
+
+    def test_C2_Claude兩窗口與pipes逐值相等(self):
+        # Claude 兩窗口讀到時，pipes 有 five_hour、seven_day，逐值相等，models 為 ["*"]
+        e = self.entry(wins={"session": (76.5, at(hours=3)), "weekly": (39.0, at(days=5))})
+        u = build_usage("claude-statusline", e, at(seconds=10), 120)
+        self.assertEqual(u["status"], "ok")
+        self.assertEqual(u["session"]["remaining_percent"], 76.5)
+        self.assertEqual(u["session"]["resets_at"], to_rfc3339(at(hours=3)))
+        self.assertEqual(u["weekly"]["remaining_percent"], 39.0)
+        self.assertEqual(u["weekly"]["resets_at"], to_rfc3339(at(days=5)))
+
+        self.assertEqual(len(u["pipes"]), 2)
+        p1, p2 = u["pipes"]
+        self.assertEqual(p1, {
+            "id": "five_hour",
+            "models": ["*"],
+            "models_except": [],
+            "remaining_percent": 76.5,
+            "resets_at": to_rfc3339(at(hours=3)),
+        })
+        self.assertEqual(p2, {
+            "id": "seven_day",
+            "models": ["*"],
+            "models_except": [],
+            "remaining_percent": 39.0,
+            "resets_at": to_rfc3339(at(days=5)),
+        })
+        self.assertEqual(p1["remaining_percent"], u["session"]["remaining_percent"])
+        self.assertEqual(p1["resets_at"], u["session"]["resets_at"])
+        self.assertEqual(p2["remaining_percent"], u["weekly"]["remaining_percent"])
+        self.assertEqual(p2["resets_at"], u["weekly"]["resets_at"])
+
+    def test_C3_Ollama讀到窗口與pipes逐值相等_新方案pipes為空(self):
+        # Ollama 讀到 session/weekly 時 pipes 有 session, weekly 且逐值相等；新方案 unknown/no_windows, pipes: []
+        e = self.entry(wins={"session": (75.0, at(hours=2)), "weekly": (40.0, at(days=4))})
+        u = build_usage("ollama-api-balance", e, at(seconds=10), 120)
+        self.assertEqual(u["status"], "ok")
+        self.assertEqual(len(u["pipes"]), 2)
+        p_sess, p_week = u["pipes"]
+        self.assertEqual(p_sess, {
+            "id": "session",
+            "models": ["*"],
+            "models_except": [],
+            "remaining_percent": 75.0,
+            "resets_at": to_rfc3339(at(hours=2)),
+        })
+        self.assertEqual(p_week, {
+            "id": "weekly",
+            "models": ["*"],
+            "models_except": [],
+            "remaining_percent": 40.0,
+            "resets_at": to_rfc3339(at(days=4)),
+        })
+        self.assertEqual(p_sess["remaining_percent"], u["session"]["remaining_percent"])
+        self.assertEqual(p_week["remaining_percent"], u["weekly"]["remaining_percent"])
+
+        # 新方案：fetch 失敗 no_windows
+        e_empty = usage_mod._Entry()
+        e_empty.last_reason = "no_windows"
+        u_empty = build_usage("ollama-api-balance", e_empty, BASE, 120)
+        self.assertEqual(u_empty["status"], "unknown")
+        self.assertEqual(u_empty["reason"], "no_windows")
+        self.assertEqual(u_empty["pipes"], [])
+
+    def test_C4_OpenRouter_free_daily與session逐值相等(self):
+        # OpenRouter free_model_daily_requests 讀到 -> pipes 有 free_daily (models ["*:free","openrouter/free"])，session 與其逐值相等
+        midnight = at(hours=5)
+        e = self.entry(wins={"session": (80.0, midnight), "weekly": None})
+        u = build_usage("openrouter-api-key", e, at(seconds=10), 120)
+        self.assertEqual(u["status"], "ok")
+        self.assertEqual(len(u["pipes"]), 1)
+        p = u["pipes"][0]
+        self.assertEqual(p, {
+            "id": "free_daily",
+            "models": ["*:free", "openrouter/free"],
+            "models_except": [],
+            "remaining_percent": 80.0,
+            "resets_at": to_rfc3339(midnight),
+        })
+        self.assertEqual(u["session"]["remaining_percent"], p["remaining_percent"])
+        self.assertEqual(u["session"]["resets_at"], p["resets_at"])
+        self.assertIsNone(u["weekly"])
+
+    def test_C5_OpenRouter_credits導出(self):
+        # OpenRouter 有 credits -> 多一根 credits（percent, resets_at null, models_except free 樣式），session 仍只由 free_daily 導出
+        midnight = at(hours=5)
+        e = self.entry(wins={
+            "session": (80.0, midnight),
+            "weekly": None,
+            "credits": (40.0, None),
+        })
+        u = build_usage("openrouter-api-key", e, at(seconds=10), 120)
+        self.assertEqual(u["status"], "ok")
+        self.assertEqual(u["session"]["remaining_percent"], 80.0)
+        self.assertEqual(len(u["pipes"]), 2)
+        p_free, p_cred = u["pipes"]
+        self.assertEqual(p_free["id"], "free_daily")
+        self.assertEqual(p_cred, {
+            "id": "credits",
+            "models": ["*"],
+            "models_except": ["*:free", "openrouter/free"],
+            "remaining_percent": 40.0,
+            "resets_at": None,
+        })
+
+    def test_C6_只有credits讀到時status為ok且session為null(self):
+        # 只有 credits 讀到、free_model_daily_requests 缺 -> status: ok，session 為 null，pipes 只有 credits
+        e = self.entry(wins={
+            "session": None,
+            "weekly": None,
+            "credits": (45.0, None),
+        })
+        u = build_usage("openrouter-api-key", e, at(seconds=10), 120)
+        self.assertEqual(u["status"], "ok")
+        self.assertIsNone(u["session"])
+        self.assertIsNone(u["weekly"])
+        self.assertEqual(len(u["pipes"]), 1)
+        self.assertEqual(u["pipes"][0]["id"], "credits")
+        self.assertEqual(u["pipes"][0]["remaining_percent"], 45.0)
+        self.assertIsNone(u["pipes"][0]["resets_at"])
+
+    def test_C7_管子resets_at過期與null過期處理(self):
+        # 管子 resets_at 已過 -> 不在 pipes；全部都沒有 -> unknown/stale_expired。resets_at 為 null 超過 6 小時一併消失
+        # 1. 兩根管子，其中一根已過
+        wins = {
+            "session": (70.0, at(hours=-1)), # 已過期
+            "weekly": (50.0, at(hours=2)),  # 未過期
+        }
+        e = self.entry(wins=wins)
+        u = build_usage("claude-statusline", e, BASE, 120)
+        self.assertEqual(u["status"], "ok")
+        self.assertIsNone(u["session"])
+        self.assertIsNotNone(u["weekly"])
+        self.assertEqual(len(u["pipes"]), 1)
+        self.assertEqual(u["pipes"][0]["id"], "seven_day")
+
+        # 2. 全部管子已過期 -> unknown/stale_expired
+        wins_expired = {
+            "session": (70.0, at(hours=-2)),
+            "weekly": (50.0, at(hours=-1)),
+        }
+        e_exp = self.entry(wins=wins_expired)
+        u_exp = build_usage("claude-statusline", e_exp, BASE, 120)
+        self.assertEqual(u_exp["status"], "unknown")
+        self.assertEqual(u_exp["reason"], "stale_expired")
+        self.assertEqual(u_exp["pipes"], [])
+
+        # 3. resets_at 為 null 的 credits 在 6 小時內仍在，超過 6 小時消失
+        wins_cred = {
+            "session": None,
+            "weekly": None,
+            "credits": (50.0, None),
+        }
+        e_cred = self.entry(fetched=BASE, wins=wins_cred)
+        u_within = build_usage("openrouter-api-key", e_cred, at(hours=5, minutes=59), 120)
+        self.assertEqual(u_within["status"], "ok")
+        self.assertEqual(len(u_within["pipes"]), 1)
+
+        u_after = build_usage("openrouter-api-key", e_cred, at(hours=6, seconds=1), 120)
+        self.assertEqual(u_after["status"], "unknown")
+        self.assertEqual(u_after["reason"], "stale_expired")
+        self.assertEqual(u_after["pipes"], [])
+
+    def test_C8_available_again_at算法不變_只由session_weekly計算(self):
+        # available_again_at 算法不變：只有 credits 為 0 時仍為 null；session/weekly 為 0 時與現行相同
+        # 只有 credits 為 0（由 build_usage 產生，驗證 credits 不在 WINDOWS 裡、不影響 session/weekly 與 available_again_at）
+        e_cred_zero = self.entry(wins={
+            "session": None,
+            "weekly": None,
+            "credits": (0.0, None),
+        })
+        u_cred_zero = build_usage("openrouter-api-key", e_cred_zero, BASE, 120)
+        self.assertEqual(set(u_cred_zero), SHAPE)
+        self.assertNotIn("credits", u_cred_zero)  # credits 絕不作為 usage 的一級鍵
+        self.assertIsNone(available_again_at(u_cred_zero, None, BASE, True))
+
+        # session 為 0
+        u_sess_zero = {
+            "status": "ok",
+            "source": "openrouter-api-key",
+            "session": {"remaining_percent": 0.0, "resets_at": to_rfc3339(at(hours=2))},
+            "weekly": None,
+            "pipes": [{
+                "id": "free_daily", "models": ["*"], "models_except": [],
+                "remaining_percent": 0.0, "resets_at": to_rfc3339(at(hours=2)),
+            }],
+        }
+        self.assertEqual(available_again_at(u_sess_zero, None, BASE, True), to_rfc3339(at(hours=2)))
+
+        # weekly 為 0
+        u_week_zero = {
+            "status": "ok",
+            "source": "claude-statusline",
+            "session": None,
+            "weekly": {"remaining_percent": 0.0, "resets_at": to_rfc3339(at(days=1))},
+            "pipes": [{
+                "id": "seven_day", "models": ["*"], "models_except": [],
+                "remaining_percent": 0.0, "resets_at": to_rfc3339(at(days=1)),
+            }],
+        }
+        self.assertEqual(available_again_at(u_week_zero, None, BASE, True), to_rfc3339(at(days=1)))
+
+        # pipes 有一根 resets_at 在未來且 percent 0，但 session/weekly 為 null -> 仍為 None
+        u_pipe_future_zero = {
+            "status": "ok",
+            "source": "fake-source",
+            "session": None,
+            "weekly": None,
+            "pipes": [{
+                "id": "custom_future", "models": ["*"], "models_except": [],
+                "remaining_percent": 0.0, "resets_at": to_rfc3339(at(hours=2)),
+            }],
+        }
+        self.assertIsNone(available_again_at(u_pipe_future_zero, None, BASE, True))
+
+    def test_C9_not_applicable的pipes是空陣列且不觸發取用量(self):
+        service = UsageService(FakeClock(BASE))
+        for p in ("opencode-zen", "opencode-go", "antigravity"):
+            with self.subTest(provider=p):
+                u = service.usage_for(p)
+                self.assertEqual(u["status"], "not_applicable")
+                self.assertIsNone(u["source"])
+                self.assertEqual(u["pipes"], [])
+
+    def test_C10_canary不出現在usage與pipes中(self):
+        # 回應（含 pipes）找不到 key/token、絕對值 canary (limit 12345.678, limit_remaining 4938.2712)、上游原文標籤
+        canary_limit = 12345.678
+        canary_rem = 4938.2712
+        pct = canary_rem / canary_limit * 100
+        e = self.entry(wins={
+            "session": (80.0, at(hours=3)),
+            "weekly": None,
+            "credits": (pct, None),
+        })
+        u = build_usage("openrouter-api-key", e, BASE, 120)
+        dump = json.dumps(u)
+        self.assertNotIn("12345.678", dump)
+        self.assertNotIn("4938.2712", dump)
+        self.assertNotIn("free_model_daily_requests", dump)
+        self.assertNotIn("limit_remaining", dump)
 
 
 if __name__ == "__main__":

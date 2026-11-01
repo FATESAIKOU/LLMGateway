@@ -1,10 +1,11 @@
 """OpenRouter 取用量（#85；spec usage-reporting「OpenRouter 取用量」）。
 
 `GET https://openrouter.ai/api/v1/key`，URL 寫死（不來自政策檔、不跟隨轉址），key 只放進
-該次請求的 `Authorization: Bearer`；逾時 5 秒、不重試。只取 `data.free_model_daily_requests`
-的 `remaining`／`limit`（每日免費請求數）換算成 `session` 窗口的 `remaining_percent`，
-`resets_at` 為下一個 UTC 00:00（官方：每日免費請求數以 UTC 日為單位重置）。`limit_remaining`
-等其他欄位不進 usage（沒有對應的窗口形狀）。key 不進例外訊息與 log。
+該次請求的 `Authorization: Bearer`；逾時 5 秒、不重試。取 `data.free_model_daily_requests`
+的 `remaining`／`limit`（每日免費請求數）換算成 `session` 窗口（與 pipes 的 `free_daily` 管子）的
+`remaining_percent`，`resets_at` 為下一個 UTC 00:00（官方：每日免費請求數以 UTC 日為單位重置）。
+取 `data.limit` 與 `data.limit_remaining` 換算成 `credits` 管子的 `remaining_percent`（`resets_at` 恆為 null；
+金額與配額絕對值不進 usage）。key 不進例外訊息與 log。
 
 前提（#85 低-4）：這個 `session` 窗口只代表 `:free` 模型的每日請求數
 （`free_model_daily_requests`），不是這把 key 的全部可用量；官方明寫
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import socket
 from datetime import datetime, time, timedelta, timezone
 
@@ -103,6 +105,27 @@ def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
             return failure(PARSE_ERROR)
         resets = _next_utc_midnight(now)
         windows["session"] = (percent, resets)
+
+    # credits 解析（C-5, C-11, C-12；design §5）：
+    # 僅當 limit 為正數且 limit_remaining 在 0～limit 範圍時才產生 credits 管子；
+    # 任何異常值（負數、大於 limit、型別不對、bool、limit <= 0）只丟棄 credits，不引發 parse_error 或 failure。
+    # resets_at 恆為 None。
+    c_limit = payload.get("limit")
+    c_rem = payload.get("limit_remaining")
+    if (
+        not isinstance(c_limit, bool)
+        and not isinstance(c_rem, bool)
+        and isinstance(c_limit, (int, float))
+        and isinstance(c_rem, (int, float))
+        and math.isfinite(c_limit)
+        and math.isfinite(c_rem)
+        and c_limit > 0
+        and 0 <= c_rem <= c_limit
+    ):
+        percent = c_rem / c_limit * 100
+        if math.isfinite(percent) and (0 <= percent <= 100):
+            windows["credits"] = (percent, None)
+
     if all(value is None for value in windows.values()):
         return failure(NO_WINDOWS)
     return FetchResult(windows=windows)

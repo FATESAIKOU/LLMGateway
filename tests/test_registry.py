@@ -2511,7 +2511,7 @@ CREATE TABLE IF NOT EXISTS audit (
                          ["cooldown", "cooldown", "cooldown"])
         self.assertEqual(legacy_audit[1][5], "2026-10-11T15:00:00Z")
 
-SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly"}
+SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly", "pipes"}
 
 
 class UsageRegistryCase(RegistryCase):
@@ -2553,7 +2553,7 @@ class ListUsageTest(UsageRegistryCase):
                 self.assertIn("available_again_at", item)
         self.assertEqual(self.item("opencode-zen")["usage"],
                          {"status": "not_applicable", "source": None, "fetched_at": None,
-                          "stale": None, "reason": None, "session": None, "weekly": None})
+                          "stale": None, "reason": None, "session": None, "weekly": None, "pipes": []})
         self.settle()
         self.assertEqual(self.item("openrouter")["usage"]["status"], "ok")
         self.assertEqual(self.item("opencode-go")["usage"]["status"], "not_applicable")
@@ -2722,6 +2722,21 @@ class ResolveUsageTest(UsageRegistryCase):
         meta = self.resolve("opencode", "opencode-zen")["meta"]
         self.assertEqual(meta["usage"]["status"], "not_applicable")
 
+    def test_整合層_驗八鍵集與available_again_at不變(self):
+        # 整合層（list／resolve）驗鍵集與 available_again_at 不變
+        self.settle()
+        item = self.item("openrouter")
+        self.assertEqual(set(item["usage"]), SHAPE)
+        self.assertIn("pipes", item["usage"])
+        self.assertIn("available_again_at", item)
+        # openrouter 在 FakeFetcher 下 session 為 75%，非 0，故 available_again_at 為 None
+        self.assertIsNone(item["available_again_at"])
+
+        res = self.resolve("opencode", "openrouter")
+        self.assertEqual(set(res["meta"]["usage"]), SHAPE)
+        self.assertIn("pipes", res["meta"]["usage"])
+        self.assertNotIn("available_again_at", res["meta"])
+
     def test_成功resolve觸發一次_不等(self):
         self.ollama.gate = threading.Event()
         self.addCleanup(self.ollama.gate.set)
@@ -2829,6 +2844,50 @@ class UsageSecretsTest(UsageRegistryCase):
             for value in CANARY.values():
                 self.assertNotIn(value, blob)
                 self.assertNotIn(value.encode(), self.db_bytes())
+
+    def test_openrouter假回應帶canary_list與resolve不外洩數字與key樣式(self):
+        # N-2: OpenRouter 假 HTTP 回應帶 canary 數字與 key 樣式，list／resolve 回覆不外洩
+        canary_limit = 12345.678
+        canary_rem = 4938.2712
+        canary_key = "sk-or-v1-canary-secret-token"
+
+        fake_body = json.dumps({
+            "data": {
+                "limit": canary_limit,
+                "limit_remaining": canary_rem,
+                "free_model_daily_requests": {"used": 10, "limit": 50, "remaining": 40},
+                "key": canary_key,
+            }
+        }).encode("utf-8")
+
+        def fake_http(url, headers, timeout):
+            return 200, {}, fake_body
+
+        from lgwd.usage_openrouter import OpenRouterUsageFetcher
+        real_openrouter_fetcher = OpenRouterUsageFetcher(http_get=fake_http, clock=self.clock)
+        self.usage = UsageService(
+            self.clock,
+            fetchers={"ollama-cloud": self.ollama, "claude-personal": self.claude,
+                      "openrouter": real_openrouter_fetcher},
+            settings={},
+            key_of=lambda s: self.keys.get(s), deployed=self.keys.deployed)
+        self.service.close()
+        self.service = RegistryService(self.db_path, self.policy, self.keys,
+                                       self.clock, usage=self.usage)
+
+        self.list_items()
+        self.settle()
+
+        item = self.item("openrouter")
+        res = self.resolve("opencode", "openrouter")
+
+        blob = json.dumps([item, res], ensure_ascii=False)
+        self.assertNotIn("12345.678", blob)
+        self.assertNotIn("4938.2712", blob)
+        self.assertNotIn("canary-secret-token", blob)
+        self.assertNotIn("sk-or-v1", blob)
+        self.assertNotIn("limit_remaining", blob)
+        self.assertNotIn("free_model_daily_requests", blob)
 
 
 class RealFetcherTtlTest(RegistryCase):

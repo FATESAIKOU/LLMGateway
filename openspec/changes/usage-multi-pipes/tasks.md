@@ -1,5 +1,5 @@
 ## 前置
-- [ ] `openrouter-usage-fetcher` 先歸檔
+- [x] `openrouter-usage-fetcher` 先歸檔
 
 ## 契約（C-n；實作報告逐條對到測試名稱）
 - C-1：任何 `usage`（含 `not_applicable`、`unknown`）鍵集恰為 `status, source, fetched_at, stale, reason, session, weekly, pipes`；`pipes` 為陣列（無管子＝`[]`）。
@@ -16,11 +16,11 @@
 - C-12：`credits.resets_at` 恆為 null（即使回應帶任何重置週期欄位）。
 
 ## 實作
-- [ ] `lgwd/usage.py`：固定表 `PIPE_TABLE`；`FetchResult.windows` 容許選填 `credits`；`build_usage` 產生 `pipes`；`_not_applicable`／`_unknown`／`internal_usage` 補 `pipes: []`；null `resets_at` 的過期處理。
-- [ ] `lgwd/usage_openrouter.py`：解析 credits（異常只丟棄）。
-- [ ] 主 spec delta、測試。
-- [ ] 改 SHAPE 為八鍵：`tests/test_usage.py:23`（使用處 `:45`、`:263`）、`tests/test_registry.py:2514`（使用處 `:2552`、`:2710`）。
-- [ ] `openspec validate usage-multi-pipes` 綠。
+- [x] `lgwd/usage.py`：固定表 `PIPE_TABLE`；`FetchResult.windows` 容許選填 `credits`；`build_usage` 產生 `pipes`；`_not_applicable`／`_unknown`／`internal_usage` 補 `pipes: []`；null `resets_at` 的過期處理。
+- [x] `lgwd/usage_openrouter.py`：解析 credits（異常只丟棄）。
+- [x] 主 spec delta、測試。
+- [x] 改 SHAPE 為八鍵：`tests/test_usage.py:23`（使用處 `:45`、`:263`）、`tests/test_registry.py:2514`（使用處 `:2552`、`:2710`）。
+- [x] `openspec validate usage-multi-pipes` 綠。
 
 ## 測試策略
 單元層：fetcher 以假 HTTP／假 rate 檔餵固定回應，驗 `FetchResult` 與 credits 異常值；`build_usage` 純函式驗過期與導出；list／resolve 層一個整合測試驗鍵集與 `available_again_at` 不變。替身：沿用現有 `http_get` 注入與假時鐘。驗收門檻由 PM 定。
