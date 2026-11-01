@@ -449,6 +449,9 @@ class UsageGatewayTest(unittest.TestCase):
     BALANCE = json.dumps({"included": {
         "session": {"remaining_percent": 75, "resets_at": "2026-10-12T07:00:00Z"},
         "weekly": {"remaining_percent": 40, "resets_at": "2026-10-14T00:00:00Z"}}}).encode()
+    OPENROUTER_BALANCE = json.dumps({"data": {
+        "free_model_daily_requests": {"used": 10, "limit": 50, "remaining": 40},
+        "limit": 100.0, "limit_remaining": 45.0}}).encode()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -472,6 +475,8 @@ class UsageGatewayTest(unittest.TestCase):
 
     def http(self, url, headers, timeout):
         self.requests.append(headers["Authorization"])
+        if "openrouter.ai" in url:
+            return 200, {}, self.OPENROUTER_BALANCE
         return 200, {}, self.BALANCE
 
     def claude_command(self, mode):
@@ -521,6 +526,34 @@ class UsageGatewayTest(unittest.TestCase):
         gw.service._clock.advance(seconds=121)       # 過 TTL
         self.items(base); gw._usage.wait_idle()
         self.assertEqual(self.requests[-1], "Bearer test-main-rotated-222")
+
+    def test_換key後取用量用新key_openrouter(self):
+        gw, base = self.gateway(usage={"ollama-cloud": {"enabled": False},
+                                      "openrouter": {"enabled": True}})
+        rotate(str(self.root / "keys.env"),
+               key_text({**FAKE_KEYS, "openrouter": "canary-or-old"}))
+        self.items(base); gw._usage.wait_idle()
+        self.assertEqual(self.requests[-1], "Bearer canary-or-old")
+        rotate(str(self.root / "keys.env"),
+               key_text({**FAKE_KEYS, "openrouter": "canary-or-new"}))
+        gw.service._clock.advance(seconds=121)       # 過 TTL
+        self.items(base); gw._usage.wait_idle()
+        self.assertEqual(self.requests[-1], "Bearer canary-or-new")
+
+    def test_換key後取用量用新key_openrouter_直接走usage(self):
+        gw, _ = self.gateway(usage={"ollama-cloud": {"enabled": False},
+                                    "openrouter": {"enabled": True}})
+        rotate(str(self.root / "keys.env"),
+               key_text({**FAKE_KEYS, "openrouter": "canary-or-old"}))
+        gw._usage.usage_for("openrouter")
+        gw._usage.wait_idle()
+        self.assertEqual(self.requests[-1], "Bearer canary-or-old")
+        rotate(str(self.root / "keys.env"),
+               key_text({**FAKE_KEYS, "openrouter": "canary-or-new"}))
+        gw.service._clock.advance(seconds=121)       # 過 TTL
+        gw._usage.usage_for("openrouter")
+        gw._usage.wait_idle()
+        self.assertEqual(self.requests[-1], "Bearer canary-or-new")
 
     def test_Claude預設關閉_不起子行程(self):
         # 預設關閉測試：用明確 disabled（出廠已開，不能再假設預設關閉）

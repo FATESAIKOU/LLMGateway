@@ -38,7 +38,7 @@ OLLAMA_USAGE = {
     "stale": None, "reason": "no_key", "session": None, "weekly": None,
 }
 OPENROUTER_USAGE = {
-    "status": "ok", "source": "openrouter-credits",
+    "status": "ok", "source": "openrouter-api-key",
     "fetched_at": "2026-10-12T02:00:00Z", "stale": False, "reason": None,
     "session": None,
     "weekly": {"remaining_percent": 10, "resets_at": "2026-10-19T00:00:00Z"},
@@ -271,7 +271,7 @@ class UsageTests(unittest.TestCase):
         # status=ok 但兩個窗口都沒有數值：說出缺什麼，不與 unknown 的「未知」混在一起。
         rows = copy.deepcopy(SUBSCRIPTIONS)
         rows[3]["usage"] = {
-            "status": "ok", "source": "openrouter-credits", "stale": False,
+            "status": "ok", "source": "openrouter-api-key", "stale": False,
             "reason": None, "session": None, "weekly": None,
         }
         self.fake.subscriptions = rows
