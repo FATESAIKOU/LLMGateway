@@ -46,11 +46,29 @@ EXPIRE_AFTER = _dt.timedelta(hours=6)     # 超過這麼久的舊值不再顯示
 BACKOFF_FLOOR_CAP = 1800.0                # 退避上限＝max(這個, TTL)
 _SHUTDOWN_GRACE = 5.0                     # stop() 等取用量執行緒收乾淨的秒數
 
+# 固定表（C-2, C-3, C-4, C-5；design §2、§5）：
+# source -> ((window_key, id, models, models_except), ...)
+PIPE_TABLE = {
+    "claude-statusline": (
+        ("session", "five_hour", ["*"], []),
+        ("weekly", "seven_day", ["*"], []),
+    ),
+    "ollama-api-balance": (
+        ("session", "session", ["*"], []),
+        ("weekly", "weekly", ["*"], []),
+    ),
+    "openrouter-api-key": (
+        ("session", "free_daily", ["*:free", "openrouter/free"], []),
+        ("credits", "credits", ["*"], ["*:free", "openrouter/free"]),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class FetchResult:
     """一次取用量的結果。成功＝windows 非 None（{"session"/"weekly": (remaining_percent, resets_at)|None}，
-    至少一個非 None）；失敗＝reason 為固定碼，retry_after 是 429 的 Retry-After 秒數（選填）。"""
+    選填 "credits": (remaining_percent, resets_at)|None，至少一個非 None）；
+    失敗＝reason 為固定碼，retry_after 是 429 的 Retry-After 秒數（選填）。"""
     windows: dict | None = None
     reason: str | None = None
     retry_after: float | None = None
@@ -101,12 +119,12 @@ class _Entry:
 
 def _not_applicable() -> dict:
     return {"status": STATUS_NOT_APPLICABLE, "source": None, "fetched_at": None,
-            "stale": None, "reason": None, "session": None, "weekly": None}
+            "stale": None, "reason": None, "session": None, "weekly": None, "pipes": []}
 
 
 def _unknown(source, reason, fetched_at=None, stale=None) -> dict:
     return {"status": STATUS_UNKNOWN, "source": source, "fetched_at": fetched_at,
-            "stale": stale, "reason": reason, "session": None, "weekly": None}
+            "stale": stale, "reason": reason, "session": None, "weekly": None, "pipes": []}
 
 
 def internal_usage(source=None) -> dict:
@@ -115,7 +133,7 @@ def internal_usage(source=None) -> dict:
 
 
 def build_usage(source, entry: _Entry | None, now: _dt.datetime, ttl: float) -> dict:
-    """由快取內容（純計算）組 `usage` 物件：七個鍵恆在。"""
+    """由快取內容（純計算）組 `usage` 物件：八個鍵恆在。"""
     if entry is None or entry.fetched_at is None:
         return _unknown(source, (entry.last_reason if entry else None) or NOT_FETCHED_YET)
     age = now - entry.fetched_at
@@ -126,14 +144,31 @@ def build_usage(source, entry: _Entry | None, now: _dt.datetime, ttl: float) -> 
     shown = {}
     for name in WINDOWS:
         window = (entry.windows or {}).get(name)
-        if window is not None and window[1] > now:   # resets_at 已過＝不假設回到 100%
+        if window is not None and window[1] is not None and window[1] > now:   # resets_at 已過＝不假設回到 100%
             shown[name] = {"remaining_percent": window[0], "resets_at": to_rfc3339(window[1])}
         else:
             shown[name] = None
-    if all(value is None for value in shown.values()):
+
+    pipes = []
+    specs = PIPE_TABLE.get(source, ())
+    for win_key, pipe_id, models, models_except in specs:
+        window = (entry.windows or {}).get(win_key)
+        if window is not None:
+            pct, resets = window
+            alive = resets is None or resets > now
+            if alive:
+                pipes.append({
+                    "id": pipe_id,
+                    "models": list(models),
+                    "models_except": list(models_except),
+                    "remaining_percent": pct,
+                    "resets_at": to_rfc3339(resets) if resets is not None else None,
+                })
+
+    if all(value is None for value in shown.values()) and not pipes:
         return _unknown(source, STALE_EXPIRED, fetched_at, stale)
     return {"status": STATUS_OK, "source": source, "fetched_at": fetched_at,
-            "stale": stale, "reason": entry.last_reason if stale else None, **shown}
+            "stale": stale, "reason": entry.last_reason if stale else None, **shown, "pipes": pipes}
 
 
 def available_again_at(usage: dict, cooldown_until: _dt.datetime | None, now: _dt.datetime,

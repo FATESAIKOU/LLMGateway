@@ -141,6 +141,85 @@ class OpenRouterFetchTest(unittest.TestCase):
         self.assertEqual(resets, datetime(2026, 10, 26, 0, 0, tzinfo=timezone.utc))
         self.assertIsNotNone(resets.tzinfo)
 
+    def test_C5_credits正常讀到(self):
+        # C-5: OpenRouter limit 為正數、limit_remaining 在 0～limit -> 多一根 credits
+        body = body_with(
+            fmdr={"used": 10, "limit": 50, "remaining": 40},
+            limit=12345.678,
+            limit_remaining=4938.2712,
+        )
+        got = run(FakeHttp(body=body))
+        self.assertTrue(got.ok)
+        self.assertIn("credits", got.windows)
+        pct, resets = got.windows["credits"]
+        self.assertAlmostEqual(pct, 4938.2712 / 12345.678 * 100)
+        self.assertIsNone(resets)
+        self.assertEqual(got.windows["session"][0], 80.0)
+
+    def test_C5_credits_limit或limit_remaining為null不影響status(self):
+        # C-5: limit 或 limit_remaining 為 null -> 沒有 credits，不影響 status
+        body = body_with(
+            fmdr={"used": 10, "limit": 50, "remaining": 40},
+            limit=None,
+            limit_remaining=None,
+        )
+        got = run(FakeHttp(body=body))
+        self.assertTrue(got.ok)
+        self.assertNotIn("credits", got.windows)
+        self.assertEqual(got.windows["session"][0], 80.0)
+
+    def test_C6_只有credits讀到_free_model_daily_requests缺(self):
+        # C-6: 只有 credits 讀到、free_model_daily_requests 缺 -> status: ok，session 為 null，pipes 只有 credits
+        body = body_with(fmdr=None, limit=100.0, limit_remaining=45.0)
+        got = run(FakeHttp(body=body))
+        self.assertTrue(got.ok)
+        self.assertIsNone(got.windows["session"])
+        self.assertIsNone(got.windows["weekly"])
+        self.assertIn("credits", got.windows)
+        self.assertEqual(got.windows["credits"][0], 45.0)
+        self.assertIsNone(got.windows["credits"][1])
+
+    def test_C11_credits異常值只丟棄credits(self):
+        # C-11: credits 異常值（limit_remaining 負數、大於 limit、型別不對、limit <= 0）
+        # -> 沒有 credits，free_daily/session 仍在，status: ok，無退避
+        cases = [
+            {"limit": 100, "limit_remaining": -5},
+            {"limit": 100, "limit_remaining": 150},
+            {"limit": 100, "limit_remaining": "50"},
+            {"limit": 0, "limit_remaining": 0},
+            {"limit": -100, "limit_remaining": 50},
+            {"limit": True, "limit_remaining": 50},
+            {"limit": 100, "limit_remaining": True},
+            {"limit": float("inf"), "limit_remaining": float("inf")},
+            {"limit": 100, "limit_remaining": float("nan")},
+            {"limit": float("nan"), "limit_remaining": 50},
+            {"limit": float("inf"), "limit_remaining": 50},
+        ]
+        for c in cases:
+            with self.subTest(case=c):
+                body = body_with(
+                    fmdr={"used": 10, "limit": 50, "remaining": 40},
+                    limit=c["limit"],
+                    limit_remaining=c["limit_remaining"],
+                )
+                got = run(FakeHttp(body=body))
+                self.assertTrue(got.ok)
+                self.assertNotIn("credits", got.windows)
+                self.assertEqual(got.windows["session"][0], 80.0)
+
+    def test_C12_credits_resets_at恆為null(self):
+        # C-12: credits.resets_at 恆為 null（即使回應帶任何重置週期欄位）
+        body = body_with(
+            fmdr={"used": 10, "limit": 50, "remaining": 40},
+            limit=100.0,
+            limit_remaining=50.0,
+            limit_reset="2026-11-01T00:00:00Z",
+            reset_at=1800000000,
+        )
+        got = run(FakeHttp(body=body))
+        self.assertTrue(got.ok)
+        self.assertIsNone(got.windows["credits"][1])
+
 class OpenRouterProviderHookTest(unittest.TestCase):
     def test_make_usage_fetcher_回傳_OpenRouterUsageFetcher(self):
         from lgwd import providers
