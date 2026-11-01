@@ -1,8 +1,7 @@
 """HTTP 層（design 決定 6、5a）。由 test 實作。
 
-- make_api_server(service, host, port) → ThreadingHTTPServer。只有五個路由：
+- make_api_server(service, host, port) → ThreadingHTTPServer。只有四個路由：
   GET  /v1/subscriptions                      → service.list_subscriptions()
-  GET  /v1/subscriptions/{id}?agent=<種類>     → service.get_subscription(id, agent)
   POST /v1/subscriptions/{id}/cooldown        → service.register_cooldown(id, body)（204）
   GET  /v1/resolve?agent=&provider=[&model=&subscription=&exclude=&data=]
                                               → service.resolve(...)（design 決定 1～3）
@@ -14,8 +13,9 @@
 - resolve 與 roles 的 query 用 parse_qs 的 form 解碼（design 決定 1）：空白值＝沒給
   （`subscription=x&exclude=` 因此是合法釘住）；已知參數重複出現 → 400；
   未知參數忽略；`+` 由呼叫端編成 %2B，server 只負責解碼。
-- get 與 resolve 的 200 加 Cache-Control: no-store、Pragma: no-cache（回覆含憑證值，
-  不讓 HTTP 快取或本機工具留下）。
+- 含憑證值的回覆只剩 resolve；它的 200 加 Cache-Control: no-store、
+  Pragma: no-cache（回覆含憑證值，不讓 HTTP 快取或本機工具留下）。單筆 get 已於 #48 移除，
+  其路徑現在落到一律 404（不進 service）。
 - log 只記方法、路徑、狀態碼；500 另記一行例外種類；不記標頭、body 與值。
 """
 
@@ -64,7 +64,7 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
 
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict,
                no_cache: bool = False) -> None:
-    """回 JSON；no_cache＝200 的 get／resolve 加不快取標頭（design 決定 1）。"""
+    """回 JSON；no_cache＝200 的 resolve 加不快取標頭（design 決定 1）。"""
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
         handler.send_response(status)
@@ -90,16 +90,12 @@ def _send_empty(handler: BaseHTTPRequestHandler, status: int) -> None:
 
 
 def _match_route(method: str, path: str):
-    """回 ("list",) ｜ ("get", id) ｜ ("cooldown", id) ｜ ("resolve",) ｜ ("roles", role) ｜ None。"""
+    """回 ("list",) ｜ ("cooldown", id) ｜ ("resolve",) ｜ ("roles", role) ｜ None。"""
     if path == "/v1/subscriptions":
         return ("list",) if method == "GET" else None
     if path == "/v1/resolve":
         return ("resolve",) if method == "GET" else None
     parts = path.split("/")
-    # ["", "v1", "subscriptions", "{id}"]
-    if (method == "GET" and len(parts) == 4
-            and parts[1] == "v1" and parts[2] == "subscriptions" and parts[3]):
-        return ("get", unquote(parts[3]))
     # ["", "v1", "roles", "{role}"]
     if (method == "GET" and len(parts) == 4
             and parts[1] == "v1" and parts[2] == "roles" and parts[3]):
@@ -190,10 +186,6 @@ def _api_handler(service):
                     payload = service.role_candidates(
                         route[1], q.get("agent"), q.get("data"))
                     status = 200
-                elif route[0] == "get":
-                    # 過渡期、刻意不動（與 resolve 的 query 規則不同）：d 單移除 get 前不要順手統一。
-                    agents = parse_qs(split.query).get("agent") or [None]
-                    status, payload = 200, service.get_subscription(route[1], agents[0])
                 else:
                     body = _read_json(self)
                     service.register_cooldown(route[1], body)
@@ -210,7 +202,7 @@ def _api_handler(service):
             _LOG.info("%s %s -> %s", method, path, status)
             if status == 204:
                 _send_empty(self, status)
-            elif status == 200 and route[0] in ("get", "resolve"):
+            elif status == 200 and route[0] == "resolve":
                 _send_json(self, status, payload, no_cache=True)
             else:
                 _send_json(self, status, payload)

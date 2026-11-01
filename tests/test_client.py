@@ -88,22 +88,6 @@ class FakeService:
                      "model_cooldowns": {}},
                 ],
             }
-        if method == "GET" and path.startswith("/v1/subscriptions/"):
-            sub_id = urllib.parse.unquote(path.rsplit("/", 1)[1])
-            if sub_id == "gone":
-                return 404, {"error": "not_found"}
-            if sub_id == "idle":
-                return 409, {"error": "not_deployed"}
-            if sub_id == "garbage":
-                return 200, b"<html>not json</html>"
-            if sub_id == "notobject":
-                return 200, b"[1, 2]"
-            agent = query.get("agent", [None])[0]
-            if sub_id == "claude-personal" and agent != "claude-code":
-                return 403, {"error": "agent_not_allowed"}
-            payload = dict(SUBSCRIPTION)
-            payload["key"] = CANARY
-            return 200, payload
         if method == "POST" and path.endswith("/cooldown"):
             sub_id = urllib.parse.unquote(path.split("/")[3])
             if sub_id == "gone":
@@ -349,55 +333,12 @@ class RolesTest(ClientCase):
         self.assertEqual(res.data, {"missing": ["agent"]})
 
 
-class GetTest(ClientCase):
-    def test_get_ok_returns_key(self):
-        res = self.client.get("claude-personal", "claude-code")
-        self.assertTrue(res.ok)
-        self.assertEqual(res.status, 200)
-        self.assertEqual(res.data["key"], CANARY)
-        method, path, query, _, auth = self.fake.requests[-1]
-        self.assertEqual((method, path), ("GET", "/v1/subscriptions/claude-personal"))
-        self.assertEqual(query, {"agent": ["claude-code"]})
-        self.assertIsNone(auth)
+class NoGetTest(ClientCase):
+    """#48：單筆 get（含 key）已移除；client 只剩 list、resolve、登錄冷卻、roles。"""
 
-    def test_get_403_agent_not_allowed(self):
-        res = self.client.get("claude-personal", "opencode")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.status, 403)
-        self.assertEqual(res.error, "agent_not_allowed")
-        self.assertFalse(res.unreachable)
-
-    def test_get_404(self):
-        res = self.client.get("gone", "claude-code")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.status, 404)
-        self.assertEqual(res.error, "not_found")
-
-    def test_get_409_not_deployed(self):
-        res = self.client.get("idle", "claude-code")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.status, 409)
-        self.assertEqual(res.error, "not_deployed")
-        self.assertEqual(res.data, {})  # get 的錯誤回覆照舊不進 data
-
-    def test_bad_response_not_json(self):
-        res = self.client.get("garbage", "claude-code")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.status, 200)
-        self.assertEqual(res.error, "bad_response")  # 碼不含空白
-        self.assertFalse(res.unreachable)
-
-    def test_bad_response_not_object(self):
-        res = self.client.get("notobject", "claude-code")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.status, 200)
-        self.assertEqual(res.error, "bad_response")
-
-    def test_get_encodes_id_and_agent(self):
-        self.client.get("a/b c", "agent x")
-        _, path, query, _, _ = self.fake.requests[-1]
-        self.assertEqual(path, "/v1/subscriptions/a%2Fb%20c")
-        self.assertEqual(query, {"agent": ["agent x"]})
+    def test_client沒有get屬性(self):
+        self.assertFalse(hasattr(self.client, "get"))
+        self.assertFalse(hasattr(Client, "get"))
 
 
 class CooldownTest(ClientCase):

@@ -16,8 +16,7 @@
 - 403 model_not_allowed：resolve 的 model 不被任何候選的 models.allow 涵蓋
 - 403 privacy_not_allowed：resolve 宣告的 data 高於所有候選的 privacy（步驟 3.5）
 - 404 not_found：不存在的 id 或未知路徑（resolve 的未知 provider／未知 subscription 同用）
-- 409 not_deployed：key 尚未部署；沒有憑證的訂閱（`kind` 為 `local-login`，例如
-  `antigravity`）的 get 一律回這個碼（它沒有可交付的值）
+- 409 not_deployed：key 尚未部署（local-login 的訂閱恆視為已部署，resolve 不會因它回此碼）
 - 409 no_candidate：resolve 的 exclude 排除後沒有候選（沒有恢復時刻）
 - 413 body_too_large：body 超過 1 MB
 - 500 internal：伺服器內部非預期錯誤
