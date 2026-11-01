@@ -135,14 +135,16 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertFalse(_covered(zen, "muse-spark-1.3"))  # 付費的 id
 
     def test_go_allow涵蓋default與免費模型(self):
-        # #95：opencode-go 的 allow 是 ["beam-free"]；default 被涵蓋，
-        # iceman-contributor-free 不再涵蓋（以授權訓練 prompt 換免費、不進輪替），
+        # #95：opencode-go 的 allow 明列；#149 起再加上 big-pickle。
+        # default 被涵蓋，big-pickle 被涵蓋（#149），iceman-contributor-free
+        # 不再涵蓋（#95：以授權訓練 prompt 換免費、不進輪替），
         # allow 以外的（付費的 kimi-k3）不被涵蓋。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         go = policy.subscriptions["opencode-go"]
-        self.assertEqual(go.models_allow, ("beam-free",))
+        self.assertEqual(go.models_allow, ("beam-free", "big-pickle"))
         self.assertFalse(_covered(go, "iceman-contributor-free"))  # #95 起 iceman 不再涵蓋
         self.assertTrue(_covered(go, "beam-free"))  # default
+        self.assertTrue(_covered(go, "big-pickle"))  # #149
         self.assertFalse(_covered(go, "kimi-k3"))  # 付費的 id
 
     def test_antigravity出廠12個字面模型id(self):
