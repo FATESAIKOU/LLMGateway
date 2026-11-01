@@ -168,42 +168,24 @@ class ApiTest(MainCase):
         priorities = [item["priority"] for item in data["subscriptions"]]
         self.assertEqual(priorities, sorted(priorities))
 
-    def test_get帶agent含key(self):
-        status, raw = http_get(
-            self.base + "/v1/subscriptions/claude-personal?agent=claude-code")
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(raw)["key"], FAKE_KEYS["claude-personal"])
+    def test_get單筆已移除回404且不含key(self):
+        # #48：單筆 get（含 key）已移除；任何 agent／id 的單筆路徑一律 404、回覆不含值
+        for path in ("/v1/subscriptions/claude-personal?agent=claude-code",
+                     "/v1/subscriptions/claude-personal?agent=opencode",
+                     "/v1/subscriptions/claude-personal",
+                     "/v1/subscriptions/ghost?agent=opencode"):
+            with self.subTest(path=path):
+                status, raw = http_get(self.base + path)
+                self.assertEqual(status, 404)
+                self.assertEqual(json.loads(raw), {"error": "not_found"})
+                for value in FAKE_KEYS.values():
+                    self.assertNotIn(value, raw.decode())
 
-    def test_opencode拿不到Claude訂閱(self):
-        status, raw = http_get(
-            self.base + "/v1/subscriptions/claude-personal?agent=opencode")
-        self.assertEqual(status, 403)
-        self.assertEqual(json.loads(raw), {"error": "agent_not_allowed"})
-
-    def test_ClaudeCode拿不到openrouter(self):
-        # 出廠政策（#23）：openrouter 只給 opencode
-        status, raw = http_get(
-            self.base + "/v1/subscriptions/openrouter?agent=claude-code")
-        self.assertEqual(status, 403)
-        self.assertEqual(json.loads(raw), {"error": "agent_not_allowed"})
-
-    def test_缺agent回400(self):
-        status, _ = http_get(self.base + "/v1/subscriptions/claude-personal")
-        self.assertEqual(status, 400)
-
-    def test_不存在的id回404(self):
-        status, _ = http_get(self.base + "/v1/subscriptions/ghost?agent=opencode")
-        self.assertEqual(status, 404)
-
-    def test_key沒部署回409(self):
+    def test_key沒部署list顯示不可用(self):
         (self.root / "keys.env").write_text(
             key_text({k: v for k, v in FAKE_KEYS.items() if k != "ollama-cloud"}),
             encoding="utf-8")
         self.gw.keys.reload()
-        status, raw = http_get(
-            self.base + "/v1/subscriptions/ollama-cloud?agent=claude-code")
-        self.assertEqual(status, 409)
-        self.assertEqual(json.loads(raw), {"error": "not_deployed"})
         self.assertFalse(self.list_items()["ollama-cloud"]["available"])
 
     def test_冷卻流程(self):
@@ -256,12 +238,14 @@ class ApiTest(MainCase):
 
 
 class ReloadTest(MainCase):
-    def _get_key(self, sub="claude-personal", agent="claude-code"):
+    def _get_key(self):
+        # #48：單筆 get 已移除；換 key 的觀察改看 resolve 回的 env（同一把，同樣會先重讀）
         status, raw = http_get(
-            self.base + f"/v1/subscriptions/{sub}?agent={agent}")
+            self.base + "/v1/resolve?agent=claude-code&provider=anthropic"
+            "&subscription=claude-personal")
         if status != 200:
             return status, None
-        return status, json.loads(raw)["key"]
+        return status, json.loads(raw)["env"]["CLAUDE_CODE_OAUTH_TOKEN"]
 
     def test_換key_mtime變了請求前重讀(self):
         # spec key-vault「換 key」：本人更新加密檔 → key-sync 換檔 → lgwd 自己重讀
@@ -385,10 +369,10 @@ class ReloadTest(MainCase):
             seen = None
             while time.time() < deadline:
                 status, raw = http_get(
-                    f"http://127.0.0.1:{api_port}/v1/subscriptions/claude-personal"
-                    "?agent=claude-code")
+                    f"http://127.0.0.1:{api_port}/v1/resolve?agent=claude-code"
+                    "&provider=anthropic&subscription=claude-personal")
                 if status == 200:
-                    seen = json.loads(raw)["key"]
+                    seen = json.loads(raw)["env"]["CLAUDE_CODE_OAUTH_TOKEN"]
                     if seen == "test-main-child-333":
                         break
                 time.sleep(0.1)

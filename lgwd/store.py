@@ -4,7 +4,7 @@
 - cooldowns：subscription → until（整把何時能再用；重複登錄取較晚的）；
 - model_cooldowns：(subscription, model) → until（單一模型何時能再用；與整把各自獨立、
   重複登錄取較晚的；本版沒有解除，過期列讀時視為無效）；
-- audit：只追加。get（過渡期）記（時刻、subscription id、agent）；resolve 記（時刻、
+- audit：只追加。（action='get' 是 #48 移除前的歷史列，留著不動；現行只寫）resolve 記（時刻、
   subscription id、agent、provider、model—— provider／model 是中介資料）；登錄冷卻記
   （時刻、subscription id、until、model——model 是選填的模型 id）。
 絕不存 key 的值，也不記客戶端（沒有應用層認證）。

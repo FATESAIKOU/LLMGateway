@@ -32,14 +32,13 @@ ITEM = {
     "priority": 10,
     "models": {"allow": ["*"], "default": None},
     "endpoint": None,
-    "key": "fake-key-in-get-reply",
     "cooldown": None,
     "model_cooldowns": {},
     "available": True,
 }
 LIST = {
     "schema": 1,
-    "subscriptions": [{k: v for k, v in ITEM.items() if k != "key"}],
+    "subscriptions": [dict(ITEM)],
 }
 RESOLVE = {
     "schema": 1,
@@ -89,9 +88,6 @@ class FakeService:
 
     def list_subscriptions(self):
         return self._finish("list_subscriptions", json.loads(json.dumps(LIST)))
-
-    def get_subscription(self, sub_id, agent):
-        return self._finish("get_subscription", dict(ITEM), sub_id, agent)
 
     def resolve(self, agent, provider, model=None, subscription=None, exclude=None,
                 data=None):
@@ -159,7 +155,7 @@ class ApiTest(ServerCase):
         self.assertEqual(status, 200)
 
     def test_list_200沒有不快取標頭(self):
-        # design 決定 1：不快取標頭是 get／resolve 的 200 才帶；list 不變
+        # design 決定 1：不快取標頭是 resolve 的 200 才帶；list 不變
         req = urllib.request.Request(self.base + "/v1/subscriptions")
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertIsNone(resp.headers.get("Cache-Control"))
@@ -243,13 +239,6 @@ class ApiTest(ServerCase):
     def test_resolve_200帶不快取標頭(self):
         req = urllib.request.Request(
             self.base + "/v1/resolve?agent=opencode&provider=opencode-zen")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
-            self.assertEqual(resp.headers.get("Pragma"), "no-cache")
-
-    def test_get_200帶不快取標頭(self):
-        req = urllib.request.Request(
-            self.base + "/v1/subscriptions/claude-personal?agent=claude-code")
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
             self.assertEqual(resp.headers.get("Pragma"), "no-cache")
@@ -350,50 +339,17 @@ class ApiTest(ServerCase):
                 self.assertEqual(self.json_of(payload)["error"], "not_found")
         self.assertFalse(self.fake.calls)  # 完全沒進 service
 
-    # --- get ---
-    def test_get_ok(self):
-        status, payload = self.call("GET", "/v1/subscriptions/claude-personal?agent=claude-code")
-        self.assertEqual(status, 200)
-        self.assertEqual(self.json_of(payload), ITEM)
-        self.assertEqual(self.fake.calls[-1],
-                         ("get_subscription", "claude-personal", "claude-code"))
-
-    def test_get_沒帶agent回400(self):
-        self.fake.raise_for["get_subscription"] = errors.bad_request(missing=["agent"])
-        status, payload = self.call("GET", "/v1/subscriptions/claude-personal")
-        self.assertEqual(status, 400)
-        data = self.json_of(payload)
-        self.assertEqual(data["error"], "bad_request")
-        self.assertEqual(data["missing"], ["agent"])
-        self.assertNotIn("detail", data)
-        self.assertIsNone(self.fake.calls[-1][2])
-
-    def test_get_空agent回400(self):
-        self.fake.raise_for["get_subscription"] = errors.bad_request(missing=["agent"])
-        status, payload = self.call("GET", "/v1/subscriptions/claude-personal?agent=")
-        self.assertEqual(status, 400)
-        self.assertNotIn("detail", self.json_of(payload))
-
-    def test_get_id解碼(self):
-        status, _ = self.call("GET", "/v1/subscriptions/ghost%2Did?agent=opencode")
-        self.assertEqual(status, 200)
-        self.assertEqual(self.fake.calls[-1][1], "ghost-id")
-
-    def test_get錯誤對應(self):
-        cases = [
-            (errors.agent_not_allowed(), 403, "agent_not_allowed"),
-            (errors.not_found(), 404, "not_found"),
-            (errors.not_deployed(), 409, "not_deployed"),
-        ]
-        for exc, code, err in cases:
-            with self.subTest(code=err):
-                self.fake.raise_for["get_subscription"] = exc
-                status, payload = self.call(
-                    "GET", "/v1/subscriptions/claude-personal?agent=opencode")
-                self.assertEqual(status, code)
-                self.assertEqual(self.json_of(payload)["error"], err)
-                self.assertNotIn("key", self.json_of(payload))
-                self.assertNotIn("detail", self.json_of(payload))
+    # --- get（單筆含 key）已於 #48 移除：路徑落到一律 404，不進 service ---
+    def test_get單筆路徑已移除回404(self):
+        for path in ("/v1/subscriptions/claude-personal?agent=claude-code",
+                     "/v1/subscriptions/claude-personal?agent=opencode",
+                     "/v1/subscriptions/claude-personal",
+                     "/v1/subscriptions/ghost%2Did?agent=opencode"):
+            with self.subTest(path=path):
+                status, payload = self.call("GET", path)
+                self.assertEqual(status, 404)
+                self.assertEqual(self.json_of(payload), {"error": "not_found"})
+        self.assertFalse([c for c in self.fake.calls if c[0] == "get_subscription"])
 
     # --- cooldown ---
     def test_cooldown_204(self):
@@ -421,6 +377,17 @@ class ApiTest(ServerCase):
         self.assertEqual(payload, b"")
         self.assertEqual(self.fake.calls[-1],
                          ("register_cooldown", "opencode-zen", body))
+
+    def test_cooldown路由的id做percent解碼(self):
+        # L1-4（#48 審查）：路由對 id 做 unquote；%2D 解成 "-" 後才進 service
+        status, payload = self.call(
+            "POST", "/v1/subscriptions/claude%2Dpersonal/cooldown",
+            {"until": "2026-10-11T15:00:00Z"})
+        self.assertEqual(status, 204)
+        self.assertEqual(payload, b"")
+        self.assertEqual(self.fake.calls[-1],
+                         ("register_cooldown", "claude-personal",
+                          {"until": "2026-10-11T15:00:00Z"}))
 
     def test_cooldown_DELETE仍404(self):
         # 沒有提前解除：DELETE 沒有路由（路由仍是四個）
@@ -589,15 +556,7 @@ class RealServiceHttpTest(ServerCase):
         self.assertEqual(self.json_of(payload)["error"], "bad_request")
         self.assertNotIn("detail", self.json_of(payload))
 
-        # 3. bad_request: get 缺 agent
-        status, payload = self.call("GET", "/v1/subscriptions/claude-personal")
-        self.assertEqual(status, 400)
-        data = self.json_of(payload)
-        self.assertEqual(data["error"], "bad_request")
-        self.assertEqual(data["missing"], ["agent"])
-        self.assertNotIn("detail", data)
-
-        # 4. bad_request: cooldown 缺 until
+        # 3. bad_request: cooldown 缺 until
         status, payload = self.call("POST", "/v1/subscriptions/claude-personal/cooldown", {})
         self.assertEqual(status, 400)
         data = self.json_of(payload)
@@ -1040,12 +999,6 @@ class UsageHttpTest(ServerCase):
         self.assertNotIn("available_again_at", body["meta"])
         self.assertEqual(body["schema"], 1)
 
-    def test_get沒有usage(self):
-        status, _, body = self.raw("/v1/subscriptions/ollama-cloud?agent=opencode")
-        self.assertEqual(status, 200)
-        self.assertNotIn("usage", body)
-        self.assertNotIn("available_again_at", body)
-
     def test_沒有新路由(self):
         for path in ("/v1/usage", "/v1/subscriptions/ollama-cloud/usage"):
             with self.subTest(path):
@@ -1129,12 +1082,6 @@ class LocalLoginHttpTest(ServerCase):
         self.assertIsNone(item["available_again_at"])
         self.assertEqual(item["usage"]["status"], "not_applicable")
         self.assertNotIn("key", item)
-
-    def test_get回409且不含key(self):
-        status, payload = self.call(
-            "GET", "/v1/subscriptions/antigravity?agent=agy")
-        self.assertEqual(status, 409)
-        self.assertEqual(self.json_of(payload), {"error": "not_deployed"})
 
     def test_未知agent仍400(self):
         status, payload = self.call(
@@ -1226,11 +1173,59 @@ class FactoryAntigravityHttpTest(ServerCase):
         self.assertEqual(item["usage"]["status"], "not_applicable")
         self.assertNotIn("key", item)
 
-    def test_get回409_not_deployed(self):
+
+class GetRemovedRealHttpTest(ServerCase):
+    """#48：單筆 get 移除後，經真 RegistryService 的端到端：404、不寫 audit、回覆不含 key。"""
+
+    CANARY = "canary-http-get-removed-0001"
+
+    def setUp(self):
+        import sqlite3
+        self.sqlite3 = sqlite3
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.db = str(root / "llm.db")
+        keys_path = root / "keys.env"
+        keys_path.write_text(
+            "# 測試用假 key\n"
+            f"CLAUDE_PERSONAL_OAUTH_TOKEN={self.CANARY}\n", encoding="utf-8")
+        policy_path = str(Path(__file__).resolve().parent.parent / "policy" / "default.json")
+        keys = KeyStore(str(keys_path))
+        self.service = RegistryService(self.db, load_policy(policy_path), keys, FakeClock())
+        self.base = self.serve(self.service)
+
+    def tearDown(self):
+        super().tearDown()
+        self.service.close()
+        self.tmp.cleanup()
+
+    def audit_rows(self):
+        conn = self.sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT action FROM audit ORDER BY rowid").fetchall()
+        finally:
+            conn.close()
+
+    def test_get單筆404且不寫audit不含key(self):
+        before = self.audit_rows()
+        for path in ("/v1/subscriptions/claude-personal?agent=claude-code",
+                     "/v1/subscriptions/claude-personal?agent=opencode"):
+            with self.subTest(path=path):
+                status, payload = self.call("GET", path)
+                self.assertEqual(status, 404)
+                self.assertEqual(json.loads(payload), {"error": "not_found"})
+                self.assertNotIn(self.CANARY.encode(), payload)
+        self.assertEqual(self.audit_rows(), before)
+        self.assertNotIn("get", [action for (action,) in self.audit_rows()])
+
+    def test_list與resolve仍照樣(self):
+        status, payload = self.call("GET", "/v1/subscriptions")
+        self.assertEqual(status, 200)
+        self.assertNotIn(self.CANARY.encode(), payload)
         status, payload = self.call(
-            "GET", "/v1/subscriptions/antigravity?agent=agy")
-        self.assertEqual(status, 409)
-        self.assertEqual(self.json_of(payload), {"error": "not_deployed"})
+            "GET", "/v1/resolve?agent=claude-code&provider=anthropic&subscription=claude-personal")
+        self.assertEqual(status, 200)
+        self.assertIn(self.CANARY, json.loads(payload)["env"].values())
 
 
 if __name__ == "__main__":

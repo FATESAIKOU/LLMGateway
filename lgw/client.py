@@ -1,4 +1,4 @@
-"""五個呼叫的客戶端（design 決定 6；tasks 2.1、2.3）：list、resolve、get（過渡期）、登錄冷卻、roles。
+"""客戶端（design 決定 6；tasks 2.1、2.3）：list、resolve、登錄冷卻、roles。（get 已於 #48 移除。）
 
 用法：
 
@@ -9,7 +9,6 @@
     client.resolve("claude-code", "anthropic", subscription="claude-personal")
     client.resolve("agy", "google", model="<agy models 的裸 id>")
     client.roles("impl", "opencode", data="public")
-    client.get("claude-personal", "claude-code")
     client.cooldown("claude-personal", "2026-10-12T03:00:00Z")
     client.cooldown("opencode-zen", "2026-10-12T03:00:00Z", model="big-pickle")
 
@@ -21,11 +20,8 @@
   `+` 因此編成 %2B，server 的 parse_qs 才不會解成空白）
 - roles(role, agent, data=None) → GET /v1/roles/{role}?agent={agent}[&data={data}]
   （#100；spec role-allocation。data 省略時不帶參數，由服務取最嚴）
-- get(id, agent) → GET /v1/subscriptions/{id}?agent={agent}（過渡期；resolve 的
-  並存夥伴，移除在 d 單）
 - agy（agent=agy、provider=google）的訂閱沒有憑證（kind local-login）：resolve 的
-  env 是空物件 {}，模型只走 meta.model；get 對它一律回 409 not_deployed（沒有可
-  交付的值），不是 200 帶 null。
+  env 是空物件 {}，模型只走 meta.model。
 - cooldown(id, until, model=None) → POST /v1/subscriptions/{id}/cooldown，body
   {"until": RFC 3339 UTC}（有給 model 時多一個 "model"）；成功 204。model 是供應商
   自己的模型 id（不帶 agent 前綴）；沒有 model 即整把冷卻。
@@ -39,9 +35,9 @@
     meta 帶 cooldown／model_cooldowns 當提示）。本 client 對它照實回狀態碼與 until，
     呼叫方要保留判讀；
   - resolve 的非 2xx 回覆把 body 裡 error 以外的欄位（until、missing）放進
-    Result.data（錯誤回覆沒有 env；過渡期 get 的錯誤不進 data，與舊行為同款）；
+    Result.data（錯誤回覆沒有 env）；
   - 客戶端判讀的：unreachable（連不上或逾時）｜bad_response（回覆不是 JSON 物件）。
-- Result 的 repr 不印 data（get 的 key、resolve 的 env 都有憑證值）；不要 log／print 整個 Result。
+- Result 的 repr 不印 data（resolve 的 env 有憑證值）；不要 log／print 整個 Result。
 - 只用標準函式庫（urllib）；不引用 subprocess、herdr、agora。
 """
 
@@ -72,7 +68,7 @@ class Result:
 
 
 class Client:
-    """只用 urllib 打四個呼叫（list／resolve／get／登錄冷卻）；網路問題一律回 unreachable，不丟例外。
+    """只用 urllib 打四個呼叫（list／resolve／登錄冷卻／roles）；網路問題一律回 unreachable，不丟例外。
 
     base_url 不得含憑證；v0 只傳 loopback URL（例如 http://127.0.0.1:4710）。
     """
@@ -179,14 +175,6 @@ class Client:
             urllib.parse.quote(str(role), safe=""), query
         )
         return self._send("GET", path, None, error_data=True)
-
-    def get(self, id: str, agent: str) -> Result:
-        """取一把 key；agent 不符 403、未部署 409、不存在 404。"""
-        path = "/v1/subscriptions/{0}?agent={1}".format(
-            urllib.parse.quote(str(id), safe=""),
-            urllib.parse.quote(str(agent), safe=""),
-        )
-        return self._send("GET", path, None)
 
     def cooldown(self, id: str, until: str, model: str | None = None) -> Result:
         """登錄冷卻；until 是何時能再用（RFC 3339 UTC 字串）；成功 204。

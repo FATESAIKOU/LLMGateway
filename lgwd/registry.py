@@ -1,9 +1,9 @@
 """Subscription registry 的服務邏輯（design 決定 6、7、8、10 與 v5 的決定 8 取代；spec subscription-registry）。
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；另帶 usage／available_again_at（#60）；
-- get_subscription(id, agent)：一筆的共通 JSON，含 key（agent 必填、要在該筆的 agents 裡、key 要已部署）；
-- kind 為 local-login 的訂閱（#107）沒有憑證：部署由 kind 判定（恆已部署，不讀 key 檔），
-  get 一律回 409 not_deployed；list／resolve／roles 都不碰它的 key（key 檔不認得它）。
+- kind 為 local-login 的訂閱（#107）沒有憑證：部署由 kind 判定（恆已部署，不讀 key 檔）；
+  list／resolve／roles 都不碰它的 key（key 檔不認得它）。
+- 單筆取回（get，含 key）已於 #48 移除（不再有 get_subscription）。
 - role_candidates(role, agent, data)：角色的候選投影（#100；spec role-allocation）。照政策
   roles.<role>.order 篩 agents 與 privacy（不低於 data 與 floor 取較嚴者），回
   {schema, role, data, agent, candidates}；每筆 {id, provider, rank, privacy, available,
@@ -22,7 +22,7 @@
 - register_cooldown(id, body)：登錄冷卻，body {"until": RFC 3339 UTC[, "model": 模型 id]}
   （過去或超過上限拒絕；同一筆重複登錄取較晚的 until；到時自動解除）。有 model 時只
   冷卻那個模型，沒有（或 null）時冷卻整把；整把與模型兩層各自獨立、互不刪除。
-- 每次 get（過渡期）與登錄冷卻也記一筆只追加的稽核（get 照舊只記 agent；不含 key）。
+- 登錄冷卻也記一筆只追加的稽核。（get 已於 #48 移除；歷史上 action='get' 的列留在 audit 裡，不刪、不遷移。）
 - 所有時刻經注入的 Clock；對外是 RFC 3339 UTC。
 - 環境變數的組成在 providers.build_env（design 決定 2）；這裡只選把與聚合回覆。
 
@@ -136,7 +136,7 @@ class RegistryService:
                 for sub in self._policy.in_priority_order()
             ]
         # 用量欄位在交易外合入（只讀快取與觸發判斷，不做 I/O；壞了只影響該筆的 usage）。
-        # _item 不動：get 與 list 共用它，get 不帶 usage／available_again_at。
+        # _item 只回共通欄位；usage／available_again_at 由這裡在交易外合入（list 專屬）。
         for item in subs:
             usage, again = self._usage_fields(item, now)
             item["available_again_at"] = again
@@ -224,7 +224,7 @@ class RegistryService:
         # kind 為 local-login 的訂閱恆算已部署，這裡 MUST NOT 讀它的 key（key 檔不認得
         # 它，讀了會丟 KeyFileError）；它的 key 欄位留 None，build_env 照樣回 {}。
         # 每把只在這裡讀一次 key（None＝未部署），後面沿用同一份值：deployed() 與
-        # get() 分兩次讀的話，中間換檔會讓 200 帶 null 憑證（TOCTOU）。
+        # keys.get() 分兩次讀的話，中間換檔會讓 200 帶 null 憑證（TOCTOU）。
         candidates = [
             (sub, info, value,
              None if info.kind == "local-login" else self._keys.get(sub.name))
@@ -274,30 +274,6 @@ class RegistryService:
             "meta": meta,
             "env": env,
         }
-
-    def get_subscription(self, subscription: str, agent: str | None) -> dict:
-        """GET /v1/subscriptions/{id}?agent=：一筆的共通 JSON，含 key。
-
-        kind 為 local-login 的訂閱沒有憑證，在讀 key 之前就回 409 not_deployed
-        （不回 200 帶 key: null；見 spec「get」）。
-        """
-        if not isinstance(agent, str) or not agent:
-            raise bad_request(missing=["agent"])
-        sub_policy = self._policy.subscriptions.get(subscription)
-        if sub_policy is None:
-            raise not_found()
-        if agent not in sub_policy.agents:
-            raise agent_not_allowed()
-        if self._is_local_login(subscription):
-            raise not_deployed()
-        key = self._keys.get(subscription)
-        if key is None:
-            raise not_deployed()
-        now = self._clock.now()
-        with self._store.txn() as cur:
-            item = self._item(cur, subscription, now, key=key)
-            self._store.audit_add(cur, to_rfc3339(now), subscription, "get", agent=agent)
-        return item
 
     def register_cooldown(self, subscription: str, body: dict) -> None:
         """POST /v1/subscriptions/{id}/cooldown {until[, model]}：成功為 None（HTTP 204）。
@@ -497,15 +473,13 @@ class RegistryService:
                 raise no_candidate()
         return picked
 
-    def _item(
-        self, cur, subscription: str, now: _dt.datetime, key: str | None = None
-    ) -> dict:
-        """共通 JSON schema（design 決定 7）；不放任何環境變數名。"""
+    def _item(self, cur, subscription: str, now: _dt.datetime) -> dict:
+        """共通 JSON schema（design 決定 7）；不放任何環境變數名，也不放 key。"""
         sub_policy = self._policy.subscriptions[subscription]
         provider = provider_for(subscription)
         cooldown = self._cooldown(cur, subscription, now)
         model_cooldowns = self._model_cooldowns(cur, subscription, now)
-        deployed = True if key is not None else self._deployed(subscription)
+        deployed = self._deployed(subscription)
         item = {
             "schema": SCHEMA_VERSION,
             "id": subscription,
@@ -519,8 +493,6 @@ class RegistryService:
             },
             "endpoint": provider.endpoint,
         }
-        if key is not None:
-            item["key"] = key
         item["cooldown"] = cooldown
         item["model_cooldowns"] = model_cooldowns
         # available 仍是「部署＋整把冷卻」的粗提示；模型冷卻不影響它（design 決定 5）。

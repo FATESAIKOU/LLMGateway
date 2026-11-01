@@ -14,7 +14,7 @@
 
 ## 0. 全貌與架構
 
-服務只做這幾件事：list、resolve、get（過渡期，之後由 d 單移除）、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`GET /v1/subscriptions/{id}?agent=`、`POST /v1/subscriptions/{id}/cooldown`）。冷卻只是提示，resolve 不因冷卻拒絕（冷卻資訊在 `meta`／`list` 的 `cooldown`、`model_cooldowns`；要不要等、換哪個模型由呼叫方決定）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
+服務只做這幾件事：list、resolve、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`POST /v1/subscriptions/{id}/cooldown`）。單筆取回 key 的 `GET /v1/subscriptions/{id}?agent=` 已於 #48 移除，現在一律 404；要拿 key 改用 resolve 回的 `env`。冷卻只是提示，resolve 不因冷卻拒絕（冷卻資訊在 `meta`／`list` 的 `cooldown`、`model_cooldowns`；要不要等、換哪個模型由呼叫方決定）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
 
 - `lgwd` 只綁放服務那台的 `127.0.0.1:<API 埠>`（預設 8480），不綁任何對外或容器網路的介面。
 - 隧道守護 `llmgateway-tunnel.service` 用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：
@@ -252,7 +252,6 @@ from lgw import client
 
 c = client.Client("http://127.0.0.1:4710")
 c.list()                                              # 取得可用訂閱（不含 key）
-c.get("claude-personal", "claude-code")               # 取得 key 明文（需指定 agent）
 c.cooldown("claude-personal", "2026-10-18T15:00:00Z") # 登錄冷卻（整把）
 c.cooldown("opencode-zen", "2026-10-18T15:00:00Z",    # 只冷卻一個模型
            model="mimo-v2.6-flash-free")
@@ -343,7 +342,7 @@ git add keys.env.enc && git commit -m 'update keys' && git push
 
 ### 5.7 用量（`usage`）與政策檔的 `usage` 段
 
-list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多同形狀的 `usage`（get 不帶）。`usage` 是附加資訊：取用量壞了、卡住，list／resolve 照常回應，該筆只是 `unknown`。
+list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多同形狀的 `usage`。`usage` 是附加資訊：取用量壞了、卡住，list／resolve 照常回應，該筆只是 `unknown`。
 
 - **來源**：Ollama Cloud 取官方 `GET /api/balance`（用 vault 的 key，只在 lgwd 行程內）；Claude 訂閱執行原版 Claude Code 讀 statusline 的 `rate_limits`；OpenRouter、OpenCode Zen 為 `not_applicable`。
 - **語意（重要）**：只在有人 list／resolve、而且快取過期時才在**背景**取一次，回應不等它。零星查詢時，多半拿到的是**上一次查詢觸發的快照**（`stale: true`；超過 6 小時轉 `unknown`／`stale_expired`）；重啟後第一次查一律 `unknown`／`not_fetched_yet`，要看新值得等取完（Ollama 約 5 秒內、Claude 最多約 60 秒）再查一次。
@@ -371,7 +370,7 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 
 ### 5.9 沒有憑證的訂閱（`antigravity`）的政策範例與限度
 
-`antigravity` 是 agy（Antigravity CLI）用的訂閱：**沒有憑證**，agy 自己在 Mac 上用本機登入，Gateway 不代管、不匯出 OAuth 憑證。它的 `kind` 是 `local-login`、`endpoint` 為 `null`，`agents` 只能剛好是 `["agy"]`；`get` 對它一律回 409 `not_deployed`（沒有可交付的值）；模型只走 resolve 的 `meta.model`（裸 id，不能帶 `agy/` 或 `google/` 前綴）。
+`antigravity` 是 agy（Antigravity CLI）用的訂閱：**沒有憑證**，agy 自己在 Mac 上用本機登入，Gateway 不代管、不匯出 OAuth 憑證。它的 `kind` 是 `local-login`、`endpoint` 為 `null`，`agents` 只能剛好是 `["agy"]`；模型只走 resolve 的 `meta.model`（裸 id，不能帶 `agy/` 或 `google/` 前綴）。
 
 政策檔的一筆範例如下（只有 id，不含任何憑證）：
 
