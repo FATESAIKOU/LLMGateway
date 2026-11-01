@@ -1,0 +1,24 @@
+#!/bin/bash
+# 停掉 start 起的那一個 lgwd：只停 pid 檔裡記的那一個，且先確認它是 lgwd。
+# 刪掉 keys.env、keys.pass、.keysync.sha、.keysync.status；llm.db 與 log 保留（稽核要用）。
+# 結束碼：OK=0；不動（pid 不是 lgwd）或設定錯=1。
+set -u
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+. "$SCRIPT_DIR/lib.sh"
+fb_load_conf || exit 1
+fb_require STATE || exit 1
+KEYS="$STATE/keys.env"
+
+if [ -f "$STATE/lgwd.pid" ]; then
+  PID=$(cat "$STATE/lgwd.pid")
+  fb_kill_lgwd "$PID" || { fb_say "STOP: 沒有動任何東西（pid 檔的 pid 不是 lgwd），請人工確認"; exit 1; }
+  rm -f "$STATE/lgwd.pid"
+elif fb_port_busy; then
+  fb_say "注意：沒有 pid 檔，但 127.0.0.1:${PORT} 有人在聽（不是 start 起的；找不到 lsof 時也會走這裡），不動它"; fb_listeners; exit 1
+else
+  fb_say "沒有 pid 檔，本來就沒有暫時 lgwd 在跑"
+fi
+rm -f "$KEYS" "$STATE/creds/keys.pass" "$STATE/.keysync.sha" "$STATE/.keysync.status"
+if fb_port_busy; then fb_say "注意：${PORT} 仍有人在聽，或無法確認（不是暫時 lgwd）"; else fb_say "${PORT} 已空出來"; fi
+fb_say "RESULT: STOPPED（keys.env、keys.pass、.keysync.sha／.status 已刪；$STATE/llm.db 保留給稽核）"
+exit 0

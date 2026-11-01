@@ -1,0 +1,41 @@
+# mac-fallback 設定檔範例。複製到 repo 外（預設 ~/.config/llmgateway/mac-fallback.conf；
+# 或用環境變數 LGW_MAC_FALLBACK_CONF 指定位置），把佔位值換成本機的實際值。
+# 這份範例只有佔位值；實際設定檔不進 repo。格式是 shell 賦值（會被 source，只放賦值，不放指令）。
+
+# 解密後的密碼檔（每行 NAME=VALUE）。腳本只讀名稱與值的對應，不印值。
+# 密碼檔若是加密的，先請本人解密，再 start。
+PWFILE=/path/to/password-file
+
+# lgwd 的 checkout（detached worktree）與預期的 tag（HEAD 必須正好是這個 tag）
+CODE=/path/to/lgwd-checkout
+TAG=lgw-vX.Y.Z
+
+# 狀態目錄（建議 0700）：llm.db、keys.env、creds/keys.pass、lgwd.log、lgwd.pid 都放這裡
+STATE=/path/to/lgw-state
+
+PORT=4710
+WAIT_SECONDS=60
+KEYSYNC_INTERVAL=600
+
+# 名稱對應：「來源名稱:lgwd 的 key 名稱」，多個用空白分隔。來源名稱是密碼檔裡的名稱（由本人對出）。
+# 路線 1：PASS_SOURCE 在密碼檔裡 → 寫 creds/keys.pass，用 lgwd 內建的 keysync 拉加密正本。
+PASS_SOURCE=SOURCE_NAME_FOR_KEYS_PASSWORD
+# 路線 2 用：下面每一組都必須在密碼檔裡，否則停。
+KEY_MAP="SOURCE_NAME_FOR_X:CLAUDE_PERSONAL_OAUTH_TOKEN SOURCE_NAME_FOR_Y:OPENROUTER_API_KEY"
+# 有就帶、沒有也可以。
+OPTIONAL_KEY_MAP="SOURCE_NAME_FOR_Z:OPTIONAL_KEY_NAME"
+
+# switch 用：稽核只看這個時間之後的 get 筆數（ISO 8601，UTC）。整個 DB 都要涵蓋時，填一個很早的時間。
+AUDIT_SINCE=2000-01-01T00:00:00Z
+
+# switch 的版本（呼叫 switch 不給參數時讀這裡）
+SWITCH_OLD_CODE=/path/to/old-lgwd-checkout
+SWITCH_OLD_TAG=lgw-vOLD
+SWITCH_NEW_CODE=/path/to/new-lgwd-checkout
+SWITCH_NEW_TAG=lgw-vNEW
+
+# switch 驗收的可選項；留空或 0 就不查
+VERIFY_PIPES=0
+VERIFY_OLD_GET_ID=
+VERIFY_RESOLVE=
+VERIFY_RESOLVE_MODEL=
