@@ -28,6 +28,7 @@ def _bsd_stat_ok():
             ["stat", "-f", "%Su %Lp", str(pathlib.Path(__file__).resolve())],
             capture_output=True,
             text=True,
+            timeout=10,
         )
         if r.returncode != 0:
             return False
@@ -38,7 +39,7 @@ def _bsd_stat_ok():
             return False
         int(parts[1], 8)
         return True
-    except Exception:
+    except (subprocess.TimeoutExpired, Exception):
         return False
 
 
@@ -460,7 +461,7 @@ def test_conf_writable_by_group_or_world_is_refused(env_tree):
     env_tree["conf"].chmod(0o666)
     r = run_script("start", env_tree)
     assert r.returncode == 1, r.stdout + r.stderr
-    assert "拒絕載入" in r.stdout
+    assert "group 或 world 可寫" in r.stdout
     assert not (env_tree["state"] / "lgwd.pid").exists()
 
 

@@ -1,6 +1,6 @@
 """lgwd/main.py 的測試：假 key 檔、真 policy/default.json、隨機埠。
 
-涵蓋 spec subscription-registry 與 key-vault 的服務端 Scenario 在主程式裡的行為
+涵蓋 spec subscription-registry（及拆出的 subscription-cooldown／registry-errors／resolve／resolve-env） 與 key-vault 的服務端 Scenario 在主程式裡的行為
 （不帶應用層憑證、換 key、只綁 loopback、SIGTERM）。v5：key 檔由 mtime 偵測重讀，
 沒有 SIGHUP／ExecReload；policy 只在啟動時讀。
 """

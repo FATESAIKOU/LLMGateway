@@ -1,6 +1,6 @@
 """lgwd/http.py 的測試：全用假 service（固定值或丟 ApiError），不用真 key。
 
-涵蓋 spec subscription-registry 的路由、spec key-vault 的「不做應用層認證」與
+涵蓋 spec subscription-registry（及拆出的 subscription-cooldown／registry-errors／resolve／resolve-env） 的路由、spec key-vault 的「不做應用層認證」與
 共通錯誤行為（404、413、500、log 不含值）。
 """
 

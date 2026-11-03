@@ -1,6 +1,6 @@
 """lgwd/registry.py 的測試：真 RegistryService（暫存 SQLite、假 key 檔、FakeClock）。
 
-測試名稱照 spec subscription-registry／key-vault 的 Scenario（v5：until-only）。key 檔的值全是假 canary。
+測試名稱照 spec subscription-registry（及拆出的 subscription-cooldown／registry-errors／resolve／resolve-env）／key-vault 的 Scenario（v5：until-only）。key 檔的值全是假 canary。
 """
 
 import datetime as _dt
@@ -1428,7 +1428,7 @@ class GroqPolicyResolveTest(RegistryCase):
 
 
 class ResolveTest(RegistryCase):
-    """spec subscription-registry「resolve」的需求（design 決定 1～4；選把集中 registry）。"""
+    """spec resolve「resolve」的需求（design 決定 1～4；選把集中 registry）。"""
 
     def _service_with_policy(self, obj) -> RegistryService:
         path = self.root / "policy-under-resolve.json"
