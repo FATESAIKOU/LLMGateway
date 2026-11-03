@@ -108,7 +108,7 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 
 #### Scenario: list 的形狀
 - **WHEN** 呼叫 list
-- **THEN** row 只有本檔各「共通 JSON …」requirement 定義的欄位：不含 key、不含任何環境變數名
+- **THEN** row 只有本檔各「共通 JSON …」requirement 定義的欄位：`schema`、`id`、`provider`、`kind`、`agents`、`priority`、`models`、`endpoint`、`cooldown`、`model_cooldowns`、`available`、`available_again_at`、`usage`；不含 key、不含任何環境變數名
 
 ### Requirement: 共通 JSON 的 agents、priority 與 models
 每筆 SHALL 含 `agents`（允許使用這一把的 agent 種類清單）、`priority`（整數，數字小的先）與 `models`（`{allow, default}`：`allow` 是模型 id 樣式（fnmatch）清單，`default` 是供應商自己的模型 id 或 null，語意見「models.default 的語意」）。
@@ -503,9 +503,9 @@ body 超過 1 MB MUST 回 413 `body_too_large`；伺服器內部非預期錯誤 
 ### Requirement: 登錄冷卻不在通則內
 登錄冷卻不在這條通則內：它的順序 SHALL 沿用現行程式（查無 404 先於 `until`／`model` 的 400，見「登錄冷卻」），因為那是既有行為、不是本 change 要改的語意。
 
-#### Scenario: 登錄冷卻不在通則內：未知的 subscription 與壞的 model
-- **WHEN** 以 `model=opencode/big-pickle`（形狀會 400）登錄一個不存在的 subscription id
-- **THEN** 回 404 `not_found`（查無先於形狀錯誤，與現行程式一致）
+#### Scenario: 登錄冷卻不在通則內：未知的 subscription 與缺 until
+- **WHEN** 登錄一個不存在的 subscription id，body 沒有 `until`
+- **THEN** 回 404 `not_found`（與「錯誤回覆」通則的「輸入形狀 400 先於查無 404」相反，是登錄冷卻的既有順序）
 
 ### Requirement: resolve
 

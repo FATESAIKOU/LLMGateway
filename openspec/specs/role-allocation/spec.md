@@ -43,7 +43,7 @@
 - **THEN** 政策載入失敗，失敗原因是 `privacy`（依序在訂閱 id 之前），lgwd 不啟動
 
 ### Requirement: 部分角色與缺少 roles 段
-只寫部分角色時，`roles` MUST 合法；未寫的角色查詢 MUST 回 404 `not_found`。沒有 `roles` 段時，`roles` 端點 MUST 對任何角色回 404 `not_found`。
+`roles` 只寫部分角色時，政策載入 MUST 成功；未寫的角色查詢 MUST 回 404 `not_found`。沒有 `roles` 段時，`roles` 端點 MUST 對任何角色回 404 `not_found`。
 
 #### Scenario: 沒有 roles 段
 - **WHEN** 政策檔沒有 `roles`，呼叫 `GET /v1/roles/impl?agent=opencode`
@@ -52,6 +52,10 @@
 #### Scenario: 角色不在 roles 段
 - **WHEN** `roles` 只有 `impl`，呼叫 `GET /v1/roles/PMO?agent=claude-code`
 - **THEN** 回 404 `not_found`（不是 500）
+
+#### Scenario: 只寫部分角色
+- **WHEN** 政策檔的 `roles` 只含 `impl`（載入），之後呼叫 `GET /v1/roles/impl?agent=opencode` 與 `GET /v1/roles/rev?agent=opencode`
+- **THEN** 政策載入成功；`impl` 回 200，`role` 為 `impl`；`rev` 回 404 `not_found`
 
 ### Requirement: order 不改 priority 與選把
 `order` 只決定同一角色內的偏好順序，MUST NOT 改變 `subscription-registry` 的 `priority` 與 `resolve` 的選把。
