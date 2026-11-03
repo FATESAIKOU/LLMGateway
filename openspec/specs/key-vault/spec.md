@@ -12,7 +12,7 @@ key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一�
 - **THEN** 下一次拉取後那台的 key 檔更新，`lgwd` 重讀後 resolve 回的 `env` 是新值
 
 ### Requirement: gh 登入前提
-服務那台 MUST 以 `llmgw` 身分登入過 `gh`，這是拉取的使用前提；LLMGateway 本身 MUST NOT 做登入引導。認證方式由本人選定：`llmgw` 用瀏覽器 `gh auth login` 登入，不用 token 檔（憑證由 `gh` 自己管在該帳號家目錄，LLMGateway 不碰）。
+服務那台 MUST 以 `llmgw` 身分登入過 `gh`，這是拉取的使用前提；LLMGateway 本身 MUST NOT 做登入引導。認證方式由本人選定：`llmgw` 用瀏覽器 `gh auth login` 登入，不用 token 檔（憑證由 `gh` 自己管在該帳號家目錄；LLMGateway MUST NOT 碰憑證值）。
 
 #### Scenario: 服務帳號完成登入
 - **WHEN** 服務那台以 `llmgw` 身分完成 `gh auth login`
