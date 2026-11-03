@@ -1,6 +1,6 @@
 對應工單：#58（c）「模型輪換表搬到 LLMGateway，每週手動調查免費模型並開 PR，可依本人 comment 修改」；源頭：MyPMO 的模型輪換手冊（private repo，不引用內容）。
 
-> 本 change 目前**只有短設計**（proposal＋design）。specs／tasks 等本人同意定稿後再寫；design.md 第 7 節目前無待決。
+> specs／tasks 已補（#63）；待實跑確認後由 PR 2 歸檔。
 
 ## Why
 
