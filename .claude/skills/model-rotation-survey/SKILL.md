@@ -97,6 +97,7 @@ disable-model-invocation: true
 - **coding**：AA Coding Index，尺度 0–100，附 URL＋日期。
 - **抽象架構設計**：AA Intelligence Index；榜上沒有才標「主觀」，尺度 0–100。表頭註明「標『主觀』的是 AI 判斷，非實測」。
 - **綜合**：只看 Intelligence Index（避免三欄重疊重複計分）。榜上沒有的模型，綜合欄標「主觀」並給 0–100，排序時照該值。
+- **AA 多檔位**：同一模型在 AA 榜單有多個 effort 檔位時，取最高檔分數。
 - **排序**：主排序鍵為綜合，由高到低。
 - **可用的 agent**：依 `policy/default.json` 各訂閱的 `agents` 欄位填（執行時重讀，以檔案為準）。目前：Claude 列只寫 `claude-code`（原版 Claude Code）；Ollama Cloud 列 `claude-code`、`opencode`；OpenRouter、Zen 列 `opencode`。
 - **計入週用量節流**：依提供商填。Claude 訂閱「是（週）」；Ollama Cloud「是（週，另有 5 小時 session 上限）」，來源寫成「本人帳號設定頁（讀取日期見該列）」（只寫這句；帳號、方案細節、餘額不寫入本 repo）；免費（OpenRouter、Zen）「否」。
