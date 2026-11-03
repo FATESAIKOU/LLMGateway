@@ -1,7 +1,7 @@
 # role-allocation Specification
 
 ## Purpose
-把「哪個角色用哪把訂閱、什麼資料等級能用」寫成政策檔裡機器可讀的分配表：每個 subscription 有選填 `privacy`（`public` < `general` < `real`，缺省 `public`），頂層 `roles` 給五個角色（`PMO`／`PM`／`impl`／`rev`／`qa`）各自的 `floor` 與有序 `order`，`GET /v1/roles/{role}?agent=[&data=]` 回該角色在生效資料等級下的有序候選（每筆 `{id, provider, rank, privacy, available, cooldown, model_cooldowns}`，不含 key、`usage`、`available_again_at`，不觸發取用量）。分配表是 advisory：Gateway 不代選、不擋 `resolve`／`get` 的釘住，冷卻與用量不影響候選成員與順序；額度仍由既有 list 與 resolve `meta` 提供，不新增端點，呈現落在 `lgwctl usage`。
+把「哪個角色用哪把訂閱、什麼資料等級能用」寫成政策檔裡機器可讀的分配表：每個 subscription 有選填 `privacy`（`public` < `general` < `real`，缺省 `public`），頂層 `roles` 給五個角色（`PMO`／`PM`／`impl`／`rev`／`qa`）各自的 `floor` 與有序 `order`，`GET /v1/roles/{role}?agent=[&data=]` 回該角色在生效資料等級下的有序候選（每筆 `{id, provider, rank, privacy, available, cooldown, model_cooldowns}`，不含 key、`usage`、`available_again_at`，不觸發取用量）。分配表是 advisory：Gateway 不代選、不擋 `resolve` 的釘住，冷卻與用量不影響候選成員與順序；額度仍由既有 list 與 resolve `meta` 提供，不新增端點，呈現落在 `lgwctl usage`。
 ## Requirements
 ### Requirement: 訂閱的隱私等級
 政策檔每個 subscription MAY 有 `privacy`，值 MUST 是 `public`、`general`、`real` 之一，順序為 `public` < `general` < `real`；缺省 MUST 當 `public`（fail-closed）。`public` 只可送 public repo 與假資料；`general` 可送一般工單內文、決定檔與交接檔，不可送憑證、機器位址、私人筆記；`real` 可送一般真資料。任何等級都不可送憑證或金鑰。值不在三者之內 MUST 拒收政策檔（`PolicyError`，訊息只帶固定字串與訂閱 id）。
@@ -69,7 +69,7 @@
 
 #### Scenario: 帶 data 的 resolve 仍擋釘住
 - **WHEN** `roles.impl.order` 含 `privacy: public` 的 `opencode-zen`，以 `agent=opencode&provider=opencode-zen&subscription=opencode-zen&data=real` resolve
-- **THEN** 回 403 `privacy_not_allowed`——advisory 的 `order` 不讓釘住繞過隱私（`get` 是另一回事，見 `subscription-registry`）
+- **THEN** 回 403 `privacy_not_allowed`——advisory 的 `order` 不讓釘住繞過隱私
 
 ### Requirement: roles 與 resolve 的隱私擋不矛盾
 `roles` 的候選篩選與 `resolve` 的隱私擋不矛盾：`roles` 可能比 `resolve` 更嚴（它把 `data` 與 `floor` 取較嚴），`resolve` MUST NOT 比 `roles` 更寬。
@@ -77,13 +77,6 @@
 #### Scenario: roles 的生效等級比 resolve 嚴
 - **WHEN** `roles.impl.floor` 為 `real`，請求 `GET /v1/roles/impl?agent=opencode&data=public`，再以回覆的 `data` 與候選的 `subscription` 與 `provider` resolve
 - **THEN** `roles` 的生效 `data` 是 `real`；resolve 不會因同一把比 `roles` 放寬（見 `subscription-registry`「roles 回覆的候選用回覆的 data resolve 不被隱私擋」）
-
-### Requirement: 過渡期的 get 不擋
-過渡期的 `get` MUST 仍不依 `privacy` 擋（洞仍在，隨 LLMGateway#48 移除）。
-
-#### Scenario: 過渡期呼叫 get
-- **WHEN** 在 LLMGateway#48 移除前，以 `get` 單筆路徑取某把 `privacy` 不足的訂閱
-- **THEN** 不依 `privacy` 擋下（移除後單筆路徑回 404，見 `subscription-registry`）
 
 ### Requirement: roles row 是候選投影
 `roles` 的 row SHALL 是候選投影，不是 `subscription-registry` 的共通 JSON，不受其欄位清單約束。
@@ -188,3 +181,4 @@
 #### Scenario: zen 的額度欄
 - **WHEN** 渲染 `opencode-zen`（`usage.status` 是 `not_applicable`）
 - **THEN** 額度欄顯示「無額度 API」，不顯示百分比
+
