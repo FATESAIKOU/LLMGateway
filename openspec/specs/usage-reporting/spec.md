@@ -294,7 +294,7 @@ Ollama 取用量 SHALL 對寫死在程式裡的 `https://ollama.com/api/balance`
 - **WHEN** 上游超過 5 秒沒回應
 - **THEN** 取用量結束、記失敗碼 `timeout`，不重試
 
-#### Scenario: 換 key 後用新值
+#### Scenario: Ollama Cloud 取用量：換 key 後用新值
 - **WHEN** key 檔在兩次取用量之間被換掉
 - **THEN** 第二次請求帶的是新 key
 
@@ -353,7 +353,7 @@ token MUST 只以子行程環境變數 `CLAUDE_CODE_OAUTH_TOKEN` 傳入，MUST N
 - **THEN** lgwd 的 log 裡找不到那段內容
 
 ### Requirement: 子行程的逾時與行程群組
-逾時 MUST 為 60 秒；子行程 MUST 以自己的行程群組啟動，逾時只 MUST 終止**自己記下 pid 的那個群組**，MUST NOT 依名稱殺行程。
+逾時 MUST 為 60 秒；子行程 MUST 以自己的行程群組啟動，逾時 MUST 只終止**自己記下 pid 的那個群組**，MUST NOT 依名稱殺行程。
 
 #### Scenario: 逾時只收自己的行程群組
 - **WHEN** 假的子行程超過 60 秒不結束（測試以縮短的逾時模擬）
@@ -459,7 +459,7 @@ OpenRouter 取用量 SHALL 對寫死在程式裡的 `https://openrouter.ai/api/v
 ### Requirement: OpenRouter 取用量的 key 處理
 key MUST 只放進該次請求的 header，不進 log、例外訊息、回覆。每次取之前 MUST 先 `reload_keys_if_changed()`，使換 key 後用新 key。
 
-#### Scenario: 換 key 後用新值
+#### Scenario: OpenRouter 取用量的 key 處理：換 key 後用新值
 - **WHEN** key 檔在兩次 OpenRouter 取用量之間被換掉
 - **THEN** 第二次請求帶的是新 key
 

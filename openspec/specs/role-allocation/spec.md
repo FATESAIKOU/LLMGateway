@@ -43,7 +43,7 @@
 - **THEN** 政策載入失敗，失敗原因是 `privacy`（依序在訂閱 id 之前），lgwd 不啟動
 
 ### Requirement: 部分角色與缺少 roles 段
-`roles` 只寫部分角色時 MUST 合法；未寫的角色查詢 MUST 回 404 `not_found`。沒有 `roles` 段時，`roles` 端點 MUST 對任何角色回 404 `not_found`。
+只寫部分角色時，`roles` MUST 合法；未寫的角色查詢 MUST 回 404 `not_found`。沒有 `roles` 段時，`roles` 端點 MUST 對任何角色回 404 `not_found`。
 
 #### Scenario: 沒有 roles 段
 - **WHEN** 政策檔沒有 `roles`，呼叫 `GET /v1/roles/impl?agent=opencode`

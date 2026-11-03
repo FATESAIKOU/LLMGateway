@@ -4,10 +4,10 @@
 LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單，共通 JSON schema，不含 key）、resolve（呼叫方給 agent、provider、可選的 model，由 Gateway 依政策挑把，回選定的 subscription 與開 agent 要用的環境變數 `env`）、登錄冷卻（收 `until` 與選填 `model`）。換哪一把由 resolve 依政策決定；LLMGateway 保管 key、列出菜單、記冷卻（只是提示）、照常挑把並附冷卻資訊。單筆取 key 的 get 已於 #48 移除（現在一律 404），取 key 改用 resolve 回的 `env`。
 > 本檔 Scenario 中的 subscription 名稱、priority 與 models.default 是**示例政策**，用來說明選把規則，不是出廠政策；出廠政策以 `policy/default.json` 為準（2026-10-23 LLMGateway#50 起：沒有 claude-company，claude-personal 為 priority 40＋default `claude-sonnet-5-5`）。
 
-> v5（2026-10-12）：冷卻 until-only（`登錄冷卻`、`稽核紀錄`、`錯誤回覆`、`共通 JSON schema` 以 until-only 語意為準）。
+> v5（2026-10-12）：冷卻 until-only（`登錄冷卻`、`稽核紀錄`、`錯誤回覆`、`共通 JSON 的 endpoint 與 cooldown` 以 until-only 語意為準）。
 ## Requirements
 ### Requirement: list
-`GET /v1/subscriptions` SHALL 回所有 subscription 的共通 JSON，依 `priority` 排序，**不含 `key`**；每一筆多帶 `usage` 與 `available_again_at`（形狀與規則見 spec `usage-reporting`）；每一筆另帶 `model_cooldowns`（該把各模型的冷卻，只列還沒過的；形狀見「共通 JSON schema」）。list 只讀用量快取，並在快取過期時觸發一次背景取用量，回覆不等它；用量讀不到或取用量壞掉時 list MUST 仍回 200。
+`GET /v1/subscriptions` SHALL 回所有 subscription 的共通 JSON，依 `priority` 排序，**不含 `key`**；每一筆多帶 `usage` 與 `available_again_at`（形狀與規則見 spec `usage-reporting`）；每一筆另帶 `model_cooldowns`（該把各模型的冷卻，只列還沒過的；形狀見「共通 JSON 的 model_cooldowns」）。list 只讀用量快取，並在快取過期時觸發一次背景取用量，回覆不等它；用量讀不到或取用量壞掉時 list MUST 仍回 200。
 
 #### Scenario: 不含秘密
 - **WHEN** 客戶端呼叫 list
@@ -108,7 +108,7 @@ LLMGateway 對外提供三個介面：list（列出 Provider-Subscription 菜單
 
 #### Scenario: list 的形狀
 - **WHEN** 呼叫 list
-- **THEN** row 只有上列欄位（含 `available_again_at`、`usage`、`model_cooldowns`）：不含 key、不含任何環境變數名
+- **THEN** row 只有本檔各「共通 JSON …」requirement 定義的欄位：不含 key、不含任何環境變數名
 
 ### Requirement: 共通 JSON 的 agents、priority 與 models
 每筆 SHALL 含 `agents`（允許使用這一把的 agent 種類清單）、`priority`（整數，數字小的先）與 `models`（`{allow, default}`：`allow` 是模型 id 樣式（fnmatch）清單，`default` 是供應商自己的模型 id 或 null，語意見「models.default 的語意」）。
@@ -227,7 +227,7 @@ Claude 訂閱的 `agents` MUST 只有 `claude-code`；openrouter 的 `agents` MU
 - **WHEN** 登錄冷卻的 body 沒有 `until`
 - **THEN** 回 400 `bad_request`，`missing` 含 `until`，冷卻不變
 
-#### Scenario: 時刻格式不對
+#### Scenario: 登錄冷卻：時刻格式不對
 - **WHEN** `until` 不是 RFC 3339 字串
 - **THEN** 回 400 `invalid_until`，冷卻不變
 
@@ -293,7 +293,7 @@ Gateway MUST NOT 正規化 `model`（不去前綴、不改大小寫）。
 ### Requirement: 登錄冷卻的驗證順序
 驗證順序 MUST 與現行程式一致、不重排：未知 subscription id → 404 `not_found`，**先於** `until`／`model` 的 400；缺 `until` → 400 `bad_request`；`until` 格式／範圍 → 400；最後才是 `model`（null 除外，見上）→ 400。
 
-#### Scenario: 未知的 subscription 與壞的 model
+#### Scenario: 登錄冷卻的驗證順序：未知的 subscription 與壞的 model
 - **WHEN** 以 `model=opencode/big-pickle`（形狀會 400）登錄一個不存在的 subscription id
 - **THEN** 回 404 `not_found`（查無先於形狀錯誤，與現行程式一致）
 
@@ -304,7 +304,7 @@ Gateway MUST NOT 正規化 `model`（不去前綴、不改大小寫）。
 ### Requirement: HTTP 層先於端點的驗證
 body 解析失敗、body 不是物件、超過 1 MB 的 413 `body_too_large`，仍 MUST 由 HTTP 層先回（它們不是這個端點的 service 層驗證，所以「404 先於 400」不涵蓋它們）。這個順序與「錯誤回覆」的通則（輸入形狀 400 先於查無 404）不同，是刻意沿用現況（404 是現行程式的第一道檢查）。
 
-#### Scenario: body 超過 1 MB
+#### Scenario: HTTP 層先於端點的驗證：body 超過 1 MB
 - **WHEN** 登錄冷卻的 body 超過 1 MB
 - **THEN** 回 413 `body_too_large`，由 HTTP 層先回，冷卻不變
 
@@ -355,7 +355,7 @@ body 解析失敗、body 不是物件、超過 1 MB 的 413 `body_too_large`，�
 - **THEN** 回 200，`env` 照常，`meta.model_cooldowns` 有那一筆（冷卻只記錄、不拒絕）
 
 ### Requirement: local-login 訂閱也可登錄冷卻
-`kind` 為 `local-login` 的訂閱也 MUST 可以用（它沒有用量來源，冷卻常是唯一的訊號）。
+`kind` 為 `local-login` 的訂閱 MUST 可以用（它沒有用量來源，冷卻常是唯一的訊號）。
 
 #### Scenario: 冷卻仍可用
 - **WHEN** 對 `antigravity` 登錄整把冷卻到未來
@@ -410,7 +410,7 @@ body 解析失敗、body 不是物件、超過 1 MB 的 413 `body_too_large`，�
 ### Requirement: 400 invalid_until 與 until_out_of_range
 `until` 不是 RFC 3339 字串（或型別不對）MUST 回 400 `invalid_until`；`until` 在過去或超過 8 天以後 MUST 回 400 `until_out_of_range`。
 
-#### Scenario: 時刻格式不對
+#### Scenario: 400 invalid_until：時刻格式不對
 - **WHEN** `until` 不是 RFC 3339 字串
 - **THEN** 回 400 `invalid_until`，冷卻不變
 
@@ -439,7 +439,7 @@ resolve 的政策拒絕 SHALL 回下列 403 之一：`agent_not_allowed`（`agen
 ### Requirement: 404 與 409 not_deployed
 未知路徑，或不存在的 subscription id（resolve 的未知 provider／未知 `subscription` 同用）MUST 回 404 `not_found`。key 尚未部署 MUST 回 409 `not_deployed`（`kind` 為 `local-login` 的訂閱沒有憑證，但 resolve 不會因它回 409）。
 
-#### Scenario: 未知 provider
+#### Scenario: 404 與 409 not_deployed：未知 provider
 - **WHEN** 以 `provider=NoSuchProvider` resolve
 - **THEN** 回 404 `not_found`
 
@@ -457,7 +457,7 @@ resolve 的 `exclude` 排除後沒有候選（沒有恢復時刻）MUST 回 409 
 ### Requirement: 413 與 500 碼
 body 超過 1 MB MUST 回 413 `body_too_large`；伺服器內部非預期錯誤 MUST 回 500 `internal`（不帶細節）。
 
-#### Scenario: body 超過 1 MB
+#### Scenario: 413 與 500 碼：body 超過 1 MB
 - **WHEN** 任一端點的 body 超過 1 MB
 - **THEN** 回 413 `body_too_large`
 
@@ -503,7 +503,7 @@ body 超過 1 MB MUST 回 413 `body_too_large`；伺服器內部非預期錯誤 
 ### Requirement: 登錄冷卻不在通則內
 登錄冷卻不在這條通則內：它的順序 SHALL 沿用現行程式（查無 404 先於 `until`／`model` 的 400，見「登錄冷卻」），因為那是既有行為、不是本 change 要改的語意。
 
-#### Scenario: 未知的 subscription 與壞的 model
+#### Scenario: 登錄冷卻不在通則內：未知的 subscription 與壞的 model
 - **WHEN** 以 `model=opencode/big-pickle`（形狀會 400）登錄一個不存在的 subscription id
 - **THEN** 回 404 `not_found`（查無先於形狀錯誤，與現行程式一致）
 
@@ -673,7 +673,7 @@ resolve 回非 200 時 MUST NOT 組裝 `usage`，也 MUST NOT 觸發取用量。
 - **THEN** `env` 依 `agent` 與 `kind` 的組成規則給出鍵（見「env 的組成」）
 
 ### Requirement: env 的憑證值不外洩
-`env` 的**憑證值** MUST NOT 出現在 list 的回覆、稽核紀錄、log 或 `GET /agents` status；model、provider、endpoint 是中介資料，稽核可記——前提是 **`endpoint` MUST NOT 內嵌憑證**（query 的 `key=`／`token=`／`api_key=`／`access_token=`、userinfo 的 `@`；providers 載入／啟動時拒絕，見「共通 JSON schema」）。
+`env` 的**憑證值** MUST NOT 出現在 list 的回覆、稽核紀錄、log 或 `GET /agents` status；model、provider、endpoint 是中介資料，稽核可記——前提是 **`endpoint` MUST NOT 內嵌憑證**（query 的 `key=`／`token=`／`api_key=`／`access_token=`、userinfo 的 `@`；providers 載入／啟動時拒絕，見「endpoint 不內嵌憑證」）。
 
 #### Scenario: 值不外洩與不快取
 - **WHEN** 以憑證樣式掃描稽核紀錄、log 與 list 的回覆（resolve 的 200 本來就含憑證值，只在 SSH 通道內），並檢查 resolve 的 200 標頭
@@ -753,7 +753,7 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤（步驟 1
 ### Requirement: 步驟 2 與 3 的 provider 與 agent
 `provider` 不存在，或該 provider 沒有任何 subscription MUST 回 404 `not_found`。候選 MUST 是 `provider` 相同、`agents` 含請求的 agent 的 subscription；無一允許 MUST 回 403 `agent_not_allowed`。
 
-#### Scenario: 未知 provider
+#### Scenario: 步驟 2 與 3 的 provider 與 agent：未知 provider
 - **WHEN** 以 `provider=NoSuchProvider` resolve
 - **THEN** 回 404 `not_found`
 
@@ -913,7 +913,7 @@ resolve SHALL 依序挑 subscription，並依斷在哪一步回錯誤（步驟 1
 
 #### Scenario: 未知鍵不出現
 - **WHEN** resolve 任一組合
-- **THEN** `env` 的每個鍵都落在下列清單內，沒有清單外的鍵
+- **THEN** `env` 的每個鍵都是本檔各 env 鍵 requirement 定義的鍵
 
 ### Requirement: CLAUDE_CODE_OAUTH_TOKEN
 `agent` 為 `claude-code` 且 `kind` 為 `claude-subscription` 時，`env` MUST 含 `CLAUDE_CODE_OAUTH_TOKEN`，字串 MUST 是該把的 key（OAuth token），MUST NOT 為空；該組合必然出現。
@@ -1076,7 +1076,7 @@ Gateway MUST NOT 把這類訂閱當成「key 未部署」而回 409 `not_deploye
 - **THEN** `antigravity` 的 `available` 為 true，不因 key 缺失為 false
 
 ### Requirement: local-login 的 agents 條款
-政策載入 MUST 拒絕這類訂閱的 `agents` 不是剛好 `["agy"]` 的政策檔（條款；見「共通 JSON schema」），也 MUST 拒絕其他訂閱的 `agents` 含 `agy`（否則 api-key 的 row 會用空 env 被選中）。
+政策載入 MUST 拒絕這類訂閱的 `agents` 不是剛好 `["agy"]` 的政策檔（條款；見「共通 JSON 的 agents 條款」），也 MUST 拒絕其他訂閱的 `agents` 含 `agy`（否則 api-key 的 row 會用空 env 被選中）。
 
 #### Scenario: 沒有憑證的訂閱 agents 改寬
 - **WHEN** 政策檔的 `antigravity.agents` 不是剛好 `["agy"]`

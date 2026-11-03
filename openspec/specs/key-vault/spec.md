@@ -80,7 +80,7 @@ LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密
 - **THEN** 檔案權限是 0600，擁有者是服務帳號
 
 ### Requirement: key 正本的 gh 登入前提
-服務那台 MUST 以 `llmgw` 身分登入過 `gh`（`gh auth login`，憑證在該帳號家目錄）；LLMGateway MUST NOT 做登入引導，也 MUST NOT 碰憑證值。
+服務那台的 `gh` 登入義務 MUST 依「gh 登入前提」（本條不另立規則，見該 Requirement）。
 
 #### Scenario: 未登入時拉取失敗
 - **WHEN** 服務那台以 `llmgw` 身分尚未登入 `gh`，key-sync 進行一次拉取
