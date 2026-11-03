@@ -76,7 +76,7 @@
 
 #### Scenario: roles 的生效等級比 resolve 嚴
 - **WHEN** `roles.impl.floor` 為 `real`，請求 `GET /v1/roles/impl?agent=opencode&data=public`，再以回覆的 `data` 與候選的 `subscription` 與 `provider` resolve
-- **THEN** `roles` 的生效 `data` 是 `real`；resolve 不會因同一把比 `roles` 放寬（見 `subscription-registry`「roles 回覆的候選用回覆的 data resolve 不被隱私擋」）
+- **THEN** `roles` 的生效 `data` 是 `real`；resolve 不會因同一把比 `roles` 放寬（見 `resolve`「roles 回覆的候選用回覆的 data resolve 不被隱私擋」）
 
 ### Requirement: roles row 是候選投影
 `roles` 的 row SHALL 是候選投影，不是 `subscription-registry` 的共通 JSON，不受其欄位清單約束。
