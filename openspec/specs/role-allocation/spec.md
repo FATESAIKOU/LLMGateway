@@ -65,7 +65,7 @@
 - **THEN** resolve 的選把仍依 `priority`（選 priority 較小的那把），不依 `roles` 的 `order`
 
 ### Requirement: roles 為 advisory
-`roles` 為 advisory：Gateway MUST NOT 代選，`order` MUST NOT 限制 `resolve` 的釘住，也 MUST NOT 讓釘住繞過隱私——`resolve` 帶 `data` 時 MUST 依 `subscription-registry` 的隱私步驟擋下 `privacy` 不足的候選（含釘住的那把）。
+`roles` 為 advisory：Gateway MUST NOT 代選，`order` MUST NOT 限制 `resolve` 的釘住，也 MUST NOT 讓釘住繞過隱私——`resolve` 帶 `data` 時 MUST 依 `resolve` 的隱私步驟擋下 `privacy` 不足的候選（含釘住的那把）。
 
 #### Scenario: 帶 data 的 resolve 仍擋釘住
 - **WHEN** `roles.impl.order` 含 `privacy: public` 的 `opencode-zen`，以 `agent=opencode&provider=opencode-zen&subscription=opencode-zen&data=real` resolve
@@ -76,7 +76,7 @@
 
 #### Scenario: roles 的生效等級比 resolve 嚴
 - **WHEN** `roles.impl.floor` 為 `real`，請求 `GET /v1/roles/impl?agent=opencode&data=public`，再以回覆的 `data` 與候選的 `subscription` 與 `provider` resolve
-- **THEN** `roles` 的生效 `data` 是 `real`；resolve 不會因同一把比 `roles` 放寬（見 `subscription-registry`「roles 回覆的候選用回覆的 data resolve 不被隱私擋」）
+- **THEN** `roles` 的生效 `data` 是 `real`；resolve 不會因同一把比 `roles` 放寬（見 `resolve`「roles 回覆的候選用回覆的 data resolve 不被隱私擋」）
 
 ### Requirement: roles row 是候選投影
 `roles` 的 row SHALL 是候選投影，不是 `subscription-registry` 的共通 JSON，不受其欄位清單約束。
@@ -136,7 +136,7 @@
 - **THEN** 含 `claude-personal` 的那筆 `provider` 是 `anthropic`，`id` 是 `claude-personal`
 
 ### Requirement: 候選 row 不含 key 與額度
-每筆 MUST NOT 含 `usage`、`available_again_at`（依 `subscription-registry`，`usage` 只在 list 與 resolve `meta`，`available_again_at` 只在 list），回覆 MUST NOT 含 `key`；`roles` MUST NOT 觸發取用量。
+每筆 MUST NOT 含 `usage`、`available_again_at`（依 `subscription-registry` 與 `resolve`，`usage` 只在 list 與 resolve `meta`，`available_again_at` 只在 list），回覆 MUST NOT 含 `key`；`roles` MUST NOT 觸發取用量。
 
 #### Scenario: 不含 key 與額度
 - **WHEN** 任何 `roles` 回覆
