@@ -2,7 +2,7 @@
 
 ## Why
 
-本人裁定（2026-11-03）：同一模型在 AA（Artificial Analysis）榜單有多個 effort 檔位時，取**最高檔**分數（例：某模型 max 檔 32、non-reasoning 檔 19，取 32）。
+本人裁定（2026-11-03）：同一模型在 AA（Artificial Analysis）榜單有多個 effort 檔位時，各 AA 指標欄（含綜合）取**最高檔**分數（例：某模型 max 檔 32、non-reasoning 檔 19，取 32）。
 
 現況沒有寫這條口徑，調查時可能取到哪個檔位就填哪個：
 
@@ -11,8 +11,8 @@
 
 ## What Changes
 
-- `.claude/skills/model-rotation-survey/SKILL.md`：「各欄填法」在「綜合」與「排序」之間加一句「同一模型在 AA 榜單有多個 effort 檔位時，取最高檔分數。」，其餘文字不動。
-- 主規格 delta（`openspec/changes/model-rotation-survey-effort/specs/model-rotation-survey/spec.md`，`## MODIFIED Requirements`）：只對「比例與能力評分欄填法」發 MODIFIED，逐字帶上主規格該條的完整內文與三個既有 Scenario，內文加上同一句規則，並新增 Scenario「多 effort 檔位取最高檔」（WHEN 某模型在 AA 榜單有 max 與 non-reasoning 兩個檔位（假分數 32／19）／THEN 該格採 32）。
+- `.claude/skills/model-rotation-survey/SKILL.md`：「各欄填法」在「綜合」與「排序」之間加一句「同一模型在 AA 榜單有多個 effort 檔位時，各 AA 指標欄（含綜合）取最高檔分數。」，其餘文字不動。
+- 主規格 delta（`openspec/changes/model-rotation-survey-effort/specs/model-rotation-survey/spec.md`，`## MODIFIED Requirements`）：只對「比例與能力評分欄填法」發 MODIFIED，逐字帶上主規格該條的完整內文與三個既有 Scenario，內文加上同一句「各 AA 指標欄（含「綜合」）取最高檔分數」規則，並新增 Scenario「多 effort 檔位取最高檔」（WHEN 某模型在 AA 榜單有 max 與 non-reasoning 兩個檔位（假分數 32／19）／THEN 該格採 32（綜合欄同理））。
 
 ## 不做
 
