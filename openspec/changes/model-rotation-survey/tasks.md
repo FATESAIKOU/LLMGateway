@@ -9,7 +9,7 @@
 
 - [x] 2.1 `openspec/changes/model-rotation-survey/specs/model-rotation-survey/spec.md`：建立 delta spec（20 條 Requirement、45 個 Scenario），涵蓋觸發限制、survey 流程、四家來源、標籤與欄位、comment 篩選與 apply、安全邊界與外部注入防護。驗證：`openspec validate model-rotation-survey --strict`。
 - [x] 2.2 `openspec/changes/model-rotation-survey/tasks.md`：建立 tasks.md 追蹤實作、規格與邊界任務。驗證：`openspec validate model-rotation-survey --strict`。
-- [x] 2.3 `docs/model-rotation.md` 首次實跑：PR #135 於 2026-10-31 完成首次實跑調查，自四家來源取得 54 筆模型資料並開啟 PR，說明差異與各格來源。驗證：人工：檢視 PR #135 之 diff 與 PR body。
+- [x] 2.3 `docs/model-rotation.md` 首次實跑：PR #135 於 2026-10-31 完成首次實跑調查，自四家來源取得 54 筆（依本 spec，Zen 兩列『待核對』應移除，之後為 52，由 #135 收尾處理）模型資料並開啟 PR，說明差異與各格來源。驗證：人工：檢視 PR #135 之 diff 與 PR body。
 
 ## 不在本 change
 
