@@ -9,7 +9,7 @@
 
 ## 1. 現況數字
 
-- 行數 1084；requirement 124；scenario 174（`wc -l`；`### Requirement` 124 個；`#### Scenario` 174 個）。其他主 spec：connectivity 47、key-vault 101、role-allocation 190、usage-reporting 564；本 spec 佔五份總和（1986）的 55%。
+- 行數 1084；requirement 124；scenario 176（`wc -l`；#165 補 opencode-go 後，原寫 174 漏算 2 個，分群小計為約數；`### Requirement` 124 個；`#### Scenario` 174 個）。其他主 spec：connectivity 47、key-vault 101、role-allocation 190、usage-reporting 564；本 spec 佔五份總和（1986）的 55%。
 - 工單 #163 內文寫「main 為 652 行、13 條」是 #137 前的舊數字；現在 main 就是 1084／124（已核對）。
 - 分群（以行號區間切；requirement 數／scenario 數）：
 
@@ -23,7 +23,7 @@
 | F | 選把規則（步驟 1～7、冷卻不參與、錯誤優先序） | 738–895 | 15 | 28 |
 | G | env 組成（各變數、空物件、未知鍵、model 省略） | 896–1028 | 17 | 20 |
 | H | local-login（沒有憑證的訂閱） | 1029–1084 | 8 | 8 |
-| 合計 | | | 124 | 174 |
+| 合計 | | | 124 | 176（分群小計加總 174，漏算 2，群別未重算） |
 
 （統計以腳本跑出：逐行掃 `### Requirement`／`#### Scenario`，以標題行號落在區間分群；B 的 scenario 數含「登錄冷卻的 model 被擋時回 400」的 6 個。）最大單條：「冷卻不參與選把」8 scenario／約 1780 字元（`:829`）。
 
@@ -70,7 +70,7 @@
 實作單 MUST 附並跑一支腳本（不進 repo 或放 `scripts/`，由 PM 定）：
 1. 切出 main 的每條 requirement：`(header, 全文含所有 scenario)`，正規化空白後取 SHA-256。
 2. 對新的五份 spec 做同樣的切法，得到集合。
-3. 斷言：(a) 標題集合相等（124 條，無遺漏無重複、跨檔標題不重名）；(b) 每條的 hash 相等，**除了**明列的白名單：被改寫跨 capability 引用的那些條（§3.4／§4，清單由 diff 腳本列出，PR 描述逐條說明只改了引用字樣）；(c) scenario 總數 174。
+3. 斷言：(a) 標題集合相等（124 條，無遺漏無重複、跨檔標題不重名）；(b) 每條的 hash 相等，**除了**明列的白名單：被改寫跨 capability 引用的那些條（§3.4／§4，清單由 diff 腳本列出，PR 描述逐條說明只改了引用字樣）；(c) scenario 總數 176。
 4. `openspec validate --specs --strict` 五份＋ role-allocation／key-vault 皆綠；`openspec list --specs` 看得到五個。
 5. 靜態：`grep -rn "subscription-registry" openspec/specs` 的每一處引用指到的 requirement 都存在於它所指的 capability。
 

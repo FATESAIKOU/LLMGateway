@@ -136,7 +136,7 @@
 - **THEN** 含 `claude-personal` 的那筆 `provider` 是 `anthropic`，`id` 是 `claude-personal`
 
 ### Requirement: 候選 row 不含 key 與額度
-每筆 MUST NOT 含 `usage`、`available_again_at`（依 `subscription-registry`，`usage` 只在 list 與 resolve `meta`，`available_again_at` 只在 list），回覆 MUST NOT 含 `key`；`roles` MUST NOT 觸發取用量。
+每筆 MUST NOT 含 `usage`、`available_again_at`（依 `subscription-registry` 與 `resolve`，`usage` 只在 list 與 resolve `meta`，`available_again_at` 只在 list），回覆 MUST NOT 含 `key`；`roles` MUST NOT 觸發取用量。
 
 #### Scenario: 不含 key 與額度
 - **WHEN** 任何 `roles` 回覆
