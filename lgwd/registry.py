@@ -1,4 +1,4 @@
-"""Subscription registry 的服務邏輯（design 決定 6、7、8、10 與 v5 的決定 8 取代；spec subscription-registry）。
+"""Subscription registry 的服務邏輯（design 決定 6、7、8、10 與 v5 的決定 8 取代；spec subscription-registry（及拆出的 subscription-cooldown／registry-errors／resolve／resolve-env））。
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；另帶 usage／available_again_at（#60）；
 - kind 為 local-login 的訂閱（#107）沒有憑證：部署由 kind 判定（恆已部署，不讀 key 檔）；

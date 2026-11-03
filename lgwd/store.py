@@ -1,4 +1,4 @@
-"""SQLite 細節（design 決定 5b、8、10 與 v5 的決定 8 取代；spec subscription-registry、key-vault）。只用標準函式庫。
+"""SQLite 細節（design 決定 5b、8、10 與 v5 的決定 8 取代；spec subscription-registry（及拆出的 subscription-cooldown／registry-errors／resolve／resolve-env）、key-vault）。只用標準函式庫。
 
 三張表：
 - cooldowns：subscription → until（整把何時能再用；重複登錄取較晚的）；
