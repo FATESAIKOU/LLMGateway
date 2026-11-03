@@ -1,6 +1,6 @@
 # #163 設計：subscription-registry 主 spec 要不要拆
 
-架構師：llmgateway-arch-m1-1　日期：2026-11-03　狀態：待 PM／本人核准（未 commit）
+架構師：llmgateway-arch-m1-1　日期：2026-11-03　狀態：已核准（PMO 轉本人 J-1／J-2／J-3 無異議，2026-11-03）
 基準：main c556be9（含 #164）。所有行號指 `openspec/specs/subscription-registry/spec.md`（下稱「本 spec」），除非另註。
 
 ## 結論

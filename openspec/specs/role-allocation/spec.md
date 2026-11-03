@@ -65,7 +65,7 @@
 - **THEN** resolve 的選把仍依 `priority`（選 priority 較小的那把），不依 `roles` 的 `order`
 
 ### Requirement: roles 為 advisory
-`roles` 為 advisory：Gateway MUST NOT 代選，`order` MUST NOT 限制 `resolve` 的釘住，也 MUST NOT 讓釘住繞過隱私——`resolve` 帶 `data` 時 MUST 依 `subscription-registry` 的隱私步驟擋下 `privacy` 不足的候選（含釘住的那把）。
+`roles` 為 advisory：Gateway MUST NOT 代選，`order` MUST NOT 限制 `resolve` 的釘住，也 MUST NOT 讓釘住繞過隱私——`resolve` 帶 `data` 時 MUST 依 `resolve` 的隱私步驟擋下 `privacy` 不足的候選（含釘住的那把）。
 
 #### Scenario: 帶 data 的 resolve 仍擋釘住
 - **WHEN** `roles.impl.order` 含 `privacy: public` 的 `opencode-zen`，以 `agent=opencode&provider=opencode-zen&subscription=opencode-zen&data=real` resolve

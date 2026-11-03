@@ -1,7 +1,7 @@
 # resolve Specification
 
 ## Purpose
-定義 LLMGateway 的挑把介面（`POST /v1/resolve`），依呼叫方給定的 agent、provider、選填 model 與 data 等級，依政策步驟挑選最適 subscription，並回傳中介資料 meta 與快取標頭。
+定義 LLMGateway 的挑把介面（`GET /v1/resolve`），依呼叫方給定的 agent、provider、選填 model 與 data 等級，依政策步驟挑選最適 subscription，並回傳中介資料 meta 與快取標頭。
 
 > 本檔 Scenario 中的 subscription 名稱、priority 與 models.default 是**示例政策**，用來說明選把規則，不是出廠政策；出廠政策以 `policy/default.json` 為準。
 ## Requirements
