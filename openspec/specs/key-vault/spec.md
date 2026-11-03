@@ -18,6 +18,10 @@ key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一�
 - **WHEN** 服務那台以 `llmgw` 身分完成 `gh auth login`
 - **THEN** key-sync 可以讀取 `FATESAIKOU/LLMGateway-keys`，LLMGateway 不讀寫 `gh` 的憑證
 
+#### Scenario: 未登入時拉取失敗
+- **WHEN** 服務那台以 `llmgw` 身分尚未登入 `gh`，key-sync 進行一次拉取
+- **THEN** 拉取失敗、記一行 log（見「gh 不能用時保留舊版」），LLMGateway 沒有讀寫任何 `gh` 憑證
+
 ### Requirement: gh 不能用時保留舊版
 `gh` 沒登入、token 失效或讀不到該 repo 時 MUST 記一行 log（不含值）、保留舊版，下次再試。
 
@@ -78,13 +82,6 @@ LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密
 #### Scenario: 權限
 - **WHEN** 檢查那台的 key 檔
 - **THEN** 檔案權限是 0600，擁有者是服務帳號
-
-### Requirement: key 正本的 gh 登入前提
-服務那台的 `gh` 登入義務 MUST 依「gh 登入前提」（本條不另立規則，見該 Requirement）。
-
-#### Scenario: 未登入時拉取失敗
-- **WHEN** 服務那台以 `llmgw` 身分尚未登入 `gh`，key-sync 進行一次拉取
-- **THEN** 拉取失敗、記一行 log（見「gh 不能用時保留舊版」），LLMGateway 沒有讀寫任何 `gh` 憑證
 
 ### Requirement: local-login 訂閱不進 key 檔
 `kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`：agy 用呼叫方那一台機器的本機登入，見 spec `subscription-registry`「沒有憑證的訂閱」）MUST NOT 出現在 key 檔，MUST NOT 佔 `KEY_NAMES` 的鍵名。Gateway MUST NOT 為它拉取、保管或轉發任何值。
