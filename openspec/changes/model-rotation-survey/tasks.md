@@ -7,7 +7,7 @@
 
 ## 2. 規格補齊與首次實跑（PR #63、PR #135）
 
-- [x] 2.1 `openspec/changes/model-rotation-survey/specs/model-rotation-survey/spec.md`：建立 delta spec（19 條 Requirement、40 個 Scenario），涵蓋觸發限制、survey 流程、四家來源、標籤與欄位、comment 篩選與 apply、安全邊界與外部注入防護。驗證：`openspec validate model-rotation-survey --strict`。
+- [x] 2.1 `openspec/changes/model-rotation-survey/specs/model-rotation-survey/spec.md`：建立 delta spec（20 條 Requirement、45 個 Scenario），涵蓋觸發限制、survey 流程、四家來源、標籤與欄位、comment 篩選與 apply、安全邊界與外部注入防護。驗證：`openspec validate model-rotation-survey --strict`。
 - [x] 2.2 `openspec/changes/model-rotation-survey/tasks.md`：建立 tasks.md 追蹤實作、規格與邊界任務。驗證：`openspec validate model-rotation-survey --strict`。
 - [x] 2.3 `docs/model-rotation.md` 首次實跑：PR #135 於 2026-10-31 完成首次實跑調查，自四家來源取得 54 筆模型資料並開啟 PR，說明差異與各格來源。驗證：人工：檢視 PR #135 之 diff 與 PR body。
 
@@ -15,4 +15,4 @@
 
 - [ ] 3.1 MyPMO 手冊改引用：MyPMO 模型輪換手冊的「候選模型與數字」改為引用 LLMGateway 的 `docs/model-rotation.md`，由 PMO 於 MyPMO 執行。
 - [ ] 3.2 PR #135 本人審核與 merge：等本人在 PR #135 留下 comment 後執行 `/model-rotation-survey apply` 套用修改並由本人 merge。
-- [ ] 3.3 主規格歸檔（PR 2）：待實跑驗收完畢後，執行 `openspec archive model-rotation-survey` 將 change 歸檔為主規格。
+- [ ] 3.3 主規格歸檔（第二個 PR（歸檔））：待實跑驗收完畢後，執行 `openspec archive model-rotation-survey` 將 change 歸檔為主規格。
