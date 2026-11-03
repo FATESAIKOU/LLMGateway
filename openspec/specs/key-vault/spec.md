@@ -5,15 +5,32 @@
 > v5（2026-10-12）：`key 只保管在一處`以 v5 全文為準；新增`拉取與輪替`。`值不外洩`、`不做應用層認證`、`服務不對外`不變。第二輪（同日，本人）：拉取改 `gh api`，repo 寫死，`gh` 登入是使用前提。
 ## Requirements
 ### Requirement: 拉取與輪替
-key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一次 `keys.env.enc`，流程固定為：`gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc` 取回 base64 內容與 blob `sha`→比對 `sha`（和上次套用的一樣就不動）→base64 解碼→`openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a -pass env:…` 解密→驗證格式（同 `keys.env` 五個 `KEY=VALUE`）→原子替換 `keys.env`→`lgwd` 重讀。使用前提是服務那台以 `llmgw` 身分登入過 `gh`（LLMGateway 本身不做登入引導）；認證方式由本人選定：`llmgw` 用瀏覽器 `gh auth login` 登入，不用 token 檔（憑證由 `gh` 自己管在該帳號家目錄，LLMGateway 不碰）。`gh` 沒登入、token 失效或讀不到該 repo 時 MUST 記一行 log（不含值）、保留舊版，下次再試。值在過程中 MUST NOT 上命令列、不寫進 log。
+key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一次 `keys.env.enc`，流程固定為：`gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc` 取回 base64 內容與 blob `sha`→比對 `sha`（和上次套用的一樣就不動）→base64 解碼→`openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a -pass env:…` 解密→驗證格式（同 `keys.env` 五個 `KEY=VALUE`）→原子替換 `keys.env`→`lgwd` 重讀。
 
 #### Scenario: 拉到新版
 - **WHEN** 本人更新加密檔並 push（blob `sha` 變了）
 - **THEN** 下一次拉取後那台的 key 檔更新，`lgwd` 重讀後 resolve 回的 `env` 是新值
 
+### Requirement: gh 登入前提
+服務那台 MUST 以 `llmgw` 身分登入過 `gh`，這是拉取的使用前提；LLMGateway 本身 MUST NOT 做登入引導。認證方式由本人選定：`llmgw` 用瀏覽器 `gh auth login` 登入，不用 token 檔（憑證由 `gh` 自己管在該帳號家目錄，LLMGateway 不碰）。
+
+#### Scenario: 服務帳號完成登入
+- **WHEN** 服務那台以 `llmgw` 身分完成 `gh auth login`
+- **THEN** key-sync 可以讀取 `FATESAIKOU/LLMGateway-keys`，LLMGateway 不讀寫 `gh` 的憑證
+
+### Requirement: gh 不能用時保留舊版
+`gh` 沒登入、token 失效或讀不到該 repo 時 MUST 記一行 log（不含值）、保留舊版，下次再試。
+
 #### Scenario: gh 不能用
 - **WHEN** `gh` 沒登入、token 失效或讀不到 `FATESAIKOU/LLMGateway-keys`
 - **THEN** key-sync 記一行 log、`keys.env` 不動，服務照用舊 key；`install.sh --check` 看得出「gh 不能用」（以服務帳號身分問，並實際驗一次讀得到那個 repo）
+
+### Requirement: 值不上命令列或 log
+值在過程中 MUST NOT 上命令列、不寫進 log。
+
+#### Scenario: 拉取過程不洩值
+- **WHEN** 拉取與解密過程中，以 canary 值掃描命令列與 log
+- **THEN** 沒有任何命中
 
 ### Requirement: 值不外洩
 key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務的 log、list 的回覆、錯誤訊息。用量取得器（spec `usage-reporting`）讀 key 只在行程內：Ollama 的 key 只放進該次請求的 `Authorization` header，Claude 的 token 只以子行程環境變數 `CLAUDE_CODE_OAUTH_TOKEN` 傳入；兩者都 MUST NOT 進 argv、檔案、log、稽核、例外訊息，也 MUST NOT 出現在 list 與 resolve 新增的 `usage`／`available_again_at` 欄位。取用量新增的外連只到官方 API（直連只有 `ollama.com` 的 `/api/balance`；Claude 的外連由原版 Claude Code 自己發出，Gateway 不另開連線）。值只出現在 resolve 回覆的 `env`，以及由 sidecar 開的 agent 的環境。
@@ -49,17 +66,36 @@ key 的值 MUST NOT 出現在 repo、服務的資料庫或稽核紀錄、服務�
 - **THEN** 連不上
 
 ### Requirement: key 只保管在一處
-key 的正本 SHALL 是 private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `keys.env.enc`（格式與加密方式見 `archive/2026-10-24-gateway-v0/design.md` 的 v5 變更；值由本人更新，AI 不經手值）。使用前提是服務那台以 `llmgw` 身分登入過 `gh`（`gh auth login`，憑證在該帳號家目錄；LLMGateway 不做登入引導、不碰憑證值）。LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密驗證過的內容寫到放服務那台、只有服務帳號讀得到的檔案（權限 0600）。拉取與解密過程中 MUST NOT 把值放在命令列或寫進 log。`kind` 為 `local-login` 的訂閱沒有憑證（本 change 的 `antigravity`：agy 用呼叫方那一台機器的本機登入，見 spec `subscription-registry`「沒有憑證的訂閱」）：它 MUST NOT 出現在 key 檔、MUST NOT 佔 `KEY_NAMES` 的鍵名，Gateway MUST NOT 為它拉取、保管或轉發任何值；它的「已部署」由 kind 判定，不由 key 檔判定。
+key 的正本 SHALL 是 private repo `FATESAIKOU/LLMGateway-keys` 根目錄的 `keys.env.enc`（格式與加密方式見 `archive/2026-10-24-gateway-v0/design.md` 的 v5 變更；值由本人更新，AI 不經手值）。
 
 #### Scenario: 部署
 - **WHEN** 本人更新加密檔並等一次拉取
 - **THEN** 那台的 key 檔更新，服務重讀後 resolve 回的 `env` 是新值，log 裡不出現任何值
 
+### Requirement: key 檔由定期拉取寫入
+LLMGateway SHALL 經由定期拉取（本檔「拉取與輪替」），把解密驗證過的內容寫到放服務那台、只有服務帳號讀得到的檔案（權限 0600）。拉取與解密過程中 MUST NOT 把值放在命令列或寫進 log。
+
 #### Scenario: 權限
 - **WHEN** 檢查那台的 key 檔
 - **THEN** 檔案權限是 0600，擁有者是服務帳號
+
+### Requirement: key 正本的 gh 登入前提
+服務那台 MUST 以 `llmgw` 身分登入過 `gh`（`gh auth login`，憑證在該帳號家目錄）；LLMGateway MUST NOT 做登入引導，也 MUST NOT 碰憑證值。
+
+#### Scenario: 未登入時拉取失敗
+- **WHEN** 服務那台以 `llmgw` 身分尚未登入 `gh`，key-sync 進行一次拉取
+- **THEN** 拉取失敗、記一行 log（見「gh 不能用時保留舊版」），LLMGateway 沒有讀寫任何 `gh` 憑證
+
+### Requirement: local-login 訂閱不進 key 檔
+`kind` 為 `local-login` 的訂閱（本 change 的 `antigravity`：agy 用呼叫方那一台機器的本機登入，見 spec `subscription-registry`「沒有憑證的訂閱」）MUST NOT 出現在 key 檔，MUST NOT 佔 `KEY_NAMES` 的鍵名。Gateway MUST NOT 為它拉取、保管或轉發任何值。
 
 #### Scenario: 沒有憑證的訂閱不進 key 檔
 - **WHEN** 檢查 key 檔的鍵名與 `KEY_NAMES`
 - **THEN** 沒有 `antigravity`（也沒有任何 `local-login` 的訂閱）；它的 resolve 仍回 200 與空 `env`，不讀 key 檔的值
 
+### Requirement: local-login 訂閱的已部署由 kind 判定
+`kind` 為 `local-login` 的訂閱的「已部署」MUST 由 kind 判定，MUST NOT 由 key 檔判定。
+
+#### Scenario: key 檔沒有鍵時仍算已部署
+- **WHEN** key 檔裡沒有任何 `antigravity` 的鍵，判定 `antigravity` 是否已部署
+- **THEN** 判定為已部署（由 kind 決定），判定過程不讀 key 檔的值

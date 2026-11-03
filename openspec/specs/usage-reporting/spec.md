@@ -8,25 +8,12 @@
 ### Requirement: usage 物件的形狀
 list 的每一筆與 resolve 的 `meta` SHALL 帶一個 `usage` 物件，欄位固定為：`status`、`source`、`fetched_at`、`stale`、`reason`、`session`、`weekly`、`pipes`，每個都 MUST 存在（缺值用 null，`pipes` 無管子時用 `[]`，不省略）。
 
-- `status`：`ok`（`session`、`weekly`、`pipes` 至少一項讀到）、`unknown`（有取用量實作，但這次讀不到，含窗口與管子全部已過期）、`not_applicable`（這個 provider 沒有取用量實作）。
-- `source`：取得來源的固定字串（Ollama Cloud 為 `ollama-api-balance`，Claude 為 `claude-statusline`，OpenRouter 為 `openrouter-api-key`）；`not_applicable` 時為 null。
-- `fetched_at`：最近一次**成功**取得的時刻（RFC 3339 UTC），從沒成功過為 null。
-- `stale`：見「stale 與 6 小時」；從沒成功過與 `not_applicable` 為 null。
-- `reason`：固定碼，只能是 `not_fetched_yet`、`disabled`、`no_key`、`upstream_error`、`rate_limited`、`timeout`、`parse_error`、`no_windows`、`stale_expired`、`internal` 或 null；MUST NOT 回顯上游內容。
-- `session`、`weekly`：`{"remaining_percent": 數字, "resets_at": RFC 3339 UTC}` 或 null。`remaining_percent` 保留原始小數，範圍 0～100。讀不到的窗口 MUST 是 null，**絕不用 0 代替**。這兩個鍵是相容層，語意與值不隨 `pipes` 的加入而改變。
-- `pipes`：陣列，見「管子（pipes）」。
-
-#### Scenario: 讀到兩個窗口
-- **WHEN** Ollama 的 balance 回 `included.session`（剩 75%、`resets_at` 2026-10-25T07:00:00Z）與 `included.weekly`（剩 40%、`resets_at` 2026-10-28T00:00:00Z），取完後再 list
-- **THEN** 該筆 `usage` 為 `status: ok`、`source: ollama-api-balance`、`stale: false`、`reason: null`，`fetched_at` 是取得時刻，`session.remaining_percent` 為 75、`weekly.remaining_percent` 為 40，`resets_at` 都是 RFC 3339 UTC
-
-#### Scenario: 只讀到一個窗口
-- **WHEN** 上游只給 `weekly`
-- **THEN** `status: ok`，`session` 是 null，`weekly` 有值；`session` 的 `remaining_percent` 不會是 0
-
 #### Scenario: 形狀恆定
 - **WHEN** 對任一種 `status`／`reason` 的 `usage` 檢查鍵集
 - **THEN** 八個鍵都在，沒有多餘鍵；`session`／`weekly` 即使是 null 也存在，`pipes` 即使沒有管子也是 `[]`
+
+### Requirement: usage 的 status 與 source
+`usage.status` MUST 是下列之一：`ok`（`session`、`weekly`、`pipes` 至少一項讀到）、`unknown`（有取用量實作，但這次讀不到，含窗口與管子全部已過期）、`not_applicable`（這個 provider 沒有取用量實作）。`usage.source` MUST 是取得來源的固定字串（Ollama Cloud 為 `ollama-api-balance`，Claude 為 `claude-statusline`，OpenRouter 為 `openrouter-api-key`）；`not_applicable` 時為 null。
 
 #### Scenario: 沒有用量來源的 provider
 - **WHEN** list 含 `opencode-zen`、`opencode-go` 與 `antigravity`
@@ -36,13 +23,34 @@ list 的每一筆與 resolve 的 `meta` SHALL 帶一個 `usage` 物件，欄位�
 - **WHEN** lgwd 剛啟動，第一次 list 含已啟用的 `ollama-cloud`
 - **THEN** 它的 `usage` 是 `status: unknown`、`reason: not_fetched_yet`、`fetched_at: null`、`stale: null`、`session: null`、`weekly: null`、`pipes: []`
 
-#### Scenario: 方案沒有 session／weekly
-- **WHEN** Ollama 的 balance 回應沒有 `included.session` 也沒有 `included.weekly`（新方案，只有 `balance_usd`／`allowance_usd`），取完後再 list
-- **THEN** `usage` 是 `status: unknown`、`reason: no_windows`，`session`／`weekly` 為 null，`pipes` 為 `[]`，回應不帶金額（沒有 `credits` 絕對值）
+### Requirement: usage 的時刻與原因碼
+`usage.fetched_at` 是最近一次**成功**取得的時刻（RFC 3339 UTC），從沒成功過為 null。`usage.stale` 見「stale 與 6 小時」；從沒成功過與 `not_applicable` 為 null。`usage.reason` MUST 是固定碼之一：`not_fetched_yet`、`disabled`、`no_key`、`upstream_error`、`rate_limited`、`timeout`、`parse_error`、`no_windows`、`stale_expired`、`internal` 或 null；MUST NOT 回顯上游內容。
 
 #### Scenario: 失敗原因碼
 - **WHEN** 取用量分別遇到：上游回非 200／連線失敗、逾時、回應不是預期結構、回 429、vault 裡沒有該 key、內部例外
 - **THEN** `usage.reason` 依序是 `upstream_error`、`timeout`、`parse_error`、`rate_limited`、`no_key`、`internal`，`status` 皆為 `unknown`（或見「stale 與 6 小時」的 `ok`＋`stale`），`session`／`weekly` 為 null、`pipes` 為 `[]`，且 `reason` 之外的欄位不含上游回應內容
+
+### Requirement: usage 的 session 與 weekly 窗口
+`usage.session` 與 `usage.weekly` MUST 是 `{"remaining_percent": 數字, "resets_at": RFC 3339 UTC}` 或 null。`remaining_percent` 保留原始小數，範圍 0～100。讀不到的窗口 MUST 是 null，**絕不用 0 代替**。這兩個鍵是相容層，語意與值不隨 `pipes` 的加入而改變。
+
+#### Scenario: 讀到兩個窗口
+- **WHEN** Ollama 的 balance 回 `included.session`（剩 75%、`resets_at` 2026-10-25T07:00:00Z）與 `included.weekly`（剩 40%、`resets_at` 2026-10-28T00:00:00Z），取完後再 list
+- **THEN** 該筆 `usage` 為 `status: ok`、`source: ollama-api-balance`、`stale: false`、`reason: null`，`fetched_at` 是取得時刻，`session.remaining_percent` 為 75、`weekly.remaining_percent` 為 40，`resets_at` 都是 RFC 3339 UTC
+
+#### Scenario: 只讀到一個窗口
+- **WHEN** 上游只給 `weekly`
+- **THEN** `status: ok`，`session` 是 null，`weekly` 有值；`session` 的 `remaining_percent` 不會是 0
+
+#### Scenario: 方案沒有 session／weekly
+- **WHEN** Ollama 的 balance 回應沒有 `included.session` 也沒有 `included.weekly`（新方案，只有 `balance_usd`／`allowance_usd`），取完後再 list
+- **THEN** `usage` 是 `status: unknown`、`reason: no_windows`，`session`／`weekly` 為 null，`pipes` 為 `[]`，回應不帶金額（沒有 `credits` 絕對值）
+
+### Requirement: usage 的 pipes 欄位
+`usage.pipes` MUST 是陣列，每個元素的格式見「管子（pipes）」；沒有管子時 MUST 為 `[]`。
+
+#### Scenario: 無法取得用量時 pipes 為空
+- **WHEN** `usage.status` 為 `unknown` 或 `not_applicable`
+- **THEN** `usage.pipes` 為 `[]`，不是 null，也不省略
 
 ### Requirement: 窗口換算與過期
 欄位白名單：Ollama 只取 `included.session`／`included.weekly` 的 `remaining_percent`、`resets_at`，其餘丟掉。Claude 的 `rate_limits.five_hour` 對應 `session`、`seven_day` 對應 `weekly`，上游給 `used_percentage`，`remaining_percent` MUST 等於 `100 - used_percentage`（不先取整），`resets_at`（epoch 秒）轉成 RFC 3339 UTC。某個窗口的 `resets_at` 已過而尚未重取時，該窗口 MUST 回 null（不假設已回到 100%）；兩個窗口都已過時 `status` 為 `unknown`、`reason` 為 `stale_expired`。
@@ -126,37 +134,54 @@ list 的每一筆 SHALL 帶 `available_again_at`（RFC 3339 UTC 或 null）。�
 - **THEN** `meta` 沒有 `available_again_at`
 
 ### Requirement: 被查到且過期才取，不等結果
-取用量 SHALL 只在 list 或 resolve 組裝某個 subscription 的 `usage` 時觸發，條件是：該 provider 有取用量實作、已啟用（見「政策檔的 usage 設定」）、key 已部署，而且快取不存在或 `now - fetched_at` 超過 TTL，而且不在退避期間內。觸發只是叫一條取用量執行緒去做，這次 list／resolve 的回覆 MUST NOT 等它：有舊值回舊值（`stale: true`），從沒取過回 `unknown`／`not_fetched_yet`；新值取完寫進快取，下一次查詢才看到。MUST NOT 有定時排程或啟動時預取。冷卻登錄 MUST NOT 觸發取用量。resolve 回非 200（409 `cooling`、409 `no_candidate`、409 `not_deployed`、404、400 `bad_request`／`no_model`、403 `agent_not_allowed`／`model_not_allowed`）時 MUST NOT 組裝 `meta.usage`，也 MUST NOT 觸發取用量。
-
-**原因碼的優先順序**：已被政策關閉（`enabled: false`）→ `disabled`（優先，不看 key）；其次 key 沒部署 → `no_key`。key 沒部署時，即使快取裡有舊值，`usage` 也 MUST 回 `unknown`／`no_key`、窗口為 null，不回舊值（key 已不在，舊值不再可信），且不觸發；key 重新部署後，快取沿用既有規則（未過期則直接顯示）。
+取用量 SHALL 只在 list 或 resolve 組裝某個 subscription 的 `usage` 時觸發，條件是：該 provider 有取用量實作、已啟用（見「政策檔的 usage 設定」）、key 已部署，而且快取不存在或 `now - fetched_at` 超過 TTL，而且不在退避期間內。
 
 #### Scenario: 快取過期的第一次查詢
 - **WHEN** 快取不存在，呼叫 list，假取用量卡住不返回
 - **THEN** list 立刻回 200，該筆 `usage` 是 `unknown`／`not_fetched_yet`，假取用量被呼叫一次
 
-#### Scenario: 下一次查詢才看到新值
-- **WHEN** 上一個 Scenario 的取用量完成並寫入快取，再呼叫 list
-- **THEN** 該筆 `usage` 是 `status: ok`；且這一次因為快取未過期，不再觸發
-
 #### Scenario: 快取還新鮮
 - **WHEN** `now - fetched_at` 小於 TTL 時 list 或 resolve
 - **THEN** 不觸發取用量
 
-#### Scenario: 沒人查就不取
-- **WHEN** lgwd 啟動後沒有任何 list 或 resolve，經過數個 TTL
-- **THEN** 取用量實作一次都沒被呼叫
+### Requirement: 觸發不等結果
+觸發只是叫一條取用量執行緒去做，這次 list／resolve 的回覆 MUST NOT 等它：有舊值回舊值（`stale: true`），從沒取過回 `unknown`／`not_fetched_yet`；新值取完寫進快取，下一次查詢才看到。
+
+#### Scenario: 下一次查詢才看到新值
+- **WHEN** 上一個 Scenario 的取用量完成並寫入快取，再呼叫 list
+- **THEN** 該筆 `usage` 是 `status: ok`；且這一次因為快取未過期，不再觸發
 
 #### Scenario: resolve 成功時帶 usage 並觸發
 - **WHEN** resolve 回 200 選中 `ollama-cloud`，快取過期
 - **THEN** `meta.usage` 與 list 同形狀（只讀快取），並觸發一次背景取用量，回覆不等它
 
-#### Scenario: resolve 非 200 不觸發
-- **WHEN** resolve 分別回 409 `cooling`、409 `no_candidate`、409 `not_deployed`、404 `not_found`、400 `bad_request`、400 `no_model`、403 `agent_not_allowed` 或 403 `model_not_allowed`，且相關 subscription 的快取過期
-- **THEN** 回覆不含 `usage`，取用量實作沒有被呼叫
+### Requirement: 不排程也不預取
+MUST NOT 有定時排程或啟動時預取。冷卻登錄 MUST NOT 觸發取用量。
+
+#### Scenario: 沒人查就不取
+- **WHEN** lgwd 啟動後沒有任何 list 或 resolve，經過數個 TTL
+- **THEN** 取用量實作一次都沒被呼叫
 
 #### Scenario: get 與冷卻登錄不觸發
 - **WHEN** 登錄冷卻，快取過期
 - **THEN** 取用量實作沒有被呼叫
+
+### Requirement: resolve 非 200 不組裝 usage
+resolve 回非 200（409 `cooling`、409 `no_candidate`、409 `not_deployed`、404、400 `bad_request`／`no_model`、403 `agent_not_allowed`／`model_not_allowed`）時 MUST NOT 組裝 `meta.usage`，也 MUST NOT 觸發取用量。
+
+#### Scenario: resolve 非 200 不觸發
+- **WHEN** resolve 分別回 409 `cooling`、409 `no_candidate`、409 `not_deployed`、404 `not_found`、400 `bad_request`、400 `no_model`、403 `agent_not_allowed` 或 403 `model_not_allowed`，且相關 subscription 的快取過期
+- **THEN** 回覆不含 `usage`，取用量實作沒有被呼叫
+
+### Requirement: 原因碼的優先順序
+原因碼的優先順序 MUST 是：已被政策關閉（`enabled: false`）→ `disabled`（優先，不看 key）；其次 key 沒部署 → `no_key`。
+
+#### Scenario: disabled 優先於 no_key
+- **WHEN** 政策檔把 `ollama-cloud` 設為 `enabled: false`，而且它的 key 沒部署
+- **THEN** `usage.reason` 是 `disabled`（不是 `no_key`）
+
+### Requirement: key 沒部署時不回舊值
+key 沒部署時，即使快取裡有舊值，`usage` MUST 回 `unknown`／`no_key`、窗口為 null，不回舊值（key 已不在，舊值不再可信），且 MUST NOT 觸發；key 重新部署後，快取沿用既有規則（未過期則直接顯示）。
 
 #### Scenario: key 沒部署不觸發
 - **WHEN** `ollama-cloud` 的 key 沒部署，呼叫 list
@@ -165,10 +190,6 @@ list 的每一筆 SHALL 帶 `available_again_at`（RFC 3339 UTC 或 null）。�
 #### Scenario: key 沒部署但快取有舊值
 - **WHEN** `ollama-cloud` 的快取有 1 分鐘前的成功值，之後 key 檔被換成不含該 key 的版本，呼叫 list
 - **THEN** `usage` 是 `unknown`／`no_key`，`session`／`weekly` 為 null，不回舊值，也不觸發取用量
-
-#### Scenario: disabled 優先於 no_key
-- **WHEN** 政策檔把 `ollama-cloud` 設為 `enabled: false`，而且它的 key 沒部署
-- **THEN** `usage.reason` 是 `disabled`（不是 `no_key`）
 
 ### Requirement: single-flight
 同一個 subscription 同時只能有一個取用量在跑。觸發判斷、in-flight 旗標與「已停止」旗標 MUST 由同一把鎖保護；取用量執行中再被查到 MUST NOT 重複觸發。
@@ -278,18 +299,46 @@ Ollama 取用量 SHALL 對寫死在程式裡的 `https://ollama.com/api/balance`
 - **THEN** 第二次請求帶的是新 key
 
 ### Requirement: Claude 取用量
-Claude 取用量 SHALL 執行**未修改的原版 Claude Code** 並讀其 statusline 的 `rate_limits`（`five_hour`／`seven_day`）；Gateway MUST NOT 自己用訂閱 token 對 Anthropic 的 API 或沒有文件的 usage endpoint 發請求，MUST NOT 收集或轉手 session token。**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前需完成 10.1／10.2 與 C1（階段 C 的前置，即以服務帳號裝原版 Claude Code、trust 固定目錄、服務的 PATH 與 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`），未完成時 `usage` 會是 `unknown`／`upstream_error`。只用管道 1（statusline）；取不到就是 `unknown`，MUST NOT 再找別條路。管道 2（`-p` 下的 `/usage`）於 2026-10-25 階段 B 探測 (b) 實測不可用（只回 session cost、沒有窗口），不採用。子行程規則：
-- token MUST 只以子行程環境變數 `CLAUDE_CODE_OAUTH_TOKEN` 傳入，MUST NOT 出現在 argv、檔案；
-- 子行程環境用白名單，MUST NOT 繼承服務的環境；
-- 子行程 stdout／stderr MUST NOT 進 log，只留 `rate_limits` 的四個數字欄位；解析失敗（欄位缺、型別不對、非 Pro／Max）→ `unknown`（`parse_error`／`no_windows`），MUST NOT 補 0；
-- 逾時 60 秒；子行程以自己的行程群組啟動，逾時只終止**自己記下 pid 的那個群組**，MUST NOT 依名稱殺行程；
-- 找不到 Claude Code 可執行檔時為 `unknown`／`upstream_error`，不拋例外；
-- 子行程的 cwd MUST 是 lgwd `Config` 指定的**固定**目錄（環境變數 `LGW_USAGE_CLAUDE_CWD`，CLI 參數 `--usage-claude-cwd`，欄位 `usage_claude_cwd`；**不放政策檔**；部署時事先 trust 的就是這個路徑，見 tasks 10.2），MUST NOT 每次新建空目錄（沒接受 workspace trust 時 statusline 一律是空的）；沒設定、目錄不存在或不可用時為 `unknown`／`upstream_error`，不起子行程、不自動建立；
-- 暫存輸出放服務帳號自己目錄下的固定前綴子目錄；lgwd 啟動時掃掉前綴相符的舊殘留。
+Claude 取用量 SHALL 執行**未修改的原版 Claude Code** 並讀其 statusline 的 `rate_limits`（`five_hour`／`seven_day`）；Gateway MUST NOT 自己用訂閱 token 對 Anthropic 的 API 或沒有文件的 usage endpoint 發請求，MUST NOT 收集或轉手 session token。只用管道 1（statusline）；取不到就是 `unknown`，MUST NOT 再找別條路。
 
 #### Scenario: 用假的 claude 取到用量
 - **WHEN** 已啟用，假的 Claude Code 可執行檔把含 `five_hour`（used 25）、`seven_day`（used 50）的 `rate_limits` JSON 交給 statusline 命令
 - **THEN** 取用量完成後 `usage` 為 `status: ok`、`source: claude-statusline`，`session.remaining_percent` 為 75、`weekly.remaining_percent` 為 50
+
+### Requirement: Claude 取用量的啟用與出廠政策
+**程式** SHALL 在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前需完成 10.1／10.2 與 C1（階段 C 的前置，即以服務帳號裝原版 Claude Code、trust 固定目錄、服務的 PATH 與 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`），未完成時 `usage` 會是 `unknown`／`upstream_error`。
+
+#### Scenario: 出廠政策開啟 Claude
+- **WHEN** lgwd 以出廠政策檔（`policy/default.json`）啟動，階段 C 的前置已完成，list 在快取過期時被呼叫
+- **THEN** 觸發一次 Claude 背景取用量，這次回覆的 `reason` 是 `not_fetched_yet`
+
+#### Scenario: 前置未完成
+- **WHEN** 以出廠政策檔啟動，但 10.1／10.2 或 C1 尚未完成，list 被呼叫
+- **THEN** `usage` 是 `unknown`／`upstream_error`，list 仍回 200
+
+### Requirement: 不採用 /usage 管道
+Gateway MUST NOT 採用管道 2（`-p` 下的 `/usage`）：它於 2026-10-25 階段 B 探測 (b) 實測不可用（只回 session cost、沒有窗口），不採用。
+
+#### Scenario: 不呼叫 /usage
+- **WHEN** Claude 取用量被觸發，statusline 取不到 `rate_limits`
+- **THEN** 取用量不改走 `/usage`，`usage` 為 `unknown`，不以 `/usage` 的輸出補窗口
+
+### Requirement: 子行程的 token 傳遞
+token MUST 只以子行程環境變數 `CLAUDE_CODE_OAUTH_TOKEN` 傳入，MUST NOT 出現在 argv、檔案。
+
+#### Scenario: token 只在環境變數
+- **WHEN** 檢查假 runner 收到的 argv、環境與工作檔
+- **THEN** token 只出現在環境變數 `CLAUDE_CODE_OAUTH_TOKEN`；argv 與檔案裡都沒有；環境裡沒有服務本身環境的其他變數（例：設在測試行程的假 `GH_TOKEN`）
+
+### Requirement: 子行程的環境白名單
+子行程環境 MUST 用白名單，MUST NOT 繼承服務的環境。
+
+#### Scenario: 環境裡沒有服務的變數
+- **WHEN** 測試行程設有假的 `GH_TOKEN`，取用量執行一次，檢查子行程環境
+- **THEN** 子行程環境不含 `GH_TOKEN`，只含白名單內的變數與 `CLAUDE_CODE_OAUTH_TOKEN`
+
+### Requirement: 子行程輸出與解析失敗
+子行程 stdout／stderr MUST NOT 進 log，只留 `rate_limits` 的四個數字欄位；解析失敗（欄位缺、型別不對、非 Pro／Max）→ `unknown`（`parse_error`／`no_windows`），MUST NOT 補 0。
 
 #### Scenario: 欄位缺席
 - **WHEN** 假的輸出沒有 `rate_limits`（非 Pro／Max，或第一個 API 回應前）
@@ -299,13 +348,26 @@ Claude 取用量 SHALL 執行**未修改的原版 Claude Code** 並讀其 status
 - **WHEN** 假的輸出 `used_percentage` 是字串或 JSON 損壞
 - **THEN** `unknown`／`parse_error`，窗口為 null
 
-#### Scenario: token 只在環境變數
-- **WHEN** 檢查假 runner 收到的 argv、環境與工作檔
-- **THEN** token 只出現在環境變數 `CLAUDE_CODE_OAUTH_TOKEN`；argv 與檔案裡都沒有；環境裡沒有服務本身環境的其他變數（例：設在測試行程的假 `GH_TOKEN`）
+#### Scenario: 子行程輸出不進 log
+- **WHEN** 假的子行程在 stdout／stderr 印出含 `canary` 字樣的內容後結束
+- **THEN** lgwd 的 log 裡找不到那段內容
+
+### Requirement: 子行程的逾時與行程群組
+逾時 MUST 為 60 秒；子行程 MUST 以自己的行程群組啟動，逾時只 MUST 終止**自己記下 pid 的那個群組**，MUST NOT 依名稱殺行程。
 
 #### Scenario: 逾時只收自己的行程群組
 - **WHEN** 假的子行程超過 60 秒不結束（測試以縮短的逾時模擬）
 - **THEN** 該子行程所在的行程群組被終止，`usage` 的失敗碼為 `timeout`；測試行程以及另一個無關的同名行程不受影響
+
+### Requirement: 找不到 Claude Code 可執行檔
+找不到 Claude Code 可執行檔時 `usage` MUST 為 `unknown`／`upstream_error`，MUST NOT 拋例外。
+
+#### Scenario: 找不到可執行檔
+- **WHEN** 已啟用但服務帳號找不到 Claude Code
+- **THEN** `usage` 是 `unknown`／`upstream_error`，list 仍回 200，lgwd 沒有例外
+
+### Requirement: 子行程的固定工作目錄
+子行程的 cwd MUST 是 lgwd `Config` 指定的**固定**目錄（環境變數 `LGW_USAGE_CLAUDE_CWD`，CLI 參數 `--usage-claude-cwd`，欄位 `usage_claude_cwd`；**不放政策檔**；部署時事先 trust 的就是這個路徑，見 tasks 10.2），MUST NOT 每次新建空目錄（沒接受 workspace trust 時 statusline 一律是空的）；沒設定、目錄不存在或不可用時 `usage` MUST 為 `unknown`／`upstream_error`，MUST NOT 起子行程、MUST NOT 自動建立。
 
 #### Scenario: 固定的工作目錄
 - **WHEN** 連續兩次取用量，以假 runner 記錄子行程的 cwd
@@ -315,13 +377,8 @@ Claude 取用量 SHALL 執行**未修改的原版 Claude Code** 並讀其 status
 - **WHEN** `usage_claude_cwd` 指定的目錄不存在，或根本沒設定
 - **THEN** `usage` 是 `unknown`／`upstream_error`，不起子行程、不自動建立該目錄，list 仍回 200
 
-#### Scenario: 找不到可執行檔
-- **WHEN** 已啟用但服務帳號找不到 Claude Code
-- **THEN** `usage` 是 `unknown`／`upstream_error`，list 仍回 200，lgwd 沒有例外
-
-#### Scenario: 子行程輸出不進 log
-- **WHEN** 假的子行程在 stdout／stderr 印出含 `canary` 字樣的內容後結束
-- **THEN** lgwd 的 log 裡找不到那段內容
+### Requirement: 暫存輸出與殘留清理
+暫存輸出 MUST 放服務帳號自己目錄下的固定前綴子目錄；lgwd 啟動時 MUST 掃掉前綴相符的舊殘留。
 
 #### Scenario: 啟動時掃殘留
 - **WHEN** 暫存前綴目錄下有舊的殘留檔，lgwd 啟動
@@ -385,7 +442,7 @@ key／token MUST NOT 出現在 list 與 resolve 的新增欄位、log、稽核�
 - **THEN** 只有對 `ollama.com` 的 `/api/balance`、`openrouter.ai` 的 `/api/v1/key`；Claude 的外連由原版 Claude Code 自己發出，lgwd 沒有為 Claude 另開連線
 
 ### Requirement: OpenRouter 取用量
-OpenRouter 取用量 SHALL 對寫死在程式裡的 `https://openrouter.ai/api/v1/key` 發 `GET`（URL 不來自政策檔、不跟隨轉址到別的主機），以 vault 的 key 當 `Authorization: Bearer`，逾時 5 秒，不重試。key MUST 只放進該次請求的 header，不進 log、例外訊息、回覆。每次取之前 MUST 先 `reload_keys_if_changed()`，使換 key 後用新 key。只取 `data.free_model_daily_requests` 的 `remaining`／`limit` 換算成 `session` 窗口的 `remaining_percent`（`remaining / limit * 100`），`resets_at` 為下一個 UTC 00:00（官方每日免費請求數以 UTC 日為單位重置）；讀不到 `free_model_daily_requests` 時該窗口為 null，全部為 null 時為 `no_windows`。`limit_remaining` 等其他欄位不進 usage。key 沒部署時不觸發。TTL 預設 120 秒、下限 60 秒（與 Ollama Cloud 相同）。此 `session` 窗口只代表 `:free` 模型的每日請求數，不是這把 key 的全部可用量（官方：exempt／BYOK 帳號不受此上限約束）。
+OpenRouter 取用量 SHALL 對寫死在程式裡的 `https://openrouter.ai/api/v1/key` 發 `GET`（URL 不來自政策檔、不跟隨轉址到別的主機），以 vault 的 key 當 `Authorization: Bearer`，逾時 5 秒，不重試。
 
 #### Scenario: 請求形狀
 - **WHEN** 以假 HTTP 層捕捉一次 OpenRouter 取用量
@@ -399,23 +456,71 @@ OpenRouter 取用量 SHALL 對寫死在程式裡的 `https://openrouter.ai/api/v
 - **WHEN** 上游回 302 指向其他主機
 - **THEN** 不對那個主機發請求；`usage.reason` 為 `upstream_error`
 
+### Requirement: OpenRouter 取用量的 key 處理
+key MUST 只放進該次請求的 header，不進 log、例外訊息、回覆。每次取之前 MUST 先 `reload_keys_if_changed()`，使換 key 後用新 key。
+
+#### Scenario: 換 key 後用新值
+- **WHEN** key 檔在兩次 OpenRouter 取用量之間被換掉
+- **THEN** 第二次請求帶的是新 key
+
+### Requirement: OpenRouter 的 session 窗口換算
+只取 `data.free_model_daily_requests` 的 `remaining`／`limit` 換算成 `session` 窗口的 `remaining_percent`（`remaining / limit * 100`），`resets_at` MUST 為下一個 UTC 00:00（官方每日免費請求數以 UTC 日為單位重置）；讀不到 `free_model_daily_requests` 時該窗口 MUST 為 null，全部為 null 時 `reason` MUST 為 `no_windows`。
+
+#### Scenario: 每日免費請求數換算
+- **WHEN** `free_model_daily_requests` 的 `remaining` 為 25、`limit` 為 50
+- **THEN** `session.remaining_percent` 為 50，`resets_at` 是下一個 UTC 00:00
+
+### Requirement: OpenRouter 取用量不納入其他欄位
+`limit_remaining` 等其他欄位 MUST NOT 進 `usage`。
+
+#### Scenario: limit_remaining 不進 usage
+- **WHEN** `/api/v1/key` 回應含 `limit_remaining`
+- **THEN** `usage` 的鍵集不含該欄位，`usage` 不含它的值
+
+### Requirement: OpenRouter 的 key 沒部署與 TTL
+key 沒部署時 MUST NOT 觸發 OpenRouter 取用量。TTL 預設 120 秒、下限 60 秒（與 Ollama Cloud 相同）。
+
+#### Scenario: OpenRouter key 沒部署不觸發
+- **WHEN** OpenRouter 的 key 沒部署，呼叫 list
+- **THEN** `usage` 是 `unknown`／`no_key`，取用量實作沒有被呼叫
+
+### Requirement: OpenRouter 的 session 只代表 :free 模型
+此 `session` 窗口 MUST 只代表 `:free` 模型的每日請求數，不是這把 key 的全部可用量（官方：exempt／BYOK 帳號不受此上限約束）。
+
+#### Scenario: session 不代表全部額度
+- **WHEN** OpenRouter 的 `session` 有值，而這把 key 另有付費額度
+- **THEN** `session` 只反映 `:free` 模型的每日請求數，不反映付費額度
+
 ### Requirement: 管子（pipes）
 `usage.pipes` SHALL 是陣列，每個元素代表同一把 key 底下一個獨立的額度桶，欄位固定為：`id`、`models`、`models_except`、`remaining_percent`、`resets_at`，每個都 MUST 存在。
 
-- `id`：字串，同一 subscription 內唯一，由 Gateway 程式內的固定表決定，MUST NOT 取自上游回應原文；出貨後 MUST NOT 改名。
-- `models`、`models_except`：fnmatch 樣式的字串陣列。模型名符合 `models` 任一樣式且不符合 `models_except` 任一樣式，才屬於該管子；`["*"]` 表示整把 key。
-- `remaining_percent`：數字，0～100，保留原始小數。
-- `resets_at`：RFC 3339 UTC 或 null。OpenRouter 的 `credits` 管子 MUST 恆為 null（重置週期的上游語意未驗，之後另開單）。
+#### Scenario: 管子欄位齊全
+- **WHEN** `usage.pipes` 有任一管子
+- **THEN** 該管子的鍵恰為 `id`、`models`、`models_except`、`remaining_percent`、`resets_at`，每個都存在
 
-只有讀到的管子 MUST 出現在陣列裡，MUST NOT 以 `remaining_percent: null` 或 0 作佔位。`resets_at` 已過的管子 MUST 從陣列拿掉；`resets_at` 為 null 的管子依「stale 與 6 小時」一併消失。OpenRouter `credits` 的值若異常（負數、大於 100%、型別不對、`limit` 非正數），MUST 只丟棄 `credits` 這一根，MUST NOT 使 `free_daily`、`status` 或退避受影響。管子 MUST NOT 帶任何絕對數量、金額或 key 值。有 `session`／`weekly` 的 source，其對應管子與這兩個鍵 MUST 逐值相等。`available_again_at` 的算法 MUST NOT 因 `pipes` 改變（仍只看 `session`／`weekly`）。
+### Requirement: 管子的 id
+`id` SHALL 是字串，同一 subscription 內唯一，由 Gateway 程式內的固定表決定，MUST NOT 取自上游回應原文；出貨後 MUST NOT 改名。
 
-#### Scenario: Claude 的兩根管子
-- **WHEN** statusline 的 `five_hour.used_percentage` 是 23.5、`seven_day.used_percentage` 是 61
-- **THEN** `pipes` 有 `five_hour`（`remaining_percent` 76.5）與 `seven_day`（39），`models` 皆為 `["*"]`，與 `session`／`weekly` 逐值相等
+#### Scenario: id 為固定值
+- **WHEN** 上游的標籤原文與先前不同，再取一次用量
+- **THEN** 該管子的 `id` 不變，仍是 fetcher 的固定值
+
+### Requirement: 管子的 models 與 models_except
+`models`、`models_except` SHALL 是 fnmatch 樣式的字串陣列。模型名符合 `models` 任一樣式且不符合 `models_except` 任一樣式，才屬於該管子；`["*"]` 表示整把 key。
 
 #### Scenario: OpenRouter 有上限的 credits
 - **WHEN** `/api/v1/key` 回 `free_model_daily_requests`（remaining 25、limit 50）、`limit` 12345.678、`limit_remaining` 4938.2712
 - **THEN** `pipes` 有 `free_daily`（50）與 `credits`（40，`resets_at` 為 null，`models_except` 為 `["*:free","openrouter/free"]`）；`session` 只等於 `free_daily`；回應不含 `12345.678`、`4938.2712`
+
+### Requirement: 管子的 remaining_percent 與 resets_at
+`remaining_percent` SHALL 是 0～100 的數字，保留原始小數；`resets_at` SHALL 是 RFC 3339 UTC 或 null。OpenRouter 的 `credits` 管子 MUST 恆為 null（重置週期的上游語意未驗，之後另開單）。
+
+#### Scenario: credits 的 resets_at 恆為 null
+- **WHEN** `/api/v1/key` 回應帶任何重置週期欄位，且 `credits` 讀到
+- **THEN** `credits.resets_at` 為 null
+
+### Requirement: 只出現讀到的管子
+只有讀到的管子 MUST 出現在陣列裡，MUST NOT 以 `remaining_percent: null` 或 0 作佔位。`resets_at` 已過的管子 MUST 從陣列拿掉；`resets_at` 為 null 的管子依「stale 與 6 小時」一併消失。
 
 #### Scenario: OpenRouter 無上限的 credits
 - **WHEN** `limit` 與 `limit_remaining` 為 null
@@ -429,19 +534,31 @@ OpenRouter 取用量 SHALL 對寫死在程式裡的 `https://openrouter.ai/api/v
 - **WHEN** 某管子的 `resets_at` 早於現在，其他管子在未來
 - **THEN** 該管子不在 `pipes`，其他照舊，`status` 仍是 `ok`
 
+### Requirement: credits 異常值只丟棄 credits
+OpenRouter `credits` 的值若異常（負數、大於 100%、型別不對、`limit` 非正數），MUST 只丟棄 `credits` 這一根，MUST NOT 使 `free_daily`、`status` 或退避受影響。
+
 #### Scenario: credits 異常值只丟棄 credits
 - **WHEN** `free_model_daily_requests` 正常，但 `limit_remaining` 為負數（或大於 `limit`、型別不對）
 - **THEN** `pipes` 沒有 `credits`，`free_daily` 與 `session` 仍在，`status: ok`，不觸發退避
 
-#### Scenario: credits 的 resets_at 恆為 null
-- **WHEN** `/api/v1/key` 回應帶任何重置週期欄位，且 `credits` 讀到
-- **THEN** `credits.resets_at` 為 null
-
-#### Scenario: 範圍聲明（available_again_at）
-- **WHEN** 檢視本 change 的 Gateway 行為
-- **THEN** `available_again_at` 只由 `cooldown.until` 與 `session`／`weekly` 計算，不依 `pipes`（讀者如何消費 `pipes` 不在本 change）
+### Requirement: 管子不帶絕對數量
+管子 MUST NOT 帶任何絕對數量、金額或 key 值。
 
 #### Scenario: 不外洩
 - **WHEN** 以憑證樣式與絕對值 canary 掃描含 `pipes` 的 list 與 resolve 回覆
 - **THEN** 沒有命中；`id` 為 fetcher 固定值，不含上游標籤原文
+
+### Requirement: 管子與 session／weekly 逐值相等
+有 `session`／`weekly` 的 source，其對應管子與這兩個鍵 MUST 逐值相等。
+
+#### Scenario: Claude 的兩根管子
+- **WHEN** statusline 的 `five_hour.used_percentage` 是 23.5、`seven_day.used_percentage` 是 61
+- **THEN** `pipes` 有 `five_hour`（`remaining_percent` 76.5）與 `seven_day`（39），`models` 皆為 `["*"]`，與 `session`／`weekly` 逐值相等
+
+### Requirement: available_again_at 不看 pipes
+`available_again_at` 的算法 MUST NOT 因 `pipes` 改變（仍只看 `session`／`weekly`）。
+
+#### Scenario: 範圍聲明（available_again_at）
+- **WHEN** 檢視本 change 的 Gateway 行為
+- **THEN** `available_again_at` 只由 `cooldown.until` 與 `session`／`weekly` 計算，不依 `pipes`（讀者如何消費 `pipes` 不在本 change）
 
