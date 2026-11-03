@@ -16,6 +16,37 @@ import time
 
 import pytest
 
+requires_lsof = pytest.mark.skipif(
+    shutil.which("lsof") is None,
+    reason="需要 lsof（Mac／有 lsof 的環境）",
+)
+
+
+def _bsd_stat_ok():
+    try:
+        r = subprocess.run(
+            ["stat", "-f", "%Su %Lp", str(pathlib.Path(__file__).resolve())],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            return False
+        parts = r.stdout.strip().split()
+        if len(parts) != 2:
+            return False
+        if ":" in parts[0]:
+            return False
+        int(parts[1], 8)
+        return True
+    except Exception:
+        return False
+
+
+requires_bsd_stat = pytest.mark.skipif(
+    not _bsd_stat_ok(),
+    reason="需要 BSD stat（macOS）；ops-scripts/mac-fallback 是 Mac 專用腳本",
+)
+
 MF = pathlib.Path(__file__).resolve().parents[1] / "ops-scripts" / "mac-fallback"
 LIB = MF / "lib.sh"
 
@@ -232,6 +263,8 @@ def test_check_scripts_catches_bash_syntax_error(tmp_path):
 
 # ---------- start／stop（假 lgwd 替身）----------
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_route2_ok_then_stop_cleans_keys(env_tree):
     code = env_tree["code"]
     set_mode(code, "serve")
@@ -253,6 +286,8 @@ def test_start_route2_ok_then_stop_cleans_keys(env_tree):
     assert not port_open(env_tree["port"])
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_route1_ok_writes_keys_pass_and_keeps_keys_env(env_tree):
     use_route1(env_tree)
     set_mode(env_tree["code"], "route1-ok")
@@ -266,6 +301,8 @@ def test_start_route1_ok_writes_keys_pass_and_keeps_keys_env(env_tree):
     assert not (env_tree["state"] / "creds" / "keys.pass").exists()
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_route1_clears_stale_sha_so_keysync_writes(env_tree):
     """殘留的 .keysync.sha 會讓 keysync 以為已是最新、不寫檔（2026-11-01 事故）；start 必須先刪掉它。"""
     use_route1(env_tree)
@@ -277,6 +314,7 @@ def test_start_route1_clears_stale_sha_so_keysync_writes(env_tree):
     assert run_script("stop", env_tree).returncode == 0
 
 
+@requires_bsd_stat
 def test_stop_refuses_pid_that_is_not_lgwd(env_tree):
     """pid 檔若指到別的行程，stop 不能動它。"""
     other = subprocess.Popen(["sleep", "600"])
@@ -292,6 +330,8 @@ def test_stop_refuses_pid_that_is_not_lgwd(env_tree):
         other.wait()
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_route1_empty_keys_env_stops(env_tree):
     use_route1(env_tree)
     set_mode(env_tree["code"], "route1-empty")
@@ -302,6 +342,8 @@ def test_start_route1_empty_keys_env_stops(env_tree):
     assert not (env_tree["state"] / "creds" / "keys.pass").exists()
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_route1_old_status_is_ignored_and_stops(env_tree):
     use_route1(env_tree)
     set_mode(env_tree["code"], "route1-old")
@@ -312,6 +354,8 @@ def test_start_route1_old_status_is_ignored_and_stops(env_tree):
     assert "keysync 結果" in r.stdout
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_route1_keysync_failure_stops(env_tree):
     use_route1(env_tree)
     set_mode(env_tree["code"], "route1-fail")
@@ -320,6 +364,8 @@ def test_start_route1_keysync_failure_stops(env_tree):
     assert "keysync 失敗：failed=x" in r.stdout
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_waits_then_stops_when_no_200(env_tree):
     set_mode(env_tree["code"], "silent")
     t = time.time()
@@ -332,6 +378,8 @@ def test_start_waits_then_stops_when_no_200(env_tree):
     assert not (env_tree["state"] / "lgwd.pid").exists()
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_acceptance_rejects_unavailable_row_without_cooldown(env_tree):
     set_mode(env_tree["code"], "unavail")
     r = run_script("start", env_tree)
@@ -340,6 +388,8 @@ def test_start_acceptance_rejects_unavailable_row_without_cooldown(env_tree):
     assert not (env_tree["state"] / "keys.env").exists()
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_refuses_when_port_busy(env_tree):
     set_mode(env_tree["code"], "serve")
     s = socket.socket()
@@ -353,6 +403,7 @@ def test_start_refuses_when_port_busy(env_tree):
     assert "已經有人在聽" in r.stdout
 
 
+@requires_bsd_stat
 def test_start_refuses_wrong_tag(env_tree):
     set_mode(env_tree["code"], "serve")
     conf = env_tree["conf"]
@@ -362,6 +413,8 @@ def test_start_refuses_wrong_tag(env_tree):
     assert "HEAD 不是 fake-v9" in r.stdout
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_start_refuses_when_names_do_not_match_and_says_password_file_hint(env_tree):
     """密碼檔在，但名稱都對不到：start 停下來，而且印出「密碼檔不可用（若已加密…）」提示。"""
     env_tree["pw"].write_text("UNRELATED=x\n")
@@ -372,12 +425,15 @@ def test_start_refuses_when_names_do_not_match_and_says_password_file_hint(env_t
     assert not (env_tree["state"] / "lgwd.pid").exists()
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_stop_without_pid_file_is_clean(env_tree):
     r = run_script("stop", env_tree)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "本來就沒有" in r.stdout
 
 
+@requires_bsd_stat
 def test_stop_without_pid_file_refuses_when_port_is_taken_by_someone_else(env_tree):
     """沒有 pid 檔，但 4710 被別人佔：stop 不能當成「本來就沒有」，要 rc=1 且不動它。"""
     s = socket.socket()
@@ -398,6 +454,7 @@ def test_missing_conf_is_refused(tmp_path):
     assert "讀不到設定檔" in r.stdout
 
 
+@requires_bsd_stat
 def test_conf_writable_by_group_or_world_is_refused(env_tree):
     """設定檔會被 source（等於執行），權限 0666 就拒絕，而且不載入。"""
     env_tree["conf"].chmod(0o666)
@@ -418,6 +475,7 @@ def _audit_db(state, rows):
     con.close()
 
 
+@requires_bsd_stat
 def test_switch_refuses_when_get_audit_is_not_zero(env_tree):
     _audit_db(env_tree["state"], [("2026-11-01T01:00:00Z", "get"), ("2026-11-01T02:00:00Z", "resolve")])
     old = env_tree["code"]
@@ -427,6 +485,8 @@ def test_switch_refuses_when_get_audit_is_not_zero(env_tree):
     assert not (env_tree["state"] / "lgwd.pid").exists()
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_switch_ok_to_new_version(env_tree):
     _audit_db(env_tree["state"], [("2026-11-01T02:00:00Z", "resolve")])
     old = env_tree["code"]
@@ -443,6 +503,8 @@ def test_switch_ok_to_new_version(env_tree):
         run_script("stop", env_tree)
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_switch_rolls_back_when_new_version_does_not_serve(env_tree):
     _audit_db(env_tree["state"], [("2026-11-01T02:00:00Z", "resolve")])
     old = env_tree["code"]
@@ -459,6 +521,8 @@ def test_switch_rolls_back_when_new_version_does_not_serve(env_tree):
         run_script("stop", env_tree)
 
 
+@requires_lsof
+@requires_bsd_stat
 @pytest.mark.parametrize("damage", ["missing", "unrelated"])
 def test_switch_refuses_before_stop_when_password_file_unusable(env_tree, damage):
     """密碼檔不在或名稱都對不到：停舊版之前就 rc=1，舊版（假 lgwd）還在跑、pid 檔還在。"""
@@ -484,6 +548,8 @@ def test_switch_refuses_before_stop_when_password_file_unusable(env_tree, damage
         run_script("stop", env_tree)
 
 
+@requires_lsof
+@requires_bsd_stat
 def test_switch_does_not_change_version_when_stop_refuses(env_tree):
     """switch 的 stop 回 rc=1（pid 檔指到別的行程）→ 不換版本，也不起新版。"""
     _audit_db(env_tree["state"], [("2026-11-01T02:00:00Z", "resolve")])
