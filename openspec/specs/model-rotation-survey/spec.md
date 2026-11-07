@@ -178,7 +178,7 @@ Claude 模型清單 SHALL 以官方公開說明頁面 `https://platform.claude.c
 - **THEN** 該格採 32（綜合欄同理）
 
 ### Requirement: 可用的 agent 與節流標記
-「可用的 agent」欄位 MUST 依 Gateway 政策檔 `policy/default.json` 之各訂閱 `agents` 欄位填寫（Claude 列填 `claude-code`，Ollama Cloud 列填 `claude-code, opencode`，OpenRouter 與 Zen 列填 `opencode`）；「計入週用量節流」欄位 Claude MUST 填「是（週）」、Ollama Cloud MUST 填「是（週，另有 5 小時 session 上限）」（來源標記為「本人帳號設定頁（讀取日期見該列）」）、免費模型 MUST 填「否」。
+「可用的 agent」欄位 MUST 依 Gateway 政策檔 `policy/default.json` 之各訂閱 `agents` 欄位填寫（Claude 列填 `claude-code`，Ollama Cloud 列填 `claude-code, opencode`，OpenRouter 與 Zen 列填 `opencode`）；「計入週用量節流」欄位 Claude MUST 填「是（週）」、Ollama Cloud MUST 填「否（每月用量額度，官方數字）」（來源標記為官方公開文件 URL 與讀取日期）、免費模型 MUST 填「否」。
 
 #### Scenario: 可用的 agent 填寫
 - **WHEN** 填寫各提供商模型之可用的 agent
@@ -186,7 +186,7 @@ Claude 模型清單 SHALL 以官方公開說明頁面 `https://platform.claude.c
 
 #### Scenario: 計入週用量節流填寫
 - **WHEN** 填寫節流欄位
-- **THEN** Claude 填「是（週）」、Ollama Cloud 填「是（週，另有 5 小時 session 上限）」、免費模型填「否」
+- **THEN** Claude 填「是（週）」、Ollama Cloud 填「否（每月用量額度，官方數字）」、免費模型填「否」
 
 ### Requirement: apply 模式的分支前置與 PR 檢查
 在 `apply` 模式執行修改前，skill SHALL 先以 `gh pr list --head survey/current` 尋找開啟中的 PR；若無開啟之 PR，MUST 回報並結束流程；若找到開啟中的 PR，在修改任何檔案前 MUST 先執行 `git fetch origin && git switch survey/current && git pull --ff-only` 同步最新變更。
@@ -245,7 +245,7 @@ skill 之寫入操作 SHALL 僅限於 `docs/model-rotation.md`，MUST NOT 修改
 
 #### Scenario: 排除私人額度數字與手冊內容
 - **WHEN** 記錄計入週用量節流來源或撰寫說明文件
-- **THEN** 僅標記「本人帳號設定頁（讀取日期見該列）」，不寫入帳號、方案費率或實際額度數字，且不抄錄 MyPMO 手冊內容
+- **THEN** 僅標記官方公開文件 URL 與讀取日期，不寫入帳號、方案費率或實際額度數字，不抄錄 MyPMO 手冊內容
 
 #### Scenario: 外部內容字元跳脫
 - **WHEN** 抓取之模型描述或欄位中含有 `|` 或換行符號

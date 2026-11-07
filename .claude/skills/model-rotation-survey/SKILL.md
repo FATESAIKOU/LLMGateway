@@ -100,5 +100,5 @@ disable-model-invocation: true
 - **AA 多檔位**：同一模型在 AA 榜單有多個 effort 檔位時，各 AA 指標欄（含綜合）取最高檔分數。
 - **排序**：主排序鍵為綜合，由高到低。
 - **可用的 agent**：依 `policy/default.json` 各訂閱的 `agents` 欄位填（執行時重讀，以檔案為準）。目前：Claude 列只寫 `claude-code`（原版 Claude Code）；Ollama Cloud 列 `claude-code`、`opencode`；OpenRouter、Zen 列 `opencode`。
-- **計入週用量節流**：依提供商填。Claude 訂閱「是（週）」；Ollama Cloud「是（週，另有 5 小時 session 上限）」，來源寫成「本人帳號設定頁（讀取日期見該列）」（只寫這句；帳號、方案細節、餘額不寫入本 repo）；免費（OpenRouter、Zen）「否」。
+- **計入週用量節流**：依提供商填。Claude 訂閱「是（週）」；Ollama Cloud「否（每月用量額度，官方數字）」，來源寫成官方公開文件 URL（`https://ollama.com/pricing`、`https://docs.ollama.com/api/balance`）與該列讀取日期（格內只放值與來源；舊方案帳號的說明留在 docs/model-rotation.md，本 skill 不帶 key、不查 `/api/balance`）（只寫這句；帳號、方案細節、餘額不寫入本 repo）；免費（OpenRouter、Zen）「否」。
 - **來源與讀取日期**：每列註明各格的來源 URL 與讀取日期（YYYY-MM-DD）。
