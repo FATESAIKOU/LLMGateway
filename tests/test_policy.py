@@ -318,9 +318,9 @@ class PolicyValidationTests(unittest.TestCase):
         self.assertIn("agy", str(ctx.exception))
 
     def test_local_login對照表與錯誤訊息固定(self):
-        # C-1：對照表只有 antigravity→agy；兩條錯誤訊息逐字不變、不帶檔案裡的值
+        # C-1／C-9a：對照表為 antigravity→agy、chatgpt-personal→codex；兩條錯誤訊息逐字不變、不帶檔案裡的值
         from lgwd.policy import LOCAL_LOGIN_AGENT
-        self.assertEqual(LOCAL_LOGIN_AGENT, {"antigravity": "agy"})
+        self.assertEqual(LOCAL_LOGIN_AGENT, {"antigravity": "agy", "chatgpt-personal": "codex"})
         obj = _good_policy()
         obj["subscriptions"]["antigravity"] = _sub(35, ["claude-code"], ("m",), None)
         with self.assertRaises(PolicyError) as ctx:

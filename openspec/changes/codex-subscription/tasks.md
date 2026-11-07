@@ -5,7 +5,7 @@
 ## 0. P0：本 change（文件）
 
 - [ ] 0.1 `openspec/changes/codex-subscription/`：proposal、design、delta specs、tasks。完成判準：`openspec validate codex-subscription --strict` 與 `openspec validate --specs --strict` 的結果如實貼進 PR。無行為改變，無契約。
-- [ ] 0.2 本人決定 Q6（分發）、Q7（U0）、Q9（等級、真資料）、Q10（界線）、Q11（roles），經 PMO；決定後把「待本人」改成定案（另開文件 PR，或併進 P4 的 design 修訂）。Q7 的 U0 目前是「作者提議（待本人）」；本人若不接受 U0，P2 的 C-6（`usage.status` 為 `not_applicable`）要跟著改，`resolve` 的「codex 的用量為 not_applicable」delta 也要重寫。
+- [x] 0.2 本人決定 Q6（分發）、Q7（U0）、Q9（等級、真資料）、Q10（界線）、Q11（roles），經 PMO；本人 2026-11-07 已定（design 各節已把「待本人」改成定案）。Q7 的 U0 已確認；本人若改變主意不接受 U0，P2 的 C-6（`usage.status` 為 `not_applicable`）要跟著改，`resolve` 的「codex 的用量為 not_applicable」delta 也要重寫。
 
 ## 1. P1：泛化 local-login 條款（純重構；依存 P0）
 
@@ -18,7 +18,7 @@
   - C-4：`build_env("agy", <key>, <model>)` 對 api-key provider 回 `{}`；`build_env("claude-code", null, <model>)` 對 `kind` 為 `local-login` 的 provider 回 `{}`（兩條判斷各自獨立可驗）。
 - 完成判準：C-1～C-4 綠；`git diff` 只有重構，對外行為（list、resolve、roles 的輸出）逐字相同。只合這一步 main 不會更糟。
 
-## 2. P2：新增 provider／訂閱／agent（依存 P1；Q10 已由本人決定，或 P2 只實作綁定表的形狀〔C-9a〕，不實作使用界線〔C-9b〕）
+## 2. P2：新增 provider／訂閱／agent（依存 P1；Q10 本人 11-07 已定；P2 只實作綁定表的形狀〔C-9a〕，不實作使用界線〔C-9b〕）
 
 - [ ] 2.1 `lgwd/providers.py`：新增 `OpenAIProvider`（`provider` `openai`，`kind` `local-login`，`endpoint` null，不實作 usage fetcher），加進 `PROVIDERS`。
 - [ ] 2.2 `lgwd/policy.py`：`SUBSCRIPTIONS` 加 `chatgpt-personal`、`AGENTS` 加 `codex`；對照表加 `"chatgpt-personal": "codex"`。
@@ -30,7 +30,7 @@
   - C-7：list 的 `chatgpt-personal` row：`provider` `openai`、`endpoint` null、`agents` `["codex"]`、`available` true（無未來冷卻）、無 `key`。
   - C-8：`KEY_NAMES` 沒有 `chatgpt-personal`；key 檔沒有它的鍵時 resolve／list 不丟 `unknown subscription`、不回 `not_deployed`。
   - C-9a（形狀，P2）：local-login 對照表裡 `chatgpt-personal.agents` 不是剛好 `["codex"]` → `PolicyError`；其他訂閱含 `codex` → `PolicyError`。
-  - C-9b（使用界線，**待 Q10**）：「只准原版 Codex CLI；Gateway 不代理、不轉手 token、不用訂閱 token 打 API」是否寫成規範、`agents` 是否允許 opencode，由本人在 Q10 決定；決定前不實作、不寫測試。
+  - C-9b（使用界線；Q10 本人 11-07 已定）：只准原版 Codex CLI、不允許 opencode；Gateway 不代理、不轉手 token、不用訂閱 token 打 API；登入檔絕不進 GitHub Actions／ghr runner。界線以 design Q10 的文字記錄，不實作、不寫測試。
   - C-10：`openai` 在 `PROVIDERS`、政策檔沒有任何 `openai` 訂閱時，`agent=codex&provider=openai` 回 404 `not_found`（既有 resolve 步驟 2 與 3 的 provider 與 agent），body 無 `env`。
   - C-11a：假政策下登錄 `chatgpt-personal` 冷卻後，`agent=codex&provider=openai` resolve 仍回 200 並帶 `meta.cooldown`。
   - C-11b：假政策下 roles 在 `order` 含 `chatgpt-personal` 且 `privacy`、`roles.impl.floor` 足夠（`public`）時才有候選，不在 `order` 時 `candidates` 為 `[]`。
@@ -54,13 +54,13 @@
 
 ## 4. P4：政策資料（依存 P2；本人定 Q9，Q5 再對一次官方頁）
 
-- [ ] 4.1 `policy/default.json`：加 `chatgpt-personal`（`priority`、`privacy`＝本人定的等級（未定前放最保守的 `public`）、`models.allow`／`default`、`agents` `["codex"]`）。
-- [ ] 4.2 是否加入 `roles.*.order`：等 Q11 與 MyLinuxPool#797；沒決定就不加。
+- [ ] 4.1 `policy/default.json`：加 `chatgpt-personal`（`priority`、`privacy`＝`general`（Q9 已定：Plus、已關訓練→○；不放 `real`）、`models.allow`／`default`、`agents` `["codex"]`）。
+- [ ] 4.2 `roles.impl`、`roles.qa` 的 `order` 加 `chatgpt-personal`，排在 `claude-personal` 之前（Q11 已定：直接進輪換、impl／qa 優先 Codex）；**前提仍是 MyLinuxPool#797 能開**，#797 就緒前不放進 `order`。「撞上限退 Sonnet」只能寫成 `chatgpt-personal` 之後接 `claude-personal`；用哪個模型（Sonnet、Opus 審查）由呼叫方決定，Gateway 不新增『角色→模型』欄位（要加是新介面，另過設計審）。
 - 契約：
-  - C-18：出廠政策載入成功，list 多一筆 `chatgpt-personal`（`available` true，`privacy` 為本人定的值；未定前為 `public`）。
+  - C-18：出廠政策載入成功，list 多一筆 `chatgpt-personal`（`available` true，`privacy` 為 `general`）。
   - C-19a（測試）：`models.default` 被 `models.allow` 涵蓋（`subscription-registry`「models.default 必須被 allow 涵蓋」），且 `allow` 等於 P4 時核對過的清單。
   - C-19b（人工驗收，不是測試）：`allow` 的每個 id 是 Codex 實際接受的裸 id；起點 `gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-astra`、`gpt-6-luna`、`gpt-6-sol`（依方案可用的不同，與 Q9 的方案種類連動）；合併前再對一次官方 models 頁，PR 附讀取日期。
-  - C-20：`roles.*.order` 的變動與 Q11 的決定一致（未決定＝不變），既有角色的候選順序不變。
+  - C-20：`roles.impl`／`roles.qa` 的 `order` 含 `chatgpt-personal` 且排在 `claude-personal` 之前（#797 就緒後），既有角色的候選相對順序不變。
 - 完成判準：C-18、C-19a、C-20 綠，C-19b 已人工核對並附日期；整套測試綠。只加訂閱、不進 order 時 main 不會更糟；進 order 前 MLP#797 要能開。
 
 ## 5. P5：model-rotation-survey（文件；依存 Q5）
@@ -71,4 +71,4 @@
 
 ## 6. P6（之後，另開一張）：用量 U1
 
-- 待本人在 Q7 決定。選 U1 時：sidecar 讀 codex app-server 的 `account/rateLimits/read`，推給 Gateway；要新端點與新契約，另寫 change。不在試用期必要範圍。
+- 試用期用 U0（Q7 已定）；試用期滿要依用量決定時再開。選 U1 時：sidecar 讀 codex app-server 的 `account/rateLimits/read`，推給 Gateway；要新端點與新契約，另寫 change。不在試用期必要範圍。

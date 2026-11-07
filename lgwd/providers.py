@@ -174,6 +174,19 @@ class GoogleProvider(CredentialProvider):
     opencode_provider_id = ""
 
 
+class OpenAIProvider(CredentialProvider):
+    """ChatGPT 訂閱（#187）：codex 用呼叫方那一台機器的本機 ChatGPT 登入直連。
+
+    kind 為 local-login：沒有憑證（不進 key 檔、不佔 KEY_NAMES）、沒有 endpoint
+    （Gateway 不代理），resolve 的 env 恆為 {}。
+    MUST NOT 覆寫 make_usage_fetcher：基底回 None，usage 才一直是 not_applicable（U0）。
+    """
+    provider = "openai"
+    kind = "local-login"
+    endpoint = None
+    opencode_provider_id = ""
+
+
 # subscription id → provider。id 是設計固定值，不是介面的一部分。
 PROVIDERS: dict[str, CredentialProvider] = {
     "claude-personal": AnthropicProvider(),
@@ -184,6 +197,7 @@ PROVIDERS: dict[str, CredentialProvider] = {
     "groq": GroqProvider(),
     "ollama-cloud": OllamaCloudProvider(),
     "antigravity": GoogleProvider(),
+    "chatgpt-personal": OpenAIProvider(),
 }
 
 

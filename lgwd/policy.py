@@ -19,8 +19,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "opencode-go",
-                 "groq", "openrouter", "ollama-cloud", "antigravity")
-AGENTS = ("claude-code", "opencode", "agy")
+                 "groq", "openrouter", "ollama-cloud", "antigravity", "chatgpt-personal")
+AGENTS = ("claude-code", "opencode", "agy", "codex")
 
 # 隱私等級（public < general < real）；缺省 public（fail-closed）。
 PRIVACY_LEVELS = ("public", "general", "real")
@@ -35,7 +35,7 @@ _OPENCODE_ONLY = ("opencode-zen", "opencode-go", "groq")
 # 每筆訂閱的 agents 只能剛好是 (該 agent,)，其他訂閱的 agents 也 MUST NOT 含該
 # agent（否則 api-key 的 row 會用空 env 被選中）。providers.build_env 的防線集合
 # 由同一張表導出。policy.py 必須能單獨 import（升級 dry-run 只保證它在），所以表放這。
-LOCAL_LOGIN_AGENT = MappingProxyType({"antigravity": "agy"})
+LOCAL_LOGIN_AGENT = MappingProxyType({"antigravity": "agy", "chatgpt-personal": "codex"})
 
 
 _OPENROUTER_ALLOW = ("*:free", "openrouter/free")
