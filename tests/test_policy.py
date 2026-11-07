@@ -297,6 +297,7 @@ class PolicyValidationTests(unittest.TestCase):
                          "gemini-test-id")
 
     def test_antigravity的agents必須剛好agy(self):
+        # C-2
         for agents in (["agy", "opencode"], ["claude-code"], ["opencode"], []):
             with self.subTest(agents=agents):
                 with self.assertRaises(PolicyError) as ctx:
@@ -308,12 +309,28 @@ class PolicyValidationTests(unittest.TestCase):
                 self.assertNotIn("gemini-test-id", str(ctx.exception))
 
     def test_其他訂閱的agents含agy拒收(self):
+        # C-3
         # 反向條款：有憑證的 row 不能允許 agy（不然它會用空 env 被選中）
         obj = _good_policy()
         obj["subscriptions"]["ollama-cloud"] = _sub(30, ("agy",))
         with self.assertRaises(PolicyError) as ctx:
             self._reload(obj)
         self.assertIn("agy", str(ctx.exception))
+
+    def test_local_login對照表與錯誤訊息固定(self):
+        # C-1：對照表只有 antigravity→agy；兩條錯誤訊息逐字不變、不帶檔案裡的值
+        from lgwd.policy import LOCAL_LOGIN_AGENT
+        self.assertEqual(LOCAL_LOGIN_AGENT, {"antigravity": "agy"})
+        obj = _good_policy()
+        obj["subscriptions"]["antigravity"] = _sub(35, ["claude-code"], ("m",), None)
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertEqual(str(ctx.exception), "antigravity must only allow agy")
+        obj = _good_policy()
+        obj["subscriptions"]["ollama-cloud"] = _sub(30, ("agy",))
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertEqual(str(ctx.exception), "agy is only allowed for antigravity")
 
     def test_agy以外的新鍵仍拒收(self):
         # 白名單仍是固定集合：只有 antigravity 被接受，其他新鍵照樣拒收

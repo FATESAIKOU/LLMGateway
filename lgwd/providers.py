@@ -9,13 +9,18 @@
   opencode 只回片段（OPENCODE_* 四鍵），OPENCODE_CONFIG_CONTENT 由 sidecar 組。
 - endpoint 是中介資料（會進 meta 與稽核），不得內嵌憑證：validate_endpoints() 在
   組裝根檢查（main.Gateway、load_policy 之後），不合法丟固定字串 ValueError，
-  不合法不啟動。本模組不 import policy.py（避免循環 import）。
+  不合法不啟動。本模組只 import policy.LOCAL_LOGIN_AGENT（policy 不 import 本模組，無循環）。
 只用標準函式庫。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .policy import LOCAL_LOGIN_AGENT
+
+# build_env 的防線集合，由 policy 的 local-login 對照表導出（#187）。
+_LOCAL_LOGIN_AGENTS = frozenset(LOCAL_LOGIN_AGENT.values())
 
 
 @dataclass
@@ -54,9 +59,9 @@ class CredentialProvider:
 
         鍵集＝spec「env 的組成」的清單（env_schema 1）；呼叫方的維運變數（server
         password、permission、instructions 等）一律不在。model 為 null（agent 自己
-        的預設）時不給模型變數。agent 為 agy 或該把的 kind 為 local-login 時回 {}。
+        的預設）時不給模型變數。agent 屬於 local-login agent 集合或該把的 kind 為 local-login 時回 {}。
         """
-        if agent == "agy" or self.kind == "local-login":
+        if agent in _LOCAL_LOGIN_AGENTS or self.kind == "local-login":
             # 沒有憑證的訂閱（#107）：env 恆為空物件，不給憑證、端點或模型變數。
             # 兩條判斷各擋一個方向、缺一不可：只判 agent 時，政策條款被改弱、agy 進了
             # 某一筆 api-key row 就會落進 claude-code 分支回出 ANTHROPIC_*；只判 kind
