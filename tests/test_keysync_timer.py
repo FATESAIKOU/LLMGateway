@@ -452,6 +452,12 @@ class TimerCase(unittest.TestCase):
             with urllib.request.urlopen(
                     f"http://{host}:{port}/v1/subscriptions", timeout=5) as resp:
                 self.assertEqual(resp.status, 200)
+            # `runs` 在狀態檔寫入前就先 +1（lgwd/keysync.py 的 run_once）。負載高時
+            # 主執行緒會比寫入早一步去讀，拿到 FileNotFoundError 而偶發失敗（#189）。
+            # 等第一次的狀態檔真的落地再讀；斷言不變：reason 仍必須是 ok。
+            self.assertTrue(
+                wait_until(lambda: os.path.exists(self.status_file()), timeout=15),
+                "keysync 第一次跑完但狀態檔沒出現")
             self.assertEqual(self.read_status()["reason"], "ok")
         finally:
             gateway.stop()
