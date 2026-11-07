@@ -208,7 +208,7 @@ class Gateway:
         try:
             validate_endpoints()  # providers 表的 endpoint 不得內嵌憑證；不合法不啟動
         except ValueError as exc:
-            # providers 不 import policy（避免循環）：固定字串在這裡轉成 PolicyError，
+            # providers 只依賴 policy 的常數、不丟 PolicyError：固定字串在這裡轉成 PolicyError，
             # 讓 spec 的「PolicyError、lgwd 不啟動」字面成立。
             raise PolicyError(str(exc)) from None
         self._keys_stamp = _stat_stamp(config.keys_path)  # 讀檔前先記，避免漏掉變動

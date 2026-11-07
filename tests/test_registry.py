@@ -470,13 +470,15 @@ class LocalLoginTest(RegistryCase):
     # --- build_env 的兩條判斷（單元層） ---
 
     def test_build_env的kind方向(self):
-        # 模擬 _AGY_ONLY 被改弱成 antigravity 的 agents 含 claude-code（經政策載入
+        # C-4（kind 方向）
+        # 模擬 local-login 對照表（LOCAL_LOGIN_AGENT）被改弱成 antigravity 的 agents 含 claude-code（經政策載入
         # 不可達）：kind 那條判斷讓它仍回 {}
         self.assertEqual(
             GoogleProvider().build_env("claude-code", None, self.MODEL), {})
 
     def test_build_env的agent方向(self):
-        # 模擬 _AGY_ONLY 被改弱成 agy 進了一筆 api-key row：agent 那條判斷讓它仍回 {}
+        # C-4（agent 方向）
+        # 模擬 local-login 對照表被改弱成 agy 進了一筆 api-key row：agent 那條判斷讓它仍回 {}
         self.assertEqual(
             provider_for("opencode-zen").build_env(
                 "agy", CANARY["opencode-zen"], self.MODEL),

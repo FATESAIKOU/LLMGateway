@@ -16,6 +16,7 @@ from __future__ import annotations
 import fnmatch
 import json
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "opencode-go",
                  "groq", "openrouter", "ollama-cloud", "antigravity")
@@ -30,9 +31,11 @@ ROLES = ("PMO", "PM", "impl", "rev", "qa")
 # 條款與設計的否定約束（固定字串的錯誤訊息）
 _CLAUDE_ONLY = ("claude-personal", "claude-company")
 _OPENCODE_ONLY = ("opencode-zen", "opencode-go", "groq")
-# 沒有憑證的訂閱（kind local-login，#107）：agents 只能剛好是 ("agy",)，
-# 其他訂閱的 agents 也 MUST NOT 含 agy（否則 api-key 的 row 會用空 env 被選中）。
-_AGY_ONLY = ("antigravity",)
+# 沒有憑證的訂閱（kind local-login，#107／#187）：「訂閱 → 唯一 agent」對照表。
+# 每筆訂閱的 agents 只能剛好是 (該 agent,)，其他訂閱的 agents 也 MUST NOT 含該
+# agent（否則 api-key 的 row 會用空 env 被選中）。providers.build_env 的防線集合
+# 由同一張表導出。policy.py 必須能單獨 import（升級 dry-run 只保證它在），所以表放這。
+LOCAL_LOGIN_AGENT = MappingProxyType({"antigravity": "agy"})
 
 
 _OPENROUTER_ALLOW = ("*:free", "openrouter/free")
@@ -267,14 +270,15 @@ def load_policy(path: str) -> Policy:
     for name in _OPENCODE_ONLY:
         if name in parsed_subs and parsed_subs[name].agents != ("opencode",):
             raise PolicyError(f"{name} must only allow opencode")
-    for name in _AGY_ONLY:
-        if name in parsed_subs and parsed_subs[name].agents != ("agy",):
-            raise PolicyError("antigravity must only allow agy")
+    for name, agent in LOCAL_LOGIN_AGENT.items():
+        if name in parsed_subs and parsed_subs[name].agents != (agent,):
+            raise PolicyError(f"{name} must only allow {agent}")
     for name, sub in parsed_subs.items():
-        if name not in _AGY_ONLY and "agy" in sub.agents:
-            # 反向的條款：agy 只准出現在沒有憑證的訂閱；不然 api-key 的 row 會用
-            # 空 env 被選中（spec「共通 JSON schema」）。
-            raise PolicyError("agy is only allowed for antigravity")
+        for ll_name, agent in LOCAL_LOGIN_AGENT.items():
+            if name != ll_name and agent in sub.agents:
+                # 反向的條款：local-login 的 agent 只准出現在沒有憑證的那筆訂閱；不然
+                # api-key 的 row 會用空 env 被選中（spec「共通 JSON schema」）。
+                raise PolicyError(f"{agent} is only allowed for {ll_name}")
     if "openrouter" in parsed_subs and parsed_subs["openrouter"].agents != ("opencode",):
         # 免費模型只經過 opencode（v5 既有 MUST，本 change 補上檢查；design 決定 3）。
         raise PolicyError("openrouter must only allow opencode")
