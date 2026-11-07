@@ -31,7 +31,7 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 
 ## Q4 resolve 回什麼
 
-`agent=codex&provider=openai[&model=]` → 200，`meta.kind` 為 `local-login`，`env` 為 `{}`，`env_schema` 仍是 1，模型只走 `meta.model`。`CODEX_HOME` 與 config 由 sidecar 決定，不進 env（`resolve-env`「env 不含呼叫方的維運變數」）。`meta.usage.status` 為 `not_applicable`。
+`agent=codex&provider=openai[&model=]` → 200，`meta.kind` 為 `local-login`，`env` 為 `{}`，`env_schema` 仍是 1，模型只走 `meta.model`。`CODEX_HOME` 由 sidecar 決定、codex config 由 MLP 固定（B6／B8），都不進 env（`resolve-env`「env 不含呼叫方的維運變數」）。`meta.usage.status` 為 `not_applicable`。
 
 ## Q5 模型 id 與 effort（查證）
 
@@ -56,7 +56,7 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 - 輪替：該頁列出需要重新種 `auth.json` 的情況，含「another machine or concurrent job rotated the token first」與「the refresh token was revoked or expired」，**間接**說明 refresh token 會輪替；頁面沒有出現「rotation」字樣，也沒有「refresh token has already been used」這句（讀取工具回報）。搜尋摘要寫「Codex rotates the refresh token and retires the previous one」並引該錯誤訊息，來源是搜尋摘要與第三方整理：標推論。「重用是否作廢」：官方頁沒有明說，查不到；與輪替合起來的推論是「舊 token 被另一份先換掉後，這一份會失效」。
 - 搬移：auth 頁把「Authenticate locally and copy your auth cache」列為 headless 的備案（在有瀏覽器的機器 `codex login`，再把 `~/.codex/auth.json` 複製到同一路徑；「Treat `~/.codex/auth.json` like a password: it contains access tokens.」）；若 OS 用 credential store，這法「may not apply」，可改用 file 儲存。CI 進階頁的前置：種檔用 `cli_auth_credentials_store = "file"` 登入，確認 `auth_mode` 是 `"chatgpt"` 且 `has_refresh_token` 為 `true`；「seed `auth.json` only if it is missing」。
 - device code：auth 頁稱「prefer device code authentication (beta)」用於 headless；`codex login --device-auth`；要先在 ChatGPT 安全設定（個人）或工作區權限（管理員）啟用 device code 登入。**多台 device code 登入能否並存：官方頁沒有寫，查不到**；推論是各登入各有一組 token，不共用 refresh token（沒驗證）。
-- Linux 無桌面：`auto` 在沒有 credential store 時回退到 `auth.json`（原文如上），`file` 則固定用檔案；「Linux 無桌面實際會走哪條」沒有官方實測敘述，查不到——所以 sidecar 應固定 `cli_auth_credentials_store = "file"`（B6）。
+- Linux 無桌面：`auto` 在沒有 credential store 時回退到 `auth.json`（原文如上），`file` 則固定用檔案；「Linux 無桌面實際會走哪條」沒有官方實測敘述，查不到——所以 MLP 應固定 `cli_auth_credentials_store = "file"`（B6）。
 
 選項（本人 11-07 已定，見下方「本人 11-07 已定」）：
 - **(a) 每台 worker 各自 device code 登入**：每台有自己的 session，沒有共用 refresh token，符合「one auth.json per runner」；代價是每台要本人核准一次（先在 ChatGPT 安全設定啟用 device code）。注意：同一台 worker 上若有多個 codex 共用同一個 `CODEX_HOME`，仍會互撞，所以仍需 sidecar 對同一個 `CODEX_HOME` 序列化或限制並行為 1（B5）。
@@ -114,7 +114,7 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 - 本人試用的是哪一種方案：工單沒寫，**不知道**；它決定上面哪一組條款適用，也決定 Q5 的可用模型。
 - 隱私等級對照（PMO 給的）：◎ 零保留且不訓練＝可碰真資料（real）；○ 不訓練但保留一段時間＝程式與一般資料（general）；△ 匿名或限時預覽；✗ 可能訓練＝只公開程式與假資料（public）。
 
-決定（形狀）：等級寫進 `privacy`（`role-allocation`「訂閱的隱私等級」），不加新欄位。Gateway 的 `privacy` 假設 sidecar 已固定把 `[analytics] enabled=false`、`[otel] exporter="none"`、`otel.metrics_exporter="none"`、`log_user_prompt=false`、`history.persistence="none"` 寫進 codex config（B8）；這是前提，要寫進 sidecar 的契約。
+決定（形狀）：等級寫進 `privacy`（`role-allocation`「訂閱的隱私等級」），不加新欄位。Gateway 的 `privacy` 假設 MLP 已固定把 `[analytics] enabled=false`、`[otel] exporter="none"`、`otel.metrics_exporter="none"`、`log_user_prompt=false`、`history.persistence="none"` 寫進 codex config，在每次 codex 執行時生效且沒有更高優先層覆寫（B8）；這是前提，要寫進 MLP 的契約。
 
 本人 11-07 已定：方案＝ChatGPT Plus，已關「Improve the model」→ 分級 ○（程式與一般資料可、**不碰真資料**；仍有保留期）→ `privacy` 最高 `general`（P4 的 `policy/default.json` 放 `general`，不放 `real`）。下面是當時依 PMO 對照表列的條件式對應（留作依據）：
 - 個人方案、訓練未關或未確認＝✗→`public`（只公開程式與假資料）。
@@ -161,10 +161,12 @@ Gateway 負責：訂閱登錄（list）、resolve 契約（`agent=codex`、`prov
 - B3：effort 由 sidecar 用 `model_reasoning_effort` 設定，Gateway 不知道。
 - B4：Q6 選的分發方式落在 MLP。值只走腳本、不經 AI；PMO 不經手；更新後的 `auth.json` 不回寫正本；憑證失效時 `exit.reason` 怎麼標、怎麼請本人重新登入由 MLP 定。
 - B5：同一個 `CODEX_HOME` 的並行上限為 1（或序列化）。
-- B6：sidecar 固定 `cli_auth_credentials_store = "file"`（Linux 無桌面不依賴 keyring）。
+- B6：MLP 固定 `cli_auth_credentials_store = "file"`（承載位置由 MLP 定，目前為 worker 映像 config.toml）（Linux 無桌面不依賴 keyring）。
 - B7：額度錯誤用 `lgw.signals.classify("codex", …)` 判讀，再以 `POST /v1/subscriptions/chatgpt-personal/cooldown` 登錄（`model` 不帶 `codex/` 前綴，帶了回 400）。**待查**：codex 錯誤文字裡的時刻是 agent 所在機器的本機時間還是帳號時區（Q8 後續選項 (i) 的前提）；未查證前一律「現在＋1 小時」。
-- B8：遙測、分析、歷史設定（Q9）由 sidecar 固定：`analytics.enabled=false`、`otel.exporter="none"`、`otel.metrics_exporter="none"`、`log_user_prompt=false`、`history.persistence="none"`。
+- B8：遙測、分析、歷史設定（Q9）由 MLP 固定（承載位置同 B6），且不得被席位 config、profile 或 `-c` 覆寫：`analytics.enabled=false`、`otel.exporter="none"`、`otel.metrics_exporter="none"`、`log_user_prompt=false`、`history.persistence="none"`。
 - B9：#798 與 #119 共用同一套 capability 分發；Gateway 在 P1 泛化後，agy 與 codex 同形狀。
+
+> 註記：MLP 的 PR-1 驗完（schema 核對 `log_user_prompt` 位置於 `[otel]`、無更高優先層覆寫）前，`chatgpt-personal` 不進 `roles.*.order`（與 Q11 的 MyLinuxPool#797 前置並列）。
 
 ## 風險與未驗證
 
