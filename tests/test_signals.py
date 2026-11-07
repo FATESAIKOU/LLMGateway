@@ -206,6 +206,65 @@ class NormalTest(unittest.TestCase):
         self.assertEqual(classify("opencode", None).kind, "normal")
 
 
+class CodexTest(unittest.TestCase):
+    NOW = datetime(2026, 2, 23, 12, 0, tzinfo=UTC)
+    # 樣本逐字取自 design 引的公開錯誤文字（openai/codex#12299 與 app-server 文件）
+    WITH_DATE = ("You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+                 "visit https://chatgpt.com/codex/settings/usage to purchase more credits "
+                 "or try again at Feb 23rd, 2026 9:01 PM.")
+    TIME_ONLY = ("You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
+                 "to purchase more credits or try again at 1:36 PM.")
+
+    def _cls(self, text, agent="codex"):
+        return classify(agent, text, now=self.NOW, tz=UTC)
+
+    def test_c13_usage_limit_exhausted(self):
+        for text in (
+            self.TIME_ONLY,
+            "You've hit your usage limit for <limit>. Switch to another model now, or try again at ...",
+            "You've hit your weekly usage limit",  # 措辭變體（design：逐限額版本未在原文確認）
+            "codexErrorInfo: usageLimitExceeded",
+        ):
+            with self.subTest(text=text):
+                res = self._cls(text)
+                self.assertEqual((res.kind, res.signal), ("exhausted", "codex_limit"))
+
+    def test_c13_順序在通用規則之前(self):
+        # 額度文字若同時帶通用標記（429、rate limit），仍要判成 codex 的 exhausted
+        for extra in ("429 Too Many Requests", "rate limit"):
+            with self.subTest(extra=extra):
+                res = self._cls("You've hit your usage limit. " + extra)
+                self.assertEqual((res.kind, res.signal), ("exhausted", "codex_limit"))
+
+    def test_c14_date_without_tz_falls_back(self):
+        res = self._cls(self.WITH_DATE)
+        self.assertEqual((res.kind, res.signal), ("exhausted", "codex_limit"))
+        self.assertIsNone(res.resets_at)  # 不換算；呼叫方用 now＋1 小時
+
+    def test_c15_time_only_falls_back(self):
+        res = self._cls(self.TIME_ONLY)
+        self.assertEqual(res.kind, "exhausted")
+        self.assertIsNone(res.resets_at)
+
+    def test_c16_capacity_not_exhausted(self):
+        res = self._cls("Selected model is at capacity")
+        self.assertEqual((res.kind, res.signal), ("transient", None))
+
+    def test_c17_other_agents_unchanged(self):
+        text = self.TIME_ONLY
+        self.assertEqual(self._cls(text, "claude-code").kind, "normal")
+        self.assertEqual(self._cls(text, "opencode").kind, "normal")
+        cap = "Selected model is at capacity"
+        self.assertEqual(self._cls(cap, "claude-code").kind, "normal")
+        res = self._cls("You've hit your session limit · resets 3:45pm", "claude-code")
+        self.assertEqual((res.kind, res.signal), ("exhausted", "claude_limit"))
+        res = self._cls("FreeUsageLimitError retrying in 2h 5m", "opencode")
+        self.assertEqual((res.kind, res.signal), ("exhausted", "zen_free_limit"))
+        self.assertEqual(self._cls("HTTP 429 Too Many Requests", "opencode").kind,
+                         "transient")
+        self.assertEqual(self._cls("HTTP 429 Too Many Requests").kind, "transient")
+
+
 class TableTest(unittest.TestCase):
     def test_rules_shape(self):
         kinds = {"exhausted", "transient"}

@@ -145,6 +145,15 @@ RULES = [
     {"agent": "opencode",
      "pattern": re.compile(r"CreditLimitExceeded"),
      "signal": "credit_limit", "kind": "exhausted", "reset": None},
+    # codex（chatgpt-personal）：額度用完；重置時刻文字都沒標時區，一律不換算
+    # （reset=None → 呼叫方退回「現在＋1 小時」；design Q8 定案 (ii)）
+    {"agent": "codex",
+     "pattern": re.compile(r"usage limit|usageLimitExceeded", re.IGNORECASE),
+     "signal": "codex_limit", "kind": "exhausted", "reset": None},
+    # codex：模型容量錯誤是暫時錯誤，不是額度用完
+    {"agent": "codex",
+     "pattern": re.compile(r"at capacity", re.IGNORECASE),
+     "signal": None, "kind": "transient", "reset": None},
     # OpenRouter：in-flight 預算的 402 是暫時錯誤（先判）
     {"agent": None,
      "pattern": re.compile(r"in_flight_budget"),
