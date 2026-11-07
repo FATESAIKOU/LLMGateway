@@ -14,8 +14,8 @@
 - 不新增 kind：沿用 `local-login`，把「agy 專用」泛化成「每把 local-login 訂閱綁一個 agent」：`{antigravity: agy, chatgpt-personal: codex}`（design Q1、Q3）。
 - 新增 provider `openai`、訂閱 `chatgpt-personal`、agent `codex`；resolve 對它回 `env: {}`、模型只走 `meta.model`、`usage` 為 `not_applicable`（design Q2、Q4）。
 - `lgw/signals.py` 加 codex 的額度判讀（P3，design Q8）；本 change 的 spec 不新增端點。
-- delta spec：`subscription-registry`、`resolve`、`resolve-env`、`role-allocation`、`key-vault`、`registry-errors`、`subscription-cooldown` 各補 codex（見 `specs/`）；使用界線（Q10）不在 delta，待本人。
-- design 記錄 Q1～Q11 的查證結果、定案與被捨棄的方案；需要本人決定的（Q6、Q7、Q9、Q10、Q11）寫成「待本人」，附選項與建議。
+- delta spec：`subscription-registry`、`resolve`、`resolve-env`、`role-allocation`、`key-vault`、`registry-errors`、`subscription-cooldown` 各補 codex（見 `specs/`）；使用界線（Q10）不在 delta：本人已定『只用原版 Codex CLI』，以 design 文字記錄。
+- design 記錄 Q1～Q11 的查證結果、定案與被捨棄的方案；需要本人決定的（Q6、Q7、Q9、Q10、Q11）附選項與建議，本人 2026-11-07 已全部定案（見 design）。
 - tasks 依 P1～P6 切 PR，每個 PR 有可驗的完成判準與契約編號（C-1…）。
 
 ## What Does Not Change
@@ -23,7 +23,7 @@
 - 不在本 change 改任何程式、測試、政策檔（`lgwd/`、`lgw/`、`tests/`、`policy/` 都不動）；`policy/default.json` 加這一筆是 P4，且要等本人定隱私等級。
 - Gateway 不保管、不分發、不轉手 `auth.json`；它不進 key 檔、不佔 `KEY_NAMES`。保管與分發歸 MyLinuxPool 的 capability。
 - 不新增端點、不 bump `schema`／`env_schema`。
-- 不做 5 小時／每週用量的讀取（P6，待本人決定 Q7）。
+- 不做 5 小時／每週用量的讀取（P6；Q7 已定試用期 U0，期滿再議）。
 - `model-rotation-survey` 的 spec 與 `docs/model-rotation.md` 屬 P5，不在本 change。
 - 不接 OpenAI API key（若日後要，同一個 provider 以 api-key kind 另開一把，到時 bump `env_schema`）。
 - 不替本人定隱私等級與使用界線。

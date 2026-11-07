@@ -5,7 +5,7 @@
 ## 0. 前提與名詞
 
 - Codex 的形狀與 agy 相同：憑證由呼叫方那一台機器自己保管，Gateway 不搬、不匯出、不代管。
-- 「本人」指一人公司的本人；「待本人」是本 change 不替本人定的決定。
+- 「本人」指一人公司的本人；「待本人」是本 change 不替本人定的決定。Q6、Q7、Q9、Q10、Q11 已由本人 2026-11-07 定案（PMO 轉述），下文各節標「本人 11-07 已定」。
 
 ## Q1 kind：沿用 `local-login`
 
@@ -46,7 +46,7 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 
 被捨棄：把 effort 編進 id（`gpt-6.1-sol-high`）。
 
-## Q6 同一份 auth.json 多處使用（查證；分發方式待本人）
+## Q6 同一份 auth.json 多處使用（查證；本人 11-07 已定）
 
 事實：
 - 儲存：「Codex caches login details locally in a plaintext file at `~/.codex/auth.json` or in your OS-specific credential store.」設定 `cli_auth_credentials_store`：`file | keyring | auto | ephemeral`；`file`＝「stores credentials in `auth.json` under `CODEX_HOME` (defaults to `~/.codex`)」；`auto`＝「uses the OS credential store when available, otherwise falls back to `auth.json`」。管理員可強制此設定。（auth 頁，`developers.openai.com/codex/auth` → `learn.chatgpt.com/docs/auth`）
@@ -58,29 +58,31 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 - device code：auth 頁稱「prefer device code authentication (beta)」用於 headless；`codex login --device-auth`；要先在 ChatGPT 安全設定（個人）或工作區權限（管理員）啟用 device code 登入。**多台 device code 登入能否並存：官方頁沒有寫，查不到**；推論是各登入各有一組 token，不共用 refresh token（沒驗證）。
 - Linux 無桌面：`auto` 在沒有 credential store 時回退到 `auth.json`（原文如上），`file` 則固定用檔案；「Linux 無桌面實際會走哪條」沒有官方實測敘述，查不到——所以 sidecar 應固定 `cli_auth_credentials_store = "file"`（B6）。
 
-選項（待本人選）：
+選項（本人 11-07 已定，見下方「本人 11-07 已定」）：
 - **(a) 每台 worker 各自 device code 登入**：每台有自己的 session，沒有共用 refresh token，符合「one auth.json per runner」；代價是每台要本人核准一次（先在 ChatGPT 安全設定啟用 device code）。注意：同一台 worker 上若有多個 codex 共用同一個 `CODEX_HOME`，仍會互撞，所以仍需 sidecar 對同一個 `CODEX_HOME` 序列化或限制並行為 1（B5）。
 - **(b) 只複製一份**：Mac 不再用，只給一台 worker，並行數 1。簡單，但吞吐量最小，且 Mac 上的 codex 要停用。
 - **(c) 同一份複製到多台**：官方明寫不要（「Do not share the same file across concurrent jobs or multiple machines」），**不建議**。
 
-建議：(a)。(a) 做不到（例如帳號不允許 device code）時退 (b)。不論哪個選項，Gateway 都不參與，也不序列化；這是呼叫方（sidecar／capability）的責任，以描述句寫進 delta（subscription-registry 的『沒有憑證的訂閱』），不是 Gateway 的行為。
+本人 11-07 已定：**每個 worker 席位一份 `auth.json`**，存在 provider 主機、以可寫方式掛進容器、容器重建時重掛；新增席位用 device code 登入一次。分發與登入歸 MLP capability，Gateway 不參與（B4）。這與 (a) 同向，並把落地方式定死。
+
+原建議：(a)。(a) 做不到（例如帳號不允許 device code）時退 (b)。不論哪個選項，Gateway 都不參與，也不序列化；這是呼叫方（sidecar／capability）的責任，以描述句寫進 delta（subscription-registry 的『沒有憑證的訂閱』），不是 Gateway 的行為。
 
 被捨棄：**由 Gateway 保管並發放 auth.json**。(1) Codex 自己更新並輪替 refresh token，Gateway 那份在第一次更新後就過期，每次 resolve 發一份副本等於把衝突放大；(2) key 檔格式是五行 `KEY=VALUE`，放不下 JSON 檔；(3) refresh token 會走 resolve 的 SSH 通道進每個 agent 的環境，暴露面比 Claude 的 OAuth token 大；(4) 與 #119 的分發路線不一致。
 
-## Q7 用量讀取（查證；U0 夠不夠待本人）
+## Q7 用量讀取（查證；本人 11-07 已定）
 
 事實：
 - `codex exec --json` 的事件為 `thread.started`、`turn.started`、`turn.completed`、`turn.failed`、`item.*`、`error`；`turn.completed` 只帶 token 用量（`input_tokens`、`cached_input_tokens`、`output_tokens`、`reasoning_output_tokens`）。**沒有 rate limit 資料**（non-interactive 頁，`developers.openai.com/codex/noninteractive` → `learn.chatgpt.com/docs/non-interactive-mode`）。
 - 互動式：「In an active CLI session, … `/status` to see remaining limits.」，儀表板在 `chatgpt.com/codex/settings/usage`（pricing 頁）。
 - 有機器可讀的出口：app-server 的 `account/rateLimits/read`（「fetch ChatGPT rate limits」）與通知 `account/rateLimits/updated`（「emitted whenever a user's ChatGPT rate limits change」）。快照欄位：`usedPercent`（窗口內已用百分比）、`windowDurationMins`（窗口長度）、`resetsAt`（Unix 秒）、`limitId`、`limitName`、`planType`、`rateLimitReachedType`，另有 `rateLimits`（單桶相容視圖）與 `rateLimitsByLimitId`（多桶視圖）。範例回覆中 `primary` 有 `usedPercent`／`windowDurationMins`／`resetsAt`，`secondary` 為 `null`；`primary`／`secondary` 與「5 小時／每週」的對應，頁面沒有文字說明，查不到。（app-server 頁，`developers.openai.com/codex/app-server` → `learn.chatgpt.com/docs/app-server`；此頁有 147590 字元，只讀到後段的 rate limits 片段。）
 
-作者提議（待本人）：試用期用 **U0**——`usage` 為 `not_applicable`，加冷卻訊號，與 agy 相同。不新增取用量實作，所以 `usage-reporting` 的文字不必改。
+本人 11-07 已定（作者提議→已確認）：試用期用 **U0**——`usage` 為 `not_applicable`，加冷卻訊號，與 agy 相同。不新增取用量實作，所以 `usage-reporting` 的文字不必改。
 
 其他選項（本 change 不做）：
 - **U1**：sidecar 啟動 `codex app-server` 呼叫 `account/rateLimits/read`，再把結果推給 Gateway。要新端點與新契約（P6）。Gateway 不持有登入，符合 Q1。
 - **U2**：讓 Gateway 那台自己登入一份，比照 Claude 跑原版 CLI 讀用量。Gateway 就成了「持有 ChatGPT 登入」，違反 Q1 的前提，且多一個使用者與一份 auth.json，**不建議**。
 
-待本人：試用期 U0 夠不夠？建議夠（只靠冷卻；人工讀 `/status` 或儀表板）；期滿要「依用量決定」時再開 P6（U1）。
+本人 11-07 已定：試用期 U0 夠。原建議夠（只靠冷卻；人工讀 `/status` 或儀表板）；期滿要「依用量決定」時再開 P6（U1）。
 
 ## Q8 冷卻怎麼標（查證）
 
@@ -100,7 +102,7 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 
 被捨棄：只有時刻時假設為本機時區換算。時區未標，錯誤的 `resets_at` 比預設的 1 小時更糟。
 
-## Q9 隱私等級（查證；等級與能不能碰真資料待本人）
+## Q9 隱私等級（查證；本人 11-07 已定）
 
 事實：
 - 個人方案（Free／Plus／Pro）：「Improve the model for everyone」也適用 Codex 任務；關閉位置：ChatGPT Settings → Data Controls，或隱私入口的「Do not train on my content」。關閉後新的對話與 Codex 任務不用於訓練；只對**新**對話生效；對回覆按讚／倒讚可能讓整段對話被用於訓練。（搜尋摘要，引自 help.openai.com 的 Data Controls FAQ 與 5722486 兩篇；讀取工具與審查者對這兩篇都回 403，**未讀到原文**，標推論。）
@@ -114,7 +116,7 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 
 決定（形狀）：等級寫進 `privacy`（`role-allocation`「訂閱的隱私等級」），不加新欄位。Gateway 的 `privacy` 假設 sidecar 已固定把 `[analytics] enabled=false`、`[otel] exporter="none"`、`otel.metrics_exporter="none"`、`log_user_prompt=false`、`history.persistence="none"` 寫進 codex config（B8）；這是前提，要寫進 sidecar 的契約。
 
-待本人（結論不替本人定；下面是依 PMO 對照表的條件式對應）：
+本人 11-07 已定：方案＝ChatGPT Plus，已關「Improve the model」→ 分級 ○（程式與一般資料可、**不碰真資料**；仍有保留期）→ `privacy` 最高 `general`（P4 的 `policy/default.json` 放 `general`，不放 `real`）。下面是當時依 PMO 對照表列的條件式對應（留作依據）：
 - 個人方案、訓練未關或未確認＝✗→`public`（只公開程式與假資料）。
 - 個人方案、本人確認已關訓練（且知道只對新對話生效、有按讚例外、"Include environments" 另有開關）＝○→最多 `general`。
 - Business＝○（預設不訓練，但保留）→`general`。
@@ -122,7 +124,7 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 - 在本人確認方案與訓練設定前，P4 先放最保守的 `public`；能不能碰真資料：目前不能。
 - 本人試用的方案種類（Plus／Pro／Business）與訓練設定：請 PMO 向本人確認。
 
-## Q10 使用界線（查證；界線待本人）
+## Q10 使用界線（查證；本人 11-07 已定）
 
 事實：
 - 官方認可 `codex exec` 用於腳本與 CI：「from scripts (for example, continuous integration (CI) jobs)」。預設「`codex exec` reuses saved CLI authentication」。
@@ -133,19 +135,20 @@ provider `openai`、訂閱 `chatgpt-personal`（日後有公司方案就加 `cha
 
 對照本 repo 對 Claude 訂閱的寫法（`usage-reporting`「Claude 取用量」）：只執行**未修改的原版 Claude Code**；Gateway MUST NOT 自己用訂閱 token 對 API 發請求，MUST NOT 收集或轉手 session token。
 
-架構與界線的分工：delta 只保留「local-login 一對一綁定表：`chatgpt-personal.agents` 剛好是 `["codex"]`」的**形狀**（`subscription-registry`「local-login 的 agents 條款」，屬架構，P2 實作）。下面的**使用界線**不在 delta，屬本人，待 Q10 決定：
+架構與界線的分工：delta 只保留「local-login 一對一綁定表：`chatgpt-personal.agents` 剛好是 `["codex"]`」的**形狀**（`subscription-registry`「local-login 的 agents 條款」，屬架構，P2 實作）。下面的**使用界線**不在 delta，屬本人，Q10 已由本人 11-07 定案：
 
-作者提議（待本人，Q10）：比照 Claude，只用**原版 Codex CLI** 搭配本人的訂閱登入；Gateway 不代理、不轉手 token、不用訂閱 token 打 API；不接 opencode 或其他第三方客戶端。若本人選 (ii)（允許 opencode 的 ChatGPT 登入外掛），綁定表的形狀要跟著改（`chatgpt-personal` 就不再只綁一個 agent），tasks 的 C-9b 也要改。
+本人 11-07 已定（Q10，選 (i)）：比照 Claude，只用**原版 Codex CLI** 搭配本人的訂閱登入；Gateway 不代理、不轉手 token、不用訂閱 token 打 API；不接 opencode 或其他第三方客戶端。若本人選 (ii)（允許 opencode 的 ChatGPT 登入外掛），綁定表的形狀要跟著改（`chatgpt-personal` 就不再只綁一個 agent），tasks 的 C-9b 也要改。
 
-待本人：
-- 界線是否照上面？選項：(i) 只原版 Codex CLI（建議）；(ii) 也允許 opencode 的 ChatGPT 登入外掛（官方未明文禁止，但屬第三方客戶端用訂閱 token，比照 Claude 的風險；不建議）。
-- worker 上跑 codex 的 repo 若是公開 repo（本 repo 即是），上面「不要用在公開或開源 repo」的官方提醒是否適用？該提醒針對 CI 上執行 repo 控制的程式碼；隊員在 worker 上跑、不接外部 PR，推論不同，但請本人裁定。
+本人 11-07 已定：
+- 界線照上面，選 (i) 只用**原版 Codex CLI**，不允許 opencode。選項原文：選項：(i) 只原版 Codex CLI（建議）；(ii) 也允許 opencode 的 ChatGPT 登入外掛（官方未明文禁止，但屬第三方客戶端用訂閱 token，比照 Claude 的風險；不建議）。
+- worker 上跑 codex 的 repo 若是公開 repo（本 repo 即是），上面「不要用在公開或開源 repo」的官方提醒是否適用？該提醒針對 CI 上執行 repo 控制的程式碼；隊員在 worker 上跑、不接外部 PR，推論不同，本人裁定：repo 公私不限；但登入檔（`auth.json`）**絕不進** GitHub Actions／ghr runner。使用界線以本節文字記錄，不實作測試（C-9b）。
 
-## Q11 roles
+## Q11 roles（本人 11-07 已定）
+
+本人 11-07 已定：**直接進輪換**——impl／qa 優先 Codex（撞上限退 Sonnet），審查用 Opus。`roles.*.order` 的資料變更在 P4 政策資料處理，不在 P2；**前提不變：MyLinuxPool#797 能開之前不放進 `order`**。`order` 是訂閱層級，模型偏好（退 Sonnet、審查用 Opus）由呼叫方決定，Gateway 不新增角色→模型欄位。下面是當時的選項與限制（留作依據）。
 
 `roles.impl` 與 `roles.rev` 的 `order` 要不要加 `chatgpt-personal`、排第幾，是政策資料，Q9 定了才放（floor 會篩）；MLP 的 codex driver（#797）能開之前不放進 `order`，否則有人照 roles 挑到它卻開不起來。
 
-待本人／PM：
 - 選項：(i) 先只登錄訂閱、不進任何 `order`（建議；P4 只做這一步，main 不會更糟）；(ii) 進 `impl`、`rev` 的 `order`，排在 `claude-personal` 之前（分擔週額度，目標與工單一致；需 Q9 等級與 #797 就緒）；(iii) 只進 `impl`（審查隊員要與實作隊員用不同的 `(provider, model)`——worker 環境說明的選模規則；codex 只有一把訂閱，兩個角色都用它時模型要不同）。
 - 排序、priority 數字：PM 與本人在 P4 決定。
 

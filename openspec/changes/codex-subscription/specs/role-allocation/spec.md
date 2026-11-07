@@ -16,7 +16,7 @@
 ### Requirement: codex 的候選
 `agent` 為 `codex` 時，只有 `agents` 含 `codex` 的 subscription SHALL 出現在 `candidates`，且是否出現 MUST 只看該角色的 `order` 與 `privacy`／`floor`，與其他 agent 同一條規則。
 
-本 change 與 P4 的第一步都不把 `chatgpt-personal` 寫進任何 `order`；要不要寫、排第幾是政策資料的決定。
+本 change 與 P2 都不把 `chatgpt-personal` 寫進任何 `order`；進 `impl`／`qa` 的 `order`（排在 `claude-personal` 之前）是 P4 的政策資料，前提是 MyLinuxPool#797 能開。
 
 #### Scenario: codex 不在 order 時是空候選
 - **WHEN** 政策檔有 `chatgpt-personal`（`agents` 為 `["codex"]`），但沒有任何 `roles.<role>.order` 含它，`roles.impl.floor` 為 `public`；呼叫 `GET /v1/roles/impl?agent=codex&data=public`

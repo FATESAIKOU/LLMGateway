@@ -15,7 +15,7 @@
 實作 MUST 同時寫兩條判斷——`agent` 屬於 local-login agent 集合（`agy`、`codex`），**或**該把的 `kind` 為 `local-login`，任一成立就回 `{}`，防線不依賴單一條件。只判 `agent` 擋的是「agy 或 codex 進了某一筆 api-key row」（政策條款被改弱，該把的 `kind` 不是 `local-login`）；只判 `kind` 擋的是「某把 local-login 訂閱的 `agents` 被改弱成含 `claude-code`」（該把仍是 `local-login` 但 agent 不在集合內）；兩條合起來，任一邊被改弱都還是回 `{}`。
 
 #### Scenario: 條款被改弱也不會回 claude 的 env
-- **WHEN** 單元測試直接以一筆 api-key provider（例如 `opencode-zen`）呼叫 `build_env("agy", <key>, <model>)`——模擬「`_AGY_ONLY` 條款被改弱、agy 進了 api-key row」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
+- **WHEN** 單元測試直接以一筆 api-key provider（例如 `opencode-zen`）呼叫 `build_env("agy", <key>, <model>)`——模擬「local-login 對照表被改弱、agy 進了 api-key row」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
 - **THEN** `env` 仍是 `{}`、不回任何 `ANTHROPIC_*`／`OPENCODE_*`：`kind` 不是 `local-login`，但 `agent` 為 `agy` 那條判斷成立
 
 #### Scenario: codex 進了 api-key row 也不會回 claude 的 env
@@ -23,7 +23,7 @@
 - **THEN** `env` 仍是 `{}`、不回任何 `ANTHROPIC_*`／`OPENCODE_*`
 
 #### Scenario: 條款被改弱成含 claude-code 也不會回 claude 的 env
-- **WHEN** 單元測試直接以一個 `kind` 為 `local-login` 的 provider（`GoogleProvider`）呼叫 `build_env("claude-code", null, <model>)`——模擬「`_AGY_ONLY` 條款被改弱、`antigravity` 的 `agents` 含 `claude-code`」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
+- **WHEN** 單元測試直接以一個 `kind` 為 `local-login` 的 provider（`GoogleProvider`）呼叫 `build_env("claude-code", null, <model>)`——模擬「local-login 對照表被改弱、`antigravity` 的 `agents` 含 `claude-code`」的組合（經政策載入不可達，所以這裡測的是單元層的第二道防線）
 - **THEN** `env` 仍是 `{}`、不回任何 `CLAUDE_CODE_OAUTH_TOKEN`／`ANTHROPIC_*`／`OPENCODE_*`：`agent` 不是 `agy`，但 `kind` 為 `local-login` 那條判斷成立
 
 #### Scenario: chatgpt-personal 的 agents 被改弱成含 claude-code 也不會回 claude 的 env

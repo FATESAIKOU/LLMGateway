@@ -5,7 +5,7 @@
 完整錯誤碼表（回覆 JSON 一律為 {"error": "<碼>", ...}）：
 - 400 bad_request：JSON 解析失敗、body 不是物件、缺必填（保留 "missing": [...] 欄位）、
   登錄冷卻的 model 不是非空字串（null 除外——那是「沒給」）、超過 200 字元、
-  以 agent 前綴開頭（opencode/、claude-code/、agy/）、含 fnmatch 萬用字元，或不被該把的
+  以 agent 前綴開頭（`AGENTS` 的任一前綴，如 opencode/、claude-code/、agy/、codex/）、含 fnmatch 萬用字元，或不被該把的
   models.allow 涵蓋、
   resolve 的輸入形狀錯（未知 agent、data 不在 public／general／real、
   subscription＋exclude 同時給、subscription 與 provider 不一致）、
