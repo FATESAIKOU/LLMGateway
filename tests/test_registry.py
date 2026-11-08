@@ -134,6 +134,8 @@ class JsonSchemaTest(RegistryCase):
                             "https://opencode.ai/inference/go/openai/v1"),
             "ollama-cloud": ("ollama-cloud", "api-key", "https://ollama.com"),
             "antigravity": ("google", "local-login", None),
+            # #187 P4：ChatGPT 個人訂閱（沒有憑證的 local-login）
+            "chatgpt-personal": ("openai", "local-login", None),
         }
         items = _by_id(self.list_items())
         for sub, (provider, kind, endpoint) in expected.items():
@@ -153,6 +155,7 @@ class JsonSchemaTest(RegistryCase):
             "opencode-zen": "https://opencode.ai/zen/v1",
             "opencode-go": "https://opencode.ai/inference/go/openai/v1",
             "antigravity": None,
+            "chatgpt-personal": None,
         }
         agents = {
             "claude-personal": "claude-code",
@@ -161,6 +164,7 @@ class JsonSchemaTest(RegistryCase):
             "opencode-zen": "opencode",
             "opencode-go": "opencode",
             "antigravity": "agy",
+            "chatgpt-personal": "codex",
         }
         listed = _by_id(self.list_items())
         self.assertEqual(set(listed), set(expected))
@@ -210,6 +214,8 @@ class JsonSchemaTest(RegistryCase):
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
             "antigravity": "gemini-3.8-flash-low",
+            # #187 P4：Codex 的個人訂閱（default 走官方推薦、非退役的 gpt-6.1-sol）
+            "chatgpt-personal": "gpt-6.1-sol",
         }
         listed = _by_id(self.list_items())
         self.assertEqual(set(listed), set(expected))
@@ -358,7 +364,7 @@ class LocalLoginTest(RegistryCase):
         self.assertEqual(
             [item["id"] for item in items],
             ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud",
-             "antigravity", "claude-personal"],
+             "antigravity", "chatgpt-personal", "claude-personal"],
         )
 
     def test_list的available與usage(self):
@@ -558,7 +564,7 @@ class ListTest(RegistryCase):
         self.assertEqual(
             [item["id"] for item in items],
             ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud",
-             "antigravity", "claude-personal"],
+             "antigravity", "chatgpt-personal", "claude-personal"],
         )
 
     def test_冷卻反映在list(self):

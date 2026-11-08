@@ -55,7 +55,8 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         order = [s.name for s in policy.in_priority_order()]
         self.assertEqual(order, ["opencode-zen", "opencode-go", "openrouter",
-                                 "ollama-cloud", "antigravity", "claude-personal"])
+                                 "ollama-cloud", "antigravity", "chatgpt-personal",
+                                 "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
         self.assertEqual(policy.subscriptions["openrouter"].models_allow,
@@ -63,19 +64,24 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
         self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
         self.assertEqual(policy.subscriptions["antigravity"].agents, ("agy",))
+        # #187 P4：Codex 的個人訂閱（agent codex、provider openai）
+        self.assertEqual(policy.subscriptions["chatgpt-personal"].agents, ("codex",))
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
         self.assertFalse(hasattr(policy, "cooldown_buffer_seconds"))  # 窗口欄位拿掉
         self.assertFalse(hasattr(policy, "resets_at_max_ahead_seconds"))
 
     def test_出廠政策移除claude_company且claude_personal排最後(self):
-        # #50：拔掉公司 Claude 訂閱；claude-personal 排在 Ollama 之後並預設 Sonnet
+        # #50：拔掉公司 Claude 訂閱；claude-personal 排在 Ollama 之後並預設 Sonnet。
+        # #187 P4：chatgpt-personal 排在 claude-personal 之前（見 test_C20）。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         self.assertEqual(set(policy.subscriptions),
                          {"claude-personal", "opencode-zen", "opencode-go",
-                          "openrouter", "ollama-cloud", "antigravity"})
+                          "openrouter", "ollama-cloud", "antigravity",
+                          "chatgpt-personal"})
         self.assertEqual([s.name for s in policy.in_priority_order()],
                          ["opencode-zen", "opencode-go", "openrouter",
-                          "ollama-cloud", "antigravity", "claude-personal"])
+                          "ollama-cloud", "antigravity", "chatgpt-personal",
+                          "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].models_default,
                          "claude-sonnet-5-5")
 
@@ -89,10 +95,11 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertIn("openrouter/free", or_sub.models_allow)
         self.assertEqual(len(or_sub.models_allow), 2)
 
-    def test_出廠六筆訂閱的models_default(self):
-        # 出廠政策檔逐筆釘住：六筆各自有 default（#50 起 claude-personal 預設
+    def test_出廠七筆訂閱的models_default(self):
+        # 出廠政策檔逐筆釘住：七筆各自有 default（#50 起 claude-personal 預設
         # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go；
-        # #88 加 groq、#128 移除；#107 加 antigravity）。非 null 的 default 必須被同一筆的 allow 樣式涵蓋
+        # #88 加 groq、#128 移除；#107 加 antigravity；#187 P4 加
+        # chatgpt-personal）。非 null 的 default 必須被同一筆的 allow 樣式涵蓋
         # （allow 是 fnmatch 樣式；lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         expected = {
@@ -102,6 +109,8 @@ class LoadDefaultPolicyTests(unittest.TestCase):
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
             "antigravity": "gemini-3.8-flash-low",
+            # #187 P4：default 為官方推薦、非退役的 gpt-6.1-sol
+            "chatgpt-personal": "gpt-6.1-sol",
         }
         self.assertEqual(set(policy.subscriptions), set(expected))
         for name, default in expected.items():
@@ -647,6 +656,8 @@ class RoleAndPrivacyPolicyTests(PolicyValidationTests):
                 "openrouter": "public",
                 "ollama-cloud": "real",
                 "antigravity": "public",
+                # #187 P4（Q9）：Plus、已關訓練→○，最高 general、不碰真資料
+                "chatgpt-personal": "general",
             },
         )
         self.assertEqual(
@@ -655,11 +666,12 @@ class RoleAndPrivacyPolicyTests(PolicyValidationTests):
                 "PMO": ("real", ("claude-personal", "ollama-cloud")),
                 "PM": ("real", ("claude-personal", "ollama-cloud")),
                 "impl": ("public", ("opencode-zen", "opencode-go", "openrouter",
-                                    "ollama-cloud", "claude-personal")),
+                                    "ollama-cloud", "chatgpt-personal",
+                                    "claude-personal")),
                 "rev": ("public", ("openrouter", "opencode-zen", "opencode-go",
                                    "ollama-cloud", "claude-personal")),
                 "qa": ("public", ("opencode-zen", "opencode-go", "openrouter",
-                                  "ollama-cloud")),
+                                  "ollama-cloud", "chatgpt-personal")),
             },
         )
         # groq 不在任何 order
@@ -672,6 +684,50 @@ class RoleAndPrivacyPolicyTests(PolicyValidationTests):
                 continue
             for sid in rp.order:
                 self.assertIn(sid, real_subs, (role, sid))
+
+    def test_C19a_chatgpt_personal的allow等於核對清單且涵蓋default(self):
+        # C-19a（#187 P4）：models.default 被 models.allow 涵蓋（subscription-registry
+        # 「models.default 必須被 allow 涵蓋」），且 allow 等於 P4 時核對過的七個
+        # 字面裸 id（不用萬用字元、不帶 agent 前綴）。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        sub = policy.subscriptions["chatgpt-personal"]
+        expected = ("gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-luna",
+                    "gpt-6-sol", "gpt-5.5", "gpt-5.6-luna")
+        self.assertEqual(sub.models_allow, expected)
+        self.assertEqual(sub.models_default, "gpt-6.1-sol")
+        self.assertTrue(_covered(sub, sub.models_default))
+        for model_id in expected:
+            with self.subTest(model=model_id):
+                self.assertTrue(_covered(sub, model_id))
+                self.assertNotIn("*", model_id)
+                self.assertNotIn("?", model_id)
+                self.assertNotIn("/", model_id)
+        # 不在清單裡的與帶 agent 前綴的都不被涵蓋
+        self.assertFalse(_covered(sub, "gpt-9-fake"))
+        self.assertFalse(_covered(sub, "codex/gpt-6.1-sol"))
+
+    def test_C20_impl與qa的order優先chatgpt_personal(self):
+        # C-20（#187 P4）：roles.impl／roles.qa 的 order 含 chatgpt-personal，且
+        # impl 排在 claude-personal 之前（qa 沒有 claude-personal：排在
+        # ollama-cloud 之後）；既有角色的候選相對順序不變、其他角色不受影響。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        impl = policy.roles["impl"].order
+        qa = policy.roles["qa"].order
+        self.assertIn("chatgpt-personal", impl)
+        self.assertLess(impl.index("chatgpt-personal"), impl.index("claude-personal"))
+        self.assertIn("chatgpt-personal", qa)
+        self.assertNotIn("claude-personal", qa)
+        # 拿掉新加入的那一把後，順序與 P4 之前逐字相同（相對順序不變）
+        self.assertEqual(tuple(x for x in impl if x != "chatgpt-personal"),
+                         ("opencode-zen", "opencode-go", "openrouter",
+                          "ollama-cloud", "claude-personal"))
+        self.assertEqual(tuple(x for x in qa if x != "chatgpt-personal"),
+                         ("opencode-zen", "opencode-go", "openrouter",
+                          "ollama-cloud"))
+        # 其餘角色不加（rev／PMO／PM）
+        for role in ("PMO", "PM", "rev"):
+            with self.subTest(role=role):
+                self.assertNotIn("chatgpt-personal", policy.roles[role].order)
 
     def test_驗證順序_privacy先於訂閱id(self):
         obj = _good_policy()

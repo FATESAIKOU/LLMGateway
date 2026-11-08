@@ -52,14 +52,31 @@
         ],
         "default": "gemini-3.8-flash-low"
       }
+    },
+    "chatgpt-personal": {
+      "priority": 38,
+      "privacy": "general",
+      "agents": ["codex"],
+      "models": {
+        "allow": [
+          "gpt-6.1-sol",
+          "gpt-6.1-terra",
+          "gpt-6-astra",
+          "gpt-6-luna",
+          "gpt-6-sol",
+          "gpt-5.5",
+          "gpt-5.6-luna"
+        ],
+        "default": "gpt-6.1-sol"
+      }
     }
   },
   "roles": {
     "PMO": {"floor": "real", "order": ["claude-personal", "ollama-cloud"]},
     "PM": {"floor": "real", "order": ["claude-personal", "ollama-cloud"]},
-    "impl": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud", "claude-personal"]},
+    "impl": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud", "chatgpt-personal", "claude-personal"]},
     "rev": {"floor": "public", "order": ["openrouter", "opencode-zen", "opencode-go", "ollama-cloud", "claude-personal"]},
-    "qa": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud"]}
+    "qa": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud", "chatgpt-personal"]}
   },
   "usage": {"claude-personal": {"enabled": true}},
   "until_max_ahead_seconds": 691200

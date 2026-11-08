@@ -54,8 +54,8 @@
 
 ## 4. P4：政策資料（依存 P2；本人定 Q9，Q5 再對一次官方頁）
 
-- [ ] 4.1 `policy/default.json`：加 `chatgpt-personal`（`priority`、`privacy`＝`general`（Q9 已定：Plus、已關訓練→○；不放 `real`）、`models.allow`／`default`、`agents` `["codex"]`）。
-- [ ] 4.2 `roles.impl`、`roles.qa` 的 `order` 加 `chatgpt-personal`，排在 `claude-personal` 之前（Q11 已定：直接進輪換、impl／qa 優先 Codex）；**前提仍是 MyLinuxPool#797 能開**，#797 就緒前不放進 `order`。「撞上限退 Sonnet」只能寫成 `chatgpt-personal` 之後接 `claude-personal`；用哪個模型（Sonnet、Opus 審查）由呼叫方決定，Gateway 不新增『角色→模型』欄位（要加是新介面，另過設計審）。
+- [x] 4.1 `policy/default.json`：加 `chatgpt-personal`（`priority`、`privacy`＝`general`（Q9 已定：Plus、已關訓練→○；不放 `real`）、`models.allow`／`default`、`agents` `["codex"]`）。
+- [x] 4.2 `roles.impl`、`roles.qa` 的 `order` 加 `chatgpt-personal`，排在 `claude-personal` 之前（Q11 已定：直接進輪換、impl／qa 優先 Codex）；**前提仍是 MyLinuxPool#797 能開**，#797 就緒前不放進 `order`。「撞上限退 Sonnet」只能寫成 `chatgpt-personal` 之後接 `claude-personal`；用哪個模型（Sonnet、Opus 審查）由呼叫方決定，Gateway 不新增『角色→模型』欄位（要加是新介面，另過設計審）。
 - 契約：
   - C-18：出廠政策載入成功，list 多一筆 `chatgpt-personal`（`available` true，`privacy` 為 `general`）。
   - C-19a（測試）：`models.default` 被 `models.allow` 涵蓋（`subscription-registry`「models.default 必須被 allow 涵蓋」），且 `allow` 等於 P4 時核對過的清單。
