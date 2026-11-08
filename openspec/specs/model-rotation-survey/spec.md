@@ -1,7 +1,7 @@
 # model-rotation-survey Specification
 
 ## Purpose
-提供固定調查指令（Claude Code skill `/model-rotation-survey`），每週由 PMO 手動調查 OpenRouter 免費、OpenCode Zen 免費、Ollama Cloud（付費）與 Claude（訂閱）之可用模型與能力評分，更新並維護人讀之模型輪換表 `docs/model-rotation.md`；並提供 `apply` 模式依本人在 PR 的 comment 調整表格內容。
+提供固定調查指令（Claude Code skill `/model-rotation-survey`），每週由 PMO 手動調查 OpenRouter 免費、OpenCode Zen 免費、Ollama Cloud（付費）、Claude（訂閱）與 ChatGPT／codex（訂閱；provider=openai、agent=codex）之可用模型與能力評分，更新並維護人讀之模型輪換表 `docs/model-rotation.md`；並提供 `apply` 模式依本人在 PR 的 comment 調整表格內容。
 ## Requirements
 ### Requirement: skill 定義與觸發限制
 指令 SHALL 定義於 `.claude/skills/model-rotation-survey/SKILL.md`，frontmatter 的 `disable-model-invocation` MUST 設為 `true`，僅准手動觸發（禁止模型自主調用）；調查作業 MUST 由 PMO 每週例在 Mac 上以本人登入之原版 Claude Code 手動執行 `/model-rotation-survey`。
@@ -70,7 +70,7 @@ skill SHALL 讀取現有 `docs/model-rotation.md` 作為現況，依來源取得
 - **THEN** skill commit 並 push 至同分支，於 PR 留言回覆差異且開頭包含 `<!-- model-rotation-survey:bot -->`
 
 ### Requirement: 機械化來源取得原則
-四家提供商的可用模型清單 SHALL 透過各自公開之端點或工具取得，抓得到即列入、抓不到即排除，MUST NOT 人工推測計費細節或補入未抓到的模型；抓取請求 MUST 使用公開 URL 且 MUST NOT 夾帶任何 API key 或 token。
+五家提供商的可用模型清單 SHALL 透過各自公開之端點或工具取得，抓得到即列入、抓不到即排除（ChatGPT／codex 另記「查不到」狀態），MUST NOT 人工推測計費細節或補入未抓到的模型；抓取請求 MUST 使用公開 URL 且 MUST NOT 夾帶任何 API key 或 token。
 
 #### Scenario: 免 key 公開抓取
 - **WHEN** skill 調查各家可用模型
@@ -159,11 +159,11 @@ Claude 模型清單 SHALL 以官方公開說明頁面 `https://platform.claude.c
 - **THEN** 綜合欄標記為「主觀」並給予 0–100 估值，表頭聲明主觀為 AI 判斷
 
 ### Requirement: 比例與能力評分欄填法
-「比例」欄位 MUST 依提供商標記（OpenRouter 免費額度為帳號共用標「共用」、Zen 官方未公布標「查不到」、Ollama Cloud 與 Claude 標「依訂閱」），不設定基準值；「terminal」與「coding」欄位採 AA Terminal-Bench 與 Coding Index，若頁面無法取得或未收錄 MUST 標為「查不到」；「抽象架構設計」欄位 MUST 採 AA Intelligence Index，榜上未收錄時才標記為「主觀」並填入 0–100 評分；同一模型在 AA 榜單有多個 effort 檔位時，各 AA 指標欄（含「綜合」）MUST 取最高檔分數。
+「比例」欄位 MUST 依提供商標記（OpenRouter 免費額度為帳號共用標「共用」、Zen 官方未公布標「查不到」、Ollama Cloud、Claude 與 ChatGPT／codex 標「依訂閱」），不設定基準值；「terminal」與「coding」欄位採 AA Terminal-Bench 與 Coding Index，若頁面無法取得或未收錄 MUST 標為「查不到」；「抽象架構設計」欄位 MUST 採 AA Intelligence Index，榜上未收錄時才標記為「主觀」並填入 0–100 評分；同一模型在 AA 榜單有多個 effort 檔位時，各 AA 指標欄（含「綜合」）MUST 取最高檔分數。
 
 #### Scenario: 比例欄填法
 - **WHEN** 填寫各提供商之比例欄
-- **THEN** OpenRouter 填「共用」、Zen 填「查不到」、Ollama Cloud 與 Claude 填「依訂閱」
+- **THEN** OpenRouter 填「共用」、Zen 填「查不到」、Ollama Cloud、Claude 與 ChatGPT／codex 填「依訂閱」
 
 #### Scenario: 抽象架構設計欄填法
 - **WHEN** 填寫模型之「抽象架構設計」欄位
@@ -178,15 +178,15 @@ Claude 模型清單 SHALL 以官方公開說明頁面 `https://platform.claude.c
 - **THEN** 該格採 32（綜合欄同理）
 
 ### Requirement: 可用的 agent 與節流標記
-「可用的 agent」欄位 MUST 依 Gateway 政策檔 `policy/default.json` 之各訂閱 `agents` 欄位填寫（Claude 列填 `claude-code`，Ollama Cloud 列填 `claude-code, opencode`，OpenRouter 與 Zen 列填 `opencode`）；「計入週用量節流」欄位 Claude MUST 填「是（週）」、Ollama Cloud MUST 填「否（每月用量額度，官方數字）」（來源標記為官方公開文件 URL 與讀取日期）、免費模型 MUST 填「否」。
+「可用的 agent」欄位 MUST 依 Gateway 政策檔 `policy/default.json` 之各訂閱 `agents` 欄位填寫（Claude 列填 `claude-code`，Ollama Cloud 列填 `claude-code, opencode`，OpenRouter 與 Zen 列填 `opencode`，ChatGPT／codex 列依 `chatgpt-personal.agents`，目前為 `codex`）；「計入週用量節流」欄位 Claude MUST 填「是（週）」、Ollama Cloud MUST 填「否（每月用量額度，官方數字）」（來源標記為官方公開文件 URL 與讀取日期）、ChatGPT／codex MUST 填「是（週，推估）」（保守政策分類，非已讀取週用量），免費模型 MUST 填「否」。
 
 #### Scenario: 可用的 agent 填寫
 - **WHEN** 填寫各提供商模型之可用的 agent
-- **THEN** Claude 列為 `claude-code`，Ollama Cloud 列為 `claude-code, opencode`，OpenRouter／Zen 列為 `opencode`
+- **THEN** Claude 列為 `claude-code`，Ollama Cloud 列為 `claude-code, opencode`，OpenRouter／Zen 列為 `opencode`，ChatGPT／codex 依 `chatgpt-personal.agents` 填 `codex`
 
 #### Scenario: 計入週用量節流填寫
 - **WHEN** 填寫節流欄位
-- **THEN** Claude 填「是（週）」、Ollama Cloud 填「否（每月用量額度，官方數字）」、免費模型填「否」
+- **THEN** Claude 填「是（週）」、Ollama Cloud 填「否（每月用量額度，官方數字）」、ChatGPT／codex 填「是（週，推估）」，免費模型填「否」
 
 ### Requirement: apply 模式的分支前置與 PR 檢查
 在 `apply` 模式執行修改前，skill SHALL 先以 `gh pr list --head survey/current` 尋找開啟中的 PR；若無開啟之 PR，MUST 回報並結束流程；若找到開啟中的 PR，在修改任何檔案前 MUST 先執行 `git fetch origin && git switch survey/current && git pull --ff-only` 同步最新變更。
@@ -251,3 +251,18 @@ skill 之寫入操作 SHALL 僅限於 `docs/model-rotation.md`，MUST NOT 修改
 - **WHEN** 抓取之模型描述或欄位中含有 `|` 或換行符號
 - **THEN** skill 將符號跳脫後再填入 markdown 表格，防止表格結構損壞或注入
 
+
+### Requirement: ChatGPT／codex 訂閱模型與額度來源
+skill MUST 以 `https://learn.chatgpt.com/docs/models` 的 ChatGPT 登入 Codex 公開說明取得可用 id，MUST NOT 用 API 模型清單替代訂閱可用性；無公開證據時 MUST 標「查不到」，退役模型 MUST NOT 列為可用。模型 id 與 effort MUST 分開；公開列出不代表帳號實測成功。能力評分 MUST 沿用 AA Terminal-Bench、Coding Index、Intelligence Index 與最高 effort 規則，無法取得時 MUST 標「查不到」。額度／冷卻 MUST 引用 `https://learn.chatgpt.com/docs/pricing` 與讀取日期，說明 5 小時窗口及例外、可能的週上限與本機／雲端共用；MUST NOT 寫帳號額度數字或推定所有模型共用單一桶，MUST NOT 讀登入檔或 dashboard、執行登入測試或猜恢復時間。U0 的用量 `not_applicable` MUST NOT 被解讀為沒有週上限。
+
+#### Scenario: 官方列出的訂閱模型
+- **WHEN** 官方頁列出 `gpt-6.1-sol` 與 `gpt-6-luna` 的 Codex 使用方式
+- **THEN** 可列為公開候選，provider 為 `openai`、agent 依 `chatgpt-personal.agents` 填 `codex`，另記實測狀態與 AA 來源日期
+
+#### Scenario: 訂閱模型退役或查不到
+- **WHEN** 官方明示 `gpt-5.5` 已從 ChatGPT 登入退役，或某 id 無訂閱可用證據
+- **THEN** 退役者不進可用模型列；無證據者標「查不到」，不從 policy allow 或 API 可用性補猜
+
+#### Scenario: 週節流與冷卻證據有限
+- **WHEN** pricing 說明有 5 小時窗口及可能的週上限，但沒有帳號實際剩餘量或重置時間
+- **THEN** 比例填「依訂閱」，節流填「是（週，推估）」並附公開來源日期，說明方案例外與 U0 未讀用量，不猜額度或冷卻時刻

@@ -1,6 +1,6 @@
 ---
 name: model-rotation-survey
-description: 調查 OpenRouter／Zen 免費、Ollama Cloud、Claude 的可用模型，更新 docs/model-rotation.md 並開 PR；`apply` 模式依 PR 上本人的 comment 修改。只准手動觸發。
+description: 調查 OpenRouter／Zen 免費、Ollama Cloud、Claude、ChatGPT／codex 的可用模型，更新 docs/model-rotation.md 並開 PR；`apply` 模式依 PR 上本人的 comment 修改。只准手動觸發。
 disable-model-invocation: true
 ---
 
@@ -32,7 +32,7 @@ disable-model-invocation: true
 1. 做「開工前」(a)。
 2. 若 `survey/current` 上有開著的 PR 還沒 merge：做「開工前」(b)，再照 `apply` 模式處理，然後在同一分支繼續調查（本人 comment 改過的格以 comment 為準，請 PMO 人工確認）。
 3. 沒有開著的 PR：`git fetch origin && git switch -C survey/current origin/main`，從最新的 `origin/main` 重建（前一輪 merge 後舊分支還留著，不接用）；之後 push 用 `--force-with-lease`。
-4. 讀 `docs/model-rotation.md` 現況（有開著的 PR 時，比對對象是分支上的現況），依下面「來源」抓四家清單，依「欄位」填表，與現況比對。
+4. 讀 `docs/model-rotation.md` 現況（有開著的 PR 時，比對對象是分支上的現況），依下面「來源」抓五家清單，依「欄位」填表，與現況比對。
 5. **沒有變化就不開 PR、不改檔**，回報「無變化」即結束。「有沒有變化」只比列的集合（模型名＋提供商）與各格的值和標籤，**不比讀取日期**；只有讀取日期變了就算無變化。
 6. 有變化：改 `docs/model-rotation.md`，`git add docs/model-rotation.md`（只加這一個檔，不用 `git add -A`），commit，push 到 `survey/current`。沒有開著的 PR 才開新的 PR（body 列出與上一版的差異與每格的來源）；已有開著的 PR 就在原 PR 回覆差異。PR body 與回覆開頭都放標記 `<!-- model-rotation-survey:bot -->`。
 7. 回報 PR 連結，等本人在 PR 留 comment。
@@ -54,20 +54,21 @@ disable-model-invocation: true
 
 > 查一下 openrouter 跟 opencode 目前的免費模型表，欄位是：模型名、推估每天可用免費 token 量（以某一個模型的免費 token 量為 1，給出其他模型可用量的比例）、terminal 能力、coding 能力、抽象架構設計能力、綜合能力（按照這個由高到低排序）、提供商
 
-範圍已由本人（2026-10-25）擴大：除 OpenRouter／Zen（opencode）免費模型外，還含 Ollama Cloud（付費）與 Claude（訂閱）。欄位在原文之外另加兩欄：
+範圍於 2026-10-25 擴大，#196 再納入 ChatGPT／codex：除 OpenRouter／Zen（opencode）免費模型外，還含 Ollama Cloud（付費）、Claude（訂閱）與 ChatGPT／codex（訂閱；provider=openai、agent=codex）。欄位在原文之外另加兩欄：
 
 - **可用的 agent**：該模型能用哪個 coding agent 呼叫。
 - **計入週用量節流**：這個模型的用量是否計入週用量規則（週用量 70% 放慢、90% 停）的節流。
 
 ## 來源（機械化）
 
-每家的可用模型由該家自己的 API 或工具取得，抓得到就列、抓不到就不列；不人工推測計費細節。
+每家的可用模型由該家自己的 API 或工具取得，抓得到就列、抓不到就不列（ChatGPT 另記「查不到」狀態，不補猜可用 id）；不人工推測計費細節。
 
 | 提供商 | 取清單的方式 | key | 抓不到時 |
 |---|---|---|---|
 | OpenRouter | `GET https://openrouter.ai/api/v1/models`；id 結尾 `:free` 或 pricing 皆 `"0"` 為免費，兩者不一致標「待確認」，排除非聊天模型 | 免 key | 不列 |
 | Zen | 價格表 `https://opencode.ai/docs/zen/`，Input／Output 皆 `Free` 為準；`https://opencode.ai/inference/v1/models`（只有 id）用來核對 id | 免 key | 不列 |
 | Ollama Cloud | `GET https://ollama.com/api/tags`，模型名以回傳為準（app／CLI 用 `<名>:cloud`） | 免 key | 回非 2xx 則整家標「查不到」 |
+| ChatGPT／codex | 官方訂閱登入模型說明 `https://learn.chatgpt.com/docs/models`；額度／冷卻說明 `https://learn.chatgpt.com/docs/pricing`；AA 分數來源同下列能力欄 | 免 key；不讀登入檔、不呼叫訂閱 API | 可用 id 查不到即標「查不到」；退役者不列為可用 |
 | Claude | 官方公開清單 `https://platform.claude.com/docs/en/models/overview` | 免 key；不用訂閱 token 打 API | 不列 |
 
 - Ollama Cloud 免 key：`/api/tags` 不帶 key 即可讀，不必經 resolve。日後若改要 key，依上列「抓不到」處理，不把 key 帶進 Claude Code。
@@ -88,17 +89,21 @@ disable-model-invocation: true
 
 `官方數字`（附 URL＋讀取日期）／`推估`／`共用`／`查不到`／`主觀`。查不到不填猜測值。
 
-另有兩個固定值會出現在格子裡：`待確認`（OpenRouter 的 `:free` 與 pricing 兩者不一致，無法判斷是否免費）、`依訂閱`（Ollama Cloud、Claude 的額度隨訂閱方案而變，不寫額度）。
+另有兩個固定值會出現在格子裡：`待確認`（OpenRouter 的 `:free` 與 pricing 兩者不一致，無法判斷是否免費）、`依訂閱`（Ollama Cloud、Claude、ChatGPT／codex 的額度隨訂閱方案而變，不寫額度）。
 
 ### 各欄填法
 
-- **比例**：不設基準，只標來源。OpenRouter 免費額度是整個帳號共用的請求數上限（`https://openrouter.ai/docs/api-reference/limits`），標「共用」；Zen 官方未公布數字，標「查不到」；Ollama Cloud、Claude 列標「依訂閱」。
+- **比例**：不設基準，只標來源。OpenRouter 免費額度是整個帳號共用的請求數上限（`https://openrouter.ai/docs/api-reference/limits`），標「共用」；Zen 官方未公布數字，標「查不到」；Ollama Cloud、Claude、ChatGPT／codex 列標「依訂閱」。
 - **terminal**：AA（Artificial Analysis）Terminal-Bench，尺度 0–100，附 URL＋日期。
 - **coding**：AA Coding Index，尺度 0–100，附 URL＋日期。
 - **抽象架構設計**：AA Intelligence Index；榜上沒有才標「主觀」，尺度 0–100。表頭註明「標『主觀』的是 AI 判斷，非實測」。
 - **綜合**：只看 Intelligence Index（避免三欄重疊重複計分）。榜上沒有的模型，綜合欄標「主觀」並給 0–100，排序時照該值。
 - **AA 多檔位**：同一模型在 AA 榜單有多個 effort 檔位時，各 AA 指標欄（含綜合）取最高檔分數。
 - **排序**：主排序鍵為綜合，由高到低。
-- **可用的 agent**：依 `policy/default.json` 各訂閱的 `agents` 欄位填（執行時重讀，以檔案為準）。目前：Claude 列只寫 `claude-code`（原版 Claude Code）；Ollama Cloud 列 `claude-code`、`opencode`；OpenRouter、Zen 列 `opencode`。
-- **計入週用量節流**：依提供商填。Claude 訂閱「是（週）」；Ollama Cloud「否（每月用量額度，官方數字）」，來源寫成官方公開文件 URL（`https://ollama.com/pricing`、`https://docs.ollama.com/api/balance`）與該列讀取日期（格內只放值與來源；舊方案帳號的說明留在 docs/model-rotation.md，本 skill 不帶 key、不查 `/api/balance`）（只寫這句；帳號、方案細節、餘額不寫入本 repo）；免費（OpenRouter、Zen）「否」。
+- **可用的 agent**：依 `policy/default.json` 各訂閱的 `agents` 欄位填（執行時重讀，以檔案為準）。目前：Claude 列只寫 `claude-code`（原版 Claude Code）；Ollama Cloud 列 `claude-code`、`opencode`；OpenRouter、Zen 列 `opencode`；ChatGPT／codex 依 `chatgpt-personal.agents`（目前只有 `codex`），不由模型 allow 清單推定實測可用性。
+- **計入週用量節流**：依提供商填。Claude 訂閱「是（週）」；ChatGPT／codex「是（週，推估）」：這是週用量節流的保守政策分類，不代表 Gateway 已能讀取週用量；目前 U0 為 `not_applicable`。公開 pricing 說明有 5 小時窗口（部分方案例外）及可能適用的週上限，本機／雲端共用；不可推論各模型共用單一桶，不寫帳號額度，冷卻不猜恢復時間；Ollama Cloud「否（每月用量額度，官方數字）」，來源寫成官方公開文件 URL（`https://ollama.com/pricing`、`https://docs.ollama.com/api/balance`）與該列讀取日期（格內只放值與來源；舊方案帳號的說明留在 docs/model-rotation.md，本 skill 不帶 key、不查 `/api/balance`）（只寫這句；帳號、方案細節、餘額不寫入本 repo）；免費（OpenRouter、Zen）「否」。
 - **來源與讀取日期**：每列註明各格的來源 URL 與讀取日期（YYYY-MM-DD）。
+
+### ChatGPT／codex 公開來源判讀
+
+官方 models 頁須明確涉及 ChatGPT 登入的 Codex，不能以 API 模型存在替代訂閱可用性；官方說明受方案與客戶端限制，不代表帳號實測。模型 id 與 effort 分開記；AA 多檔位仍取最高 effort。能力頁抓不到標「查不到」；官方退役 id 僅留在 allow 實測狀態備註，不進可用模型列。不得為調查執行登入測試。額度／冷卻只引公開 pricing URL 與日期，不讀帳號 dashboard 或登入資料。
