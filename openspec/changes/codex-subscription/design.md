@@ -161,7 +161,7 @@ Gateway 負責：訂閱登錄（list）、resolve 契約（`agent=codex`、`prov
 - B3：effort 由 sidecar 用 `model_reasoning_effort` 設定，Gateway 不知道。
 - B4：Q6 選的分發方式落在 MLP。值只走腳本、不經 AI；PMO 不經手；更新後的 `auth.json` 不回寫正本；憑證失效時 `exit.reason` 怎麼標、怎麼請本人重新登入由 MLP 定。
 - B5：同一個 `CODEX_HOME` 的並行上限為 1（或序列化）。
-- B6：MLP 固定 `cli_auth_credentials_store = "file"`（承載位置由 MLP 定，目前為 worker 映像 config.toml）（Linux 無桌面不依賴 keyring）。
+- B6：MLP 固定 `cli_auth_credentials_store = "file"`（承載位置由 MLP 定，目前為映像內的 /etc/codex/managed_config.toml）（Linux 無桌面不依賴 keyring）。
 - B7：額度錯誤用 `lgw.signals.classify("codex", …)` 判讀，再以 `POST /v1/subscriptions/chatgpt-personal/cooldown` 登錄（`model` 不帶 `codex/` 前綴，帶了回 400）。**待查**：codex 錯誤文字裡的時刻是 agent 所在機器的本機時間還是帳號時區（Q8 後續選項 (i) 的前提）；未查證前一律「現在＋1 小時」。
 - B8：遙測、分析、歷史設定（Q9）由 MLP 固定（承載位置同 B6），且不得被席位 config、profile 或 `-c` 覆寫：`analytics.enabled=false`、`otel.exporter="none"`、`otel.metrics_exporter="none"`、`log_user_prompt=false`、`history.persistence="none"`。
 - B9：#798 與 #119 共用同一套 capability 分發；Gateway 在 P1 泛化後，agy 與 codex 同形狀。

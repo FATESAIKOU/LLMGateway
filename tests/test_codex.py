@@ -1,7 +1,9 @@
-"""#187 P2：Codex（ChatGPT 訂閱 chatgpt-personal，provider openai，agent codex）的測試。
+"""#187 P2／P4：Codex（ChatGPT 訂閱 chatgpt-personal，provider openai，agent codex）的測試。
 
-契約編號 C-n 對 openspec/changes/codex-subscription/tasks.md。出廠政策（policy/default.json）
-在 P2 不含 chatgpt-personal，所以一律用臨時政策檔；key 檔裡從來沒有它的鍵。
+契約編號 C-n 對 openspec/changes/codex-subscription/tasks.md。P4 起出廠政策
+（policy/default.json）已含 chatgpt-personal（C-18、C-19a、C-20）；
+P2 的「出廠沒有這一筆」已過期，需要「沒有 openai 訂閱」的政策時用
+`_factory_obj_without_codex()`。key 檔裡從來沒有它的鍵。
 """
 
 import json
@@ -25,6 +27,16 @@ SUB = "chatgpt-personal"
 
 def _factory_obj():
     return json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
+
+
+def _factory_obj_without_codex():
+    """出廠政策拿掉 chatgpt-personal（P4 起出廠有它；需要「沒有 openai 訂閱」時用）。"""
+    obj = _factory_obj()
+    obj["subscriptions"].pop(SUB, None)
+    for role in obj.get("roles", {}).values():
+        if SUB in role.get("order", []):
+            role["order"] = [sid for sid in role["order"] if sid != SUB]
+    return obj
 
 
 def _codex_sub(agents=("codex",), privacy="public", allow=(MODEL,), default=MODEL):
@@ -61,7 +73,9 @@ class _Base(unittest.TestCase):
         return service
 
     def with_codex(self, in_impl_order=False, **kw):
-        obj = _factory_obj()
+        # 以「出廠政策拿掉 chatgpt-personal」為底再放回這一筆：P4 起出廠的
+        # roles.impl 已含它，直接 append 會重複（order 不得重複）。
+        obj = _factory_obj_without_codex()
         obj["subscriptions"][SUB] = _codex_sub(**kw)
         if in_impl_order:
             obj["roles"]["impl"]["order"].append(SUB)
@@ -115,7 +129,9 @@ class CodexResolveTest(_Base):
 
     def test_C10_政策沒有openai訂閱時回404(self):
         self.assertIn(SUB, PROVIDERS)
-        service = self.service(_factory_obj())
+        # 出廠政策自 P4 起有 openai 訂閱；這一條要的是「沒有任何 openai 訂閱」的
+        # 政策（P2 當時出廠就沒有，P4 起改用拿掉這一筆的副本）。
+        service = self.service(_factory_obj_without_codex())
         err = self.assert_api_error(
             404, "not_found", service.resolve, "codex", "openai")
         self.assertNotIn("env", err.body())
@@ -148,13 +164,20 @@ class CodexListTest(_Base):
         self.assertNotIn("key", item)
         self.assertEqual(item["usage"]["status"], "not_applicable")
 
-    def test_C7_出廠政策沒有chatgpt_personal(self):
-        # P2 不動 policy/default.json
+    def test_C18_出廠政策有chatgpt_personal且list的row可用(self):
+        # C-18（#187 P4）：出廠政策載入成功，list 多一筆 chatgpt-personal
+        # （available true、privacy 為 general）。P2 的「出廠政策沒有它」是 P2 的
+        # 完成判準，P4 必然過期——改成本條的新預期。
         policy = load_policy(POLICY_PATH)
-        self.assertNotIn(SUB, policy.subscriptions)
+        self.assertEqual(policy.subscriptions[SUB].privacy, "general")
+        self.assertEqual(policy.subscriptions[SUB].agents, ("codex",))
         service = self.service(_factory_obj())
-        ids = [i["id"] for i in service.list_subscriptions()["subscriptions"]]
-        self.assertNotIn(SUB, ids)
+        item = self.item(service)
+        self.assertTrue(item["available"])
+        self.assertIsNone(item["available_again_at"])
+        self.assertEqual(item["provider"], "openai")
+        self.assertEqual(item["kind"], "local-login")
+        self.assertEqual(item["models"]["default"], "gpt-6.1-sol")
 
 
 class CodexPolicyShapeTest(_Base):
