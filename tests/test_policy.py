@@ -156,8 +156,8 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(_covered(go, "big-pickle"))  # #149
         self.assertFalse(_covered(go, "kimi-k3"))  # 付費的 id
 
-    def test_antigravity出廠12個字面模型id(self):
-        # #107 本人裁定：本人從 `agy models` 抄的 12 個裸 id，照抄、不增不減不改。
+    def test_antigravity出廠16個字面模型id(self):
+        # #107 本人裁定：本人從 `agy models` 抄的 16 個裸 id，照抄、不增不減不改。
         # 出廠政策只放字面 id（不含萬用字元）：錯字在 resolve 就是 403，不會延到 agy。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         sub = policy.subscriptions["antigravity"]
@@ -168,6 +168,10 @@ class LoadDefaultPolicyTests(unittest.TestCase):
             "gemini-4-argon-low",
             "gemini-4-argon-medium",
             "gemini-4-argon-high",
+            "gemini-4-hydrogen-low",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-xhigh",
             "claude-opus-5-5-low",
             "claude-opus-5-5-medium",
             "claude-opus-5-5-high",

@@ -1100,6 +1100,10 @@ class FactoryAntigravityHttpTest(ServerCase):
         "gemini-4-argon-low",
         "gemini-4-argon-medium",
         "gemini-4-argon-high",
+        "gemini-4-hydrogen-low",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-xhigh",
         "claude-opus-5-5-low",
         "claude-opus-5-5-medium",
         "claude-opus-5-5-high",
@@ -1129,7 +1133,7 @@ class FactoryAntigravityHttpTest(ServerCase):
     def json_of(self, payload):
         return json.loads(payload.decode())
 
-    def test_resolve12個模型id回200(self):
+    def test_resolve16個模型id回200(self):
         for model in self.MODELS:
             with self.subTest(model=model):
                 status, payload = self.call(
@@ -1171,6 +1175,8 @@ class FactoryAntigravityHttpTest(ServerCase):
         self.assertTrue(item["available"])
         self.assertIsNone(item["available_again_at"])
         self.assertEqual(item["usage"]["status"], "not_applicable")
+        self.assertEqual(item["models"]["default"], "gemini-3.8-flash-low")
+        self.assertEqual(item["models"]["allow"], list(self.MODELS))
         self.assertNotIn("key", item)
 
 
