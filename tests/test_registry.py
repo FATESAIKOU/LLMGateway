@@ -501,6 +501,10 @@ class FactoryAntigravityTest(RegistryCase):
         "gemini-4-argon-low",
         "gemini-4-argon-medium",
         "gemini-4-argon-high",
+        "gemini-4-hydrogen-low",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-xhigh",
         "claude-opus-5-5-low",
         "claude-opus-5-5-medium",
         "claude-opus-5-5-high",
@@ -509,7 +513,7 @@ class FactoryAntigravityTest(RegistryCase):
         "claude-sonnet-5-5-high",
     )
 
-    def test_resolve12個模型id都回200且env空(self):
+    def test_resolve16個模型id都回200且env空(self):
         for model in self.MODELS:
             with self.subTest(model=model):
                 payload = self.resolve("agy", "google", model=model)
