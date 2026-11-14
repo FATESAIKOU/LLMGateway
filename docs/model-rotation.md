@@ -89,6 +89,110 @@
 | `liquid/lfm-2.5-2.6b:free` | 共用 | 查不到 | 查不到 | 3（主觀） | 3（主觀） | OpenRouter | opencode | 否 | 清單 https://openrouter.ai/api/v1/models；比例 https://openrouter.ai/docs/api-reference/limits；分數 榜單前段未見，AI 判斷；2026-11-07 |
 | `liquid/lfm-3-1.7b:free` | 共用 | 查不到 | 查不到 | 3（主觀） | 3（主觀） | OpenRouter | opencode | 否 | 清單 https://openrouter.ai/api/v1/models；比例 https://openrouter.ai/docs/api-reference/limits；分數 榜單前段未見，AI 判斷；2026-11-07 |
 
+## AA Intelligence Index 分數對照（v5.0.1，讀取日期 2026-11-14）
+
+- (a) 這些分數是 AA Intelligence Index **v5.0.1**（2026-11-14 讀取），與外部文件 MyPMO handbook/model-rotation.md（v4.3.2 尺度，不在本 repo）不是同一把尺，兩邊數字不可直接比；
+- (b) 本節是 2026-11-14 的補充對照；與上表同一模型的分數不同時，以本節為準，上表各列不改。
+- (c) 28／33／27（glm／deepseek／mimo）在 v5.0.1 是對的，deepseek 的 33 是 1017 Max 的值，無日期版 `deepseek-v4.1-flash` 在 AA 為 deprecated／null，只能當推估。
+
+### ① codex（chatgpt-personal allow；可用性依 learn.chatgpt.com/docs/models）
+
+| 模型 | effort | AA 分數 | 來源 URL＋日期 | 官方／推估 | 可否在 ChatGPT 登入的 Codex 使用 |
+|---|---|---|---|---|---|
+| `gpt-6.1-sol` | Low | 35 | https://artificialanalysis.ai/models/gpt-6-1-sol ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-sol`；已實測） |
+| `gpt-6.1-sol` | Medium | 46 | https://artificialanalysis.ai/models/gpt-6-1-sol ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-sol`；已實測） |
+| `gpt-6.1-sol` | High | 50 | https://artificialanalysis.ai/models/gpt-6-1-sol ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-sol`；已實測） |
+| `gpt-6.1-sol` | Xhigh | 52 | https://artificialanalysis.ai/models/gpt-6-1-sol ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-sol`；已實測） |
+| `gpt-6.1-sol` | Max | 55 | https://artificialanalysis.ai/models/gpt-6-1-sol ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-sol`；已實測） |
+| `gpt-6.1-terra` | Non-reasoning | 31 | https://artificialanalysis.ai/models/gpt-6-1-terra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-terra`，需 Codex CLI ≥ 0.159.0） |
+| `gpt-6.1-terra` | Low | 29 | https://artificialanalysis.ai/models/gpt-6-1-terra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-terra`，需 Codex CLI ≥ 0.159.0） |
+| `gpt-6.1-terra` | Medium | 38 | https://artificialanalysis.ai/models/gpt-6-1-terra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-terra`，需 Codex CLI ≥ 0.159.0） |
+| `gpt-6.1-terra` | High | 42 | https://artificialanalysis.ai/models/gpt-6-1-terra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-terra`，需 Codex CLI ≥ 0.159.0） |
+| `gpt-6.1-terra` | Xhigh | 45 | https://artificialanalysis.ai/models/gpt-6-1-terra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-terra`，需 Codex CLI ≥ 0.159.0） |
+| `gpt-6.1-terra` | Max | 51 | https://artificialanalysis.ai/models/gpt-6-1-terra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6.1-terra`，需 Codex CLI ≥ 0.159.0） |
+| `gpt-6-astra` | Low | 43 | https://artificialanalysis.ai/models/gpt-6-astra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6-astra`；CLI / IDE 支援） |
+| `gpt-6-astra` | Medium | 52 | https://artificialanalysis.ai/models/gpt-6-astra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-astra` | High | 55 | https://artificialanalysis.ai/models/gpt-6-astra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-astra` | Xhigh | 55 | https://artificialanalysis.ai/models/gpt-6-astra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-astra` | Max | 57 | https://artificialanalysis.ai/models/gpt-6-astra ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-luna` | Non-reasoning | 9 | https://artificialanalysis.ai/models/gpt-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（官方推薦模型；支援 `codex -m gpt-6-luna`；已實測） |
+| `gpt-6-luna` | Low | 10 | https://artificialanalysis.ai/models/gpt-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-luna` | Medium | 18 | https://artificialanalysis.ai/models/gpt-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-luna` | High | 21 | https://artificialanalysis.ai/models/gpt-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-luna` | Xhigh | 23 | https://artificialanalysis.ai/models/gpt-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-luna` | Max | 28 | https://artificialanalysis.ai/models/gpt-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字 | 可（同上） |
+| `gpt-6-sol` | Max | 44 | https://artificialanalysis.ai/models/gpt-6-sol ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字（AA 已 deprecated） | 待驗 / 歷史候選（官方頁面未列入 Recommended models；仍是 gpt-5.4 的官方替換建議） |
+| `gpt-6-sol` | Low / Medium / High / Xhigh / Non-reasoning | 查不到 | https://artificialanalysis.ai/models/gpt-6-sol；2026-11-14 | 查不到（AA 頁面 null，AA 已 deprecated） | 待驗 / 歷史候選（同上） |
+| `gpt-5.5` | 所有 effort（Low / Medium / High / Xhigh / Non-reasoning） | 查不到 | https://artificialanalysis.ai/models/gpt-5-5 ＋ https://learn.chatgpt.com/docs/models#gpt-55-retirement；2026-11-14 | 查不到（AA v5.0.1 頁面全為 null，AA 已 deprecated） | 否（官方已於 2026-10-14 從 ChatGPT 登入之 Codex 正式退役；API key 登入不受影響） |
+| `gpt-5.6-luna` | Max | 24 | https://artificialanalysis.ai/models/gpt-5-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 官方數字（AA 已 deprecated） | 查不到（ChatGPT / Codex 官方文件未列出此模型；訂閱可用性查不到） |
+| `gpt-5.6-luna` | Low / Medium / High / Xhigh / Non-reasoning | 查不到 | https://artificialanalysis.ai/models/gpt-5-6-luna ＋ https://learn.chatgpt.com/docs/models；2026-11-14 | 查不到（AA 頁面 null，AA 已 deprecated） | 查不到（同上） |
+
+※ policy 的 chatgpt-personal allow 實為 7 個（含 `gpt-5.5`）。
+
+### ② agy（antigravity allow）
+
+| 模型 | effort | AA 分數 | 來源 URL＋日期 | 官方／推估 |
+|---|---|---|---|---|
+| `gemini-3.8-flash` | low | 23 | https://artificialanalysis.ai/models/gemini-3-8-flash；2026-11-14 | 官方數字 |
+| `gemini-3.8-flash` | medium | 30 | https://artificialanalysis.ai/models/gemini-3-8-flash；2026-11-14 | 官方數字 |
+| `gemini-3.8-flash` | high | 31 | https://artificialanalysis.ai/models/gemini-3-8-flash；2026-11-14 | 官方數字 |
+| `gemini-4-hydrogen` | low | 27 | https://artificialanalysis.ai/models/gemini-4-hydrogen；2026-11-14 | 官方數字 |
+| `gemini-4-hydrogen` | medium | 41 | https://artificialanalysis.ai/models/gemini-4-hydrogen；2026-11-14 | 官方數字 |
+| `gemini-4-hydrogen` | high | 51 | https://artificialanalysis.ai/models/gemini-4-hydrogen；2026-11-14 | 官方數字 |
+| `gemini-4-hydrogen` | xhigh | 54 | https://artificialanalysis.ai/models/gemini-4-hydrogen；2026-11-14 | 官方數字 |
+| `gemini-4-argon` | low | 查不到 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 查不到（官方未測） |
+| `gemini-4-argon` | medium | 48 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 官方數字 |
+| `gemini-4-argon` | high | 50 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 官方數字 |
+| `claude-sonnet-5-5` | low | 26 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
+| `claude-sonnet-5-5` | medium | 31 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
+| `claude-sonnet-5-5` | high | 42 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
+| `claude-opus-5-5` | low | 35 | https://artificialanalysis.ai/models/claude-opus-5-5；2026-11-14 | 官方數字 |
+| `claude-opus-5-5` | medium | 48 | https://artificialanalysis.ai/models/claude-opus-5-5；2026-11-14 | 官方數字 |
+| `claude-opus-5-5` | high | 52 | https://artificialanalysis.ai/models/claude-opus-5-5；2026-11-14 | 官方數字 |
+
+註：外部文件 MyPMO handbook/model-rotation.md（v4.3.2 尺度，不在本 repo）曾標記 hydrogen medium「≈45（推估）」、argon medium「≈44（推估）」，AA 目前官方值為 41／48。另 Claude 系列在 AA 另有較高檔位（`claude-sonnet-5-5` Xhigh 50、Max 55；`claude-opus-5-5` Xhigh 57、Max 59），Antigravity 政策未列此 effort。
+
+### ③ 免費（v5.0.1，官方）
+
+| 模型 | effort | AA 分數 | 來源 URL＋日期 | 官方／推估 |
+|---|---|---|---|---|
+| `glm-5.3-flash-free` | 未命名 reasoning | 28 | https://artificialanalysis.ai/models/glm-5-3-flash ＋ https://artificialanalysis.ai/leaderboards/models；2026-11-14 | 官方數字 |
+| `deepseek-v4.1-flash-free` | Non-reasoning | 19 | https://artificialanalysis.ai/models/deepseek-v4-1-flash-1017 ＋ https://artificialanalysis.ai/leaderboards/models；2026-11-14 | 官方數字（對應 1017；Zen 實際版本與 effort 查不到） |
+| `deepseek-v4.1-flash-free` | High | 29 | https://artificialanalysis.ai/models/deepseek-v4-1-flash-1017 ＋ https://artificialanalysis.ai/leaderboards/models；2026-11-14 | 官方數字（對應 1017；Zen 實際版本與 effort 查不到） |
+| `deepseek-v4.1-flash-free` | Max | 33 | https://artificialanalysis.ai/models/deepseek-v4-1-flash-1017 ＋ https://artificialanalysis.ai/leaderboards/models；2026-11-14 | 官方數字（對應 1017；Zen 實際版本與 effort 查不到） |
+| `mimo-v2.6-flash-free` | 未命名 reasoning | 27 | https://artificialanalysis.ai/models/mimo-v2-6-flash ＋ https://artificialanalysis.ai/leaderboards/models；2026-11-14 | 官方數字 |
+
+註：GLM-5.3-Flash 與 MiMo-V2.6-Flash 在 AA 頁面皆為 reasoning 模型（`isReasoning:true`），未命名 effort。Zen 的 `deepseek-v4.1-flash-free` 實際上線版本及 effort 查不到（Zen 公開端點回傳 403）。
+
+### ④ Ollama Cloud 與 Claude
+
+| 模型 | effort | AA 分數 | 來源 URL＋日期 | 官方／推估 |
+|---|---|---|---|---|
+| `deepseek-v4.1-flash`（ollama-cloud 無日期舊版） | Max | 查不到 | https://artificialanalysis.ai/models/deepseek-v4-1-flash；2026-11-14 | 查不到（AA 頁面 null，AA 已 deprecated；上表寫 33（官方數字），AA v5.0.1 該版本為 null，故本節標「查不到」，33 僅 1017 Max 的值可作推估） |
+| `deepseek-v4.1-flash:1017` | Max | 33 | https://artificialanalysis.ai/models/deepseek-v4-1-flash-1017；2026-11-14 | 官方數字 |
+| `deepseek-v4.1-flash`（無日期） | Max | 33 | https://artificialanalysis.ai/models/deepseek-v4-1-flash-1017；2026-11-14 | 推估（依據 1017 Max，非官方） |
+| `claude-haiku-5-5` | Low | 19 | https://artificialanalysis.ai/models/claude-haiku-5-5；2026-11-14 | 官方數字 |
+| `claude-haiku-5-5` | Medium | 25 | https://artificialanalysis.ai/models/claude-haiku-5-5；2026-11-14 | 官方數字 |
+| `claude-haiku-5-5` | High | 30 | https://artificialanalysis.ai/models/claude-haiku-5-5；2026-11-14 | 官方數字 |
+| `claude-haiku-5-5` | Xhigh | 35 | https://artificialanalysis.ai/models/claude-haiku-5-5；2026-11-14 | 官方數字 |
+| `claude-haiku-5-5` | Max | 36 | https://artificialanalysis.ai/models/claude-haiku-5-5；2026-11-14 | 官方數字 |
+| `claude-sonnet-5-5` | High（Default Fallback） | 42 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
+| `claude-opus-5-5` | Medium（Default Fallback） | 48 | https://artificialanalysis.ai/models/claude-opus-5-5；2026-11-14 | 官方數字 |
+
+註：既有表的 Haiku 36 在 v5.0.1 對應 Max 檔。
+
+### 沒查到／不確定
+
+照 AA-TABLE.md 與查證報告：
+- 外部文件 MyPMO handbook/model-rotation.md（v4.3.2 尺度，不在本 repo）數字的歷史出處（42／38／≈36·39）：查不到，不能當現行官方值。
+- Zen 免費版的實際上游版本／effort：查不到（Zen 公開端點 403）。
+- GLM／MiMo 的「未命名 reasoning」對應哪個 effort：查不到。
+- `gemini-4-argon-low`：查不到（AA 官方僅測 Medium 與 High）。
+- `gpt-5.5` 在 AA v5.0.1 之分數：查不到（所有 effort 皆為 null）。
+- `gpt-5.6-luna` 之非 Max effort 分數及 Codex 可用性：查不到（非 Max 為 null，官方文件未列）。
+- `gpt-6-sol` 之非 Max effort 分數：查不到（非 Max 為 null）。
+- Ollama Cloud 無日期版 `deepseek-v4.1-flash` 的官方分數：查不到（AA 頁面已 deprecated 且 null；33 是 1017 Max 的值，僅可當推估）。
+
 ## ChatGPT／codex 公開調查（2026-11-08）
 
 本輪僅補查第五家，其他四家保留各列原讀取日期。worker 主模型為 `gpt-6.1-sol`、次模型為 `gpt-6-luna`（主觀：本單輪換建議，非 AA 名次）。官方亦列 `gpt-6.1-terra`、`gpt-6-astra`、`gpt-6-sol` 為公開候選；能否在特定登入使用仍待驗。`gpt-5.6-luna` 的訂閱可用性查不到。來源：https://learn.chatgpt.com/docs/models、https://learn.chatgpt.com/docs/pricing，讀取日期 2026-11-08。
