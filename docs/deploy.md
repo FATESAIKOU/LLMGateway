@@ -376,6 +376,10 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 
   只認 `enabled`（布林）與 `ttl_seconds`（正整數），其他鍵一律拒收。**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前需完成 10.1／10.2 與 C1（階段 C 的前置，即以服務帳號裝原版 Claude Code、trust 固定目錄、服務的 PATH 與 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`，見 `openspec/changes/archive/2026-10-26-usage-in-responses/tasks.md` 第 10 節），未完成時 `usage` 會是 `unknown`／`upstream_error`。
 - **`available_again_at`**：`cooldown.until`（未來）與「用完（`remaining_percent` ≤ 0）的窗口之 `resets_at`」中最晚者；`available` 不因用量為 0 而變 false，選把規則也不變。
+- **`GET /v1/usage`（用量一覽）**：唯讀，只接受 GET（其他方法 404）；回 `{"schema": 1, "subscriptions": [...]}`，順序與 list 相同（依 `priority`）。每筆恰十二鍵：`id`、`kind`，加上 list 的 `usage` 八個共用欄位（`status`、`source`、`fetched_at`、`stale`、`reason`、`note`、`session`、`weekly`，同一快取狀態下與 list 逐值相等），再加 `weekly_used_usd`、`weekly_used_usd_fetched_at`。沒有 `pipes`。存取控制與 list 相同：沒有應用層認證，只靠 SSH 與本機綁定。用途是週報或 AI 取一覽，不必抓整份 list。
+- **`weekly_used_usd`／`weekly_used_usd_fetched_at`**：只有 OpenRouter 可以是非 null。`weekly_used_usd` 是上游 `usage_weekly` 的原值，單位 USD，不換算、不取整，不是餘額或配額。`weekly_used_usd_fetched_at` 是該金額的取得時刻（RFC 3339 UTC），與窗口的 `fetched_at` 各自獨立；金額可能在窗口失敗時仍有值，應以金額自己的時間判讀。`0` 是真的 0，表示上游回報本週用量為 0；`null` 是拿不到，**不是金額**，不得當 0 用。拿不到的原因包括：欄位缺、值無效、上游失敗、未取過、停用或未部署、超過 6 小時、跨 UTC 週一 00:00 之後（金額屬上一週）、取用量內部例外。兩鍵同時為 null。其他訂閱、list、resolve、pipes、note 仍不含金額。
+- **讀法（消費者）**：查詢不等背景請求，第一次可能是 null。先呼叫一次 `GET /v1/usage` 觸發取值；間隔 ≥ 6 秒（上游逾時為 5 秒）再讀；仍為 null 再間隔 ≥ 6 秒讀第二次；第二次也是 null 就記「金額未取得」（附窗口的 `status` 與 `reason`），不以 0 代替，也不再等待。
+- **相容**：兩鍵是新增欄位，舊消費端忽略即可。但嚴格檢查舊的十鍵一覽的外部讀者會壞；週報讀取端尚未實作，部署前須確認它容忍未知鍵。
 - 退版（`install.sh --tag` 回前一版）安全：欄位是新增的，舊消費端忽略即可。
 
 ### 5.8 政策檔的 `models.allow`（fnmatch 樣式）
