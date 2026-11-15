@@ -40,6 +40,24 @@ PARSE_ERROR = "parse_error"
 NO_WINDOWS = "no_windows"
 STALE_EXPIRED = "stale_expired"
 INTERNAL = "internal"
+# not_applicable 專用（spec「not_applicable 的 reason 與固定表」）；其他 status 不得用。
+NO_QUOTA_API = "no_quota_api"
+UNAVAILABLE = "unavailable"
+
+# not_applicable 的 reason／note 固定表（design D5）：subscription id -> (reason, note)。
+# note 是程式內固定的一句話，不取上游內容（design D4）。
+NOT_APPLICABLE_TABLE = {
+    "opencode-zen": (UNAVAILABLE,
+                     "額度與預算只在 opencode 的本機 server 端點與 Console 網頁，Gateway 取不到。"),
+    "opencode-go": (UNAVAILABLE,
+                    "週額度只在 opencode 的本機 server 端點（需 server 認證），Gateway 取不到。"),
+    "antigravity": (UNAVAILABLE,
+                    "額度只在 agy 的 /usage 與設定頁，沒有公開 API；登入在呼叫方機器上，Gateway 取不到。"),
+    "chatgpt-personal": (UNAVAILABLE,
+                         "額度只在 Codex 的 app-server 介面（需帳戶 session，登入在呼叫方機器上），Gateway 取不到。"),
+}
+# 固定表未收錄的 not_applicable subscription 用的通用說明（design D9）。
+GENERIC_NOTE = "這個訂閱的額度來源未登記在 Gateway 的說明表，Gateway 取不到。"
 
 WINDOWS = ("session", "weekly")
 EXPIRE_AFTER = _dt.timedelta(hours=6)     # 超過這麼久的舊值不再顯示
@@ -117,14 +135,24 @@ class _Entry:
         self.in_flight = False
 
 
-def _not_applicable() -> dict:
+def _not_applicable(subscription: str, on_unlisted=None) -> dict:
+    """沒有取用量實作的 usage：reason／note 依固定表（D5）；表外降級為 unavailable＋通用 note（D9）。
+    表外者才呼叫 on_unlisted(subscription)（由 UsageService 決定是否真的記 warning）。"""
+    if subscription in NOT_APPLICABLE_TABLE:
+        reason, note = NOT_APPLICABLE_TABLE[subscription]
+    else:
+        if on_unlisted is not None:
+            on_unlisted(subscription)
+        reason, note = UNAVAILABLE, GENERIC_NOTE
     return {"status": STATUS_NOT_APPLICABLE, "source": None, "fetched_at": None,
-            "stale": None, "reason": None, "session": None, "weekly": None, "pipes": []}
+            "stale": None, "reason": reason, "note": note,
+            "session": None, "weekly": None, "pipes": []}
 
 
 def _unknown(source, reason, fetched_at=None, stale=None) -> dict:
     return {"status": STATUS_UNKNOWN, "source": source, "fetched_at": fetched_at,
-            "stale": stale, "reason": reason, "session": None, "weekly": None, "pipes": []}
+            "stale": stale, "reason": reason, "note": None,
+            "session": None, "weekly": None, "pipes": []}
 
 
 def internal_usage(source=None) -> dict:
@@ -133,7 +161,7 @@ def internal_usage(source=None) -> dict:
 
 
 def build_usage(source, entry: _Entry | None, now: _dt.datetime, ttl: float) -> dict:
-    """由快取內容（純計算）組 `usage` 物件：八個鍵恆在。"""
+    """由快取內容（純計算）組 `usage` 物件：九個鍵恆在。"""
     if entry is None or entry.fetched_at is None:
         return _unknown(source, (entry.last_reason if entry else None) or NOT_FETCHED_YET)
     age = now - entry.fetched_at
@@ -168,7 +196,8 @@ def build_usage(source, entry: _Entry | None, now: _dt.datetime, ttl: float) -> 
     if all(value is None for value in shown.values()) and not pipes:
         return _unknown(source, STALE_EXPIRED, fetched_at, stale)
     return {"status": STATUS_OK, "source": source, "fetched_at": fetched_at,
-            "stale": stale, "reason": entry.last_reason if stale else None, **shown, "pipes": pipes}
+            "stale": stale, "reason": entry.last_reason if stale else None, "note": None,
+            **shown, "pipes": pipes}
 
 
 def available_again_at(usage: dict, cooldown_until: _dt.datetime | None, now: _dt.datetime,
@@ -210,6 +239,7 @@ class UsageService:
         self._lock = threading.Lock()
         self._guard = ProcessGuard(self._lock)
         self._entries: dict[str, _Entry] = {}
+        self._unlisted_logged: set[str] = set()   # 表外 not_applicable 的 id，每個只記一次（D9）
         self._threads: list = []
         self._enabled: dict[str, bool] = {}
         self._ttl: dict[str, float] = {}
@@ -237,7 +267,7 @@ class UsageService:
         """
         fetcher = self._fetchers.get(subscription)
         if fetcher is None:
-            return _not_applicable()
+            return _not_applicable(subscription, self._warn_unlisted)
         try:
             if not self._enabled[subscription]:
                 return _unknown(fetcher.source, DISABLED)          # disabled 優先於 no_key
@@ -253,6 +283,14 @@ class UsageService:
         except Exception as exc:  # 用量壞了不拖累主要功能
             _LOG.warning("usage assemble failed for %s: %s", subscription, type(exc).__name__)
             return _unknown(fetcher.source, INTERNAL)
+
+    def _warn_unlisted(self, subscription: str) -> None:
+        """表外的 not_applicable：每個 id 只記一條 warning（D9）；不影響回覆。"""
+        with self._lock:
+            if subscription in self._unlisted_logged:
+                return
+            self._unlisted_logged.add(subscription)
+        _LOG.warning("usage note table has no entry for %s; reason=unavailable", subscription)
 
     def _maybe_trigger(self, subscription, fetcher, entry, now, ttl) -> None:
         """（持鎖）符合條件才建背景執行緒。"""

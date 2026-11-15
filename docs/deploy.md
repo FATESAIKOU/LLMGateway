@@ -344,7 +344,27 @@ git add keys.env.enc && git commit -m 'update keys' && git push
 
 list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多同形狀的 `usage`。`usage` 是附加資訊：取用量壞了、卡住，list／resolve 照常回應，該筆只是 `unknown`。
 
-- **來源**：Ollama Cloud 取官方 `GET /api/balance`（用 vault 的 key，只在 lgwd 行程內）；Claude 訂閱執行原版 Claude Code 讀 statusline 的 `rate_limits`；OpenRouter、OpenCode Zen 為 `not_applicable`。
+- **來源**：Ollama Cloud 取官方 `GET /api/balance`（用 vault 的 key，只在 lgwd 行程內；`source` 為 `ollama-api-balance`）；Claude 訂閱執行原版 Claude Code 讀 statusline 的 `rate_limits`（`claude-statusline`）；OpenRouter 用部署的 key 取額度（`openrouter-api-key`，預設開啟）。OpenCode Zen、OpenCode Go、Antigravity、ChatGPT 個人（`chatgpt-personal`）沒有取用量實作，為 `not_applicable`，`source` 為 null。
+- **`reason`**（`status` 為 `unknown` 時必有；`not_applicable` 時必有 `no_quota_api` 或 `unavailable`；`ok` 時為 null，但 `stale: true` 的 `ok` 沿用最近一次失敗的碼）：
+
+  | `reason` | 意思 |
+  |---|---|
+  | `not_fetched_yet` | 還沒成功取過（重啟後第一次查） |
+  | `disabled` | 政策 `usage` 段關閉 |
+  | `no_key` | 這把 key 還沒部署 |
+  | `upstream_error` | 上游回非 200 或連線失敗 |
+  | `rate_limited` | 上游回 429（照 `Retry-After` 退避） |
+  | `timeout` | 取用量逾時 |
+  | `parse_error` | 上游回應不是預期結構 |
+  | `no_windows` | 回應裡沒有可讀的窗口 |
+  | `stale_expired` | 最後一次成功超過 6 小時 |
+  | `internal` | 取用量路徑內部例外（只記型別名） |
+  | `no_quota_api` | `not_applicable`：研究文件或官方文件明載上游沒有額度資訊來源。出廠政策目前沒有訂閱符合，碼保留給日後有實證者 |
+  | `unavailable` | `not_applicable`：上游有額度資訊，但 Gateway 取不到（例如只在帳戶 session 或呼叫方本機登入的介面上）。出廠的 `opencode-zen`、`opencode-go`、`antigravity`、`chatgpt-personal` 都是這一類 |
+
+  **注意**：`not_applicable` 的 `reason` 由舊版的 `null` 變為上表兩個碼之一；讀取方若以「`reason` 為 null」判斷，要改。
+
+- **`note`**（第九個鍵）：只在 `reason` 為 `no_quota_api` 或 `unavailable` 時是一句固定說明，說明為何拿不到；其餘情況為 null。說明來自程式內的固定表（依 subscription id 查），不取上游回應，不含 key、token、帳號或金額。政策檔有、但固定表沒收錄的 `not_applicable` 訂閱，`reason` 為 `unavailable`、`note` 為通用說明，並在 log 記一條 warning（同一個 id 只記一次），lgwd 照常啟動。
 - **語意（重要）**：只在有人 list／resolve、而且快取過期時才在**背景**取一次，回應不等它。零星查詢時，多半拿到的是**上一次查詢觸發的快照**（`stale: true`；超過 6 小時轉 `unknown`／`stale_expired`）；重啟後第一次查一律 `unknown`／`not_fetched_yet`，要看新值得等取完（Ollama 約 5 秒內、Claude 最多約 60 秒）再查一次。
 - **TTL**：Ollama 預設 120 秒（下限 60 秒）；Claude 預設與下限都是 30 分鐘（每次取耗少量訂閱額度，低於 30 分鐘會被夾到 30 分鐘並記 log）。失敗後依 TTL 加倍退避（上限 max(30 分鐘, TTL)），429 照 `Retry-After`。
 - **政策檔**（選填，頂層 `usage`；鍵是 subscription id，不合法 lgwd 不啟動，改檔後先經 `llmgwctl` 的 policy 預檢）：

@@ -359,7 +359,7 @@ class RegistryService:
         return self._keys.deployed(subscription)
 
     def _safe_usage(self, subscription: str) -> dict:
-        """resolve meta 用：任何錯誤都回 unknown／internal，不拖累 resolve（#60）。"""
+        """usage 的唯一組裝點，list 與 resolve meta 共用：任何錯誤都回 unknown／internal，不拖累回覆（#60）。"""
         try:
             return self._usage.usage_for(subscription)
         except Exception as exc:
@@ -373,9 +373,9 @@ class RegistryService:
             return None
 
     def _usage_fields(self, item: dict, now: _dt.datetime) -> tuple[dict, str | None]:
-        """list 用：回 (usage, available_again_at)；失敗該筆 unknown／internal＋null。"""
+        """list 用：回 (usage, available_again_at)。usage 經 _safe_usage：usage_for 拋例外時回 internal_usage，之後仍依冷卻時間算 available_again_at；其餘步驟拋例外時整筆回 internal＋null。"""
         try:
-            usage = self._usage.usage_for(item["id"])
+            usage = self._safe_usage(item["id"])
             cooldown = item["cooldown"]
             until = from_rfc3339(cooldown["until"]) if cooldown else None
             return usage, available_again_at(usage, until, now, self._deployed(item["id"]))
