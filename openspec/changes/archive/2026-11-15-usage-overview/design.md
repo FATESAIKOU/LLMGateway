@@ -85,7 +85,7 @@
 groq：出廠政策檔沒有它，研究文件也沒有它的額度列（grep 零命中）；但 `lgwd/providers.py` 的 PROVIDERS 與 `tests/test_registry.py` 的 groq 測試已存在，該測試的 `usage` 為 `not_applicable`（註解「Groq 沒有公布查剩餘配額的端點」）。依上面的定義，研究文件沒有明載，若歸類應是 `unavailable`；本 change 不為 groq 特別處理，它落在 D9 的通用情形。
 
 ## D9. 固定表未收錄的 `not_applicable` 訂閱（提議；取代先前「建構時失敗」）
-- 做法：`reason` 與 `note` 的查找順序是**先查固定表（表內用專屬 note）；查不到才用通用 note**。不在固定表的 `not_applicable` subscription 以 `reason: unavailable` 與固定的通用說明（「這個訂閱的額度來源未登記在 Gateway 的說明表，Gateway 取不到。」）降級，並記一條 warning；**每個 subscription id 只記一次**（模組層的已記集合）。原因：`usage_for` 在每次 list／resolve／`GET /v1/usage` 都會呼叫，不限次數會刷屏。固定表的鍵是 **subscription id**（政策檔的名稱），不是 provider。
+- 做法：`reason` 與 `note` 的查找順序是**先查固定表（表內用專屬 note）；查不到才用通用 note**。不在固定表的 `not_applicable` subscription 以 `reason: unavailable` 與固定的通用說明（「這個訂閱的額度來源未登記在 Gateway 的說明表，Gateway 取不到。」）降級，並記一條 warning；**每個 subscription id 只記一次**（`UsageService` 實例上的已記集合）。原因：`usage_for` 在每次 list／resolve／`GET /v1/usage` 都會呼叫，不限次數會刷屏。固定表的鍵是 **subscription id**（政策檔的名稱），不是 provider。
 - 不做建構時檢查，因此 `UsageService` 不需要新參數。
 - 空的 `UsageService`（測試或未注入）：所有 subscription 仍是 `not_applicable`，依上面的順序查找。表內 id（例如 `opencode-zen`）得專屬 note；表外 id（例如 `groq`）得通用 note。`tests/test_usage.py` L148–151 的字典相等會因此改寫（見 §3）。
 - 被放棄的 (a)：建構時檢查、缺項即失敗。`UsageService.__init__` 只收 `fetchers`、`settings`、`key_of`、`deployed`（`lgwd/usage.py:204–205`），不認得政策檔的 subscription 清單，要新增參數；而 `RegistryService` 沒注入時用空的 `UsageService`（`lgwd/registry.py:122–124`），測試與多數 test_registry／test_http 依賴這條。若要求建構時全部歸類，測試中空的 `UsageService` 會讓 `openrouter`、`claude-personal` 也失敗。「載入失敗」還會讓 lgwd 起不來，違反「用量是附加資訊，壞了不能拖累 list／resolve」（`usage-reporting` Purpose）。

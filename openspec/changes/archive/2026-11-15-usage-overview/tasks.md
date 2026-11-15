@@ -13,7 +13,7 @@
 ## 1. PR1：usage 九鍵、reason 細分、note（依存 0.3，已完成）
 
 - [ ] 1.1 `lgwd/usage.py`：`_not_applicable(subscription)` 依固定表回 `reason`（`no_quota_api` 或 `unavailable`）與 `note`；`_unknown()` 與 `build_usage()` 補 `note: null`；`reason` 碼表加兩個新碼。
-- [ ] 1.2 `lgwd/usage.py`：固定表（subscription id → reason、note）。未收錄的 `not_applicable` subscription 依 design D9 降級為 `reason: unavailable`＋固定通用 note＋一條 warning log（**每個 subscription id 只記一次**，模組層已記集合），**不啟動失敗**；`UsageService` 不新增參數，不做建構時檢查。`reason`／`note` 的查找順序：先查固定表（表內用專屬 note），查不到才用通用 note。
+- [ ] 1.2 `lgwd/usage.py`：固定表（subscription id → reason、note）。未收錄的 `not_applicable` subscription 依 design D9 降級為 `reason: unavailable`＋固定通用 note＋一條 warning log（**每個 subscription id 只記一次**，實例上的已記集合），**不啟動失敗**；`UsageService` 不新增參數，不做建構時檢查。`reason`／`note` 的查找順序：先查固定表（表內用專屬 note），查不到才用通用 note。
 - [ ] 1.3 `lgwd/registry.py`：`meta.usage` 與 list 的 `usage` 共用同一個組裝函式，確保 resolve 也帶 `note`。
 - [ ] 1.4 更新會壞的測試（清單來自 `grep -n "SHAPE\|not_applicable\|\"reason\": None"`，不是猜的）：
   - `tests/test_usage.py`：L24 `SHAPE` 與使用它的 L46、L264、L388–400、L574 改為九鍵；L148–152（整個 `usage` 字典相等，`reason: None`）改為 `reason: unavailable`＋通用 note。
@@ -68,5 +68,5 @@
 - 每週快照：由 MyPMO#386 呼叫後自己存，Gateway 不存（不新增儲存）。
 - 未決 2（opencode-zen 是否 `no_quota_api`）：需要實證或官方文件明載，實證後另開單，改固定表與 C-2。
 - 未決 3（`/v1/usage` 認證）、未決 4（`available_again_at` 放進一覽）：依 design §5，另議。
-- [ ] 4.1 **PR3 合併後** archive（負責人：PM）：`openspec archive usage-overview`，再手動改兩份 Purpose（`openspec/specs/role-allocation/spec.md`、`openspec/specs/usage-reporting/spec.md`，文字見 design §3.2；OpenSpec 的 delta 不能改 Purpose），最後跑 `openspec validate --specs --strict`。**archive 必須在 PR1＋PR3 之後**：主 spec `role-allocation` 會要求 lgwctl 對 `unavailable` 顯示「無法取得」，提前 archive 則主 spec 與程式不符。
+- [x] 4.1 **PR3 合併後** archive（負責人：PM）：`openspec archive usage-overview`，再手動改兩份 Purpose（`openspec/specs/role-allocation/spec.md`、`openspec/specs/usage-reporting/spec.md`，文字見 design §3.2；OpenSpec 的 delta 不能改 Purpose），最後跑 `openspec validate --specs --strict`。**archive 必須在 PR1＋PR3 之後**：主 spec `role-allocation` 會要求 lgwctl 對 `unavailable` 顯示「無法取得」，提前 archive 則主 spec 與程式不符。
 - [ ] 4.2 PM 在 MyPMO#386 留言提醒：not_applicable 的 `reason` 現為固定碼，不可視為異常（不要用 `reason != null` 判斷告警；見 design §3.1）。負責人：PM。
