@@ -21,7 +21,8 @@ from lgwd.usage import (
     failure,
 )
 
-SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly", "pipes"}
+# 九鍵（spec usage-reporting「usage 物件的形狀」；note 是第九個鍵）
+SHAPE = {"status", "source", "fetched_at", "stale", "reason", "note", "session", "weekly", "pipes"}
 
 
 def make(fetcher=None, *, settings=None, deployed=True, sub="sub"):
@@ -41,7 +42,7 @@ class BuildUsageTest(unittest.TestCase):
         e.fetched_at, e.windows, e.last_reason = fetched, wins or windows(), reason
         return e
 
-    def test_八個鍵恆在_ok(self):
+    def test_九個鍵恆在_ok(self):
         u = build_usage("s", self.entry(), at(seconds=10), 120)
         self.assertEqual(set(u), SHAPE)
         self.assertEqual(u["status"], "ok")
@@ -54,7 +55,8 @@ class BuildUsageTest(unittest.TestCase):
     def test_沒取過_not_fetched_yet(self):
         u = build_usage("s", None, BASE, 120)
         self.assertEqual(u, {"status": "unknown", "source": "s", "fetched_at": None, "stale": None,
-                             "reason": "not_fetched_yet", "session": None, "weekly": None, "pipes": []})
+                             "reason": "not_fetched_yet", "note": None,
+                             "session": None, "weekly": None, "pipes": []})
 
     def test_從沒成功過_reason帶最近失敗碼(self):
         e = usage_mod._Entry()
@@ -146,10 +148,12 @@ class AvailableAgainAtTest(unittest.TestCase):
 
 class TriggerTest(unittest.TestCase):
     def test_沒有fetcher是not_applicable(self):
+        # C-2a：空的 UsageService 下，表外 id（openrouter 在此沒有 fetcher）得通用 note、reason unavailable
         service = UsageService(FakeClock(BASE))
         self.assertEqual(service.usage_for("openrouter"),
                          {"status": "not_applicable", "source": None, "fetched_at": None,
-                          "stale": None, "reason": None, "session": None, "weekly": None, "pipes": []})
+                          "stale": None, "reason": "unavailable", "note": usage_mod.GENERIC_NOTE,
+                          "session": None, "weekly": None, "pipes": []})
 
     def test_卡住時不等_回not_fetched_yet_並只觸發一次(self):
         service, fetcher, _, _ = make()
@@ -382,9 +386,9 @@ class PipesContractTest(unittest.TestCase):
         e.fetched_at, e.windows, e.last_reason = fetched, wins or windows(), reason
         return e
 
-    def test_C1_形狀恆為八鍵且pipes為陣列(self):
-        # 任何 usage（含 not_applicable、unknown）鍵集恰為八鍵，pipes 為陣列（無管子＝[]）
-        na = usage_mod._not_applicable()
+    def test_C1_形狀恆為九鍵且pipes為陣列(self):
+        # 任何 usage（含 not_applicable、unknown）鍵集恰為九鍵，pipes 為陣列（無管子＝[]）
+        na = usage_mod._not_applicable("opencode-zen")
         self.assertEqual(set(na), SHAPE)
         self.assertEqual(na["pipes"], [])
 
@@ -639,6 +643,122 @@ class PipesContractTest(unittest.TestCase):
         self.assertNotIn("4938.2712", dump)
         self.assertNotIn("free_model_daily_requests", dump)
         self.assertNotIn("limit_remaining", dump)
+
+
+# 出廠四個 not_applicable 訂閱（design D5）
+FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity", "chatgpt-personal")
+FORBIDDEN_FOR_OK_UNKNOWN = {"no_quota_api", "unavailable"}
+
+
+def _entry_ok():
+    e = usage_mod._Entry()
+    e.fetched_at, e.windows, e.last_reason = BASE, windows(), None
+    return e
+
+
+class NoteContractTest(unittest.TestCase):
+    """#204 PR1：usage 九鍵、reason 細分、note（契約 C-1～C-4a；spec usage-reporting；design D3–D5、D9）。"""
+
+    def test_C1_九鍵恰為note新增_各建構路徑都在(self):
+        self.assertEqual(len(SHAPE), 9)
+        na = usage_mod._not_applicable("opencode-zen")
+        unk = usage_mod._unknown("s", "upstream_error")
+        internal = usage_mod.internal_usage("s")
+        not_fetched = build_usage("s", None, BASE, 120)
+        ok = build_usage("s", _entry_ok(), at(seconds=10), 120)
+        for u in (na, unk, internal, not_fetched, ok):
+            self.assertEqual(set(u), SHAPE)
+        for u in (unk, internal, not_fetched, ok):
+            self.assertIsNone(u["note"])
+
+    def test_C2_出廠四個not_applicable_為unavailable_且有專屬note(self):
+        service = UsageService(FakeClock(BASE))   # 沒有 fetcher：全部 not_applicable
+        for sid in FACTORY_NOT_APPLICABLE:
+            with self.subTest(sid):
+                u = service.usage_for(sid)
+                self.assertEqual(u["status"], "not_applicable")
+                self.assertEqual(u["reason"], "unavailable")
+                self.assertIsInstance(u["note"], str)
+                self.assertTrue(u["note"])
+                self.assertNotEqual(u["note"], usage_mod.GENERIC_NOTE)   # 表內用專屬 note
+                self.assertIsNone(u["source"])
+                self.assertIsNone(u["session"])
+                self.assertIsNone(u["weekly"])
+                self.assertEqual(u["pipes"], [])
+
+    def test_C2a_表外not_applicable不啟動失敗_通用note_每id只記一次(self):
+        service = UsageService(FakeClock(BASE))
+        with self.assertLogs("lgwd.usage", level="WARNING") as logs:
+            results = [service.usage_for("fake-unlisted") for _ in range(10)]
+        self.assertEqual(len(logs.records), 1)                       # 十次只記一條
+        for u in results:
+            self.assertEqual((u["status"], u["reason"], u["note"]),
+                             ("not_applicable", "unavailable", usage_mod.GENERIC_NOTE))
+
+    def test_C2a_記錄集合在實例上_不是模組全域(self):
+        first, second = UsageService(FakeClock(BASE)), UsageService(FakeClock(BASE))
+        with self.assertLogs("lgwd.usage", level="WARNING") as logs:
+            first.usage_for("fake-unlisted")
+            second.usage_for("fake-unlisted")
+        self.assertEqual(len(logs.records), 2)                       # 每個實例各記一次
+
+    def test_C2a_空的UsageService_表內id用專屬note_表外id用通用note(self):
+        service = UsageService(FakeClock(BASE))
+        with self.assertLogs("lgwd.usage", level="WARNING"):
+            self.assertEqual(service.usage_for("opencode-zen")["note"],
+                             usage_mod.NOT_APPLICABLE_TABLE["opencode-zen"][1])
+            self.assertEqual(service.usage_for("groq")["note"], usage_mod.GENERIC_NOTE)
+
+    def test_C3_note只在reason為no_quota_api或unavailable時非null(self):
+        samples = [usage_mod._unknown("s", reason) for reason in (
+            "not_fetched_yet", "disabled", "no_key", "upstream_error", "rate_limited",
+            "timeout", "parse_error", "no_windows", "stale_expired", "internal")]
+        samples.append(build_usage("s", None, BASE, 120))
+        samples.append(build_usage("s", _entry_ok(), at(seconds=10), 120))
+        for u in samples:
+            self.assertIsNone(u["note"], u["reason"])
+        for sid in FACTORY_NOT_APPLICABLE:
+            u = usage_mod._not_applicable(sid)
+            self.assertIn(u["reason"], ("no_quota_api", "unavailable"))
+            self.assertIsNotNone(u["note"])
+            self.assertNotIn("canary", u["note"])
+
+    def test_C4_ok與unknown_的reason絕不是no_quota_api或unavailable(self):
+        samples = []
+        service, _, _, _ = make(settings={"sub": UsageSetting(enabled=False)})
+        samples.append(service.usage_for("sub"))                      # disabled
+        service, _, _, _ = make(deployed=False)
+        samples.append(service.usage_for("sub"))                      # no_key
+        service, _, _, _ = make()
+        samples.append(service.usage_for("sub"))                      # not_fetched_yet
+        service.wait_idle()
+        samples.append(service.usage_for("sub"))                      # ok
+        service, fetcher, _, _ = make()
+        fetcher.outcome = failure(usage_mod.UPSTREAM_ERROR)
+        service.usage_for("sub")
+        service.wait_idle()
+        samples.append(service.usage_for("sub"))                      # unknown／upstream_error
+        for u in samples:
+            self.assertIn(u["status"], ("ok", "unknown"))
+            self.assertNotIn(u["reason"], FORBIDDEN_FOR_OK_UNKNOWN)
+
+    def test_C4a_claude_personal的disabled_not_fetched_yet_upstream_error_逐值不變_note為null(self):
+        service, _, _, _ = make(settings={"sub": UsageSetting(enabled=False)})
+        self.assertEqual(service.usage_for("sub"),
+                         {"status": "unknown", "source": "fake-source", "fetched_at": None,
+                          "stale": None, "reason": "disabled", "note": None,
+                          "session": None, "weekly": None, "pipes": []})
+        service, fetcher, _, _ = make()
+        fetcher.outcome = failure(usage_mod.UPSTREAM_ERROR)           # 先設好，避免與背景執行緒競態
+        self.assertEqual(service.usage_for("sub"),                    # 第一次：not_fetched_yet
+                         {"status": "unknown", "source": "fake-source", "fetched_at": None,
+                          "stale": None, "reason": "not_fetched_yet", "note": None,
+                          "session": None, "weekly": None, "pipes": []})
+        service.wait_idle()                                           # 失敗寫入 last_reason，進退避
+        got = service.usage_for("sub")
+        self.assertEqual(got, {"status": "unknown", "source": "fake-source", "fetched_at": None,
+                               "stale": None, "reason": "upstream_error", "note": None,
+                               "session": None, "weekly": None, "pipes": []})
 
 
 if __name__ == "__main__":

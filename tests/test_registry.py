@@ -21,6 +21,7 @@ from lgwd.keys import KEY_NAMES, KeyStore
 from lgwd.policy import UsageSetting, load_policy
 from lgwd.providers import AnthropicProvider, GoogleProvider, UsageDeps, provider_for
 from lgwd.registry import RegistryService
+from lgwd import usage as lgwd_usage
 from lgwd.usage import FetchResult, UsageService, failure
 from lgwd.usage_ollama import OllamaUsageFetcher
 from lgwd.usage_openrouter import OpenRouterUsageFetcher
@@ -2409,7 +2410,8 @@ CREATE TABLE IF NOT EXISTS audit (
                          ["cooldown", "cooldown", "cooldown"])
         self.assertEqual(legacy_audit[1][5], "2026-10-11T15:00:00Z")
 
-SHAPE = {"status", "source", "fetched_at", "stale", "reason", "session", "weekly", "pipes"}
+# 九鍵（spec usage-reporting「usage 物件的形狀」；note 是第九個鍵）
+SHAPE = {"status", "source", "fetched_at", "stale", "reason", "note", "session", "weekly", "pipes"}
 
 
 class UsageRegistryCase(RegistryCase):
@@ -2449,9 +2451,13 @@ class ListUsageTest(UsageRegistryCase):
             with self.subTest(item["id"]):
                 self.assertEqual(set(item["usage"]), SHAPE)
                 self.assertIn("available_again_at", item)
-        self.assertEqual(self.item("opencode-zen")["usage"],
+        zen = self.item("opencode-zen")["usage"]
+        self.assertEqual({k: v for k, v in zen.items() if k != "note"},
                          {"status": "not_applicable", "source": None, "fetched_at": None,
-                          "stale": None, "reason": None, "session": None, "weekly": None, "pipes": []})
+                          "stale": None, "reason": "unavailable", "session": None,
+                          "weekly": None, "pipes": []})
+        self.assertIsInstance(zen["note"], str)
+        self.assertTrue(zen["note"])
         self.settle()
         self.assertEqual(self.item("openrouter")["usage"]["status"], "ok")
         self.assertEqual(self.item("opencode-go")["usage"]["status"], "not_applicable")
@@ -2612,7 +2618,7 @@ class ResolveUsageTest(UsageRegistryCase):
         meta = self.resolve("opencode", "opencode-zen")["meta"]
         self.assertEqual(meta["usage"]["status"], "not_applicable")
 
-    def test_整合層_驗八鍵集與available_again_at不變(self):
+    def test_整合層_驗九鍵集與available_again_at不變(self):
         # 整合層（list／resolve）驗鍵集與 available_again_at 不變
         self.settle()
         item = self.item("openrouter")
@@ -2903,6 +2909,284 @@ class ExternalHostsTest(unittest.TestCase):
 
         hosts = {urlsplit(u).hostname for u in requests}
         self.assertEqual(hosts, {"ollama.com", "openrouter.ai"})
+
+
+
+# --- #204 PR1：usage 九鍵、reason 細分、note（契約 C-2～C-4c；spec usage-reporting；design D5、D9）---
+
+NOT_APPLICABLE_REASONS = ("no_quota_api", "unavailable")
+FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity", "chatgpt-personal")
+
+# C-4c 的快照：PR1 前（現行 main 的 usage 組裝）以 list 與 resolve 的非 usage 欄位輸出，手抄成常數。
+# 設定：空的 UsageService（沒注入取用量實作）、claude-personal 冷卻至 2026-10-11T00:30:00Z、FakeClock 預設時間。
+# 只放非 usage 欄位（list 去掉 usage；resolve 的 meta 去掉 usage）；usage 另由 C-2、C-4a 等測試驗證。
+_PRE_PR1_SNAPSHOT = {'list': [{'agents': ['opencode'],
+           'available': True,
+           'available_again_at': None,
+           'cooldown': None,
+           'endpoint': 'https://opencode.ai/zen/v1',
+           'id': 'opencode-zen',
+           'kind': 'api-key',
+           'model_cooldowns': {},
+           'models': {'allow': ['*-free', 'big-pickle'], 'default': 'mimo-v2.6-flash-free'},
+           'priority': 10,
+           'provider': 'opencode-zen',
+           'schema': 1},
+          {'agents': ['opencode'],
+           'available': True,
+           'available_again_at': None,
+           'cooldown': None,
+           'endpoint': 'https://opencode.ai/inference/go/openai/v1',
+           'id': 'opencode-go',
+           'kind': 'api-key',
+           'model_cooldowns': {},
+           'models': {'allow': ['beam-free', 'big-pickle'], 'default': 'beam-free'},
+           'priority': 15,
+           'provider': 'opencode-go',
+           'schema': 1},
+          {'agents': ['opencode'],
+           'available': True,
+           'available_again_at': None,
+           'cooldown': None,
+           'endpoint': 'https://openrouter.ai/api',
+           'id': 'openrouter',
+           'kind': 'api-key',
+           'model_cooldowns': {},
+           'models': {'allow': ['*:free', 'openrouter/free'], 'default': 'openrouter/free'},
+           'priority': 20,
+           'provider': 'openrouter',
+           'schema': 1},
+          {'agents': ['claude-code', 'opencode'],
+           'available': True,
+           'available_again_at': None,
+           'cooldown': None,
+           'endpoint': 'https://ollama.com',
+           'id': 'ollama-cloud',
+           'kind': 'api-key',
+           'model_cooldowns': {},
+           'models': {'allow': ['*'], 'default': 'deepseek-v4.1-flash'},
+           'priority': 30,
+           'provider': 'ollama-cloud',
+           'schema': 1},
+          {'agents': ['agy'],
+           'available': True,
+           'available_again_at': None,
+           'cooldown': None,
+           'endpoint': None,
+           'id': 'antigravity',
+           'kind': 'local-login',
+           'model_cooldowns': {},
+           'models': {'allow': ['gemini-3.8-flash-low',
+                                'gemini-3.8-flash-medium',
+                                'gemini-3.8-flash-high',
+                                'gemini-4-argon-low',
+                                'gemini-4-argon-medium',
+                                'gemini-4-argon-high',
+                                'gemini-4-hydrogen-low',
+                                'gemini-4-hydrogen-medium',
+                                'gemini-4-hydrogen-high',
+                                'gemini-4-hydrogen-xhigh',
+                                'claude-opus-5-5-low',
+                                'claude-opus-5-5-medium',
+                                'claude-opus-5-5-high',
+                                'claude-sonnet-5-5-low',
+                                'claude-sonnet-5-5-medium',
+                                'claude-sonnet-5-5-high'],
+                      'default': 'gemini-3.8-flash-low'},
+           'priority': 35,
+           'provider': 'google',
+           'schema': 1},
+          {'agents': ['codex'],
+           'available': True,
+           'available_again_at': None,
+           'cooldown': None,
+           'endpoint': None,
+           'id': 'chatgpt-personal',
+           'kind': 'local-login',
+           'model_cooldowns': {},
+           'models': {'allow': ['gpt-6.1-sol',
+                                'gpt-6.1-terra',
+                                'gpt-6-astra',
+                                'gpt-6-luna',
+                                'gpt-6-sol',
+                                'gpt-5.5',
+                                'gpt-5.6-luna'],
+                      'default': 'gpt-6.1-sol'},
+           'priority': 38,
+           'provider': 'openai',
+           'schema': 1},
+          {'agents': ['claude-code'],
+           'available': False,
+           'available_again_at': '2026-10-11T00:30:00Z',
+           'cooldown': {'until': '2026-10-11T00:30:00Z'},
+           'endpoint': None,
+           'id': 'claude-personal',
+           'kind': 'claude-subscription',
+           'model_cooldowns': {},
+           'models': {'allow': ['*'], 'default': 'claude-sonnet-5-5'},
+           'priority': 40,
+           'provider': 'anthropic',
+           'schema': 1}],
+ 'resolve': {'claude': {'env': {'ANTHROPIC_MODEL': 'claude-sonnet-5-5',
+                                'ANTHROPIC_SMALL_FAST_MODEL': 'claude-sonnet-5-5',
+                                'CLAUDE_CODE_OAUTH_TOKEN': 'canary-registry-personal-0001'},
+                        'env_schema': 1,
+                        'meta': {'agent': 'claude-code',
+                                 'cooldown': {'until': '2026-10-11T00:30:00Z'},
+                                 'data': None,
+                                 'endpoint': None,
+                                 'kind': 'claude-subscription',
+                                 'model': 'claude-sonnet-5-5',
+                                 'model_cooldowns': {},
+                                 'models': {'allow': ['*'], 'default': 'claude-sonnet-5-5'},
+                                 'priority': 40,
+                                 'provider': 'anthropic',
+                                 'subscription': 'claude-personal'},
+                        'schema': 1},
+             'ollama': {'env': {'OPENCODE_API_KEY': 'canary-registry-ollama-0005',
+                                'OPENCODE_MODEL': 'deepseek-v4.1-flash',
+                                'OPENCODE_PROVIDER_ID': 'ollama-cloud',
+                                'OPENCODE_SMALL_MODEL': 'deepseek-v4.1-flash'},
+                        'env_schema': 1,
+                        'meta': {'agent': 'opencode',
+                                 'cooldown': None,
+                                 'data': None,
+                                 'endpoint': 'https://ollama.com',
+                                 'kind': 'api-key',
+                                 'model': 'deepseek-v4.1-flash',
+                                 'model_cooldowns': {},
+                                 'models': {'allow': ['*'], 'default': 'deepseek-v4.1-flash'},
+                                 'priority': 30,
+                                 'provider': 'ollama-cloud',
+                                 'subscription': 'ollama-cloud'},
+                        'schema': 1},
+             'openrouter': {'env': {'OPENCODE_API_KEY': 'canary-registry-openrouter-0003',
+                                    'OPENCODE_MODEL': 'openrouter/free',
+                                    'OPENCODE_PROVIDER_ID': 'openrouter',
+                                    'OPENCODE_SMALL_MODEL': 'openrouter/free'},
+                            'env_schema': 1,
+                            'meta': {'agent': 'opencode',
+                                     'cooldown': None,
+                                     'data': None,
+                                     'endpoint': 'https://openrouter.ai/api',
+                                     'kind': 'api-key',
+                                     'model': 'openrouter/free',
+                                     'model_cooldowns': {},
+                                     'models': {'allow': ['*:free', 'openrouter/free'],
+                                                'default': 'openrouter/free'},
+                                     'priority': 20,
+                                     'provider': 'openrouter',
+                                     'subscription': 'openrouter'},
+                            'schema': 1},
+             'zen': {'env': {'OPENCODE_API_KEY': 'canary-registry-zen-0004',
+                             'OPENCODE_MODEL': 'mimo-v2.6-flash-free',
+                             'OPENCODE_PROVIDER_ID': 'opencode',
+                             'OPENCODE_SMALL_MODEL': 'mimo-v2.6-flash-free'},
+                     'env_schema': 1,
+                     'meta': {'agent': 'opencode',
+                              'cooldown': None,
+                              'data': None,
+                              'endpoint': 'https://opencode.ai/zen/v1',
+                              'kind': 'api-key',
+                              'model': 'mimo-v2.6-flash-free',
+                              'model_cooldowns': {},
+                              'models': {'allow': ['*-free', 'big-pickle'],
+                                         'default': 'mimo-v2.6-flash-free'},
+                              'priority': 10,
+                              'provider': 'opencode-zen',
+                              'subscription': 'opencode-zen'},
+                     'schema': 1}}}
+
+
+class NoteListResolveContractTest(UsageRegistryCase):
+    """#204 PR1：list 與 resolve 的 usage（note、reason 細分）契約（C-2、C-3、C-4b、canary）。"""
+
+    def test_C2_出廠四個not_applicable的list與resolve都是unavailable且有專屬note(self):
+        self.settle()
+        for sid in FACTORY_NOT_APPLICABLE:
+            with self.subTest(sid):
+                usage = self.item(sid)["usage"]
+                self.assertEqual(usage["status"], "not_applicable")
+                self.assertEqual(usage["reason"], "unavailable")
+                self.assertEqual(usage["note"], lgwd_usage.NOT_APPLICABLE_TABLE[sid][1])
+                self.assertEqual(usage["pipes"], [])
+        meta = self.resolve("codex", "openai")["meta"]
+        self.assertEqual(meta["usage"]["reason"], "unavailable")
+        self.assertEqual(meta["usage"]["note"], lgwd_usage.NOT_APPLICABLE_TABLE["chatgpt-personal"][1])
+
+    def _fetch_then_settle(self, outcome=None):
+        """先把 ollama／openrouter 的取用量結果設成 outcome（None＝維持現況），過期後 list 觸發一次，並等它寫入快取。"""
+        if outcome is not None:
+            self.ollama.outcome = self.openrouter.outcome = outcome
+            self.clock.advance(hours=1)
+        self.list_items()
+        self.settle()
+
+    def test_C3_全部出廠訂閱掃描_note只在拿不到時非null_且不含canary(self):
+        for outcome in (None, failure(lgwd_usage.UPSTREAM_ERROR)):
+            self._fetch_then_settle(outcome)
+            for item in self.list_items():
+                usage = item["usage"]
+                with self.subTest(item["id"], outcome=outcome):
+                    self.assertEqual(usage["reason"] in NOT_APPLICABLE_REASONS, usage["note"] is not None)
+                    self.assertFalse(usage["status"] == "not_applicable" and usage["reason"] is None)
+                    if usage["note"] is not None:
+                        self.assertEqual(usage["status"], "not_applicable")
+                        self.assertNotIn("canary", usage["note"])
+
+    def test_C4b_resolve的meta_usage與list同一把逐值相等(self):
+        for outcome in (None, failure(lgwd_usage.UPSTREAM_ERROR)):
+            self._fetch_then_settle(outcome)
+            for agent, provider, sub in (("opencode", "opencode-zen", "opencode-zen"),
+                                         ("opencode", "ollama-cloud", "ollama-cloud"),
+                                         ("opencode", "openrouter", "openrouter"),
+                                         ("claude-code", "anthropic", "claude-personal"),
+                                         ("codex", "openai", "chatgpt-personal")):
+                with self.subTest(sub, outcome=outcome):
+                    meta_usage = self.resolve(agent, provider)["meta"]["usage"]
+                    self.assertEqual(meta_usage, self.item(sub)["usage"])
+                    self.assertEqual(set(meta_usage), SHAPE)
+            if outcome is not None:
+                self.assertEqual(self.item("ollama-cloud")["usage"]["reason"], "upstream_error")
+                self.assertEqual(self.item("openrouter")["usage"]["reason"], "upstream_error")
+
+    def test_canary不進note與其他欄位_上游失敗不回顯(self):
+        self.ollama.outcome = RuntimeError("canary-secret upstream body")
+        self.openrouter.outcome = failure(lgwd_usage.UPSTREAM_ERROR)
+        self._fetch_then_settle()   # 先觸發、等失敗結果寫入快取；之後的 payload 與 resolve 才是失敗態
+        payload = self.service.list_subscriptions()
+        resolved = self.resolve("opencode", "openrouter")
+        usage_by_id = {item["id"]: item["usage"] for item in payload["subscriptions"]}
+        self.assertEqual(usage_by_id["ollama-cloud"]["reason"], "internal")
+        self.assertEqual(usage_by_id["openrouter"]["reason"], "upstream_error")
+        self.assertEqual(resolved["meta"]["usage"]["reason"], "upstream_error")
+        # resolve 的 env 本來就帶 key（給 agent 用），不在掃描範圍；掃的是 list 與 resolve 的 usage
+        dump = json.dumps([payload, resolved["meta"]["usage"]], ensure_ascii=False)
+        self.assertNotIn("canary-secret", dump)
+        for value in CANARY.values():
+            self.assertNotIn(value, dump)
+        self.assertIsNone(usage_by_id["openrouter"]["note"])
+        self.assertIsNone(resolved["meta"]["usage"]["note"])
+
+
+
+
+class SnapshotC4cTest(RegistryCase):
+    """C-4c：空的 UsageService（同 PR1 前快照的設定），list 與 resolve 的非 usage 欄位逐值不變。"""
+
+    def test_C4c_list與resolve非usage欄位逐值不變(self):
+        self.cooldown("claude-personal", "2026-10-11T00:30:00Z")
+        listed = [{k: v for k, v in item.items() if k != "usage"} for item in self.list_items()]
+        self.assertEqual(listed, _PRE_PR1_SNAPSHOT["list"])
+        resolved = {}
+        for label, (agent, provider) in {"zen": ("opencode", "opencode-zen"),
+                                         "ollama": ("opencode", "ollama-cloud"),
+                                         "openrouter": ("opencode", "openrouter"),
+                                         "claude": ("claude-code", "anthropic")}.items():
+            payload = self.resolve(agent, provider)
+            meta = {k: v for k, v in payload["meta"].items() if k != "usage"}
+            resolved[label] = dict(payload, meta=meta)
+        self.assertEqual(resolved, _PRE_PR1_SNAPSHOT["resolve"])
 
 
 if __name__ == "__main__":
