@@ -327,3 +327,43 @@ class OpenRouterProviderHookTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+BIG = "1" + "0" * 400      # 超過 float 範圍的整數：float() 會丟 OverflowError
+
+
+class OverflowIntegerTest(unittest.TestCase):
+    """超大整數（float() 會 OverflowError）視為該欄位無效；合法金額與窗口照常。"""
+
+    def test_credits超大整數只丟棄credits_金額與session保留(self):
+        cases = [
+            f'"limit": {BIG}, "limit_remaining": 1',
+            f'"limit": 100, "limit_remaining": {BIG}',
+            f'"limit": {BIG}, "limit_remaining": {BIG}',
+            f'"limit": 1, "limit_remaining": -{BIG}',
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra[:40]):
+                body = (
+                    '{"data": {' + FMDR_OK + ', "usage_weekly": 1.25, ' + extra + "}}"
+                ).encode()
+                got = fetch_raw(body)
+                self.assertTrue(got.ok)
+                self.assertEqual(got.weekly_usd, (1.25, NOW))
+                self.assertEqual(got.windows["session"][0], 80.0)
+                self.assertNotIn("credits", got.windows)
+
+    def test_fmdr超大整數視為無效_金額保留(self):
+        cases = [
+            f'{{"used": 10, "limit": {BIG}, "remaining": 1}}',
+            f'{{"used": 10, "limit": 50, "remaining": {BIG}}}',
+            f'{{"used": 10, "limit": {BIG}, "remaining": {BIG}}}',
+        ]
+        for fmdr in cases:
+            with self.subTest(fmdr=fmdr[:40]):
+                body = ('{"data": {"free_model_daily_requests": ' + fmdr
+                        + ', "usage_weekly": 1.25}}').encode()
+                got = fetch_raw(body)
+                self.assertFalse(got.ok)
+                self.assertEqual(got.reason, "parse_error")
+                self.assertEqual(got.weekly_usd, (1.25, NOW))

@@ -75,22 +75,25 @@ def _next_utc_midnight(now: datetime | None = None) -> datetime:
     return datetime.combine(nxt, time.min, tzinfo=timezone.utc)
 
 
+def _finite(value) -> bool:
+    """數字能轉成有限 float 才算有效。json.loads 的 NaN／Infinity／1e400 是非有限 float；
+    超過 float 範圍的整數 float() 會丟 OverflowError。兩者都視為該欄位無效，不向外拋。"""
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def _weekly_usd(payload: dict) -> float | None:
     """data.usage_weekly：有限、非負的 JSON 數字（D2）；其他一律 None，不回顯上游值。
 
-    json.loads 會把 NaN／Infinity 字面值解析成非有限 float，1e400 解析成 inf，
-    所以逐值用 math.isfinite 擋；不靠 parse_constant（它拋錯會連窗口一起判壞）。
-    bool 是 int 子類，先排除。超大整數 float() 會丟 OverflowError，當無效。
-    驗證只用 float() 的結果；通過後回傳原始數值（整數維持 int，不因轉 float 失真）。
+    不靠 parse_constant（它拋錯會連窗口一起判壞）。bool 是 int 子類，先排除。
+    通過後回傳原始數值（整數維持 int，不因轉 float 失真）。
     """
     value = payload.get("usage_weekly")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        number = float(value)
-    except OverflowError:
-        return None
-    if not math.isfinite(number) or number < 0:
+    if not _finite(value) or value < 0:
         return None
     return value
 
@@ -125,6 +128,8 @@ def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
             return failure(PARSE_ERROR, weekly_usd=weekly_usd)
         if not isinstance(limit, (int, float)) or not isinstance(remaining, (int, float)):
             return failure(PARSE_ERROR, weekly_usd=weekly_usd)
+        if not _finite(limit) or not _finite(remaining):   # 超大整數或非有限：該欄位無效
+            return failure(PARSE_ERROR, weekly_usd=weekly_usd)
         if limit <= 0:
             return failure(PARSE_ERROR, weekly_usd=weekly_usd)
         percent = remaining / limit * 100
@@ -135,7 +140,7 @@ def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
 
     # credits 解析（C-5, C-11, C-12；design §5）：
     # 僅當 limit 為正數且 limit_remaining 在 0～limit 範圍時才產生 credits 管子；
-    # 任何異常值（負數、大於 limit、型別不對、bool、limit <= 0）只丟棄 credits，不引發 parse_error 或 failure。
+    # 任何異常值（負數、大於 limit、型別不對、bool、limit <= 0、超大整數）只丟棄 credits，不引發 parse_error 或 failure。
     # resets_at 恆為 None。
     c_limit = payload.get("limit")
     c_rem = payload.get("limit_remaining")
@@ -144,8 +149,8 @@ def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
         and not isinstance(c_rem, bool)
         and isinstance(c_limit, (int, float))
         and isinstance(c_rem, (int, float))
-        and math.isfinite(c_limit)
-        and math.isfinite(c_rem)
+        and _finite(c_limit)
+        and _finite(c_rem)
         and c_limit > 0
         and 0 <= c_rem <= c_limit
     ):

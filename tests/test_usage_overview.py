@@ -598,6 +598,22 @@ class WeeklyUsdBoundaryTest(WeeklyUsdHarness):
         self.assertIsNone(row["weekly_used_usd_fetched_at"])
 
 
+class WeeklyUsdOverflowTest(WeeklyUsdHarness):
+    def test_超大credits整數_合法金額與窗口照常一覽(self):
+        # 回歸：超過 float 範圍的 credits 整數不得讓合法 usage_weekly 與取得時刻一起消失
+        big = "1" + "0" * 400
+        body = ('{"data": {' + FMDR_OK + ', "usage_weekly": 1.25,'
+                ' "limit": %s, "limit_remaining": 1}}' % big).encode()
+        service = self.build(openrouter_http=ScriptedHttp(body))
+        row = self.row(self.settle(service), "openrouter")
+        self.assertEqual(row["weekly_used_usd"], 1.25)
+        self.assertEqual(row["weekly_used_usd_fetched_at"], "2026-10-25T03:00:00Z")
+        self.assertEqual(row["status"], "ok")
+        self.assertIsNotNone(row["session"])
+        listed = self.row(service.list_subscriptions(), "openrouter")
+        self.assertEqual([pipe["id"] for pipe in listed["usage"]["pipes"]], ["free_daily"])
+
+
 class _LogCapture(logging.Handler):
     def __init__(self):
         super().__init__(logging.DEBUG)
