@@ -2,11 +2,12 @@
 
 資料只來自既有的兩個呼叫（不新增端點）：
 
-- ``list``：每筆帶 ``usage``（七鍵）與 ``cooldown``／``model_cooldowns``；
+- ``list``：每筆帶 ``usage``（九鍵）與 ``cooldown``／``model_cooldowns``；
 - ``roles(role, agent, data)``：候選依 ``rank``，另帶 ``cooldown``／``model_cooldowns``。
 
-兩邊依 ``id`` 合併排版。``usage.status`` 是 ``not_applicable``（沒有額度 API）時標
-「無額度 API」，**不顯示 100%**；``unknown`` 照實標出固定碼 ``reason``；冷卻旁列
+兩邊依 ``id`` 合併排版。``usage.status`` 是 ``not_applicable`` 時依 ``reason`` 分流：``no_quota_api`` 標
+「無額度 API」，``unavailable`` 標「無法取得」並附 ``note``，**都不顯示 100%**；
+``unknown`` 照實標出固定碼 ``reason``；冷卻旁列
 （整把與各模型分開）。沒給 ``--role`` 時只列 ``list`` 的用量表；給了就照 ``roles``
 的 ``rank`` 順序，只列該角色的候選。
 
@@ -36,7 +37,14 @@ def _usage_text(usage) -> str:
         return "未知"
     status = usage.get("status")
     if status == "not_applicable":
-        return "無額度 API"
+        # reason 分流（spec role-allocation）：絕不顯示百分比。
+        reason = usage.get("reason")
+        if reason == "no_quota_api":
+            return "無額度 API"
+        if reason == "unavailable":
+            note = usage.get("note")
+            return f"無法取得；{note}" if note else "無法取得"
+        return f"未知（{reason}）" if reason else "未知"
     if status == "ok":
         parts = []
         for name in WINDOWS:

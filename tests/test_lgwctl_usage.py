@@ -25,21 +25,30 @@ CANARY = "FakeUsageKey_DoNotUse_101"
 
 CLAUDE_USAGE = {
     "status": "ok", "source": "claude-statusline",
-    "fetched_at": "2026-10-12T02:00:00Z", "stale": False, "reason": None,
+    "fetched_at": "2026-10-12T02:00:00Z", "stale": False, "reason": None, "note": None,
     "session": {"remaining_percent": 76.5, "resets_at": "2026-10-25T07:00:00Z"},
     "weekly": {"remaining_percent": 39, "resets_at": "2026-10-28T00:00:00Z"},
 }
+# not_applicable 的 note 與 lgwd/usage.py 的固定表原文一致（PR1 出廠分類皆為 unavailable）。
+ZEN_NOTE = "額度與預算只在 opencode 的本機 server 端點與 Console 網頁，Gateway 取不到。"
+GO_NOTE = "週額度只在 opencode 的本機 server 端點（需 server 認證），Gateway 取不到。"
 ZEN_USAGE = {
     "status": "not_applicable", "source": None, "fetched_at": None,
-    "stale": None, "reason": None, "session": None, "weekly": None,
+    "stale": None, "reason": "unavailable", "note": ZEN_NOTE,
+    "session": None, "weekly": None,
+}
+GO_USAGE = {
+    "status": "not_applicable", "source": None, "fetched_at": None,
+    "stale": None, "reason": "unavailable", "note": GO_NOTE,
+    "session": None, "weekly": None,
 }
 OLLAMA_USAGE = {
     "status": "unknown", "source": "ollama-api-balance", "fetched_at": None,
-    "stale": None, "reason": "no_key", "session": None, "weekly": None,
+    "stale": None, "reason": "no_key", "note": None, "session": None, "weekly": None,
 }
 OPENROUTER_USAGE = {
     "status": "ok", "source": "openrouter-api-key",
-    "fetched_at": "2026-10-12T02:00:00Z", "stale": False, "reason": None,
+    "fetched_at": "2026-10-12T02:00:00Z", "stale": False, "reason": None, "note": None,
     "session": None,
     "weekly": {"remaining_percent": 10, "resets_at": "2026-10-19T00:00:00Z"},
 }
@@ -66,7 +75,7 @@ SUBSCRIPTIONS = [
         "kind": "api-key", "agents": ["opencode"], "priority": 30,
         "models": {"allow": ["beam-free"], "default": "beam-free"}, "endpoint": None,
         "cooldown": None, "model_cooldowns": {}, "available": True,
-        "available_again_at": None, "usage": ZEN_USAGE, "key": CANARY,
+        "available_again_at": None, "usage": GO_USAGE, "key": CANARY,
     },
     {
         "schema": 1, "id": "openrouter", "provider": "openrouter",
@@ -193,9 +202,10 @@ class UsageTests(unittest.TestCase):
         self.assertIn("weekly 39%（reset 2026-10-28T00:00:00Z）", out)
         self.assertIn("weekly 10%", out)          # 只有一個窗口時不補另一個
         self.assertIn("未知（no_key）", out)       # unknown 照實標，不猜數字
-        # not_applicable：標「無額度 API」，整行不帶百分比（不是 100%）
+        # not_applicable（reason=unavailable）：標「無法取得」並附 note，整行不帶百分比（不是 100%）
         zen = self.zen_line(out)
-        self.assertIn("無額度 API", zen)
+        self.assertIn(f"無法取得；{ZEN_NOTE}", zen)
+        self.assertNotIn("無額度 API", zen)
         self.assertNotIn("%", zen)
         self.assertNotIn("100%", out)
         # 冷卻旁列：整把與各模型分開
@@ -220,7 +230,8 @@ class UsageTests(unittest.TestCase):
         # 只列角色候選；claude-personal 不在 impl/opencode 的候選裡
         self.assertNotIn("claude-personal", out)
         # usage 仍是 list 的（roles 不帶 usage）
-        self.assertIn("無額度 API", out)
+        self.assertIn(f"無法取得；{ZEN_NOTE}", out)
+        self.assertNotIn("無額度 API", out)
         self.assertIn("未知（no_key）", out)
         self.assertIn("模型 m2-small 2026-10-12T04:00:00Z", out)
         # roles 的查詢參數與 list 都在；沒有認證標頭
@@ -319,6 +330,104 @@ class UsageTests(unittest.TestCase):
         self.assertIn("--agent", err)
         self.assertIn("只在有 --role", err)
         self.assertEqual(self.fake.requests, [])
+
+    def _rows_with(self, usage_by_id):
+        # 每個 id 一筆假列（只給 usage 與 id／provider 需要的欄位）。
+        rows = []
+        for priority, (subscription_id, usage) in enumerate(usage_by_id.items(), 10):
+            rows.append({
+                "schema": 1, "id": subscription_id, "provider": subscription_id,
+                "kind": "api-key", "agents": ["opencode"], "priority": priority,
+                "models": {"allow": ["*"], "default": None}, "endpoint": None,
+                "cooldown": None, "model_cooldowns": {}, "available": True,
+                "available_again_at": None, "usage": usage, "key": CANARY,
+            })
+        return rows
+
+    def test_C12_unavailable列顯示無法取得與note原文(self):
+        # C-12：四個出廠 unavailable 訂閱的列都是「無法取得；」加 note 原文，
+        # 且不含「無額度 API」與「100%」。note 原文與 lgwd/usage.py 固定表一致。
+        notes = {
+            "chatgpt-personal": "額度只在 Codex 的 app-server 介面（需帳戶 session，登入在呼叫方機器上），Gateway 取不到。",
+            "antigravity": "額度只在 agy 的 /usage 與設定頁，沒有公開 API；登入在呼叫方機器上，Gateway 取不到。",
+            "opencode-zen": ZEN_NOTE,
+            "opencode-go": GO_NOTE,
+        }
+        usage_by_id = {
+            subscription_id: {
+                "status": "not_applicable", "source": None, "fetched_at": None,
+                "stale": None, "reason": "unavailable", "note": note,
+                "session": None, "weekly": None,
+            }
+            for subscription_id, note in notes.items()
+        }
+        self.fake.subscriptions = self._rows_with(usage_by_id)
+        rc, out, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, out + err)
+        for subscription_id, note in notes.items():
+            line = next(line for line in out.splitlines()
+                        if line.startswith(f"{subscription_id} |"))
+            self.assertIn(f"無法取得；{note}", line)
+            self.assertNotIn("無額度 API", line)
+            self.assertNotIn("100%", line)
+
+    def test_C13_no_quota_api列顯示無額度API不帶unavailable文字(self):
+        # C-13：no_quota_api 的列（假資料）顯示「無額度 API」，不含 note 的 unavailable 文字。
+        usage = {
+            "status": "not_applicable", "source": None, "fetched_at": None,
+            "stale": None, "reason": "no_quota_api", "note": ZEN_NOTE,
+            "session": None, "weekly": None,
+        }
+        self.fake.subscriptions = self._rows_with({"fake-no-quota": usage})
+        rc, out, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, out + err)
+        line = next(line for line in out.splitlines()
+                    if line.startswith("fake-no-quota |"))
+        self.assertIn("無額度 API", line)
+        self.assertNotIn("無法取得", line)
+        self.assertNotIn(ZEN_NOTE, line)
+        self.assertNotIn("%", line)
+
+    def test_C14_ok與unknown列與PR1前逐字相同(self):
+        # C-14：ok、unknown 的列不因 reason 分流而改變（PR1 前的輸出逐字）。
+        rc, out, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, out + err)
+        lines = out.splitlines()
+        self.assertIn(
+            "claude-personal | anthropic | session 76.5%（reset 2026-10-25T07:00:00Z）"
+            "；weekly 39%（reset 2026-10-28T00:00:00Z） | -", lines)
+        self.assertIn("openrouter | openrouter | weekly 10%（reset 2026-10-19T00:00:00Z） | -",
+                      lines)
+        self.assertIn("ollama-cloud | ollama-cloud | 未知（no_key） | 模型 m2-small 2026-10-12T04:00:00Z",
+                      lines)
+        rc, out, err = self.box.run_cli(
+            ["usage", "--role", "impl", "--agent", "opencode", "--data", "public"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("2 | ollama-cloud | ollama-cloud | 未知（no_key） | 模型 m2-small 2026-10-12T04:00:00Z",
+                      out.splitlines())
+
+    def test_not_applicable_other_or_missing_reason_is_unknown(self):
+        # spec role-allocation：not_applicable 的其他 reason 或缺值 → 「未知」並附 reason（缺值不附）。
+        usage_by_id = {
+            "fake-other": {
+                "status": "not_applicable", "source": None, "fetched_at": None,
+                "stale": None, "reason": "internal", "note": None,
+                "session": None, "weekly": None,
+            },
+            "fake-missing": {
+                "status": "not_applicable", "source": None, "fetched_at": None,
+                "stale": None, "reason": None, "note": None,
+                "session": None, "weekly": None,
+            },
+        }
+        self.fake.subscriptions = self._rows_with(usage_by_id)
+        rc, out, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, out + err)
+        other = next(line for line in out.splitlines() if line.startswith("fake-other |"))
+        missing = next(line for line in out.splitlines() if line.startswith("fake-missing |"))
+        self.assertIn("未知（internal）", other)
+        self.assertIn("| 未知 |", missing)
+        self.assertNotIn("%", other + missing)
 
     def test_unreachable_is_readable_and_nonzero(self):
         # 找一個現在沒人聽的埠（綁完就關），避免連到任何服務
