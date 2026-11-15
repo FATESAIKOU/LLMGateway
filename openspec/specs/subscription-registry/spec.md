@@ -5,7 +5,9 @@
 > 本檔 Scenario 中的 subscription 名稱、priority 與 models.default 是**示例政策**，用來說明規則，不是出廠政策；出廠政策以 `policy/default.json` 為準。
 
 > v5（2026-10-12）：冷卻 until-only（`稽核紀錄`、`共通 JSON 的 endpoint 與 cooldown` 以 until-only 語意為準）。
+
 ## Requirements
+
 ### Requirement: list
 `GET /v1/subscriptions` SHALL 回所有 subscription 的共通 JSON，依 `priority` 排序，**不含 `key`**；每一筆多帶 `usage` 與 `available_again_at`（形狀與規則見 spec `usage-reporting`）；每一筆另帶 `model_cooldowns`（該把各模型的冷卻，只列還沒過的；形狀見「共通 JSON 的 model_cooldowns」）。list 只讀用量快取，並在快取過期時觸發一次背景取用量，回覆不等它；用量讀不到或取用量壞掉時 list MUST 仍回 200。
 
@@ -19,7 +21,7 @@
 
 #### Scenario: 每一筆都有 usage 與 available_again_at
 - **WHEN** 客戶端呼叫 list
-- **THEN** 每一筆都有 `usage`（七個鍵齊全）與 `available_again_at`（RFC 3339 UTC 或 null）；沒有用量來源的 provider 是 `usage.status: not_applicable`
+- **THEN** 每一筆都有 `usage`（九個鍵齊全）與 `available_again_at`（RFC 3339 UTC 或 null）；沒有用量來源的 provider 是 `usage.status: not_applicable`
 
 #### Scenario: 用量壞了 list 照回
 - **WHEN** 取用量實作拋例外或卡住
@@ -292,4 +294,3 @@ Gateway MUST NOT 把這類訂閱當成「key 未部署」而回 409 `not_deploye
 #### Scenario: 沒有憑證的訂閱 agents 改寬
 - **WHEN** 政策檔的 `antigravity.agents` 不是剛好 `["agy"]`
 - **THEN** 政策載入失敗（`PolicyError`），lgwd 不啟動
-

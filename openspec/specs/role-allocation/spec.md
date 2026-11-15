@@ -1,8 +1,10 @@
 # role-allocation Specification
 
 ## Purpose
-把「哪個角色用哪把訂閱、什麼資料等級能用」寫成政策檔裡機器可讀的分配表：每個 subscription 有選填 `privacy`（`public` < `general` < `real`，缺省 `public`），頂層 `roles` 給五個角色（`PMO`／`PM`／`impl`／`rev`／`qa`）各自的 `floor` 與有序 `order`，`GET /v1/roles/{role}?agent=[&data=]` 回該角色在生效資料等級下的有序候選（每筆 `{id, provider, rank, privacy, available, cooldown, model_cooldowns}`，不含 key、`usage`、`available_again_at`，不觸發取用量）。分配表是 advisory：Gateway 不代選、不擋 `resolve` 的釘住，冷卻與用量不影響候選成員與順序；額度仍由既有 list 與 resolve `meta` 提供，不新增端點，呈現落在 `lgwctl usage`。
+把「哪個角色用哪把訂閱、什麼資料等級能用」寫成政策檔裡機器可讀的分配表：每個 subscription 有選填 `privacy`（`public` < `general` < `real`，缺省 `public`），頂層 `roles` 給五個角色（`PMO`／`PM`／`impl`／`rev`／`qa`）各自的 `floor` 與有序 `order`，`GET /v1/roles/{role}?agent=[&data=]` 回該角色在生效資料等級下的有序候選（每筆 `{id, provider, rank, privacy, available, cooldown, model_cooldowns}`，不含 key、`usage`、`available_again_at`，不觸發取用量）。分配表是 advisory：Gateway 不代選、不擋 `resolve` 的釘住，冷卻與用量不影響候選成員與順序；額度仍由 list 與 resolve `meta` 提供，並由唯讀的 `GET /v1/usage` 提供精簡一覽，呈現落在 `lgwctl usage`。
+
 ## Requirements
+
 ### Requirement: 訂閱的隱私等級
 政策檔每個 subscription MAY 有 `privacy`，值 MUST 是 `public`、`general`、`real` 之一，順序為 `public` < `general` < `real`；缺省 MUST 當 `public`（fail-closed）。`public` 只可送 public repo 與假資料；`general` 可送一般工單內文、決定檔與交接檔，不可送憑證、機器位址、私人筆記；`real` 可送一般真資料。任何等級都不可送憑證或金鑰。值不在三者之內 MUST 拒收政策檔（`PolicyError`，訊息只帶固定字串與訂閱 id）。
 
@@ -175,10 +177,13 @@
 - **WHEN** `roles.impl.order` 不含 `antigravity`，呼叫 `GET /v1/roles/impl?agent=opencode&data=public`
 - **THEN** 候選與加這筆之前相同（`antigravity` 的 `agents` 不含 `opencode`，也不會被選進來）
 
-### Requirement: 額度的顯示不新增端點
-額度資料 SHALL 只由 `list` 與 `resolve` 的 `meta` 的 `usage` 提供（形狀與規則見 `usage-reporting`），`roles` 不提供；呈現層以 `id` 合併 `list` 與 `roles`。`usage.status` 為 `not_applicable` 的訂閱（本 change 呈現的 `opencode-zen`、`opencode-go`）MUST NOT 被呈現成「剩 100%」或任何數字；呈現層 MUST 標示「無額度 API」，並可附 `cooldown`／`model_cooldowns`。呈現入口為 `lgwctl` 的 `usage` 子命令。
+### Requirement: 額度的顯示與用量一覽
+額度資料 SHALL 由 `list` 與 `resolve` 的 `meta` 的 `usage` 提供（形狀與規則見 `usage-reporting`），並可由唯讀的 `GET /v1/usage` 取得精簡一覽（見 `usage-reporting`「用量一覽（GET /v1/usage）」）；`roles` 不提供額度。呈現層以 `id` 合併 `list` 與 `roles`。`usage.status` 為 `not_applicable` 的訂閱 MUST NOT 被呈現成「剩 100%」或任何數字；呈現層依 `usage.reason` 分流：`no_quota_api` MUST 標示「無額度 API」；`unavailable` MUST 標示「無法取得」並附 `usage.note`；其他 reason 或缺值 MUST 標示「未知」並附 reason。兩種 `not_applicable` 都可附 `cooldown`／`model_cooldowns`。呈現入口為 `lgwctl` 的 `usage` 子命令。
 
 #### Scenario: zen 的額度欄
-- **WHEN** 渲染 `opencode-zen`（`usage.status` 是 `not_applicable`）
-- **THEN** 額度欄顯示「無額度 API」，不顯示百分比
+- **WHEN** 渲染 `opencode-zen`（`usage.status` 是 `not_applicable`，`usage.reason` 是 `unavailable`）
+- **THEN** 額度欄顯示「無法取得」並附 `usage.note`，不顯示百分比，也不顯示「無額度 API」
 
+#### Scenario: no_quota_api 的額度欄
+- **WHEN** 渲染一筆 `usage.reason` 是 `no_quota_api` 的訂閱（出廠政策目前沒有，以假資料測）
+- **THEN** 額度欄顯示「無額度 API」，不顯示百分比
