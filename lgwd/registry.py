@@ -1,7 +1,8 @@
 """Subscription registry 的服務邏輯（design 決定 6、7、8、10 與 v5 的決定 8 取代；spec subscription-registry（及拆出的 subscription-cooldown／registry-errors／resolve／resolve-env））。
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；另帶 usage／available_again_at（#60）；
-- list_usage_summary()：GET /v1/usage 的精簡一覽（usage-overview；id、kind 與 usage 的八個鍵，不含 pipes）；
+- list_usage_summary()：GET /v1/usage 的精簡一覽（usage-overview；id、kind 與 usage 的八個鍵，不含 pipes；
+  另加 OpenRouter 的 weekly_used_usd 兩鍵，design D1）；
 - kind 為 local-login 的訂閱（#107）沒有憑證：部署由 kind 判定（恆已部署，不讀 key 檔）；
   list／resolve／roles 都不碰它的 key（key 檔不認得它）。
 - 單筆取回（get，含 key）已於 #48 移除（不再有 get_subscription）。
@@ -53,7 +54,7 @@ from .keys import KeyStore
 from .policy import AGENTS, PRIVACY_LEVELS, ROLES, Policy, SubscriptionPolicy
 from .providers import CredentialProvider, provider_for
 from .store import Store
-from .usage import UsageService, available_again_at, internal_usage
+from .usage import INTERNAL, UsageService, available_again_at, internal_usage
 
 _LOG = logging.getLogger("lgwd.registry")
 
@@ -151,9 +152,10 @@ class RegistryService:
     def list_usage_summary(self) -> dict:
         """GET /v1/usage：用量一覽（spec usage-reporting「用量一覽（GET /v1/usage）」；C-5、C-6、C-9）。
 
-        每筆只取 id、kind 與 usage 的八個欄位（共十鍵，不含 pipes），usage 經 _usage_fields 組裝，
-        與 list 同一條路徑，所以同一快取狀態下逐值相等。順序依 priority；冷卻只為了
-        _usage_fields 算 available_again_at，那個值在這裡丟掉。
+        每筆取 id、kind、usage 的八個欄位（不含 pipes），再加 OpenRouter 金額兩鍵（共十二鍵）。
+        usage 經 _usage_fields 組裝，與 list 同一條路徑，所以同一快取狀態下逐值相等；窗口與金額
+        共用同一個 now（design D2）。順序依 priority；冷卻只為了 _usage_fields 算 available_again_at，
+        那個值在這裡丟掉。
         """
         now = self._clock.now()
         with self._store.txn() as cur:
@@ -164,10 +166,15 @@ class RegistryService:
         subs = []
         for name, cooldown in rows:
             usage, _ = self._usage_fields({"id": name, "cooldown": cooldown}, now)
+            # 組裝為 internal（例外保底）時，金額也不投影：單筆失敗只影響該筆（delta）。
+            usd = {"weekly_used_usd": None, "weekly_used_usd_fetched_at": None}
+            if usage["reason"] != INTERNAL:
+                usd = self._usd_fields(name, now)
             subs.append({
                 "id": name,
                 "kind": provider_for(name).kind,
                 **{key: usage[key] for key in USAGE_SUMMARY_KEYS},
+                **usd,
             })
         return {"schema": SCHEMA_VERSION, "subscriptions": subs}
 
@@ -386,10 +393,10 @@ class RegistryService:
             return True
         return self._keys.deployed(subscription)
 
-    def _safe_usage(self, subscription: str) -> dict:
+    def _safe_usage(self, subscription: str, now: _dt.datetime | None = None) -> dict:
         """usage 的唯一組裝點，list 與 resolve meta 共用：任何錯誤都回 unknown／internal，不拖累回覆（#60）。"""
         try:
-            return self._usage.usage_for(subscription)
+            return self._usage.usage_for(subscription, now)
         except Exception as exc:
             _LOG.warning("usage unavailable for %s: %s", subscription, type(exc).__name__)
             return internal_usage(self._source_of(subscription))
@@ -400,10 +407,18 @@ class RegistryService:
         except Exception:
             return None
 
+    def _usd_fields(self, subscription: str, now: _dt.datetime) -> dict:
+        """一覽專用的 weekly_used_usd／weekly_used_usd_fetched_at（design D2）：組裝失敗只讓該筆兩鍵為 null。"""
+        try:
+            return self._usage.usd_fields(subscription, now)
+        except Exception as exc:
+            _LOG.warning("usd unavailable for %s: %s", subscription, type(exc).__name__)
+            return {"weekly_used_usd": None, "weekly_used_usd_fetched_at": None}
+
     def _usage_fields(self, item: dict, now: _dt.datetime) -> tuple[dict, str | None]:
         """list 用：回 (usage, available_again_at)。usage 經 _safe_usage：usage_for 拋例外時回 internal_usage，之後仍依冷卻時間算 available_again_at；其餘步驟拋例外時整筆回 internal＋null。"""
         try:
-            usage = self._safe_usage(item["id"])
+            usage = self._safe_usage(item["id"], now)
             cooldown = item["cooldown"]
             until = from_rfc3339(cooldown["until"]) if cooldown else None
             return usage, available_again_at(usage, until, now, self._deployed(item["id"]))

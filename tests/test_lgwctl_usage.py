@@ -278,6 +278,20 @@ class UsageTests(unittest.TestCase):
         self.assertIn("（舊資料）", line)
         self.assertEqual((out + err).count("（舊資料）"), 1)
 
+    def test_一覽新鍵不影響lgwctl_usage輸出(self):
+        # 一覽的 weekly_used_usd／_fetched_at 是新鍵：lgwctl 讀 list 的 usage，不認得也不該因此壞掉；
+        # 同一份 list 帶上這兩鍵與不帶時，輸出逐字相同。
+        self.fake.subscriptions = copy.deepcopy(SUBSCRIPTIONS)
+        rc, plain, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, plain + err)
+        rows = copy.deepcopy(SUBSCRIPTIONS)
+        rows[3]["weekly_used_usd"] = 7.3191
+        rows[3]["weekly_used_usd_fetched_at"] = "2026-10-25T03:00:00Z"
+        self.fake.subscriptions = rows
+        rc, with_new, err = self.box.run_cli(["usage"])
+        self.assertEqual(rc, 0, with_new + err)
+        self.assertEqual(with_new, plain)
+
     def test_ok_without_window_values_is_explained(self):
         # status=ok 但兩個窗口都沒有數值：說出缺什麼，不與 unknown 的「未知」混在一起。
         rows = copy.deepcopy(SUBSCRIPTIONS)

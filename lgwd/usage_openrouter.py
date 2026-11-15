@@ -5,7 +5,8 @@
 的 `remaining`／`limit`（每日免費請求數）換算成 `session` 窗口（與 pipes 的 `free_daily` 管子）的
 `remaining_percent`，`resets_at` 為下一個 UTC 00:00（官方：每日免費請求數以 UTC 日為單位重置）。
 取 `data.limit` 與 `data.limit_remaining` 換算成 `credits` 管子的 `remaining_percent`（`resets_at` 恆為 null；
-金額與配額絕對值不進 usage）。key 不進例外訊息與 log。
+金額與配額絕對值不進 usage）。`data.usage_weekly` 獨立取成 `FetchResult.weekly_usd`，只給一覽的
+`weekly_used_usd`（design D2、D4；不進 windows，不進 list／resolve）。key 不進例外訊息與 log。
 
 前提（#85 低-4）：這個 `session` 窗口只代表 `:free` 模型的每日請求數
 （`free_model_daily_requests`），不是這把 key 的全部可用量；官方明寫
@@ -74,7 +75,29 @@ def _next_utc_midnight(now: datetime | None = None) -> datetime:
     return datetime.combine(nxt, time.min, tzinfo=timezone.utc)
 
 
+def _weekly_usd(payload: dict) -> float | None:
+    """data.usage_weekly：有限、非負的 JSON 數字（D2）；其他一律 None，不回顯上游值。
+
+    json.loads 會把 NaN／Infinity 字面值解析成非有限 float，1e400 解析成 inf，
+    所以逐值用 math.isfinite 擋；不靠 parse_constant（它拋錯會連窗口一起判壞）。
+    bool 是 int 子類，先排除。超大整數 float() 會丟 OverflowError，當無效。
+    驗證只用 float() 的結果；通過後回傳原始數值（整數維持 int，不因轉 float 失真）。
+    """
+    value = payload.get("usage_weekly")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return value
+
+
 def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
+    if now is None:
+        now = datetime.now(timezone.utc)
     try:
         data = json.loads(body)
         payload = data["data"]
@@ -83,26 +106,30 @@ def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
     if not isinstance(payload, dict):
         return failure(PARSE_ERROR)
 
+    # 金額先獨立解析（D2）：窗口壞或缺時，合法金額仍保留，且帶這次請求前的 now 當取得時刻。
+    amount = _weekly_usd(payload)
+    weekly_usd = None if amount is None else (amount, now)
+
     windows = {name: None for name in WINDOWS}
     fmdr = payload.get("free_model_daily_requests")
     if fmdr is None:
         # 沒給這個欄位：該窗口讀不到，不算 parse_error
         pass
     elif not isinstance(fmdr, dict):
-        return failure(PARSE_ERROR)
+        return failure(PARSE_ERROR, weekly_usd=weekly_usd)
     else:
         used = fmdr.get("used")
         limit = fmdr.get("limit")
         remaining = fmdr.get("remaining")
         if isinstance(used, bool) or isinstance(limit, bool) or isinstance(remaining, bool):
-            return failure(PARSE_ERROR)
+            return failure(PARSE_ERROR, weekly_usd=weekly_usd)
         if not isinstance(limit, (int, float)) or not isinstance(remaining, (int, float)):
-            return failure(PARSE_ERROR)
+            return failure(PARSE_ERROR, weekly_usd=weekly_usd)
         if limit <= 0:
-            return failure(PARSE_ERROR)
+            return failure(PARSE_ERROR, weekly_usd=weekly_usd)
         percent = remaining / limit * 100
         if not (0 <= percent <= 100):
-            return failure(PARSE_ERROR)
+            return failure(PARSE_ERROR, weekly_usd=weekly_usd)
         resets = _next_utc_midnight(now)
         windows["session"] = (percent, resets)
 
@@ -126,8 +153,8 @@ def _parse(body: bytes, now: datetime | None = None) -> FetchResult:
         windows["credits"] = (percent, None)
 
     if all(value is None for value in windows.values()):
-        return failure(NO_WINDOWS)
-    return FetchResult(windows=windows)
+        return failure(NO_WINDOWS, weekly_usd=weekly_usd)
+    return FetchResult(windows=windows, weekly_usd=weekly_usd)
 
 
 class OpenRouterUsageFetcher:
@@ -135,6 +162,7 @@ class OpenRouterUsageFetcher:
     default_ttl = 120
     min_ttl = 60
     default_enabled = True
+    reports_weekly_usd = True      # 唯一會回 weekly_used_usd 的 fetcher（design D1）
 
     def __init__(self, http_get=None, clock=None):
         self._http_get = http_get or default_http_get

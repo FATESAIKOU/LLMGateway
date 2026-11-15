@@ -86,18 +86,21 @@ PIPE_TABLE = {
 class FetchResult:
     """一次取用量的結果。成功＝windows 非 None（{"session"/"weekly": (remaining_percent, resets_at)|None}，
     選填 "credits": (remaining_percent, resets_at)|None，至少一個非 None）；
-    失敗＝reason 為固定碼，retry_after 是 429 的 Retry-After 秒數（選填）。"""
+    失敗＝reason 為固定碼，retry_after 是 429 的 Retry-After 秒數（選填）。
+    weekly_usd 是獨立於窗口的金額：(金額, 請求前取得的 now)|None（design D2）；不入 windows。"""
     windows: dict | None = None
     reason: str | None = None
     retry_after: float | None = None
+    weekly_usd: tuple | None = None
 
     @property
     def ok(self) -> bool:
         return self.windows is not None
 
 
-def failure(reason: str, retry_after: float | None = None) -> FetchResult:
-    return FetchResult(windows=None, reason=reason, retry_after=retry_after)
+def failure(reason: str, retry_after: float | None = None,
+            weekly_usd: tuple | None = None) -> FetchResult:
+    return FetchResult(windows=None, reason=reason, retry_after=retry_after, weekly_usd=weekly_usd)
 
 
 class ProcessGuard:
@@ -124,7 +127,8 @@ class ProcessGuard:
 
 
 class _Entry:
-    __slots__ = ("fetched_at", "windows", "last_reason", "failures", "next_allowed", "in_flight")
+    __slots__ = ("fetched_at", "windows", "last_reason", "failures", "next_allowed", "in_flight",
+                 "weekly_usd")
 
     def __init__(self):
         self.fetched_at = None
@@ -133,6 +137,7 @@ class _Entry:
         self.failures = 0
         self.next_allowed = None
         self.in_flight = False
+        self.weekly_usd = None      # (金額, 取得時刻)|None；與窗口獨立，只在記憶體（design D2）
 
 
 def _not_applicable(subscription: str, on_unlisted=None) -> dict:
@@ -200,6 +205,13 @@ def build_usage(source, entry: _Entry | None, now: _dt.datetime, ttl: float) -> 
             **shown, "pipes": pipes}
 
 
+def week_start(moment: _dt.datetime) -> _dt.datetime:
+    """moment 所屬 UTC 週的週一 00:00 UTC（跨週判斷用；design D2）。"""
+    utc = moment.astimezone(_dt.timezone.utc)
+    midnight = utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - _dt.timedelta(days=utc.weekday())
+
+
 def available_again_at(usage: dict, cooldown_until: _dt.datetime | None, now: _dt.datetime,
                        deployed: bool) -> str | None:
     """cooldown.until（未來才算）與「remaining_percent ≤ 0 的窗口之 resets_at」中最晚者。
@@ -243,6 +255,9 @@ class UsageService:
         self._threads: list = []
         self._enabled: dict[str, bool] = {}
         self._ttl: dict[str, float] = {}
+        # 只有宣告 reports_weekly_usd 的 fetcher（OpenRouter）才寫入金額（design D1、D4）
+        self._reports_usd = {sub: bool(getattr(fetcher, "reports_weekly_usd", False))
+                             for sub, fetcher in self._fetchers.items()}
         for sub, fetcher in self._fetchers.items():
             setting = (settings or {}).get(sub)
             enabled = setting.enabled if setting and setting.enabled is not None else fetcher.default_enabled
@@ -260,9 +275,10 @@ class UsageService:
         return fetcher.source if fetcher is not None else None
 
     # --- 查詢路徑（list／resolve）：不做 I/O、不等取用量 ---
-    def usage_for(self, subscription: str) -> dict:
+    def usage_for(self, subscription: str, now: _dt.datetime | None = None) -> dict:
         """該 subscription 的 `usage` 物件；快取過期且符合條件時觸發一次背景取用量。
 
+        now 由一覽傳入，讓窗口與金額在同一個時刻判定（design D2）；沒傳就取目前時間。
         任何內部錯誤都回 unknown／internal（不丟例外給 list／resolve）。
         """
         fetcher = self._fetchers.get(subscription)
@@ -273,7 +289,8 @@ class UsageService:
                 return _unknown(fetcher.source, DISABLED)          # disabled 優先於 no_key
             if not self._deployed(subscription):
                 return _unknown(fetcher.source, NO_KEY)            # 不回舊值、不觸發
-            now = self._clock.now()
+            if now is None:
+                now = self._clock.now()
             ttl = self._ttl[subscription]
             with self._lock:
                 entry = self._entries.get(subscription)
@@ -283,6 +300,28 @@ class UsageService:
         except Exception as exc:  # 用量壞了不拖累主要功能
             _LOG.warning("usage assemble failed for %s: %s", subscription, type(exc).__name__)
             return _unknown(fetcher.source, INTERNAL)
+
+    def usd_fields(self, subscription: str, now: _dt.datetime) -> dict:
+        """一覽的 `weekly_used_usd`／`weekly_used_usd_fetched_at`（design D2）：純讀取投影，不改快取。
+
+        停用、key 未部署、沒有金額、超過六小時、或金額所屬 UTC 週與 now 不同週，兩值都是 null。
+        """
+        empty = {"weekly_used_usd": None, "weekly_used_usd_fetched_at": None}
+        if not self._reports_usd.get(subscription):
+            return empty
+        if not self._enabled[subscription] or not self._deployed(subscription):
+            return empty
+        with self._lock:
+            entry = self._entries.get(subscription)
+            held = entry.weekly_usd if entry is not None else None
+        if held is None:
+            return empty
+        amount, taken_at = held
+        if now - taken_at > EXPIRE_AFTER:
+            return empty
+        if week_start(taken_at) != week_start(now):
+            return empty
+        return {"weekly_used_usd": amount, "weekly_used_usd_fetched_at": to_rfc3339(taken_at)}
 
     def _warn_unlisted(self, subscription: str) -> None:
         """表外的 not_applicable：每個 id 只記一條 warning（D9）；不影響回覆。"""
@@ -335,6 +374,9 @@ class UsageService:
             entry.in_flight = False
             if self._guard.stopped:
                 return
+            # 金額與窗口各自寫入：帶金額就寫（含其請求前的時刻），沒帶就清空；不動 fetched_at、退避（D2）
+            held = result.weekly_usd if self._reports_usd.get(subscription) else None
+            entry.weekly_usd = held
             if result.ok:
                 entry.fetched_at, entry.windows = now, result.windows
                 entry.last_reason, entry.failures, entry.next_allowed = None, 0, None
