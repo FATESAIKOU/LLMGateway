@@ -224,6 +224,94 @@ class OpenRouterFetchTest(unittest.TestCase):
         self.assertTrue(got.ok)
         self.assertIsNone(got.windows["credits"][1])
 
+FMDR_OK = '"free_model_daily_requests": {"used": 10, "limit": 50, "remaining": 40}'
+NOW = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
+
+
+def raw(usd, fmdr=FMDR_OK):
+    """usd 是 JSON 字面值（None＝欄位不給）；NaN、1e400 等照原樣放進 body。"""
+    parts = [p for p in (fmdr, None if usd is None else f'"usage_weekly": {usd}') if p]
+    return ("{\"data\": {" + ", ".join(parts) + "}}").encode()
+
+
+def fetch_raw(body, status=200, now=NOW):
+    return OpenRouterUsageFetcher(http_get=FakeHttp(status=status, body=body),
+                                  clock=FakeClock(start=now)).fetch(KEY)
+
+
+class WeeklyUsdParseTest(unittest.TestCase):
+    """C-4：金額只接受有限、非負、非 bool 的 JSON number；0 與 null 分得開；時間與金額成對。"""
+
+    def test_正數與零(self):
+        for literal, expected in (("1.25", 1.25), ("0", 0.0), ("0.0", 0.0), ("7.3191", 7.3191)):
+            with self.subTest(literal=literal):
+                got = fetch_raw(raw(literal))
+                self.assertTrue(got.ok)
+                self.assertEqual(got.weekly_usd, (expected, NOW))
+                self.assertIsNotNone(got.weekly_usd)
+
+    def test_無效值一律不給金額(self):
+        cases = ["null", '"1.25"', "true", "false", "-1", "-0.5", "NaN", "Infinity", "-Infinity",
+                 "1e400", "-1e400", "1" + "0" * 400, "[1]", "{}"]
+        for literal in cases:
+            with self.subTest(literal=literal):
+                got = fetch_raw(raw(literal))
+                self.assertIsNone(got.weekly_usd)
+                self.assertTrue(got.ok)                      # 窗口照常
+                self.assertEqual(got.windows["session"][0], 80.0)
+
+    def test_缺欄位(self):
+        got = fetch_raw(raw(None))
+        self.assertIsNone(got.weekly_usd)
+        self.assertTrue(got.ok)
+
+    def test_整數保留原值與型別_超過2的53次方不失真(self):
+        # 低-1：有限性驗證後保留原始數值；float() 會把 9007199254740993 換成 ...992.0
+        for literal in ("9007199254740993", "0", "42"):
+            with self.subTest(literal=literal):
+                got = fetch_raw(raw(literal))
+                amount, taken_at = got.weekly_usd
+                self.assertIs(type(amount), int)
+                self.assertEqual(amount, int(literal))
+                self.assertEqual(taken_at, NOW)
+
+    def test_窗口壞或缺時金額仍保留且帶自己的時間(self):
+        # delta「窗口與金額獨立」：PARSE_ERROR／NO_WINDOWS 的 FetchResult 也帶金額
+        cases = [
+            (raw("7.3191", fmdr='"free_model_daily_requests": 1'), "parse_error"),
+            (raw("7.3191", fmdr='"free_model_daily_requests": {"used": 1, "limit": 0, "remaining": 0}'),
+             "parse_error"),
+            (raw("7.3191", fmdr=None), "no_windows"),
+        ]
+        for body, reason in cases:
+            with self.subTest(body=body):
+                got = fetch_raw(body)
+                self.assertFalse(got.ok)
+                self.assertEqual(got.reason, reason)
+                self.assertEqual(got.weekly_usd, (7.3191, NOW))
+
+    def test_窗口全缺時金額仍獨立保留(self):
+        # 窗口與 credits 都缺：窗口仍是 no_windows；金額照給
+        got = fetch_raw(raw("1.25", fmdr=None))
+        self.assertEqual(got.reason, "no_windows")
+        self.assertEqual(got.weekly_usd, (1.25, NOW))
+
+    def test_非200與壞data不帶金額(self):
+        body = raw("7.3191")
+        self.assertIsNone(fetch_raw(body, status=500).weekly_usd)
+        self.assertIsNone(fetch_raw(b'{"data": [], "usage_weekly": 7.3191}').weekly_usd)
+        self.assertIsNone(fetch_raw(b"not json").weekly_usd)
+
+    def test_金額時刻是請求前的now(self):
+        clock = FakeClock(start=datetime(2026, 10, 25, 23, 59, tzinfo=timezone.utc))
+        http = FakeHttp(body=raw("7.3191"))
+        got = OpenRouterUsageFetcher(http_get=http, clock=clock).fetch(KEY)
+        self.assertEqual(got.weekly_usd, (7.3191, datetime(2026, 10, 25, 23, 59, tzinfo=timezone.utc)))
+
+    def test_reports_weekly_usd宣告(self):
+        self.assertTrue(OpenRouterUsageFetcher.reports_weekly_usd)
+
+
 class OpenRouterProviderHookTest(unittest.TestCase):
     def test_make_usage_fetcher_回傳_OpenRouterUsageFetcher(self):
         from lgwd import providers
@@ -239,3 +327,43 @@ class OpenRouterProviderHookTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+BIG = "1" + "0" * 400      # 超過 float 範圍的整數：float() 會丟 OverflowError
+
+
+class OverflowIntegerTest(unittest.TestCase):
+    """超大整數（float() 會 OverflowError）視為該欄位無效；合法金額與窗口照常。"""
+
+    def test_credits超大整數只丟棄credits_金額與session保留(self):
+        cases = [
+            f'"limit": {BIG}, "limit_remaining": 1',
+            f'"limit": 100, "limit_remaining": {BIG}',
+            f'"limit": {BIG}, "limit_remaining": {BIG}',
+            f'"limit": 1, "limit_remaining": -{BIG}',
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra[:40]):
+                body = (
+                    '{"data": {' + FMDR_OK + ', "usage_weekly": 1.25, ' + extra + "}}"
+                ).encode()
+                got = fetch_raw(body)
+                self.assertTrue(got.ok)
+                self.assertEqual(got.weekly_usd, (1.25, NOW))
+                self.assertEqual(got.windows["session"][0], 80.0)
+                self.assertNotIn("credits", got.windows)
+
+    def test_fmdr超大整數視為無效_金額保留(self):
+        cases = [
+            f'{{"used": 10, "limit": {BIG}, "remaining": 1}}',
+            f'{{"used": 10, "limit": 50, "remaining": {BIG}}}',
+            f'{{"used": 10, "limit": {BIG}, "remaining": {BIG}}}',
+        ]
+        for fmdr in cases:
+            with self.subTest(fmdr=fmdr[:40]):
+                body = ('{"data": {"free_model_daily_requests": ' + fmdr
+                        + ', "usage_weekly": 1.25}}').encode()
+                got = fetch_raw(body)
+                self.assertFalse(got.ok)
+                self.assertEqual(got.reason, "parse_error")
+                self.assertEqual(got.weekly_usd, (1.25, NOW))

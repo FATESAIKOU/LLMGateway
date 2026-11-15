@@ -53,6 +53,7 @@ class FakeService:
 
     def __init__(self):
         self.requests = []  # (method, path, query, body, authorization)
+        self.usage_rows = [dict(USAGE_ROW)]
 
     def handle(self, method, path, query, body, authorization):
         self.requests.append((method, path, query, body, authorization))
@@ -60,7 +61,7 @@ class FakeService:
             return 200, {"schema": 1, "subscriptions": [dict(SUBSCRIPTION)]}
         if method == "GET" and path == "/v1/usage":
             # C-11：回 200 時 Client.usage() 的 data 原樣等於這個 dict（十個鍵，不含 pipes）。
-            return 200, {"schema": 1, "subscriptions": [dict(USAGE_ROW)]}
+            return 200, {"schema": 1, "subscriptions": [dict(row) for row in self.usage_rows]}
         if method == "GET" and path == "/v1/resolve":
             agent = query.get("agent", [None])[0]
             provider = query.get("provider", [None])[0]
@@ -358,6 +359,15 @@ class UsageTest(ClientCase):
         self.assertTrue(res.ok)
         self.assertEqual(res.status, 200)
         self.assertEqual(res.data, {"schema": 1, "subscriptions": [USAGE_ROW]})
+
+    def test_usage_透傳十二鍵與金額為null的新回應(self):  # C-7（design D3）
+        row12 = dict(USAGE_ROW, weekly_used_usd=0, weekly_used_usd_fetched_at="2026-10-25T03:00:00Z")
+        self.fake.usage_rows = [row12, dict(USAGE_ROW, id="ollama-cloud")]
+        res = self.client.usage()
+        self.assertTrue(res.ok)
+        self.assertEqual(res.data["subscriptions"][0], row12)
+        self.assertEqual(res.data["subscriptions"][0]["weekly_used_usd"], 0)   # 零不是 null
+        self.assertIsNone(res.data["subscriptions"][1].get("weekly_used_usd"))  # 舊行缺鍵也能讀
 
     def test_usage_請求形狀(self):  # C-11
         self.client.usage()

@@ -2584,10 +2584,10 @@ class ListUsageTest(UsageRegistryCase):
     def test_組裝出錯_該筆internal_其他筆不受影響(self):
         real = self.usage.usage_for
 
-        def broken(sub):
+        def broken(sub, now=None):
             if sub == "ollama-cloud":
                 raise RuntimeError("canary-secret-assemble")
-            return real(sub)
+            return real(sub, now)
         self.usage.usage_for = broken
         with self.assertLogs("lgwd.registry", level="WARNING") as logs:
             items = _by_id(self.list_items())
