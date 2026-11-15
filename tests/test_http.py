@@ -40,6 +40,16 @@ LIST = {
     "schema": 1,
     "subscriptions": [dict(ITEM)],
 }
+# GET /v1/usage 的假回覆（C-5：每筆恰十個鍵，沒有 pipes）。
+USAGE = {
+    "schema": 1,
+    "subscriptions": [{
+        "id": "ollama-cloud", "kind": "ollama-cloud",
+        "status": "unknown", "source": "ollama-api-balance", "fetched_at": None,
+        "stale": None, "reason": "not_fetched_yet", "note": None,
+        "session": None, "weekly": None,
+    }],
+}
 RESOLVE = {
     "schema": 1,
     "env_schema": 1,
@@ -88,6 +98,9 @@ class FakeService:
 
     def list_subscriptions(self):
         return self._finish("list_subscriptions", json.loads(json.dumps(LIST)))
+
+    def list_usage_summary(self):
+        return self._finish("list_usage_summary", json.loads(json.dumps(USAGE)))
 
     def resolve(self, agent, provider, model=None, subscription=None, exclude=None,
                 data=None):
@@ -999,12 +1012,11 @@ class UsageHttpTest(ServerCase):
         self.assertNotIn("available_again_at", body["meta"])
         self.assertEqual(body["schema"], 1)
 
-    def test_沒有新路由(self):
-        for path in ("/v1/usage", "/v1/subscriptions/ollama-cloud/usage"):
-            with self.subTest(path):
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    self.raw(path)
-                self.assertIn(ctx.exception.code, (404, 405))
+    def test_沒有逐訂閱的用量路由(self):
+        # /v1/usage 是 usage-overview 新增的一覽（見 UsageRouteHttpTest）；逐訂閱路徑仍沒有。
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.raw("/v1/subscriptions/ollama-cloud/usage")
+        self.assertIn(ctx.exception.code, (404, 405))
 
     def test_取用量失敗後log與回覆不含key(self):
         self.fetcher.outcome = RuntimeError(f"leak {self.KEY}")
@@ -1017,6 +1029,60 @@ class UsageHttpTest(ServerCase):
         blob = json.dumps([listed, resolved["meta"]]) + "\n".join(logs.output)
         self.assertNotIn(self.KEY, blob)
         self.assertEqual(resolved["meta"]["usage"]["reason"], "internal")
+
+
+class UsageRouteHttpTest(ServerCase):
+    """usage-overview：GET /v1/usage 的路由（假 service；C-5、C-8）。"""
+
+    def setUp(self):
+        self.fake = FakeService()
+        self.base = self.serve(self.fake)
+
+    def json_of(self, payload):
+        return json.loads(payload.decode())
+
+    def test_get_v1_usage回一覽(self):  # C-5
+        status, payload = self.call("GET", "/v1/usage")
+        self.assertEqual(status, 200)
+        data = self.json_of(payload)
+        self.assertEqual(data, USAGE)
+        self.assertEqual(data["schema"], 1)
+        self.assertEqual(
+            set(data["subscriptions"][0]),
+            {"id", "kind", "status", "source", "fetched_at", "stale",
+             "reason", "note", "session", "weekly"},
+        )
+        self.assertNotIn("pipes", json.dumps(data))
+
+    def test_get_v1_usage忽略query且不驗憑證(self):  # C-5
+        status, payload = self.call("GET", "/v1/usage?x=1", headers={"Authorization": "Bearer x"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(payload), USAGE)
+        self.assertEqual(self.fake.calls, [("list_usage_summary",)])
+
+    def test_非GET與其他路徑一律404_不進service(self):  # C-8
+        cases = [
+            ("POST", "/v1/usage", b"{}"),
+            ("PUT", "/v1/usage", b"{}"),
+            ("DELETE", "/v1/usage", None),
+            ("PATCH", "/v1/usage", b"{}"),
+            ("GET", "/v1/usage/", None),
+            ("GET", "/v1/usages", None),
+            ("GET", "/v1/subscriptions/ollama-cloud/usage", None),
+        ]
+        for method, path, raw in cases:
+            with self.subTest(method=method, path=path):
+                status, payload = self.call(method, path, raw=raw)
+                self.assertEqual(status, 404)
+                self.assertEqual(self.json_of(payload), {"error": "not_found"})
+        self.assertEqual(self.fake.calls, [])  # 假取用量呼叫次數為 0（沒有進 service）
+
+    def test_service例外泛化為500(self):  # C-9 的整體保底：路由不外洩例外內容
+        self.fake.raise_for["list_usage_summary"] = RuntimeError("leak-canary")
+        status, payload = self.call("GET", "/v1/usage")
+        self.assertEqual(status, 500)
+        self.assertEqual(self.json_of(payload), {"error": "internal"})
+        self.assertNotIn(b"leak-canary", payload)
 
 
 class LocalLoginHttpTest(ServerCase):

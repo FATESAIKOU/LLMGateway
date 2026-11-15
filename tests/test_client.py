@@ -34,6 +34,20 @@ SUBSCRIPTION = {
 }
 
 
+USAGE_ROW = {
+    "id": "claude-personal",
+    "kind": "claude-subscription",
+    "status": "ok",
+    "source": "claude-statusline",
+    "fetched_at": "2026-10-25T03:00:00Z",
+    "stale": False,
+    "reason": None,
+    "note": None,
+    "session": {"remaining_percent": 75.0, "resets_at": "2026-10-25T08:00:00Z"},
+    "weekly": None,
+}
+
+
 class FakeService:
     """假 v4 service：list／get／登錄冷卻；記下每個請求的形狀。"""
 
@@ -44,6 +58,9 @@ class FakeService:
         self.requests.append((method, path, query, body, authorization))
         if method == "GET" and path == "/v1/subscriptions":
             return 200, {"schema": 1, "subscriptions": [dict(SUBSCRIPTION)]}
+        if method == "GET" and path == "/v1/usage":
+            # C-11：回 200 時 Client.usage() 的 data 原樣等於這個 dict（十個鍵，不含 pipes）。
+            return 200, {"schema": 1, "subscriptions": [dict(USAGE_ROW)]}
         if method == "GET" and path == "/v1/resolve":
             agent = query.get("agent", [None])[0]
             provider = query.get("provider", [None])[0]
@@ -333,6 +350,26 @@ class RolesTest(ClientCase):
         self.assertEqual(res.data, {"missing": ["agent"]})
 
 
+class UsageTest(ClientCase):
+    """C-11：Client.usage() → GET /v1/usage（用量一覽；只讀，不帶參數與認證）。"""
+
+    def test_usage_回原樣的dict(self):  # C-11
+        res = self.client.usage()
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.data, {"schema": 1, "subscriptions": [USAGE_ROW]})
+
+    def test_usage_請求形狀(self):  # C-11
+        self.client.usage()
+        method, path, query, body, auth = self.fake.requests[-1]
+        self.assertEqual((method, path, query, body), ("GET", "/v1/usage", {}, {}))
+        self.assertIsNone(auth)  # 不帶任何認證標頭
+
+    def test_usage_repr不印data(self):  # C-11
+        res = self.client.usage()
+        self.assertNotIn("claude-statusline", repr(res))
+
+
 class NoGetTest(ClientCase):
     """#48：單筆 get（含 key）已移除；client 只剩 list、resolve、登錄冷卻、roles。"""
 
@@ -403,6 +440,14 @@ class UnreachableTest(unittest.TestCase):
         self.assertTrue(res.unreachable)
         self.assertIsNone(res.status)
         self.assertTrue(res.error)
+
+    def test_usage_closed_port(self):  # C-11：服務關閉時與 list() 同為 unreachable
+        client = Client("http://{0}:{1}".format(HOST, self._closed_port()), timeout=2)
+        res = client.usage()
+        self.assertFalse(res.ok)
+        self.assertTrue(res.unreachable)
+        self.assertIsNone(res.status)
+        self.assertEqual(res.error, client.list().error)
 
     def test_timeout(self):
         class SleepHandler(BaseHTTPRequestHandler):
