@@ -1,6 +1,7 @@
 """Subscription registry 的服務邏輯（design 決定 6、7、8、10 與 v5 的決定 8 取代；spec subscription-registry（及拆出的 subscription-cooldown／registry-errors／resolve／resolve-env））。
 
 - list_subscriptions()：所有 subscription 的共通 JSON，依 priority，不含 key；另帶 usage／available_again_at（#60）；
+- list_usage_summary()：GET /v1/usage 的精簡一覽（usage-overview；id、kind 與 usage 的八個鍵，不含 pipes）；
 - kind 為 local-login 的訂閱（#107）沒有憑證：部署由 kind 判定（恆已部署，不讀 key 檔）；
   list／resolve／roles 都不碰它的 key（key 檔不認得它）。
 - 單筆取回（get，含 key）已於 #48 移除（不再有 get_subscription）。
@@ -65,6 +66,10 @@ RESOLVE_SCHEMA_VERSION = 1
 # env 組成（鍵集與鍵的語意）的版本（design 決定 1、2）：新增／移除 env 鍵或改變
 # 鍵的語意時 MUST bump；同一個 env_schema 內不改變鍵集。
 ENV_SCHEMA_VERSION = 1
+
+# GET /v1/usage 每筆取 usage 的哪些鍵（spec usage-reporting；不含 pipes）。
+USAGE_SUMMARY_KEYS = ("status", "source", "fetched_at", "stale", "reason", "note",
+                      "session", "weekly")
 
 # 登錄冷卻的 model 長度上限（Unicode 字元數；design 決定 1）：allow 是 ["*"] 的
 # 把什麼字串都收，過期列又不刪，所以把誤送或亂送的長字串擋在寫入之前。
@@ -141,6 +146,29 @@ class RegistryService:
             usage, again = self._usage_fields(item, now)
             item["available_again_at"] = again
             item["usage"] = usage
+        return {"schema": SCHEMA_VERSION, "subscriptions": subs}
+
+    def list_usage_summary(self) -> dict:
+        """GET /v1/usage：用量一覽（spec usage-reporting「用量一覽（GET /v1/usage）」；C-5、C-6、C-9）。
+
+        每筆只取 id、kind 與 usage 的八個欄位（共十鍵，不含 pipes），usage 經 _usage_fields 組裝，
+        與 list 同一條路徑，所以同一快取狀態下逐值相等。順序依 priority；冷卻只為了
+        _usage_fields 算 available_again_at，那個值在這裡丟掉。
+        """
+        now = self._clock.now()
+        with self._store.txn() as cur:
+            rows = [
+                (sub.name, self._cooldown(cur, sub.name, now))
+                for sub in self._policy.in_priority_order()
+            ]
+        subs = []
+        for name, cooldown in rows:
+            usage, _ = self._usage_fields({"id": name, "cooldown": cooldown}, now)
+            subs.append({
+                "id": name,
+                "kind": provider_for(name).kind,
+                **{key: usage[key] for key in USAGE_SUMMARY_KEYS},
+            })
         return {"schema": SCHEMA_VERSION, "subscriptions": subs}
 
     def role_candidates(self, role: str, agent: str | None,

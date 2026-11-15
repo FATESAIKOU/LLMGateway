@@ -1,13 +1,16 @@
 """HTTP 層（design 決定 6、5a）。由 test 實作。
 
-- make_api_server(service, host, port) → ThreadingHTTPServer。只有四個路由：
+- make_api_server(service, host, port) → ThreadingHTTPServer。只有五個路由：
   GET  /v1/subscriptions                      → service.list_subscriptions()
+  GET  /v1/usage                              → service.list_usage_summary()
+                                              （usage-overview；C-5～C-9，用量一覽）
   POST /v1/subscriptions/{id}/cooldown        → service.register_cooldown(id, body)（204）
   GET  /v1/resolve?agent=&provider=[&model=&subscription=&exclude=&data=]
                                               → service.resolve(...)（design 決定 1～3）
   GET  /v1/roles/{role}?agent=[&data=]        → service.role_candidates(role, agent, data)
                                               （#100；spec role-allocation）
-  其他路徑與方法一律 404。沒有應用層認證（本人選 (a)）；存取控制只靠 SSH。
+  其他路徑與方法一律 404（含 GET 以外對 /v1/usage 的方法）。沒有應用層認證（本人選 (a)）；
+  存取控制只靠 SSH。
 - JSON 解析失敗或 body 不是物件 → 400；ApiError → 對應狀態碼＋body()；204 不帶 body。
 - body 超過 1 MB 直接回 413，不讀 body。
 - resolve 與 roles 的 query 用 parse_qs 的 form 解碼（design 決定 1）：空白值＝沒給
@@ -90,9 +93,11 @@ def _send_empty(handler: BaseHTTPRequestHandler, status: int) -> None:
 
 
 def _match_route(method: str, path: str):
-    """回 ("list",) ｜ ("cooldown", id) ｜ ("resolve",) ｜ ("roles", role) ｜ None。"""
+    """回 ("list",) ｜ ("usage",) ｜ ("cooldown", id) ｜ ("resolve",) ｜ ("roles", role) ｜ None。"""
     if path == "/v1/subscriptions":
         return ("list",) if method == "GET" else None
+    if path == "/v1/usage":
+        return ("usage",) if method == "GET" else None
     if path == "/v1/resolve":
         return ("resolve",) if method == "GET" else None
     parts = path.split("/")
@@ -171,6 +176,8 @@ def _api_handler(service):
             try:
                 if route[0] == "list":
                     status, payload = 200, service.list_subscriptions()
+                elif route[0] == "usage":
+                    status, payload = 200, service.list_usage_summary()
                 elif route[0] == "resolve":
                     q = _resolve_query(split.query)
                     payload = service.resolve(

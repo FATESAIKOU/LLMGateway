@@ -1,9 +1,10 @@
-"""客戶端（design 決定 6；tasks 2.1、2.3）：list、resolve、登錄冷卻、roles。（get 已於 #48 移除。）
+"""客戶端（design 決定 6；tasks 2.1、2.3）：list、usage、resolve、登錄冷卻、roles。（get 已於 #48 移除。）
 
 用法：
 
     client = lgw.client.Client("http://127.0.0.1:4710")  # base URL 由呼叫方給
     client.list()
+    client.usage()
     client.resolve("opencode", "opencode-zen", model="big-pickle")
     client.resolve("opencode", "opencode-zen", model="big-pickle", data="public")
     client.resolve("claude-code", "anthropic", subscription="claude-personal")
@@ -13,6 +14,8 @@
     client.cooldown("opencode-zen", "2026-10-12T03:00:00Z", model="big-pickle")
 
 - list() → GET /v1/subscriptions
+- usage() → GET /v1/usage（用量一覽；回 200 時 data 是服務原樣回的 dict；連線失敗
+  行為與 list() 相同，回 unreachable）
 - resolve(agent, provider, model, subscription, exclude, data) → GET /v1/resolve
   （model／subscription 是供應商 id 與釘住的 id；exclude 由 client 用 ",".join
   合併；data 是選填的資料等級宣告（public／general／real），省略時不帶參數＝服務
@@ -68,7 +71,7 @@ class Result:
 
 
 class Client:
-    """只用 urllib 打四個呼叫（list／resolve／登錄冷卻／roles）；網路問題一律回 unreachable，不丟例外。
+    """只用 urllib 打五個呼叫（list／usage／resolve／登錄冷卻／roles）；網路問題一律回 unreachable，不丟例外。
 
     base_url 不得含憑證；v0 只傳 loopback URL（例如 http://127.0.0.1:4710）。
     """
@@ -132,6 +135,10 @@ class Client:
     def list(self) -> Result:
         """列出 subscriptions（不含 key；依 priority 排序由服務負責）。"""
         return self._send("GET", "/v1/subscriptions", None)
+
+    def usage(self) -> Result:
+        """用量一覽：GET /v1/usage（每筆精簡欄位，不含 pipes；只讀快取，不觸發等結果）。"""
+        return self._send("GET", "/v1/usage", None)
 
     def resolve(self, agent: str, provider: str, model: str | None = None,
                 subscription: str | None = None,
