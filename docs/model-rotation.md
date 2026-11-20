@@ -131,6 +131,8 @@
 
 ### ② agy（antigravity 可見模型；實際 allow 見 `policy/default.json`，neon 只放 low）
 
+**額度（本人 2026-11-20 提醒，MyPMO#451）**：`gemini-4-neon` 吃的是 agy「Gemini models」那一管額度，與 `gemini-3.8-flash` **共用**（同一管）。把 neon-low 排進 review／架構師來源時，會與 flash 的 impl／qa 搶同一份額度；不要把它當成獨立額度來源，agy 該管用盡時兩者一起進入冷卻。
+
 | 模型 | effort | AA 分數 | 來源 URL＋日期 | 官方／推估 |
 |---|---|---|---|---|
 | `gemini-3.8-flash` | low | 23 | https://artificialanalysis.ai/models/gemini-3-8-flash；2026-11-14 | 官方數字 |
