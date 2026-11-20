@@ -131,6 +131,8 @@
 
 ### ② agy（antigravity 可見模型；實際 allow 見 `policy/default.json`，neon 只放 low）
 
+**額度**：官方 `agy` 的 `/usage` 文件（https://antigravity.google/docs/cli/commands/usage/ ，2026-11-20 讀取）寫「Gemini models」等同一模型組共用一個週上限與一個 5 小時上限；本人 2026-11-20 提醒（MyPMO#451）`gemini-4-neon` 吃 agy「Gemini models」那一管額度，與 `gemini-3.8-flash` 共用同一管。官方沒有逐字點名 Neon 屬於「Gemini models」組，這一步來自本人提醒。**推論**（未驗）：同管用盡時上游會同時拒絕這兩支；Gateway 的冷卻是逐模型登錄的（`openspec/specs/subscription-cooldown`），一支撞 429 不會讓另一支自動顯示冷卻，派工要自己避開。所以把 neon-low 排進 review／架構師來源時，會與 flash 的其他用途搶同一份額度，不要把它當成獨立額度來源。
+
 | 模型 | effort | AA 分數 | 來源 URL＋日期 | 官方／推估 |
 |---|---|---|---|---|
 | `gemini-3.8-flash` | low | 23 | https://artificialanalysis.ai/models/gemini-3-8-flash；2026-11-14 | 官方數字 |
@@ -143,10 +145,10 @@
 | `gemini-4-argon` | low | 查不到 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 查不到（官方未測） |
 | `gemini-4-argon` | medium | 48 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 官方數字 |
 | `gemini-4-argon` | high | 50 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 官方數字 |
-| `gemini-4-neon` | low | 44 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
-| `gemini-4-neon` | medium | 55 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
-| `gemini-4-neon` | high | 60 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
-| `gemini-4-neon` | xhigh | 61 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
+| `gemini-4-neon` | low | 44 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1）；額度與 flash 同管（見本節開頭） |
+| `gemini-4-neon` | medium | 55 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1）；額度與 flash 同管（見本節開頭） |
+| `gemini-4-neon` | high | 60 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1）；額度與 flash 同管（見本節開頭） |
+| `gemini-4-neon` | xhigh | 61 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1）；額度與 flash 同管（見本節開頭） |
 | `claude-sonnet-5-5` | low | 26 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
 | `claude-sonnet-5-5` | medium | 31 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
 | `claude-sonnet-5-5` | high | 42 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
@@ -159,7 +161,7 @@
 agy 可見但不放行（#217，2026-11-20）：下列在 agy 的模型清單裡看得到（orchestrator 兩個是 agy 1.5.13 在 PMO 帳號的清單，帳號／版本條件見下），但**不在** `policy/default.json` 的 allow，resolve 會 403，不進輪換。
 
 - `gemini-4-neon` medium（55）、high（60）、xhigh（61）：分數高於期七三個區間（impl／qa 25–40、review 33–46、架構師 42–51；MyPMO#383 的輪換表定義，本 repo 只寫聯集 25–51）；只放行 low（44，落在 review 與架構師區間）。既有 allow 的 `gemini-4-hydrogen-xhigh`（54）、`claude-opus-5-5-high`（52）早於期七，這次沒有調整；本判準只用在新增。
-- `gemini-pro-orchestrator-neon`（Orchestrator (Neon)）、`gemini-pro-orchestrator-g1-pro`（Orchestrator (Argon)）：AA 無分數（`gemini-pro-orchestrator-neon` 的 AA 頁面 404、榜上沒有）；是組合管線而非單一模型，用量可能重複計算。官方 `agy changelog`（1.5.10 條）寫：Orchestrator 以 Carbon 或 Argon 規劃、交給 Gemini 4 Hydrogen (High) 執行，且只在 Gemini Enterprise／ADC 登入出現；「Neon 規劃」的說法只見於第三方資料，**官方 changelog 沒有記載，未確認**。因此不放。
+- `gemini-pro-orchestrator-neon`（Orchestrator (Neon)）、`gemini-pro-orchestrator-g1-pro`（Orchestrator (Argon)）：AA 無分數（`gemini-pro-orchestrator-neon` 的 AA 頁面 404、榜上沒有）；是組合管線而非單一模型，用量可能重複計算。官方 `agy changelog`（1.5.10 條）寫：Orchestrator 以 Carbon 或 Argon 規劃、交給 Gemini 4 Hydrogen (High) 執行，且只在 Gemini Enterprise／ADC 登入出現；官方 blog〈Gemini 4 Neon in Google Antigravity〉（2026-11-18，https://antigravity.google/blog/gemini-4-neon-in-google-antigravity ）寫 Orchestrator 現在支援 Neon 當 planner、Hydrogen 當 executor（官方 changelog 1.5.10 條只寫過 Carbon／Argon 規劃）。所以「組合管線」成立，結論仍是不放（AA 無分數、非單一模型、用量可能重複計算、不能指定 effort）。
 - `gpt-oss-120b-medium`：AA 上 `gpt-oss-120b` 為 High 4（沒有 medium 檔，2026-11-20 讀取），遠低於期七區間（下限 25），且不在輪換。
 
 ### ③ 免費（v5.0.1，官方）
