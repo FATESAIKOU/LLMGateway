@@ -89,10 +89,10 @@
 | `liquid/lfm-2.5-2.6b:free` | 共用 | 查不到 | 查不到 | 3（主觀） | 3（主觀） | OpenRouter | opencode | 否 | 清單 https://openrouter.ai/api/v1/models；比例 https://openrouter.ai/docs/api-reference/limits；分數 榜單前段未見，AI 判斷；2026-11-07 |
 | `liquid/lfm-3-1.7b:free` | 共用 | 查不到 | 查不到 | 3（主觀） | 3（主觀） | OpenRouter | opencode | 否 | 清單 https://openrouter.ai/api/v1/models；比例 https://openrouter.ai/docs/api-reference/limits；分數 榜單前段未見，AI 判斷；2026-11-07 |
 
-## AA Intelligence Index 分數對照（v5.0.1，讀取日期 2026-11-14）
+## AA Intelligence Index 分數對照（v5.0.1，讀取日期 2026-11-14；§② 的 gemini-4-neon 四列為 2026-11-20）
 
 - (a) 這些分數是 AA Intelligence Index **v5.0.1**（2026-11-14 讀取），與外部文件 MyPMO handbook/model-rotation.md（v4.3.2 尺度，不在本 repo）不是同一把尺，兩邊數字不可直接比；
-- (b) 本節是 2026-11-14 的補充對照；與上表同一模型的分數不同時，以本節為準，上表各列不改。
+- (b) 本節是 2026-11-14 的補充對照（gemini-4-neon 在 11-18 才上榜，那四列是 2026-11-20 讀取）；與上表同一模型的分數不同時，以本節為準，上表各列不改。
 - (c) 28／33／27（glm／deepseek／mimo）在 v5.0.1 是對的，deepseek 的 33 是 1017 Max 的值，無日期版 `deepseek-v4.1-flash` 在 AA 為 deprecated／null，只能當推估。
 
 ### ① codex（chatgpt-personal allow；可用性依 learn.chatgpt.com/docs/models）
@@ -129,7 +129,7 @@
 
 ※ policy 的 chatgpt-personal allow 實為 7 個（含 `gpt-5.5`）。
 
-### ② agy（antigravity allow）
+### ② agy（antigravity 可見模型；實際 allow 見 `policy/default.json`，neon 只放 low）
 
 | 模型 | effort | AA 分數 | 來源 URL＋日期 | 官方／推估 |
 |---|---|---|---|---|
@@ -143,6 +143,10 @@
 | `gemini-4-argon` | low | 查不到 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 查不到（官方未測） |
 | `gemini-4-argon` | medium | 48 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 官方數字 |
 | `gemini-4-argon` | high | 50 | https://artificialanalysis.ai/models/gemini-4-argon；2026-11-14 | 官方數字 |
+| `gemini-4-neon` | low | 44 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
+| `gemini-4-neon` | medium | 55 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
+| `gemini-4-neon` | high | 60 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
+| `gemini-4-neon` | xhigh | 61 | https://artificialanalysis.ai/models/gemini-4-neon；2026-11-20 | 官方數字（AA Intelligence Index v5.0.1） |
 | `claude-sonnet-5-5` | low | 26 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
 | `claude-sonnet-5-5` | medium | 31 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
 | `claude-sonnet-5-5` | high | 42 | https://artificialanalysis.ai/models/claude-sonnet-5-5；2026-11-14 | 官方數字 |
@@ -151,6 +155,12 @@
 | `claude-opus-5-5` | high | 52 | https://artificialanalysis.ai/models/claude-opus-5-5；2026-11-14 | 官方數字 |
 
 註：外部文件 MyPMO handbook/model-rotation.md（v4.3.2 尺度，不在本 repo）曾標記 hydrogen medium「≈45（推估）」、argon medium「≈44（推估）」，AA 目前官方值為 41／48。另 Claude 系列在 AA 另有較高檔位（`claude-sonnet-5-5` Xhigh 50、Max 55；`claude-opus-5-5` Xhigh 57、Max 59），Antigravity 政策未列此 effort。
+
+agy 可見但不放行（#217，2026-11-20）：下列在 agy 的模型清單裡看得到（orchestrator 兩個是 agy 1.5.13 在 PMO 帳號的清單，帳號／版本條件見下），但**不在** `policy/default.json` 的 allow，resolve 會 403，不進輪換。
+
+- `gemini-4-neon` medium（55）、high（60）、xhigh（61）：分數高於期七三個區間（impl／qa 25–40、review 33–46、架構師 42–51；MyPMO#383 的輪換表定義，本 repo 只寫聯集 25–51）；只放行 low（44，落在 review 與架構師區間）。既有 allow 的 `gemini-4-hydrogen-xhigh`（54）、`claude-opus-5-5-high`（52）早於期七，這次沒有調整；本判準只用在新增。
+- `gemini-pro-orchestrator-neon`（Orchestrator (Neon)）、`gemini-pro-orchestrator-g1-pro`（Orchestrator (Argon)）：AA 無分數（`gemini-pro-orchestrator-neon` 的 AA 頁面 404、榜上沒有）；是組合管線而非單一模型，用量可能重複計算。官方 `agy changelog`（1.5.10 條）寫：Orchestrator 以 Carbon 或 Argon 規劃、交給 Gemini 4 Hydrogen (High) 執行，且只在 Gemini Enterprise／ADC 登入出現；「Neon 規劃」的說法只見於第三方資料，**官方 changelog 沒有記載，未確認**。因此不放。
+- `gpt-oss-120b-medium`：AA 上 `gpt-oss-120b` 為 High 4（沒有 medium 檔，2026-11-20 讀取），遠低於期七區間（下限 25），且不在輪換。
 
 ### ③ 免費（v5.0.1，官方）
 

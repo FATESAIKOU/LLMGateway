@@ -47,6 +47,7 @@
           "gemini-4-hydrogen-medium",
           "gemini-4-hydrogen-high",
           "gemini-4-hydrogen-xhigh",
+          "gemini-4-neon-low",
           "claude-opus-5-5-low",
           "claude-opus-5-5-medium",
           "claude-opus-5-5-high",

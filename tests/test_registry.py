@@ -506,6 +506,7 @@ class FactoryAntigravityTest(RegistryCase):
         "gemini-4-hydrogen-medium",
         "gemini-4-hydrogen-high",
         "gemini-4-hydrogen-xhigh",
+        "gemini-4-neon-low",
         "claude-opus-5-5-low",
         "claude-opus-5-5-medium",
         "claude-opus-5-5-high",
@@ -514,7 +515,7 @@ class FactoryAntigravityTest(RegistryCase):
         "claude-sonnet-5-5-high",
     )
 
-    def test_resolve16個模型id都回200且env空(self):
+    def test_resolve17個模型id都回200且env空(self):
         for model in self.MODELS:
             with self.subTest(model=model):
                 payload = self.resolve("agy", "google", model=model)
@@ -536,7 +537,10 @@ class FactoryAntigravityTest(RegistryCase):
 
     def test_model不在清單回403(self):
         for model in ("gemini-9-fake", "google/gemini-3.8-flash-low",
-                      "gpt-oss-120b"):
+                      "gpt-oss-120b", "gemini-4-neon-medium",
+                      "gemini-4-neon-high", "gemini-4-neon-xhigh",
+                      "gemini-pro-orchestrator-neon",
+                      "gemini-pro-orchestrator-g1-pro", "gpt-oss-120b-medium"):
             with self.subTest(model=model):
                 self.assert_api_error(
                     403, "model_not_allowed", self.resolve, "agy", "google", model)
@@ -2917,7 +2921,7 @@ class ExternalHostsTest(unittest.TestCase):
 NOT_APPLICABLE_REASONS = ("no_quota_api", "unavailable")
 FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity", "chatgpt-personal")
 
-# C-4c 的快照：PR1 前（現行 main 的 usage 組裝）以 list 與 resolve 的非 usage 欄位輸出，手抄成常數。
+# C-4c 的快照：PR1 前（現行 main 的 usage 組裝）以 list 與 resolve 的非 usage 欄位輸出，手抄成常數；policy 的 allow 變更時要同步此常數（不是凍結的歷史快照）。
 # 設定：空的 UsageService（沒注入取用量實作）、claude-personal 冷卻至 2026-10-11T00:30:00Z、FakeClock 預設時間。
 # 只放非 usage 欄位（list 去掉 usage；resolve 的 meta 去掉 usage）；usage 另由 C-2、C-4a 等測試驗證。
 _PRE_PR1_SNAPSHOT = {'list': [{'agents': ['opencode'],
@@ -2986,6 +2990,7 @@ _PRE_PR1_SNAPSHOT = {'list': [{'agents': ['opencode'],
                                 'gemini-4-hydrogen-medium',
                                 'gemini-4-hydrogen-high',
                                 'gemini-4-hydrogen-xhigh',
+                                'gemini-4-neon-low',
                                 'claude-opus-5-5-low',
                                 'claude-opus-5-5-medium',
                                 'claude-opus-5-5-high',
