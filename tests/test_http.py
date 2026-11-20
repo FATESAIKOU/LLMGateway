@@ -1170,6 +1170,7 @@ class FactoryAntigravityHttpTest(ServerCase):
         "gemini-4-hydrogen-medium",
         "gemini-4-hydrogen-high",
         "gemini-4-hydrogen-xhigh",
+        "gemini-4-neon-low",
         "claude-opus-5-5-low",
         "claude-opus-5-5-medium",
         "claude-opus-5-5-high",
@@ -1199,7 +1200,7 @@ class FactoryAntigravityHttpTest(ServerCase):
     def json_of(self, payload):
         return json.loads(payload.decode())
 
-    def test_resolve16個模型id回200(self):
+    def test_resolve17個模型id回200(self):
         for model in self.MODELS:
             with self.subTest(model=model):
                 status, payload = self.call(

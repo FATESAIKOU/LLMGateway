@@ -416,6 +416,7 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
       "gemini-4-hydrogen-medium",
       "gemini-4-hydrogen-high",
       "gemini-4-hydrogen-xhigh",
+      "gemini-4-neon-low",
       "claude-opus-5-5-low",
       "claude-opus-5-5-medium",
       "claude-opus-5-5-high",

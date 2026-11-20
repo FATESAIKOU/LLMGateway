@@ -156,8 +156,8 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(_covered(go, "big-pickle"))  # #149
         self.assertFalse(_covered(go, "kimi-k3"))  # 付費的 id
 
-    def test_antigravity出廠16個字面模型id(self):
-        # #107 本人裁定：本人從 `agy models` 抄的 16 個裸 id，照抄、不增不減不改。
+    def test_antigravity出廠17個字面模型id(self):
+        # 出廠 antigravity allow 17 個（#107 本人從 `agy models` 抄的 12＋#198 的 hydrogen 4＋#217 的 neon-low 1）；agy models 另有不放行的 id（見 docs/model-rotation.md §②）。
         # 出廠政策只放字面 id（不含萬用字元）：錯字在 resolve 就是 403，不會延到 agy。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         sub = policy.subscriptions["antigravity"]
@@ -172,6 +172,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
             "gemini-4-hydrogen-medium",
             "gemini-4-hydrogen-high",
             "gemini-4-hydrogen-xhigh",
+            "gemini-4-neon-low",
             "claude-opus-5-5-low",
             "claude-opus-5-5-medium",
             "claude-opus-5-5-high",
@@ -193,6 +194,12 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertFalse(_covered(sub, "gemini-9-fake"))
         self.assertFalse(_covered(sub, "google/gemini-3.8-flash-low"))
         self.assertFalse(_covered(sub, "gpt-oss-120b"))
+        # #217：neon 只放 low；medium／high／xhigh 與組合管線 orchestrator 不放行
+        for model_id in ("gemini-4-neon-medium", "gemini-4-neon-high",
+                         "gemini-4-neon-xhigh", "gemini-pro-orchestrator-neon",
+                         "gemini-pro-orchestrator-g1-pro", "gpt-oss-120b-medium"):
+            with self.subTest(model=model_id):
+                self.assertFalse(_covered(sub, model_id))
 
     def test_roles不含antigravity(self):
         # #107 本人裁定：roles 不納入（不改 roles 段）。
