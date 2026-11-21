@@ -56,6 +56,26 @@ def wait_local_ok(layout, seconds: float) -> bool:
         time.sleep(min(1.0, remaining))
 
 
+def remote_rc(layout, timeout: float | None = None) -> int | None:
+    """經會合點探針的原始結束碼（0／1／2…）；找不到或跑不起來回 None。
+
+    給需要區分 rc=2（無法探）與 rc=1（不是 200）的呼叫方（tunnel-apply）。
+    """
+    probe = layout.tunnel_bin
+    if not os.path.isfile(probe):
+        return None
+    env = layout.child_env(HOME=layout.service_home,
+                           **{ENV_TUNNEL_ENV: layout.tunnel_env_file})
+    if os.access(probe, os.X_OK):
+        argv = [probe, "--probe-once"]
+    else:
+        argv = [layout.python3, probe, "--probe-once"]
+    try:
+        return run(argv, env=env, timeout=PROBE_TIMEOUT if timeout is None else timeout).returncode
+    except RunError:
+        return None
+
+
 def remote(layout) -> tuple[str, str]:
     """經會合點的探針：用當版的 ``llmgateway-tunnel --probe-once``（0／1／2）。"""
     probe = layout.tunnel_bin

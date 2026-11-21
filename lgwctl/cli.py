@@ -37,6 +37,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_reset = sub.add_parser("follow-reset", help="重設隧道水位或抓取狀態")
     p_reset.add_argument("--fetch-state", action="store_true")
 
+    p_apply = sub.add_parser(
+        "tunnel-apply",
+        help="以反向保險套用新的 tunnel.env／drop-in 並重啟隧道（需 root；"
+             "窗口內勿重開機：transient timer 重開機後失效）")
+    p_apply.add_argument("--new-env", default=None, help="暫存的新 tunnel.env（以複製套用，保留）")
+    p_apply.add_argument("--new-dropin", default=None, help="暫存的新 credential.conf（選填）")
+    p_apply.add_argument("--revert-after", default="10m",
+                         help="保險多久後自動還原（預設 10m，下限 5m）")
+    p_apply.add_argument("--confirm", action="store_true", help="驗收完成，取消自動還原")
+    p_apply.add_argument("--retry-revert", action="store_true",
+                         help="還原失敗（revert-failed）後重試還原（需 root）")
+    p_apply.add_argument("--revert-attempt", type=int, default=0, help=argparse.SUPPRESS)
+    p_apply.add_argument("--round", default=None, help=argparse.SUPPRESS)
+    p_apply.add_argument("--revert-inner", action="store_true", help=argparse.SUPPRESS)
+    p_apply.add_argument("--apply-inner", action="store_true", help=argparse.SUPPRESS)
+
     p_install = sub.add_parser("install", help="第一次安裝（可重跑；冪等）")
     p_install.add_argument("--tag", required=True, help="版本 tag（lgw-vX.Y.Z）")
     p_install.add_argument("--repo", default=None, help=f"取碼來源（預設 {DEFAULT_REPO}）")
@@ -127,6 +143,15 @@ def main(argv=None, env=None) -> int:
             return 0
         action = units.start if args.command == "start" else units.restart
         return 0 if action(layout, SERVICE_NAME) and probe.wait_local_ok(layout, layout.list_wait) else 1
+    if args.command == "tunnel-apply":
+        # 沿用 migrate.py 的鎖與時間格式；晚點才匯入（沒有 migrate.py 時其他子指令不受影響）。
+        from . import tunnel_apply
+        return tunnel_apply.run(layout, new_env=args.new_env, new_dropin=args.new_dropin,
+                                revert_after=args.revert_after, confirm=args.confirm,
+                                revert_inner=args.revert_inner, apply_inner=args.apply_inner,
+                                retry_revert=args.retry_revert,
+                                revert_attempt=args.revert_attempt, round_id=args.round,
+                                report=report)
     if args.command == "install":
         return install.run(layout, tag=args.tag, repo=args.repo, report=report)
     if args.command == "check":
