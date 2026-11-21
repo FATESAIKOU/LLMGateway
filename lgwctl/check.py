@@ -29,7 +29,7 @@ import time
 
 from . import probe, units
 from . import run as runmod
-from .layout import KEYS_REPO, TUNNEL_SERVICE_NAME, UNIT_NAMES
+from .layout import KEYS_REPO, TUNNEL_SERVICE_NAME, SERVICE_NAME
 from .report import Report
 
 # .keysync.status 的 reason 白名單（低-8）：writer（lgwd/keysync.py、sync.py）
@@ -67,22 +67,85 @@ def _keys_age(path: str) -> float | None:
         return None
 
 
-def _check_units(layout, report) -> None:
-    tunnel_ready, _ = layout.tunnel_config_state()
-    for unit in UNIT_NAMES:
-        state = units.unit_state(layout, unit)
-        if state == "active":
-            report.ok(unit)
-        elif state == "missing":
-            # unit 檔不在＝確定沒裝（含隧道：install 本來就該放兩個 unit），
-            # 不能當 todo／unknown，否則「沒裝」會被誤當「無法確認」（中-1）。
-            report.fail(unit, "unit 不在（沒裝）")
-        elif state == "unknown":
-            report.todo(unit, f"{layout.systemctl} 不能用，無法確認")
-        elif unit == TUNNEL_SERVICE_NAME and not tunnel_ready:
-            report.todo(unit, "沒在跑（隧道設定未填，屬本人動作）")
+def _check_units(layout, report, *, no_remote=False) -> tuple[bool, str]:
+    core = units.unit_state(layout, SERVICE_NAME)
+    if core == "active":
+        report.ok(SERVICE_NAME)
+    elif core == "unknown":
+        report.todo(SERVICE_NAME, "systemctl 不能用，無法確認")
+    else:
+        report.fail(SERVICE_NAME, "unit 不在（沒裝）" if core == "missing" else "沒在跑")
+    if no_remote:
+        return False, "missing"
+    state = units.unit_state(layout, TUNNEL_SERVICE_NAME)
+    configured = layout.tunnel_configured()
+    present = state != "missing" or configured or layout.tunnel_follow_state()[0] == "unreadable" or os.path.isfile(layout.unit_file(TUNNEL_SERVICE_NAME))
+    if not present:
+        return False, state
+    follow, _ = layout.tunnel_follow_state()
+    if state == "active":
+        report.ok(TUNNEL_SERVICE_NAME)
+    elif follow == "unreadable" or (layout.tunnel_follow_configured() and layout.tunnel_fetch_state() == "unreadable"):
+        report.todo(TUNNEL_SERVICE_NAME, "需 root 或 llmgw 才能讀")
+    elif state == "unknown":
+        report.todo(TUNNEL_SERVICE_NAME, "systemctl 不能用，無法確認")
+    elif not configured:
+        report.todo(TUNNEL_SERVICE_NAME, "沒在跑（隧道設定未填）")
+    else:
+        report.fail(TUNNEL_SERVICE_NAME, "unit 不在（沒裝）" if state == "missing" else "沒在跑")
+    return True, state
+
+
+def _check_follow(layout, report, active):
+    follow, gen = layout.tunnel_follow_state()
+    fetch = layout.tunnel_fetch_state()
+    if follow == "unconfigured" and fetch == "none":
+        return
+    if follow == "unconfigured":
+        pass
+    elif follow == "unreadable" or fetch == "unreadable":
+        report.todo("tunnel-follow", "unreadable（需 root 或 llmgw 才能讀）")
+    elif follow in ("missing", "invalid", "regressed"):
+        reason = {"missing": "follow 檔缺失", "invalid": "follow 檔無效", "regressed": "follow 檔回退"}[follow]
+        if active:
+            report.todo("tunnel-follow", reason + "，現存連線靠最後已知位址維持；需人工確認 NODE_GATEWAY")
         else:
-            report.fail(unit, "沒在跑")
+            report.fail("tunnel-follow", reason + "，請人工確認 NODE_GATEWAY；確認回退後執行 llmgwctl follow-reset")
+    else:
+        report.ok("tunnel-follow", "ok (gen=" + (str(gen) if gen is not None else "pending") + ")")
+    rejected = {"regressed", "invalid", "hostkey_missing", "auth_failed"}
+    if fetch == "auth_failed":
+        detail = "auth_failed：token 可能失效，請跑 llmgateway-tunnel --fetch-check，換好 token 後執行 llmgwctl follow-reset --fetch-state"
+        (report.todo if active else report.fail)("tunnel-fetch", detail)
+    elif fetch in rejected:
+        detail = fetch + "：最近抓取被拒，現存連線靠最後已知位址維持，需人工確認 NODE_GATEWAY；確認回退後執行 llmgwctl follow-reset"
+        (report.todo if active else report.fail)("tunnel-fetch", detail)
+    elif fetch == "config_partial":
+        report.todo("tunnel-fetch", "config_partial：GitHub 抓取設定半套，僅跑靜態設定")
+    elif fetch == "credential_unreadable":
+        report.todo("tunnel-fetch", "credential_unreadable：檢查金鑰檔路徑、權限或 drop-in LoadCredential")
+    elif fetch == "unreadable":
+        report.todo("tunnel-fetch", "unreadable（需 root 或 llmgw 才能讀）")
+    else:
+        report.ok("tunnel-fetch", fetch)
+    token = layout.tunnel_token_state()
+    if token == "expiry_invalid":
+        reason = "TOKEN_EXPIRES_AT 格式不合" if layout.tunnel_values().get("TOKEN_EXPIRES_AT") else "token 到期資訊無效"
+        report.todo("tunnel-token", reason)
+    elif token == "expiry_due":
+        report.todo("tunnel-token", "token 即將到期或已到期")
+    elif token == "unreadable":
+        report.todo("tunnel-token", "unreadable（需 root 或 llmgw 才能讀）")
+    else:
+        report.ok("tunnel-token", token)
+    key = layout.tunnel_values().get("GATEWAY_GITHUB_KEY_FILE")
+    if key:
+        try:
+            os.stat(key)
+        except PermissionError:
+            report.todo("tunnel-credential", "需權限確認金鑰檔")
+        except OSError:
+            report.todo("tunnel-credential", "檢查金鑰檔路徑、權限或 drop-in LoadCredential")
 
 
 def _check_tag(layout, report, tag: str) -> None:
@@ -205,11 +268,12 @@ def _check_gh_repo(layout, report) -> None:
 def run(layout, *, report: Report | None = None, no_remote: bool = False,
         tag: str | None = None) -> int:
     report = report or Report()
-    _check_units(layout, report)
+    tunnel_present, tunnel_state = _check_units(layout, report, no_remote=no_remote)
     if tag:
         _check_tag(layout, report, tag)
     _check_list_local(layout, report)
-    if not no_remote:
+    if tunnel_present:
+        _check_follow(layout, report, tunnel_state == "active")
         _check_list_remote(layout, report)
     _check_keysync(layout, report)
     _check_policy(layout, report)

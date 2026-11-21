@@ -32,7 +32,6 @@ from .layout import (
     TAG_RE,
     TUNNEL_ENV_NAME,
     TUNNEL_SERVICE_NAME,
-    UNIT_NAMES,
 )
 from .report import Report
 
@@ -266,14 +265,6 @@ def _step_config(layout, report) -> bool:
         _write_one(layout, layout.env_file, ENV_FILE_NAME,
                    LLMGATEWAY_ENV_TEMPLATE.format(port=DEFAULT_API_PORT),
                    0o644, created, kept)
-        port = layout.api_port()
-        identity = os.path.join(layout.service_home, ".ssh", TUNNEL_KEY_NAME)
-        known_hosts = os.path.join(layout.service_home, ".ssh", TUNNEL_KNOWN_HOSTS_NAME)
-        _write_one(layout, layout.tunnel_env_file, TUNNEL_ENV_NAME,
-                   TUNNEL_ENV_TEMPLATE.format(
-                       home=layout.service_home, identity=identity,
-                       known_hosts=known_hosts, port=port),
-                   0o644, created, kept)
         _write_one(layout, layout.keys_pass_file, KEYS_PASS_NAME, KEYS_PASS_TEMPLATE,
                    0o640, created, kept)
         _write_one(layout, layout.keys_env, KEYS_ENV_NAME, "", 0o600, created, kept)
@@ -320,11 +311,14 @@ def _step_daemon_reload(layout, report) -> bool:
 
 
 def _step_enable(layout, report) -> bool:
-    failed = [name for name in UNIT_NAMES if not units.enable(layout, name)]
+    names = [SERVICE_NAME]
+    if layout.tunnel_configured() and os.path.isfile(layout.unit_file(TUNNEL_SERVICE_NAME)):
+        names.append(TUNNEL_SERVICE_NAME)
+    failed = [name for name in names if not units.enable(layout, name)]
     if failed:
         report.fail("enable", "、".join(failed) + " enable 失敗")
         return False
-    report.ok("enable", "、".join(UNIT_NAMES))
+    report.ok("enable", "、".join(names))
     return True
 
 
@@ -491,8 +485,9 @@ def run(layout, *, tag: str, repo: str | None = None, report: Report | None = No
         return report.exit_code(todo_ok=True)
     if not _step_service(layout, report):
         return report.exit_code(todo_ok=True)
-    ready, missing = layout.tunnel_config_state()
-    _step_tunnel(layout, report, ready, missing)
+    if layout.tunnel_configured():
+        ready, missing = layout.tunnel_config_state()
+        _step_tunnel(layout, report, ready, missing)
     _step_todos(layout, report)
     removed = release.cleanup_old_versions(layout)
     report.ok("cleanup", "、".join(removed) + " 已移除" if removed else "沒有多餘版本")

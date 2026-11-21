@@ -166,7 +166,7 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
         report.fail("rollback", f"previous 的目錄不在（{previous}）")
         return 1
     # 中-3：先確認 previous 有 unit 檔（沒有就在切 link 之前停手）。
-    missing = [name for name in units.UNIT_NAMES
+    missing = [name for name in (units.SERVICE_NAME,)
                if not os.path.isfile(units.unit_source(previous_dir, name))]
     if missing:
         report.fail("rollback", f"{previous} 沒有 deploy/units 的 "

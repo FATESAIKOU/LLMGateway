@@ -12,7 +12,7 @@ import os
 import pwd
 
 from . import atomic
-from .layout import ENV_RUNUSER, UNIT_NAMES
+from .layout import ENV_RUNUSER, UNIT_NAMES, SERVICE_NAME
 from .run import RunError, run
 
 UNITS_REL_DIR = os.path.join("deploy", "units")
@@ -29,18 +29,21 @@ def unit_source(tag_dir: str, name: str) -> str:
 
 
 def install_unit_files(layout, tag_dir: str, report) -> bool:
-    """把兩個 system unit 檔裝進 unit 目錄；缺檔或寫不進去回 False。"""
-    for name in UNIT_NAMES:
+    """安裝必要 unit，以及版本內存在的可選 unit。"""
+    for name in (SERVICE_NAME,):
         if not os.path.isfile(unit_source(tag_dir, name)):
             report.fail("units", f"版本裡缺 {UNITS_REL_DIR}/{name}")
             return False
+    installed = []
     try:
         for name in UNIT_NAMES:
-            copy_file(unit_source(tag_dir, name), layout.unit_file(name), 0o644)
+            if os.path.isfile(unit_source(tag_dir, name)):
+                copy_file(unit_source(tag_dir, name), layout.unit_file(name), 0o644)
+                installed.append(name)
     except OSError as exc:
         report.fail("units", f"寫 unit 失敗（{type(exc).__name__}）")
         return False
-    report.ok("units", "、".join(UNIT_NAMES))
+    report.ok("units", "、".join(installed))
     return True
 
 
@@ -131,6 +134,13 @@ def enable(layout, unit: str) -> bool:
 def start(layout, unit: str) -> bool:
     try:
         return _systemctl(layout, "start", unit).returncode == 0
+    except RunError:
+        return False
+
+
+def stop(layout, unit: str) -> bool:
+    try:
+        return _systemctl(layout, "stop", unit).returncode == 0
     except RunError:
         return False
 

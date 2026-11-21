@@ -7,6 +7,7 @@ detail。detail 只有 http 碼、rc 與種類，沒有設定值。
 from __future__ import annotations
 
 import os
+import re
 import time
 
 from .layout import ENV_TUNNEL_ENV
@@ -35,7 +36,7 @@ def local_code(layout) -> tuple[str, str]:
         return "fail", f"curl rc={proc.returncode}（連不上或逾時）"
     if code == "200":
         return "ok", "200"
-    return "fail", f"回 {code or '（空）'}"
+    return "fail", f"回 {code}" if re.fullmatch(r"[0-9]{3}", code) else "回應無效"
 
 
 def local_ok(layout) -> bool:
@@ -77,5 +78,5 @@ def remote(layout) -> tuple[str, str]:
     if proc.returncode == 1:
         return "fail", "經會合點不是 200 或沒回應"
     if proc.returncode == 2:
-        return "todo", "無法探（隧道設定未填或找不到 ssh）"
+        return "todo", "無法探"
     return "todo", f"探針無法執行（rc={proc.returncode}）"
