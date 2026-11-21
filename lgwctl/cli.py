@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
-from . import check, install, status, sync, upgrade, usage
-from .layout import DEFAULT_REPO, Layout
+from . import check, install, status, sync, upgrade, usage, units, probe
+from .layout import DEFAULT_REPO, Layout, SERVICE_NAME
 from .report import Report
 
 MIGRATE_COMMANDS = ("prepare-migration", "cutover", "confirm", "rollback-to-user",
@@ -31,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    for command, help_text in (("start", "啟動服務"), ("stop", "停止服務"), ("restart", "重啟服務")):
+        sub.add_parser(command, help=help_text)
+    p_reset = sub.add_parser("follow-reset", help="重設隧道水位或抓取狀態")
+    p_reset.add_argument("--fetch-state", action="store_true")
+
     p_install = sub.add_parser("install", help="第一次安裝（可重跑；冪等）")
     p_install.add_argument("--tag", required=True, help="版本 tag（lgw-vX.Y.Z）")
     p_install.add_argument("--repo", default=None, help=f"取碼來源（預設 {DEFAULT_REPO}）")
@@ -40,7 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="跳過經會合點的探針（不列那一項）")
     p_check.add_argument("--tag", default=None, help="順便確認裝的是這個 tag")
 
-    sub.add_parser("status", help="看版本與兩個 unit 狀態（不用 root）")
+    p_status = sub.add_parser("status", help="看版本與 unit 狀態（不用 root）")
+    p_status.add_argument("--no-remote", action="store_true")
 
     p_upgrade = sub.add_parser("upgrade", help="換新版（policy 預檢、失敗自動切回）")
     p_upgrade.add_argument("--tag", required=True, help="新版本 tag（lgw-vX.Y.Z）")
@@ -65,13 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _migrate(argv, env=None) -> int:
     """轉給 lgwctl/migrate.py；沒有那個檔就明確說一聲（結束碼 3）。"""
+    import importlib
     import importlib.util
 
     if importlib.util.find_spec(f"{__package__}.migrate") is None:
         print(f"llmgwctl: {argv[0]} 還沒有實作（這版沒有 lgwctl/migrate.py）",
               file=sys.stderr)
         return 3
-    from . import migrate
+    migrate = importlib.import_module(f"{__package__}.migrate")
 
     if not hasattr(migrate, "main"):
         print(f"llmgwctl: {argv[0]} 還沒有實作（lgwctl/migrate.py 沒有 main()）",
@@ -87,12 +95,44 @@ def main(argv=None, env=None) -> int:
     args = build_parser().parse_args(args_in)
     layout = Layout.from_env(env)
     report = Report()
+    if args.command == "follow-reset":
+        if os.geteuid() != 0:
+            print("follow-reset 需要 root 權限", file=sys.stderr)
+            return 1
+        names = [".tunnel_fetch_backoff", ".tunnel_fetch_state"]
+        if not args.fetch_state:
+            names.append(".tunnel_generation")
+        try:
+            try:
+                state_fd = os.open(layout.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                return 0
+            try:
+                for name in names:
+                    try:
+                        os.unlink(name, dir_fd=state_fd)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(state_fd)
+        except OSError:
+            print("follow-reset 無法清除狀態", file=sys.stderr)
+            return 1
+        return 0
+    if args.command in ("start", "stop", "restart"):
+        state = units.unit_state(layout, SERVICE_NAME)
+        if args.command == "stop":
+            return 0 if state == "inactive" or units.stop(layout, SERVICE_NAME) else 1
+        if args.command == "start" and state == "active" and probe.local_ok(layout):
+            return 0
+        action = units.start if args.command == "start" else units.restart
+        return 0 if action(layout, SERVICE_NAME) and probe.wait_local_ok(layout, layout.list_wait) else 1
     if args.command == "install":
         return install.run(layout, tag=args.tag, repo=args.repo, report=report)
     if args.command == "check":
         return check.run(layout, report=report, no_remote=args.no_remote, tag=args.tag)
     if args.command == "status":
-        return status.run(layout)
+        return status.run(layout, no_remote=args.no_remote)
     if args.command == "upgrade":
         return upgrade.upgrade(layout, tag=args.tag, repo=args.repo, report=report)
     if args.command == "rollback":

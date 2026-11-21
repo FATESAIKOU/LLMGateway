@@ -130,16 +130,16 @@ class CheckTests(unittest.TestCase):
         rc, out, err = self.check()
         self.assertEqual(rc, 1)
         self.assertTrue(has_line(out, "llmgateway.service", "fail"), out)
-        self.assertTrue(has_line(out, "llmgateway-tunnel.service", "fail"), out)
+        self.assertFalse(has_line(out, "llmgateway-tunnel.service"), out)
         self.assertIn("沒裝", out)
         self.assertNotIn("不能用", out)   # 不是「systemctl 不能用」的那種 todo
 
-    def test_missing_tunnel_unit_is_fail_even_without_config(self):
-        """隧道 unit 不在＝沒裝（install 本來就該放兩個），「設定未填」特例不適用。"""
+    def test_missing_tunnel_unit_without_config_is_optional(self):
         self.box.set_missing("llmgateway-tunnel.service")
         rc, out, err = self.check()
-        self.assertEqual(rc, 1)
-        self.assertTrue(has_line(out, "llmgateway-tunnel.service", "fail"), out)
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(has_line(out, "llmgateway-tunnel.service"), out)
+        self.assertFalse(has_line(out, "list-remote"), out)
 
     # -- list ---------------------------------------------------------------
 

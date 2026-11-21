@@ -93,12 +93,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn(FAKE_TAG, self.box.read(tunnel_unit))
         # 設定範本
         self.assertIn('LGW_API_PORT="8480"', self.box.read(self.box.etc("llmgateway.env")))
-        tunnel_env = self.box.read(self.box.etc("tunnel.env"))
-        self.assertIn("IDENTITY=" + os.path.join(self.box.service_home, ".ssh",
-                                                 "id_llmgw_tunnel"), tunnel_env)
-        self.assertIn("RENDEZVOUS=", tunnel_env)
-        # LOCAL_API 要跟上面的 LGW_API_PORT 一致（低-1；這裡是預設 8480）
-        self.assertIn("LOCAL_API=8480", tunnel_env)
+        self.assertFalse(os.path.exists(self.box.etc("tunnel.env")))
         # keys.pass 是空殼（只有註解）、keys.env 是空的 0600
         keys_pass = self.box.etc("keys.pass")
         self.assertNotIn(FAKE_PASSWORD, self.box.read(keys_pass))
@@ -114,12 +109,12 @@ class InstallTests(unittest.TestCase):
         actions = self.box.actions()
         self.assertIn("daemon-reload daemon-reload", actions)
         self.assertIn("enable llmgateway.service", actions)
-        self.assertIn("enable llmgateway-tunnel.service", actions)
+        self.assertNotIn("enable llmgateway-tunnel.service", actions)
         self.assertIn("start llmgateway.service", actions)
         self.assertNotIn("start llmgateway-tunnel.service", actions)
         # 本人動作的 todo（假 gh 預設沒登入）
         self.assertTrue(has_line(out, "keys-pass", "todo"), out)
-        self.assertTrue(has_line(out, "tunnel-key", "todo"), out)
+        self.assertFalse(has_line(out, "tunnel-key", "todo"), out)
         self.assertTrue(has_line(out, "gh-login", "todo"), out)
         # 帳號是假的 useradd 建的
         self.assertIn("lgwfake", self.box.log("useradd.log"))
@@ -190,13 +185,11 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.box.current_link))
         self.assertFalse(os.path.lexists(self.box.unit("llmgateway.service")))
 
-    def test_tag_without_tunnel_unit_is_rejected(self):
-        rc, out, err = self.install(
-            FAKE_GIT_SKIP="deploy/units/llmgateway-tunnel.service")
-        self.assertEqual(rc, 1)
-        self.assertTrue(has_line(out, "fetch", "fail"), out)
-        self.assertIn("deploy/units/llmgateway-tunnel.service", out)
-        self.assertFalse(os.path.lexists(self.box.current_link))
+    def test_tag_without_tunnel_unit_is_accepted(self):
+        rc, out, err = self.install(FAKE_GIT_SKIP="deploy/units/llmgateway-tunnel.service")
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.lexists(self.box.current_link))
+        self.assertFalse(os.path.exists(self.box.unit("llmgateway-tunnel.service")))
 
     # -- 取碼的 repo 與必備檔（中-6／低-8）-----------------------------------
 
@@ -275,6 +268,7 @@ class InstallTests(unittest.TestCase):
 
     def test_tunnel_todo_tells_the_next_step(self):
         """設定未填的 todo 要寫明下一步（低-2）。"""
+        self.box.write(self.box.etc("tunnel.env"), "RENDEZVOUS=user@example:22\n")
         rc, out, err = self.install()
         self.assertEqual(rc, 0, out + err)
         self.assertTrue(has_line(out, "tunnel-key", "todo"), out)
@@ -339,12 +333,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(os.readlink(self.box.current_link), self.box.opt(FAKE_TAG))
 
-    def test_tunnel_env_port_follows_llmgateway_env(self):
-        """tunnel.env 的 LOCAL_API 要跟 llmgateway.env 的 LGW_API_PORT 一致（低-1）。"""
+    def test_existing_tunnel_env_is_preserved(self):
         self.box.write(self.box.etc("llmgateway.env"), 'LGW_API_PORT="9999"\n')
+        self.box.write(self.box.etc("tunnel.env"), "LOCAL_API=1234\n")
         rc, out, err = self.install()
         self.assertEqual(rc, 0, out + err)
-        self.assertIn("LOCAL_API=9999", self.box.read(self.box.etc("tunnel.env")))
+        self.assertEqual("LOCAL_API=1234\n", self.box.read(self.box.etc("tunnel.env")))
 
     # -- 帳號與權限（中-4／低-9）--------------------------------------------
 

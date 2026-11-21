@@ -28,9 +28,7 @@ REQUIRED_FILES = (
     os.path.join("lgwd", "keys.py"),
     os.path.join("lgwctl", "__main__.py"),
     os.path.join(OPS_DIR_NAME, KEYSYNC_BIN_NAME),
-    os.path.join(OPS_DIR_NAME, TUNNEL_BIN_NAME),
     os.path.join("deploy", "units", "llmgateway.service"),
-    os.path.join("deploy", "units", "llmgateway-tunnel.service"),
 )
 TAG_FILE_NAME = ".lgw-tag"
 

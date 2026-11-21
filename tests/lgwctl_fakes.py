@@ -57,8 +57,10 @@ case "$1" in
         if [[ -f "${fake}/start_fail/${unit}" ]]; then
             exit 1
         fi
-        # start_noop：回 0 但不標 active（模擬 simple 型 unit、exec 前就回 0）。
-        if [[ ! -f "${fake}/start_noop/${unit}" ]]; then
+        # stop 清除 active；start_noop 模擬啟動回 0 但尚未 active。
+        if [[ "$1" == "stop" ]]; then
+            rm -f "${fake}/active/${unit}"
+        elif [[ ! -f "${fake}/start_noop/${unit}" ]]; then
             : > "${fake}/active/${unit}"
         fi
         exit 0 ;;

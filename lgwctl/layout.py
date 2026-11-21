@@ -22,6 +22,14 @@
 from __future__ import annotations
 
 import os
+import base64
+import binascii
+import hashlib
+import ipaddress
+import struct
+import json
+import stat
+from datetime import datetime, timezone
 import pwd
 import re
 
@@ -34,7 +42,9 @@ BIN_DIR = "/usr/local/bin"
 
 SERVICE_NAME = "llmgateway.service"
 TUNNEL_SERVICE_NAME = "llmgateway-tunnel.service"
-UNIT_NAMES = (SERVICE_NAME, TUNNEL_SERVICE_NAME)
+CORE_UNIT_NAMES = (SERVICE_NAME,)
+OPTIONAL_UNIT_NAMES = (TUNNEL_SERVICE_NAME,)
+UNIT_NAMES = CORE_UNIT_NAMES + OPTIONAL_UNIT_NAMES
 
 ENV_FILE_NAME = "llmgateway.env"
 TUNNEL_ENV_NAME = "tunnel.env"
@@ -124,7 +134,7 @@ def parse_env_text(text: str) -> dict:
     return values
 
 
-def parse_env_file(path: str) -> dict:
+def parse_env_file(path: str, *, raise_permission: bool = False) -> dict:
     """讀 KEY=VALUE 的設定檔（llmgateway.env／tunnel.env）；讀不到回空字典。
 
     與 ops-scripts/llmgateway-tunnel 的 parse_env_file 同一套規則：略過空行與
@@ -133,10 +143,71 @@ def parse_env_file(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
+    except PermissionError:
+        if raise_permission:
+            raise
+        return {}
     except OSError:
         return {}
     return parse_env_text(text)
 
+
+def _follow_fields(data):
+    """Validate and normalize the four connection fields used by the watermark."""
+    host = data.get("ip")
+    user = data.get("tunnel_user")
+    key = data.get("host_key")
+    port = data.get("ssh_port")
+    if not isinstance(host, str) or not host or "%" in host:
+        raise ValueError()
+    try:
+        host = str(ipaddress.ip_address(host))
+    except ValueError:
+        labels = host.split(".")
+        if len(host) > 253 or not labels or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", x) for x in labels) or labels[-1].isdigit():
+            raise ValueError()
+        host = host.lower()
+    if not isinstance(user, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*[$]?", user):
+        raise ValueError()
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError()
+    if not isinstance(key, str) or not re.fullmatch(r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) [A-Za-z0-9+/]+={0,2}", key):
+        raise ValueError()
+    kind, encoded = key.split(" ")
+    try:
+        blob = base64.b64decode(encoded, validate=True)
+        if base64.b64encode(blob).decode() != encoded:
+            raise ValueError()
+        index = 0
+        fields = []
+        while index < len(blob):
+            if index + 4 > len(blob):
+                raise ValueError()
+            length = struct.unpack_from(">I", blob, index)[0]
+            index += 4
+            if length == 0 or index + length > len(blob):
+                raise ValueError()
+            fields.append(blob[index:index + length])
+            index += length
+        if not fields or fields[0] != kind.encode():
+            raise ValueError()
+        if kind == "ssh-ed25519" and (len(fields) != 2 or len(fields[1]) != 32):
+            raise ValueError()
+        if kind == "ssh-rsa" and len(fields) != 3:
+            raise ValueError()
+        if kind.startswith("ecdsa-") and (len(fields) != 3 or fields[1] != kind.removeprefix("ecdsa-sha2-").encode()):
+            raise ValueError()
+    except (binascii.Error, struct.error):
+        raise ValueError() from None
+    return (host, port, user, key)
+
+
+def follow_fingerprint(data):
+    """將正規化的 ip、ssh_port、tunnel_user、host_key 依序組成陣列，
+    以 ensure_ascii=True、無空白分隔符的 JSON 編碼為 UTF-8，再取 SHA-256 十六進位。
+    """
+    fields = _follow_fields(data)
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
 
 class Layout:
     """一次執行用到的位置與指令；``Layout.from_env()`` 由環境變數組出來。
@@ -355,6 +426,138 @@ class Layout:
             return DEFAULT_API_PORT
         return port if 1 <= port <= 65535 else DEFAULT_API_PORT
 
+    def tunnel_values(self) -> dict:
+        return parse_env_file(self.tunnel_env_file)
+
+    def tunnel_configured(self) -> bool:
+        values = self.tunnel_values()
+        return any(values.get(key) for key in (
+            "RENDEZVOUS", "IDENTITY", "KNOWN_HOSTS", "TUNNEL_USER", "FOLLOW_FILE",
+            "GATEWAY_SOURCE_REPO", "GATEWAY_SOURCE_PATH", "GATEWAY_GITHUB_KEY_FILE"))
+
+    def tunnel_follow_configured(self) -> bool:
+        values = self.tunnel_values()
+        return any(values.get(key) for key in ("FOLLOW_FILE", "GATEWAY_SOURCE_REPO",
+                   "GATEWAY_SOURCE_PATH", "GATEWAY_GITHUB_KEY_FILE"))
+
+    @staticmethod
+    def _read_state(path: str) -> tuple[str, str | None]:
+        """Read a bounded regular file without following its final symlink."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                    return "invalid", None
+                with os.fdopen(fd, "rb", closefd=False) as f:
+                    data = f.read(65537)
+                if len(data) > 65536:
+                    return "invalid", None
+                return "ok", data.decode("utf-8")
+            finally:
+                os.close(fd)
+        except PermissionError:
+            return "unreadable", None
+        except FileNotFoundError:
+            return "missing", None
+        except (OSError, UnicodeError):
+            return "invalid", None
+
+    def tunnel_follow_state(self) -> tuple[str, int | None]:
+        try:
+            parse_env_file(self.tunnel_env_file, raise_permission=True)
+        except PermissionError:
+            return "unreadable", None
+        if not self.tunnel_follow_configured():
+            return "unconfigured", None
+        path = self.tunnel_values().get("FOLLOW_FILE") or os.path.join(self.state_dir, "gateway.json")
+        state, raw = self._read_state(path)
+        if state != "ok":
+            return state, None
+        try:
+            data = json.loads(raw)
+            generation = data["generation"]
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+                raise ValueError()
+            fingerprint = follow_fingerprint(data)
+        except (ValueError, TypeError, KeyError):
+            return "invalid", None
+        state, raw = self._read_state(os.path.join(self.state_dir, ".tunnel_generation"))
+        if state == "missing":
+            return "ok", None
+        if state != "ok":
+            return state, None
+        try:
+            verified = json.loads(raw)
+            gen = verified["generation"]
+            verified_fingerprint = verified["fingerprint"]
+            if isinstance(gen, bool) or not isinstance(gen, int) or gen < 0 or not isinstance(verified_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", verified_fingerprint):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError):
+            return "invalid", None
+        if generation == gen and fingerprint != verified_fingerprint:
+            return "invalid", gen
+        return ("regressed" if generation < gen else "ok"), gen
+
+    def tunnel_fetch_state(self) -> str:
+        state, raw = self._read_state(os.path.join(self.state_dir, ".tunnel_fetch_state"))
+        if state == "missing":
+            return "none"
+        if state != "ok":
+            return state
+        try:
+            value = json.loads(raw)
+            if isinstance(value, dict):
+                value = value.get("status", value.get("classification", value.get("result", value.get("state"))))
+        except ValueError:
+            value = raw.strip()
+        allowed = {"ok", "regressed", "invalid", "hostkey_missing", "auth_failed",
+                   "rate_limited", "unreachable", "config_partial", "credential_unreadable"}
+        return value if isinstance(value, str) and value in allowed else "invalid"
+
+    @staticmethod
+    def _parse_time(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if result.tzinfo is None:
+                result = result.replace(tzinfo=timezone.utc)
+            return result.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            return None
+
+    def tunnel_token_state(self) -> str:
+        values = self.tunnel_values()
+        raw = values.get("TOKEN_EXPIRES_AT")
+        if raw:
+            expiry = self._parse_time(raw)
+            if expiry is None:
+                return "expiry_invalid"
+        else:
+            state, raw = self._read_state(os.path.join(self.state_dir, ".tunnel_token_meta"))
+            if state == "unreadable":
+                return "unreadable"
+            if state == "invalid":
+                return "expiry_invalid"
+            if state == "missing":
+                return "expiry_unknown"
+            try:
+                meta = json.loads(raw)
+                expiry = self._parse_time(meta.get("expires_at", meta.get("expiration", meta.get("github_authentication_token_expiration"))))
+                fetched = self._parse_time(meta.get("fetched_at"))
+                if expiry is None or fetched is None or expiry <= fetched:
+                    return "expiry_unknown"
+            except (ValueError, TypeError, AttributeError):
+                return "expiry_invalid"
+        try:
+            warn = max(0, int(values.get("TOKEN_EXPIRY_WARN_DAYS", "7")))
+        except ValueError:
+            warn = 7
+        if (expiry - datetime.now(timezone.utc)).total_seconds() <= warn * 86400:
+            return "expiry_due"
+        return "ok"
+
     def tunnel_config_state(self) -> tuple[bool, str]:
         """隧道設定是否就緒；回 (就緒, 缺什麼的文字)。
 
@@ -362,6 +565,19 @@ class Layout:
         金鑰維持在 ~llmgw/.ssh）。文字不含值，只寫鍵名。
         """
         values = parse_env_file(self.tunnel_env_file)
+        if self.tunnel_follow_configured():
+            missing = []
+            identity = values.get("IDENTITY")
+            if not identity or not os.path.isfile(identity):
+                missing.append("IDENTITY")
+            if not values.get("TUNNEL_USER") and "@" not in values.get("RENDEZVOUS", ""):
+                missing.append("TUNNEL_USER")
+            source = ("GATEWAY_SOURCE_REPO", "GATEWAY_SOURCE_PATH", "GATEWAY_GITHUB_KEY_FILE")
+            static_ready = bool(values.get("RENDEZVOUS") and values.get("KNOWN_HOSTS")
+                                and os.path.isfile(values["KNOWN_HOSTS"]))
+            if not all(values.get(k) for k in source) and not static_ready and self.tunnel_follow_state()[0] != "ok":
+                missing.append("FOLLOW_FILE／GATEWAY_SOURCE")
+            return not missing, "、".join(missing)
         missing: list[str] = []
         if not values.get("RENDEZVOUS"):
             missing.append("RENDEZVOUS")
