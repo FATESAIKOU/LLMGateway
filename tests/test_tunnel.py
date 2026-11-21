@@ -229,7 +229,10 @@ while :; do sleep 0.05; done
         self.assertIn("UserKnownHostsFile=" + FAKE_KNOWN_HOSTS, ssh_log)
         self.assertIn("-i " + FAKE_IDENTITY, ssh_log)
         self.assertIn("-p " + FAKE_PORT, ssh_log)
-        self.assertIn(FAKE_USER + "@" + FAKE_HOST, ssh_log)
+        # #226：使用者與主機分開、以 `--` 隔離（design §4.4），不再把 user@host 放在尾端
+        self.assertIn("-o ConnectTimeout=10", ssh_log)
+        self.assertIn("-l " + FAKE_USER + " -- " + FAKE_HOST, ssh_log)
+        self.assertNotIn(FAKE_USER + "@" + FAKE_HOST, ssh_log)
         self.assertNotIn("accept-new", ssh_log)
 
         stderr = self.read_stderr()
@@ -291,7 +294,9 @@ while :; do sleep 0.05; done
         self.assertIn("-o StrictHostKeyChecking=yes", ssh_log)
         self.assertIn("-o BatchMode=yes", ssh_log)
         self.assertIn("-p " + FAKE_PORT, ssh_log)
-        self.assertIn(FAKE_USER + "@" + FAKE_HOST, ssh_log)
+        self.assertIn("-o ConnectTimeout=10", ssh_log)
+        self.assertIn("-l " + FAKE_USER + " -- " + FAKE_HOST, ssh_log)
+        self.assertNotIn(FAKE_USER + "@" + FAKE_HOST, ssh_log)
         self.assertNotIn("-N", ssh_log)
 
     def test_probe_once_returns_1_on_non_200_or_no_response(self):
@@ -363,7 +368,8 @@ while :; do sleep 0.05; done
         self.assertTrue(wait_until(lambda: "argv:" in self.read_ssh_log()))
         ssh_log = self.read_ssh_log()
         self.assertIn("-p " + other_port, ssh_log)
-        self.assertIn(other_user + "@" + other_host, ssh_log)
+        self.assertIn("-l " + other_user + " -- " + other_host, ssh_log)
+        self.assertNotIn(other_user + "@" + other_host, ssh_log)
         self.assertNotIn(FAKE_HOST, ssh_log)
         self.assertEqual(self.stop_daemon(), 0)
 

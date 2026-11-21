@@ -904,7 +904,9 @@ exit 1
 
         ssh_log = self.read_log("ssh")
         self.assertIn("-W 127.0.0.1:4710", ssh_log)
-        self.assertIn("sshproxy@jump.example.com", ssh_log)
+        # #226：探針改用 `-l <user> -- <host>`（design §4.4），不再把 user@host 放在尾端
+        self.assertIn("-p 2222 -l sshproxy -- jump.example.com", ssh_log)
+        self.assertNotIn("sshproxy@jump.example.com", ssh_log)
 
     def test_check_probe_non_200_is_fail(self):
         """探針回非 200 時 check 記 fail、結束碼 1（不是 todo）"""

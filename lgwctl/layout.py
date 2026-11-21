@@ -152,6 +152,52 @@ def parse_env_file(path: str, *, raise_permission: bool = False) -> dict:
     return parse_env_text(text)
 
 
+_EC_CURVES = {
+    # name: (p, b, 座標位元組數)；a = -3
+    "nistp256": (2 ** 256 - 2 ** 224 + 2 ** 192 + 2 ** 96 - 1,
+                 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b, 32),
+    "nistp384": (2 ** 384 - 2 ** 128 - 2 ** 96 + 2 ** 32 - 1,
+                 int("b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875a"
+                     "c656398d8a2ed19d2a85c8edd3ec2aef", 16), 48),
+    "nistp521": (2 ** 521 - 1,
+                 int("0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef1"
+                     "09e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b50"
+                     "3f00", 16), 66),
+}
+
+
+def _mpint_value(raw):
+    """SSH mpint（正、最短編碼）→ int；不合擲 ValueError。"""
+    if not raw or raw[0] & 0x80 or (raw[0] == 0 and (len(raw) == 1 or not raw[1] & 0x80)):
+        raise ValueError()
+    return int.from_bytes(raw, "big")
+
+
+def _check_key_material(kind, fields):
+    """依金鑰型別驗 wire-format 欄位（OpenSSH 實際接受的條件，且不寬於它）。"""
+    if kind == "ssh-ed25519":
+        if len(fields) != 2 or len(fields[1]) != 32:
+            raise ValueError()
+    elif kind == "ssh-rsa":
+        if len(fields) != 3:
+            raise ValueError()
+        e, n = _mpint_value(fields[1]), _mpint_value(fields[2])
+        if not 1024 <= n.bit_length() <= 16384 or n % 2 == 0 or e < 3 or e % 2 == 0 or e >= n:
+            raise ValueError()
+    else:
+        curve = kind.removeprefix("ecdsa-sha2-")
+        if len(fields) != 3 or fields[1] != curve.encode() or curve not in _EC_CURVES:
+            raise ValueError()
+        p, b, size = _EC_CURVES[curve]
+        point = fields[2]
+        if len(point) != 1 + 2 * size or point[0] != 4:
+            raise ValueError()
+        x = int.from_bytes(point[1:1 + size], "big")
+        y = int.from_bytes(point[1 + size:], "big")
+        if x >= p or y >= p or (y * y - (x * x * x - 3 * x + b)) % p:
+            raise ValueError()
+
+
 def _follow_fields(data):
     """Validate and normalize the four connection fields used by the watermark."""
     host = data.get("ip")
@@ -191,12 +237,7 @@ def _follow_fields(data):
             index += length
         if not fields or fields[0] != kind.encode():
             raise ValueError()
-        if kind == "ssh-ed25519" and (len(fields) != 2 or len(fields[1]) != 32):
-            raise ValueError()
-        if kind == "ssh-rsa" and len(fields) != 3:
-            raise ValueError()
-        if kind.startswith("ecdsa-") and (len(fields) != 3 or fields[1] != kind.removeprefix("ecdsa-sha2-").encode()):
-            raise ValueError()
+        _check_key_material(kind, fields)
     except (binascii.Error, struct.error):
         raise ValueError() from None
     return (host, port, user, key)
