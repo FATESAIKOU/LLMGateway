@@ -1,38 +1,80 @@
 #!/usr/bin/env python3
-# llmgateway-tunnel：伺服器端的隧道守護（design 決定 3）。
+# llmgateway-tunnel：伺服器端的隧道守護（design 決定 3；#221 脫鉤設計 §4）。
 # 用自己的金鑰與自己的 SSH 連線，把本機 API 埠與本機 sshd 以 reverse tunnel
 # 公開到會合點的 127.0.0.1；定時經會合點做端對端探針（GET /v1/subscriptions，
-# 只有 HTTP 200 算健康）。連線斷掉、公開失敗或連續探針失敗就結束，由
-# systemd 重開（llmgateway-tunnel.service）。
+# 只有 HTTP 200 算健康）。連線斷掉、公開失敗或連續探針失敗：同一個行程內
+# （受退避限制）向 GitHub 抓 MLP 的 NODE_GATEWAY 取得新位址與主機金鑰，嚴格
+# 驗證後原子寫入本機狀態並立刻重連；抓不到就保留最後已知位址、以 1 結束，
+# 由 systemd 重開（llmgateway-tunnel.service）。健康時完全不碰 GitHub。
 #
 # 設定：~/.config/llmgateway/tunnel.env（KEY=VALUE；可用環境變數 LGW_TUNNEL_ENV
 # 改成別的絕對路徑——新的 system unit 讀 /etc/llmgateway/tunnel.env）
-#   RENDEZVOUS=user@host:port（必填）、IDENTITY（必填）、KNOWN_HOSTS（必填）、
-#   REMOTE_API=4710、REMOTE_SSH=4711、LOCAL_API=8480、
-#   PROBE_INTERVAL=60、PROBE_FAILS=3、SSH_PATH=ssh。
-# 必填缺一（或值不能用）時：log 寫一行 config_missing、以 78 結束；unit 的
-# RestartPreventExitStatus=78 讓它不會在設定填好前反覆重開。
+#   輸入①（連線）：IDENTITY（必填）、本機 SSH 使用者（RENDEZVOUS 的 user@ 或
+#     TUNNEL_USER，至少一個；兩個都設必須相同）、初始 RENDEZVOUS=[user@]host:port
+#     與 KNOWN_HOSTS（最後已知位址的基準；沒有 FOLLOW_FILE 時用）。
+#   輸入②（位址來源）：GATEWAY_SOURCE_REPO、GATEWAY_SOURCE_PATH、
+#     GATEWAY_GITHUB_KEY_FILE（三個都填才啟用；只填一部分記 config_partial 但不停機）、
+#     選填 TOKEN_EXPIRES_AT（給 llmgwctl 告警用，本程式不讀）、FOLLOW_FILE
+#     （預設 <STATE_DIR>/gateway.json）。
+#   埠與探針：REMOTE_API=4710、REMOTE_SSH=4711（留空也是 4711；不支援 off）、
+#     LOCAL_API=8480、PROBE_INTERVAL=60、PROBE_FAILS=3、SSH_PATH=ssh、
+#     SSH_CONNECT_TIMEOUT=10、SERVER_ALIVE_INTERVAL=30、SERVER_ALIVE_COUNT_MAX=3、
+#     FETCH_TIMEOUT=10、FETCH_MIN_INTERVAL=60、FETCH_BACKOFF_MAX=900。
+# 狀態目錄 STATE_DIR 預設 /var/lib/llmgateway（環境變數 LGW_STATE_DIR 可覆寫，測試用）。
+# token：優先讀 $CREDENTIALS_DIRECTORY/gateway-token，否則讀 GATEWAY_GITHUB_KEY_FILE；
+# 讀不到（含沒權限）只算抓取失敗（credential_unreadable、結束碼 1），不是 78。
 #
-# log 只寫事件種類（tunnel_up、probe_fail、restart、config_missing、spawn_fail）；
-# 不寫設定值、不寫主機名、不寫 ssh 的 stderr 原文。
+# 結束碼：78 只給「設定本身就不能啟動」（缺 IDENTITY／本機使用者、靜態位址與
+# GitHub 來源兩者皆無且沒有有效 FOLLOW_FILE、參數非法含 REMOTE_SSH=off、
+# 未授權的 LGW_GATEWAY_API_BASE）；其餘執行期失敗一律 1。unit 的
+# RestartPreventExitStatus=78 讓 78 不會在設定填好前反覆重開。
+#
+# log 只寫固定事件種類（tunnel_up、gateway_updated、gateway_reverted_to_verified、
+# unverified_retry、fetch_ok、fetch_failed、fetch_auth_failed、fetch_rate_limited、
+# fetch_invalid、fetch_skipped、follow_missing、follow_invalid、follow_regressed、
+# verified_invalid、verified_unreadable、verified_write_failed、hostkey_missing、
+# probe_fail、restart、config_missing、config_partial、spawn_fail）；
+# 不寫設定值、主機名、IP、token、不寫 ssh 的 stderr 原文。
 #
 # 用法：
 #   llmgateway-tunnel               當守護程式跑。
-#   llmgateway-tunnel --probe-once  只跑一次端對端探針就結束（給 install.sh
-#                                   --check 用）：讀同一份 tunnel.env、用與
-#                                   守護程式同一套 ssh 參數。0＝HTTP 200、
-#                                   1＝不是 200 或沒回應、2＝無法執行
-#                                   （config_missing 或找不到 ssh）。不寫 log。
+#   llmgateway-tunnel --probe-once  只跑一次端對端探針就結束（給 llmgwctl check 用）：
+#                                   0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行
+#                                   （設定不能用、找不到 ssh、私用 known_hosts 未就緒）。
+#                                   嚴格只讀：不寫任何檔、不打 GitHub、不寫 log。
+#   llmgateway-tunnel --fetch-check 人工驗 token 與 NODE_GATEWAY（單次請求）：
+#                                   0＝可用、1＝抓取或格式失敗、78＝設定不能用。
+#                                   只讀、不寫任何狀態檔、不印位址／金鑰／token。
+import base64
+import binascii
+import datetime
+import hashlib
+import http.client
+import ipaddress
+import json
 import os
+import re
 import shutil
 import signal
+import stat
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.utils import parsedate_to_datetime
 
 CONFIG_REL = os.path.join(".config", "llmgateway", "tunnel.env")
 ENV_CONFIG = "LGW_TUNNEL_ENV"
-REQUIRED_KEYS = ("RENDEZVOUS", "IDENTITY", "KNOWN_HOSTS")
+ENV_STATE_DIR = "LGW_STATE_DIR"
+ENV_API_BASE = "LGW_GATEWAY_API_BASE"
+ENV_ALLOW_INSECURE = "LGW_ALLOW_INSECURE_API_BASE"
+DEFAULT_STATE_DIR = "/var/lib/llmgateway"
+GITHUB_API_BASE = "https://api.github.com"
 DEFAULTS = {
     "REMOTE_API": "4710",
     "REMOTE_SSH": "4711",
@@ -40,25 +82,74 @@ DEFAULTS = {
     "PROBE_INTERVAL": "60",
     "PROBE_FAILS": "3",
     "SSH_PATH": "ssh",
+    "SSH_CONNECT_TIMEOUT": "10",
+    "SERVER_ALIVE_INTERVAL": "30",
+    "SERVER_ALIVE_COUNT_MAX": "3",
+    "FETCH_TIMEOUT": "10",
+    "FETCH_MIN_INTERVAL": "60",
+    "FETCH_BACKOFF_MAX": "900",
 }
+GITHUB_KEYS = ("GATEWAY_SOURCE_REPO", "GATEWAY_SOURCE_PATH", "GATEWAY_GITHUB_KEY_FILE")
 EXIT_CONFIG_MISSING = 78
 EXIT_FAILED = 1
 EXIT_PROBE_OK = 0
 EXIT_PROBE_FAIL = 1
 EXIT_PROBE_UNAVAILABLE = 2
 PROBE_REQUEST = b"GET /v1/subscriptions HTTP/1.0\r\n\r\n"
+MAX_STATE_BYTES = 65536
+MAX_RESPONSE_BYTES = 65536
+RETRY_AFTER_CEILING = 3600.0
+FETCH_CHECK_HINT = "如 check 仍紅請執行 llmgwctl follow-reset --fetch-state"
+
+USER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\Z")
+HOST_RE = re.compile(
+    r"(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
+HOSTKEY_RE = re.compile(
+    r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)"
+    r" ([A-Za-z0-9+/]+={0,2})\Z")
+GENERATION_RE = re.compile(r"[0-9]{1,18}\Z")
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+PATH_RE = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
+TOKEN_RE = re.compile(r"[\x21-\x7e]{1,4096}\Z")
+PUBLISHED_RE = re.compile(r"[0-9A-Za-z:.+ -]{1,40}\Z")
+FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+# 抓取分類（.tunnel_fetch_state；與 lgwctl.layout.tunnel_fetch_state 的白名單一致）
+FETCH_CLASSES = ("ok", "regressed", "invalid", "hostkey_missing", "auth_failed",
+                 "rate_limited", "unreachable", "config_partial", "credential_unreadable")
+FOLLOW_STATE_EVENTS = {
+    "missing": "follow_missing",
+    "invalid": "follow_invalid",
+    "regressed": "follow_regressed",
+    "verified_invalid": "verified_invalid",
+    "verified_unreadable": "verified_unreadable",
+}
+FAIL_EVENTS = {
+    "unreachable": "fetch_failed",
+    "credential_unreadable": "fetch_failed",
+    "auth_failed": "fetch_auth_failed",
+    "rate_limited": "fetch_rate_limited",
+    "invalid": "fetch_invalid",
+    "hostkey_missing": "hostkey_missing",
+    "regressed": "follow_regressed",
+}
 
 
 def log(event):
     print(event, file=sys.stderr, flush=True)
 
 
+# ---------------------------------------------------------------------------
+# 設定
+# ---------------------------------------------------------------------------
+
 def parse_env_file(path):
     values = {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return values
     for line in lines:
         line = line.strip()
@@ -79,59 +170,23 @@ def parse_env_file(path):
 
 
 def parse_rendezvous(value):
-    user_host, sep, port_text = value.rpartition(":")
-    if not sep or "@" not in user_host:
+    """``[user@]host:port`` → (user 或 None, host, port)；host 一律走嚴格驗證。"""
+    host_part, sep, port_text = value.rpartition(":")
+    if not sep or not host_part:
         return None
-    user, _, host = user_host.rpartition("@")
-    if not user or not host:
-        return None
+    user = None
+    if "@" in host_part:
+        user, _, host_part = host_part.rpartition("@")
+        if not valid_user(user):
+            return None
     try:
+        host = validate_host(host_part)
         port = int(port_text)
     except ValueError:
         return None
-    if not 1 <= port <= 65535:
+    if not port_text.isascii() or not port_text.isdigit() or not 1 <= port <= 65535:
         return None
     return user, host, port
-
-
-def load_config(path):
-    values = parse_env_file(path)
-    for key in REQUIRED_KEYS:
-        if not values.get(key):
-            return None
-    rendezvous = parse_rendezvous(values["RENDEZVOUS"])
-    if rendezvous is None:
-        return None
-    merged = {}
-    for key, default in DEFAULTS.items():
-        merged[key] = values.get(key) or default
-    try:
-        remote_api = int(merged["REMOTE_API"])
-        remote_ssh = int(merged["REMOTE_SSH"])
-        local_api = int(merged["LOCAL_API"])
-        probe_interval = float(merged["PROBE_INTERVAL"])
-        probe_fails = int(merged["PROBE_FAILS"])
-    except ValueError:
-        return None
-    for port in (remote_api, remote_ssh, local_api):
-        if not 1 <= port <= 65535:
-            return None
-    if probe_interval <= 0 or probe_fails < 1:
-        return None
-    user, host, ssh_port = rendezvous
-    return {
-        "identity": values["IDENTITY"],
-        "known_hosts": values["KNOWN_HOSTS"],
-        "remote_api": remote_api,
-        "remote_ssh": remote_ssh,
-        "local_api": local_api,
-        "probe_interval": probe_interval,
-        "probe_fails": probe_fails,
-        "ssh_path": merged["SSH_PATH"],
-        "user": user,
-        "host": host,
-        "ssh_port": ssh_port,
-    }
 
 
 def config_path():
@@ -145,39 +200,495 @@ def config_path():
     return os.path.join(home, CONFIG_REL)
 
 
-def _ssh_common(cfg):
+def state_dir():
+    return (os.environ.get(ENV_STATE_DIR) or "").strip() or DEFAULT_STATE_DIR
+
+
+def api_base():
+    """正式只認 https://api.github.com；測試旗標＋loopback 才能換。回 None＝未授權（78）。"""
+    override = os.environ.get(ENV_API_BASE)
+    if override is None or override == "":
+        return GITHUB_API_BASE
+    if os.environ.get(ENV_ALLOW_INSECURE) != "1":
+        return None
+    try:
+        parts = urllib.parse.urlsplit(override)
+        host = parts.hostname
+        parts.port  # 觸發埠號驗證
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or host not in ("127.0.0.1", "::1", "localhost"):
+        return None
+    if parts.username or parts.password or parts.path not in ("", "/") or parts.query or parts.fragment:
+        return None
+    return override.rstrip("/")
+
+
+def load_config(path):
+    """回設定 dict；設定本身不能啟動時回 None（呼叫端以 78 結束）。"""
+    values = parse_env_file(path)
+    if not values.get("IDENTITY"):
+        return None
+    rendezvous = None
+    if values.get("RENDEZVOUS"):
+        rendezvous = parse_rendezvous(values["RENDEZVOUS"])
+        if rendezvous is None:
+            return None
+    explicit = values.get("TUNNEL_USER") or None
+    if explicit is not None and not valid_user(explicit):
+        return None
+    rv_user = rendezvous[0] if rendezvous else None
+    if explicit and rv_user and explicit != rv_user:
+        return None
+    local_user = rv_user or explicit
+    if not local_user:
+        return None
+    merged = {}
+    for key, default in DEFAULTS.items():
+        merged[key] = values.get(key) or default
+    try:
+        remote_api = int(merged["REMOTE_API"])
+        remote_ssh = int(merged["REMOTE_SSH"])
+        local_api = int(merged["LOCAL_API"])
+        probe_interval = float(merged["PROBE_INTERVAL"])
+        probe_fails = int(merged["PROBE_FAILS"])
+        connect_timeout = int(merged["SSH_CONNECT_TIMEOUT"])
+        alive_interval = int(merged["SERVER_ALIVE_INTERVAL"])
+        alive_count = int(merged["SERVER_ALIVE_COUNT_MAX"])
+        fetch_timeout = float(merged["FETCH_TIMEOUT"])
+        fetch_min = float(merged["FETCH_MIN_INTERVAL"])
+        fetch_max = float(merged["FETCH_BACKOFF_MAX"])
+    except ValueError:
+        return None
+    for port in (remote_api, remote_ssh, local_api):
+        if not 1 <= port <= 65535:
+            return None
+    if probe_interval <= 0 or probe_fails < 1 or connect_timeout < 1 or alive_interval < 1 \
+            or alive_count < 1 or fetch_timeout <= 0 or fetch_min <= 0 or fetch_max < fetch_min:
+        return None
+    base = api_base()
+    if base is None:
+        return None
+    github_set = [bool(values.get(key)) for key in GITHUB_KEYS]
+    github_complete = all(github_set)
+    github_partial = any(github_set) and not github_complete
+    if github_complete:
+        if not REPO_RE.fullmatch(values["GATEWAY_SOURCE_REPO"]) \
+                or not PATH_RE.fullmatch(values["GATEWAY_SOURCE_PATH"]) \
+                or {".", ".."} & set(values["GATEWAY_SOURCE_REPO"].split("/")
+                                     + values["GATEWAY_SOURCE_PATH"].split("/")):
+            return None
+    sdir = state_dir()
+    cfg = {
+        "identity": values["IDENTITY"],
+        "known_hosts": values.get("KNOWN_HOSTS") or "",
+        "remote_api": remote_api,
+        "remote_ssh": remote_ssh,
+        "local_api": local_api,
+        "probe_interval": probe_interval,
+        "probe_fails": probe_fails,
+        "ssh_path": merged["SSH_PATH"],
+        "connect_timeout": connect_timeout,
+        "alive_interval": alive_interval,
+        "alive_count": alive_count,
+        "fetch_timeout": fetch_timeout,
+        "fetch_min": fetch_min,
+        "fetch_max": fetch_max,
+        "local_user": local_user,
+        "static": None,
+        "github": github_complete,
+        "github_partial": github_partial,
+        "repo": values.get("GATEWAY_SOURCE_REPO", ""),
+        "source_path": values.get("GATEWAY_SOURCE_PATH", ""),
+        "key_file": values.get("GATEWAY_GITHUB_KEY_FILE", ""),
+        "api_base": base,
+        "state_dir": sdir,
+        "follow_file": values.get("FOLLOW_FILE") or os.path.join(sdir, "gateway.json"),
+    }
+    if rendezvous is not None and cfg["known_hosts"]:
+        cfg["static"] = {"host": rendezvous[1], "port": rendezvous[2],
+                         "known_hosts": cfg["known_hosts"], "follow": None}
+    if cfg["static"] is None and not cfg["github"] and read_follow(cfg)[0] != "ok":
+        return None
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# 欄位驗證（純函式；NODE_GATEWAY 與本機 FOLLOW_FILE 共用）
+# ---------------------------------------------------------------------------
+
+def valid_user(value):
+    return isinstance(value, str) and USER_RE.fullmatch(value) is not None
+
+
+def validate_host(value):
+    """回正規化後的主機字串（IP 用 str(addr)、主機名轉小寫）；不合法擲 ValueError。"""
+    if not isinstance(value, str) or not value or "%" in value:
+        raise ValueError("host")
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        if getattr(addr, "scope_id", None) is not None:
+            raise ValueError("host")
+        return str(addr)
+    if HOST_RE.fullmatch(value) is None:
+        raise ValueError("host")
+    if value.rsplit(".", 1)[-1].isdigit():
+        # 最後一個 label 全為數字：ssh／inet_aton 會把它當成別種位址寫法
+        raise ValueError("host")
+    return value.lower()
+
+
+def validate_port(value, default=None):
+    if value is None:
+        if default is None:
+            raise ValueError("port")
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ValueError("port")
+    return value
+
+
+def validate_generation(value):
+    if isinstance(value, bool):
+        raise ValueError("generation")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("generation")
+        return value
+    if isinstance(value, str) and GENERATION_RE.fullmatch(value):
+        return int(value)
+    raise ValueError("generation")
+
+
+_EC_CURVES = {
+    # name: (p, b, 座標位元組數)；a = -3
+    "nistp256": (2 ** 256 - 2 ** 224 + 2 ** 192 + 2 ** 96 - 1,
+                 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b, 32),
+    "nistp384": (2 ** 384 - 2 ** 128 - 2 ** 96 + 2 ** 32 - 1,
+                 int("b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875a"
+                     "c656398d8a2ed19d2a85c8edd3ec2aef", 16), 48),
+    "nistp521": (2 ** 521 - 1,
+                 int("0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef1"
+                     "09e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b50"
+                     "3f00", 16), 66),
+}
+
+
+def _mpint_value(raw):
+    """SSH mpint（正、最短編碼）→ int；不合擲 ValueError。"""
+    if not raw or raw[0] & 0x80 or (raw[0] == 0 and (len(raw) == 1 or not raw[1] & 0x80)):
+        raise ValueError()
+    return int.from_bytes(raw, "big")
+
+
+def _check_key_material(kind, fields):
+    """依金鑰型別驗 wire-format 欄位（OpenSSH 實際接受的條件，且不寬於它）。"""
+    if kind == "ssh-ed25519":
+        if len(fields) != 2 or len(fields[1]) != 32:
+            raise ValueError()
+    elif kind == "ssh-rsa":
+        if len(fields) != 3:
+            raise ValueError()
+        e, n = _mpint_value(fields[1]), _mpint_value(fields[2])
+        if not 1024 <= n.bit_length() <= 16384 or n % 2 == 0 or e < 3 or e % 2 == 0 or e >= n:
+            raise ValueError()
+    else:
+        curve = kind.removeprefix("ecdsa-sha2-")
+        if len(fields) != 3 or fields[1] != curve.encode() or curve not in _EC_CURVES:
+            raise ValueError()
+        p, b, size = _EC_CURVES[curve]
+        point = fields[2]
+        if len(point) != 1 + 2 * size or point[0] != 4:
+            raise ValueError()
+        x = int.from_bytes(point[1:1 + size], "big")
+        y = int.from_bytes(point[1 + size:], "big")
+        if x >= p or y >= p or (y * y - (x * x * x - 3 * x + b)) % p:
+            raise ValueError()
+
+
+def validate_host_key(value):
+    """單行兩欄、base64 正規往返、完整 OpenSSH wire-format；回原字串。"""
+    if not isinstance(value, str):
+        raise ValueError("host_key")
+    match = HOSTKEY_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("host_key")
+    kind, encoded = match.group(1), match.group(2)
+    try:
+        blob = base64.b64decode(encoded, validate=True)
+        if base64.b64encode(blob).decode("ascii") != encoded:
+            raise ValueError("host_key")
+        index = 0
+        fields = []
+        while index < len(blob):
+            if index + 4 > len(blob):
+                raise ValueError("host_key")
+            length = struct.unpack_from(">I", blob, index)[0]
+            index += 4
+            if length == 0 or index + length > len(blob):
+                raise ValueError("host_key")
+            fields.append(blob[index:index + length])
+            index += length
+    except (binascii.Error, struct.error):
+        raise ValueError("host_key") from None
+    if not fields or fields[0] != kind.encode():
+        raise ValueError("host_key")
+    _check_key_material(kind, fields)
+    return value
+
+
+def validate_gateway(data, local_user):
+    """NODE_GATEWAY 內層 JSON → 正規化的連線欄位；不合擲 ValueError(分類)。
+
+    分類：host_key 問題＝hostkey_missing，其餘＝invalid。其他欄位（user、
+    key_secret、ssh_listen_ports、ports…）一律忽略。
+    """
+    if not isinstance(data, dict):
+        raise ValueError("invalid")
+    try:
+        key = validate_host_key(data.get("host_key"))
+    except ValueError:
+        raise ValueError("hostkey_missing") from None
+    try:
+        host = validate_host(data.get("ip"))
+        port = validate_port(data.get("port"), default=22)
+        user = data.get("tunnel_user")
+        if not valid_user(user) or user != local_user:
+            raise ValueError("tunnel_user")
+        generation = validate_generation(data.get("generation"))
+    except ValueError:
+        raise ValueError("invalid") from None
+    published = data.get("published_at", data.get("rotated_at"))
+    if not isinstance(published, str) or PUBLISHED_RE.fullmatch(published) is None:
+        published = None
+    return {"ip": host, "ssh_port": port, "tunnel_user": user, "host_key": key,
+            "generation": generation, "published_at": published}
+
+
+def validate_follow(data, local_user):
+    """本機 FOLLOW_FILE（我們自己寫的正規化格式）→ 欄位 dict；不合擲 ValueError。"""
+    if not isinstance(data, dict):
+        raise ValueError("invalid")
+    port = data.get("ssh_port")
+    if port is None:
+        raise ValueError("invalid")
+    generation = data.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise ValueError("invalid")
+    try:
+        fields = validate_gateway({"ip": data.get("ip"), "port": port,
+                                   "tunnel_user": data.get("tunnel_user"),
+                                   "host_key": data.get("host_key"),
+                                   "generation": generation}, local_user)
+    except ValueError:
+        raise ValueError("invalid") from None
+    if fields["ip"] != data.get("ip"):
+        raise ValueError("invalid")           # 我們寫的一定是正規化形式
+    fields["published_at"] = data.get("published_at") if isinstance(data.get("published_at"), str) else None
+    return fields
+
+
+def fingerprint(fields):
+    """與 lgwctl.layout.follow_fingerprint 相同：[ip, ssh_port, tunnel_user, host_key]
+    以 ensure_ascii、無空白分隔的 JSON → UTF-8 → SHA-256 十六進位。"""
+    payload = [fields["ip"], fields["ssh_port"], fields["tunnel_user"], fields["host_key"]]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def same_fields(a, b):
+    return all(a[k] == b[k] for k in ("ip", "ssh_port", "tunnel_user", "host_key"))
+
+
+def known_hosts_line(fields):
+    host = fields["ip"]
+    pattern = host if fields["ssh_port"] == 22 else "[%s]:%d" % (host, fields["ssh_port"])
+    return "%s %s\n" % (pattern, fields["host_key"])
+
+
+# ---------------------------------------------------------------------------
+# 狀態檔（讀：O_NOFOLLOW＋一般檔＋64 KiB；寫：同目錄暫存檔＋rename、0600）
+# ---------------------------------------------------------------------------
+
+def read_bounded(path):
+    """回 ("ok", 文字) / ("missing", None) / ("unreadable", None) / ("invalid", None)。
+    只有檔案真的不存在才是 missing；權限不足是 unreadable；symlink、非一般檔、過大、
+    不是 UTF-8 等都是 invalid（與 lgwctl.layout 的 _read_state 同語意）。"""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "missing", None
+    except PermissionError:
+        return "unreadable", None
+    except OSError:
+        return "invalid", None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATE_BYTES:
+            return "invalid", None
+        data = os.read(fd, MAX_STATE_BYTES + 1)
+        if len(data) > MAX_STATE_BYTES:
+            return "invalid", None
+        return "ok", data.decode("utf-8")
+    except PermissionError:
+        return "unreadable", None
+    except (OSError, UnicodeError):
+        return "invalid", None
+    finally:
+        os.close(fd)
+
+
+def read_json(path):
+    state, text = read_bounded(path)
+    if state != "ok":
+        return state, None
+    try:
+        return "ok", json.loads(text)
+    except ValueError:
+        return "invalid", None
+
+
+def write_atomic(path, text):
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tmp-llmgw-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def safe_write(path, text):
+    """狀態檔寫入失敗不該弄垮守護程式（唯讀 STATE_DIR 時照樣連線）；回是否成功。"""
+    try:
+        write_atomic(path, text)
+        return True
+    except OSError:
+        return False
+
+
+def state_path(cfg, name):
+    return os.path.join(cfg["state_dir"], name)
+
+
+def known_hosts_path(cfg):
+    return state_path(cfg, ".tunnel_known_hosts")
+
+
+def read_follow(cfg):
+    """本機 FOLLOW_FILE → ("ok", 欄位) / ("missing"|"invalid", None)。"""
+    state, data = read_json(cfg["follow_file"])
+    if state != "ok":
+        return ("missing" if state == "missing" else "invalid"), None
+    try:
+        return "ok", validate_follow(data, cfg["local_user"])
+    except ValueError:
+        return "invalid", None
+
+
+def read_verified(cfg):
+    """.tunnel_generation → ("ok", {"generation", "fingerprint"}) /
+    ("missing", None)（真的不存在＝首次）/ ("invalid"|"unreadable", None)。
+    後兩者不可當成首次啟動：呼叫端一律 fail-closed。"""
+    state, data = read_json(state_path(cfg, ".tunnel_generation"))
+    if state != "ok":
+        return state, None
+    if not isinstance(data, dict):
+        return "invalid", None
+    gen = data.get("generation")
+    fp = data.get("fingerprint")
+    if isinstance(gen, bool) or not isinstance(gen, int) or gen < 0 \
+            or not isinstance(fp, str) or FINGERPRINT_RE.fullmatch(fp) is None:
+        return "invalid", None
+    return "ok", {"generation": gen, "fingerprint": fp}
+
+
+def write_verified(cfg, fields):
+    """寫已驗證水位；回是否成功（失敗時呼叫端不可當成已記錄）。"""
+    return safe_write(state_path(cfg, ".tunnel_generation"), json.dumps(
+        {"generation": fields["generation"], "fingerprint": fingerprint(fields)}))
+
+
+def read_backoff(cfg):
+    state, data = read_json(state_path(cfg, ".tunnel_fetch_backoff"))
+    if state != "ok" or not isinstance(data, dict):
+        return 0.0, 0
+    nxt = data.get("next_allowed_epoch")
+    failures = data.get("consecutive_failures")
+    if isinstance(nxt, bool) or not isinstance(nxt, (int, float)):
+        nxt = 0.0
+    if isinstance(failures, bool) or not isinstance(failures, int) or failures < 0:
+        failures = 0
+    return float(nxt), failures
+
+
+def write_backoff(cfg, next_allowed, failures):
+    return safe_write(state_path(cfg, ".tunnel_fetch_backoff"), json.dumps(
+        {"next_allowed_epoch": next_allowed, "consecutive_failures": failures}))
+
+
+def write_fetch_state(cfg, status):
+    if status in FETCH_CLASSES:
+        safe_write(state_path(cfg, ".tunnel_fetch_state"),
+                   json.dumps({"status": status, "ts": int(time.time())}))
+
+
+def utc_iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+# ---------------------------------------------------------------------------
+# ssh 命令列
+# ---------------------------------------------------------------------------
+
+def _ssh_common(cfg, target):
+    """-l <本機使用者> -- <正規化主機>：使用者與主機都不可能被 ssh 當成選項。"""
     return [
         "-i", cfg["identity"],
-        "-o", "UserKnownHostsFile=" + cfg["known_hosts"],
+        "-o", "UserKnownHostsFile=" + target["known_hosts"],
         "-o", "GlobalKnownHostsFile=/dev/null",
         "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=yes",
         "-o", "BatchMode=yes",
-        "-p", str(cfg["ssh_port"]),
-        cfg["user"] + "@" + cfg["host"],
+        "-o", "ConnectTimeout=%d" % cfg["connect_timeout"],
+        "-p", str(target["port"]),
+        "-l", cfg["local_user"],
+        "--", target["host"],
     ]
 
 
-def tunnel_argv(cfg):
+def tunnel_argv(cfg, target):
     return [
         cfg["ssh_path"], "-N",
         "-R", "127.0.0.1:%d:127.0.0.1:%d" % (cfg["remote_api"], cfg["local_api"]),
         "-R", "127.0.0.1:%d:127.0.0.1:22" % cfg["remote_ssh"],
         "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=3",
-    ] + _ssh_common(cfg)
+        "-o", "ServerAliveInterval=%d" % cfg["alive_interval"],
+        "-o", "ServerAliveCountMax=%d" % cfg["alive_count"],
+    ] + _ssh_common(cfg, target)
 
 
-def probe_argv(cfg):
+def probe_argv(cfg, target):
     return [
         cfg["ssh_path"],
         "-W", "127.0.0.1:%d" % cfg["remote_api"],
-    ] + _ssh_common(cfg)
+    ] + _ssh_common(cfg, target)
 
 
-def probe_healthy(cfg):
-    argv = probe_argv(cfg)
+def probe_healthy(cfg, target):
+    argv = probe_argv(cfg, target)
     try:
         proc = subprocess.Popen(
             argv,
@@ -202,72 +713,502 @@ def probe_healthy(cfg):
     return len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1] == b"200"
 
 
-def probe_once():
-    """一次端對端探針；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。"""
-    path = config_path()
-    cfg = load_config(path) if path else None
-    if cfg is None:
-        return EXIT_PROBE_UNAVAILABLE
-    if shutil.which(cfg["ssh_path"]) is None:
-        return EXIT_PROBE_UNAVAILABLE
-    return EXIT_PROBE_OK if probe_healthy(cfg) else EXIT_PROBE_FAIL
+# ---------------------------------------------------------------------------
+# 目標位址的選擇
+# ---------------------------------------------------------------------------
+
+def follow_status(cfg):
+    """FOLLOW_FILE 的狀態（與 lgwctl 六態中的 ok／missing／invalid／regressed 對應；
+    已驗證水位本身壞掉時回 verified_invalid／verified_unreadable）。
+
+    回 (狀態, 欄位或 None)。regressed＝generation 低於已驗證水位；同代但指紋與
+    已驗證不同算 invalid。"""
+    state, fields = read_follow(cfg)
+    if state != "ok":
+        return state, None
+    verified_state, verified = read_verified(cfg)
+    if verified_state in ("invalid", "unreadable"):
+        return "verified_" + verified_state, None        # 水位壞了＝無從比對，fail-closed
+    if verified is not None:
+        if fields["generation"] < verified["generation"]:
+            return "regressed", None
+        if fields["generation"] == verified["generation"] \
+                and fingerprint(fields) != verified["fingerprint"]:
+            return "invalid", None
+    return "ok", fields
 
 
-def main():
-    if sys.argv[1:] == ["--probe-once"]:
-        return probe_once()
+def follow_target(cfg, fields):
+    return {"host": fields["ip"], "port": fields["ssh_port"],
+            "known_hosts": known_hosts_path(cfg), "follow": fields}
+
+
+def choose_target(cfg, write=True, notify=True):
+    """啟動時用哪個位址：有效 FOLLOW_FILE 優先，其次初始 RENDEZVOUS＋KNOWN_HOSTS，
+    都沒有回 None（呼叫端同行程去抓）。write=False（--probe-once）時不寫任何檔，
+    私用 known_hosts 缺或不符就回 None。"""
+    state, fields = follow_status(cfg)
+    if state == "ok":
+        target = follow_target(cfg, fields)
+        expected = known_hosts_line(fields)
+        current = read_bounded(target["known_hosts"])
+        if current != ("ok", expected):
+            if not write:
+                return None
+            # 私用 known_hosts 由已驗證的 FOLLOW_FILE 決定，缺漏／被改時重寫
+            if not safe_write(target["known_hosts"], expected):
+                return None
+        return target
+    if notify and cfg["follow_file"] and (state != "missing" or cfg["github"]):
+        log(FOLLOW_STATE_EVENTS[state])
+    if cfg["static"] is not None:
+        return dict(cfg["static"])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 向 GitHub 抓 NODE_GATEWAY（只在連不上時；標準函式庫 urllib）
+# ---------------------------------------------------------------------------
+
+class FetchError(Exception):
+    """抓取／驗證失敗；args[0] 是固定分類（FETCH_CLASSES 之一），不含任何敏感文字。"""
+
+    def __init__(self, cls, retry_after=None):
+        super().__init__(cls)
+        self.cls = cls
+        self.retry_after = retry_after
+
+
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """只跟隨同協定同主機的轉址；其他一律當 HTTPError（Authorization 不外送）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        if (new.scheme, new.hostname, new.port or 0) != (old.scheme, old.hostname, old.port or 0):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def read_token(cfg):
+    """token 只在記憶體：優先 $CREDENTIALS_DIRECTORY/gateway-token，否則 GATEWAY_GITHUB_KEY_FILE。"""
+    paths = []
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred_dir:
+        candidate = os.path.join(cred_dir, "gateway-token")
+        if os.path.lexists(candidate):
+            paths.append(candidate)
+    if not paths:
+        paths.append(cfg["key_file"])
+    try:
+        fd = os.open(paths[0], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise FetchError("credential_unreadable")
+            raw = os.read(fd, 8192)
+        finally:
+            os.close(fd)
+        token = raw.decode("ascii").strip()
+    except (OSError, UnicodeError):
+        raise FetchError("credential_unreadable") from None
+    if TOKEN_RE.fullmatch(token) is None:
+        raise FetchError("credential_unreadable")
+    return token
+
+
+def retry_delay(headers, now):
+    """Retry-After（秒或日期）與 X-RateLimit-Reset（限流用盡時）換成等待秒數；沒有回 None。"""
+    delays = []
+    value = headers.get("Retry-After")
+    if value:
+        value = value.strip()
+        try:
+            delays.append(float(int(value)))
+        except ValueError:
+            try:
+                delays.append(parsedate_to_datetime(value).timestamp() - now)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    if (headers.get("X-RateLimit-Remaining") or "").strip() == "0":
+        try:
+            delays.append(float(int((headers.get("X-RateLimit-Reset") or "").strip())) - now)
+        except ValueError:
+            pass
+    delays = [d for d in delays if d > 0]
+    return min(max(delays), RETRY_AFTER_CEILING) if delays else None
+
+
+def classify_status(code, headers, now):
+    """非 200 的 HTTP 狀態 → 固定分類。"""
+    if code == 429:
+        return FetchError("rate_limited", retry_delay(headers, now))
+    if code == 403:
+        limited = (headers.get("X-RateLimit-Remaining") or "").strip() == "0" or headers.get("Retry-After")
+        if limited:
+            return FetchError("rate_limited", retry_delay(headers, now))
+        return FetchError("auth_failed")
+    if code == 401:
+        return FetchError("auth_failed")
+    if 300 <= code < 400:
+        return FetchError("invalid")          # 不跟隨的轉址（含跨主機）
+    return FetchError("unreachable")
+
+
+def http_get(cfg, token):
+    """單次 GET；回 (回應文字 bytes, 標頭 dict)。失敗擲 FetchError。"""
+    url = "%s/repos/%s/%s" % (cfg["api_base"], cfg["repo"], cfg["source_path"])
+    request = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "llmgateway-tunnel",
+    })
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SameHostRedirect)
+    deadline = time.monotonic() + cfg["fetch_timeout"]
+    now = time.time()
+    try:
+        with opener.open(request, timeout=cfg["fetch_timeout"]) as response:
+            body = b""
+            while len(body) <= MAX_RESPONSE_BYTES:
+                if time.monotonic() > deadline:
+                    raise FetchError("unreachable")
+                chunk = response.read(4096)
+                if not chunk:
+                    break
+                body += chunk
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise FetchError("invalid")
+            return body, {k.lower(): v for k, v in response.headers.items()}
+    except urllib.error.HTTPError as err:
+        headers = err.headers
+        err.close()
+        raise classify_status(err.code, headers, now) from None
+    except FetchError:
+        raise
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError):
+        raise FetchError("unreachable") from None
+
+
+def parse_gateway_response(body, local_user):
+    """Variables API 外層 {"value": "<JSON 字串>"} → 驗證過的連線欄位；擲 FetchError。"""
+    try:
+        outer = json.loads(body.decode("utf-8"))
+        value = outer["value"] if isinstance(outer, dict) else None
+        inner = json.loads(value) if isinstance(value, str) else None
+    except (ValueError, UnicodeError, KeyError):
+        raise FetchError("invalid") from None
+    try:
+        return validate_gateway(inner, local_user)
+    except ValueError as err:
+        cls = str(err)
+        raise FetchError(cls if cls in ("invalid", "hostkey_missing") else "invalid") from None
+
+
+def parse_expiry(header, fetched_at):
+    """github-authentication-token-expiration（如 ``2026-02-01 00:00:00 UTC``）→ UTC epoch；
+    缺、壞、≤ 抓取當下時間（GitHub 曾回等於現在的怪值）都回 None＝expiry_unknown。"""
+    if not header:
+        return None
+    text = header.strip()
+    if text.endswith(" UTC"):
+        text = text[:-4] + "+00:00"
+    elif text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    try:
+        stamp = moment.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+    return stamp if stamp > fetched_at else None
+
+
+def fetch_gateway(cfg):
+    """抓一次並驗證；回 (欄位, 標頭)。失敗擲 FetchError。不寫任何檔。"""
+    token = read_token(cfg)
+    body, headers = http_get(cfg, token)
+    return parse_gateway_response(body, cfg["local_user"]), headers
+
+
+def write_token_meta(cfg, headers, fetched_at):
+    meta = {"http_status": 200, "fetched_at": utc_iso(fetched_at)}
+    expiry = parse_expiry(headers.get("github-authentication-token-expiration"), fetched_at)
+    if expiry is not None:
+        meta["expires_at"] = utc_iso(expiry)
+    safe_write(state_path(cfg, ".tunnel_token_meta"), json.dumps(meta))
+
+
+def record_failure(cfg, cls, retry_after=None, event=None):
+    """抓取失敗或被拒：寫分類、累加連敗、依指數退避（FETCH_MIN_INTERVAL×2^n，上限
+    FETCH_BACKOFF_MAX）與 Retry-After／X-RateLimit-Reset 取大者設下次允許時間。"""
+    _, failures = read_backoff(cfg)
+    failures += 1
+    delay = min(cfg["fetch_max"], cfg["fetch_min"] * (2 ** min(failures - 1, 20)))
+    if retry_after:
+        delay = max(delay, retry_after)
+    write_backoff(cfg, time.time() + delay, failures)
+    write_fetch_state(cfg, cls)
+    log(event or FAIL_EVENTS.get(cls, "fetch_failed"))
+
+
+def fetch_check():
+    """人工驗收（P4.2）：單次請求、嚴格只讀、不印位址／金鑰／token。"""
     path = config_path()
     cfg = load_config(path) if path else None
-    if cfg is None:
-        log("config_missing")
+    if cfg is None or not cfg["github"]:
+        print("config_missing")
         return EXIT_CONFIG_MISSING
+    try:
+        fields, headers = fetch_gateway(cfg)
+    except FetchError as err:
+        print("fetch_check: failed (%s)" % err.cls)
+        return EXIT_FAILED
+    print("fetch_check: ok")
+    print("http_status: 200")
+    print("format: ok")
+    print("generation: %d" % fields["generation"])
+    expiry = headers.get("github-authentication-token-expiration")
+    print("expiry_header: %s" % ("present" if parse_expiry(expiry, time.time()) else "absent"))
+    print(FETCH_CHECK_HINT)
+    return 0
 
-    state = {"shutdown": False}
-    stop = threading.Event()
+
+# ---------------------------------------------------------------------------
+# 守護程式
+# ---------------------------------------------------------------------------
+
+class Runtime:
+    """行程內共用狀態：收到 SIGTERM／SIGINT 的旗標與目前的 ssh 子行程。"""
+
+    def __init__(self):
+        self.shutdown = False
+        self.child = None
+        self.lock = threading.Lock()
+
+    def request_shutdown(self):
+        self.shutdown = True
+        with self.lock:
+            child = self.child
+        if child is not None and child.poll() is None:
+            child.terminate()
+
+
+def run_session(cfg, rt, target):
+    """以 target 建隧道並盯到它結束；回 "shutdown"／"spawn_fail"／"lost"。"""
     try:
         tunnel = subprocess.Popen(
-            tunnel_argv(cfg),
+            tunnel_argv(cfg, target),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     except OSError:
         log("spawn_fail")
-        return EXIT_FAILED
-
-    def on_signal(signum, frame):
-        state["shutdown"] = True
-        stop.set()
-        if tunnel.poll() is None:
-            tunnel.terminate()
-
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
+        return "spawn_fail"
+    with rt.lock:
+        rt.child = tunnel
+    if rt.shutdown:
+        tunnel.terminate()
     log("tunnel_up")
+    stop = threading.Event()
+    applied = target["follow"]
 
     def watch():
         fails = 0
-        while not stop.wait(cfg["probe_interval"]):
-            if probe_healthy(cfg):
+        recorded = applied is None
+        mark_state = None            # 上一次 mark_verified 的非成功結果（同一種只記一次）
+        seen = set()                 # 本連線已記過的狀態事件（不洗版）
+
+        def note(event):
+            if event not in seen:
+                seen.add(event)
+                log(event)
+        delay = min(2.0, cfg["probe_interval"])    # 新連線盡快驗通；之後照 PROBE_INTERVAL
+        flagged = False
+        while not stop.wait(delay):
+            delay = cfg["probe_interval"]
+            if probe_healthy(cfg, target):
                 fails = 0
-                continue
-            fails += 1
-            log("probe_fail")
-            if fails >= cfg["probe_fails"]:
-                log("restart")
-                stop.set()
-                if tunnel.poll() is None:
-                    tunnel.terminate()
-                return
+                if not recorded:
+                    result = mark_verified(cfg, applied)
+                    if result == "ok":
+                        recorded = True
+                    elif result != mark_state:
+                        mark_state = result
+                        note(result)          # verified_invalid／unreadable／write_failed
+            else:
+                fails += 1
+                log("probe_fail")
+                if fails >= cfg["probe_fails"]:
+                    log("restart")
+                    stop.set()
+                    if tunnel.poll() is None:
+                        tunnel.terminate()
+                    return
+            if applied is not None and not flagged:
+                state = follow_status(cfg)[0]
+                if state != "ok":
+                    flagged = True       # 只在狀態轉換記一次，不打斷健康的 ssh
+                    note(FOLLOW_STATE_EVENTS[state])
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     tunnel.wait()
     stop.set()
     watcher.join(timeout=5)
-    if state["shutdown"]:
-        return 0
-    return EXIT_FAILED
+    with rt.lock:
+        rt.child = None
+    return "shutdown" if rt.shutdown else "lost"
+
+
+def mark_verified(cfg, fields):
+    """首次端對端探針 200 後才寫 .tunnel_generation，並把連敗計數歸零。
+
+    回 "ok"（水位已是最新且退避已清）或固定事件名：水位壞了／讀不到（不覆寫，
+    verified_invalid／verified_unreadable）、寫入失敗（verified_write_failed）。
+    非 "ok" 時呼叫端不得當成完成，之後的探針會再試。"""
+    state, verified = read_verified(cfg)
+    if state in ("invalid", "unreadable"):
+        return "verified_" + state
+    if verified is None or verified["generation"] != fields["generation"] \
+            or verified["fingerprint"] != fingerprint(fields):
+        if not write_verified(cfg, fields):
+            return "verified_write_failed"
+    nxt, failures = read_backoff(cfg)
+    if failures and not write_backoff(cfg, nxt, 0):
+        return "verified_write_failed"
+    return "ok"
+
+
+def apply_gateway(cfg, fields, now):
+    """原子寫私用 known_hosts 與 FOLLOW_FILE；回新的 target，寫不進去回 None。"""
+    stored = dict(fields)
+    stored["published_at"] = fields["published_at"] or utc_iso(now)
+    if not safe_write(known_hosts_path(cfg), known_hosts_line(fields)):
+        return None
+    record = {"ip": stored["ip"], "ssh_port": stored["ssh_port"],
+              "tunnel_user": stored["tunnel_user"], "host_key": stored["host_key"],
+              "generation": stored["generation"], "published_at": stored["published_at"]}
+    if not safe_write(cfg["follow_file"], json.dumps(record)):
+        return None
+    return follow_target(cfg, stored)
+
+
+def acquire(cfg, rt):
+    """連不上時的同行程取得新位址（design §4.4 步驟 3）；回新的 target 或 None
+    （呼叫端以 1 結束，由 systemd 帶起、沿用最後已知位址重試）。"""
+    if not cfg["github"] or rt.shutdown:
+        return None
+    now = time.time()
+    next_allowed, _ = read_backoff(cfg)
+    if now < next_allowed:
+        log("fetch_skipped")
+        return None
+    try:
+        fields, headers = fetch_gateway(cfg)
+    except FetchError as err:
+        record_failure(cfg, err.cls, err.retry_after)
+        return None
+    if rt.shutdown:
+        return None
+    write_token_meta(cfg, headers, now)
+    log("fetch_ok")
+    generation = fields["generation"]
+    fp = fingerprint(fields)
+    verified_state, verified = read_verified(cfg)
+    if verified_state in ("invalid", "unreadable"):
+        # 水位壞了／讀不到不是首次啟動：不套用、不覆寫水位，等操作人處理
+        record_failure(cfg, "invalid", event="verified_" + verified_state)
+        return None
+    applied = read_follow(cfg)[1]
+    if verified is not None and generation < verified["generation"]:
+        record_failure(cfg, "regressed")                                  # 規則 1
+        return None
+    if applied is not None and generation == applied["generation"] and same_fields(fields, applied):
+        # 規則 2：未換代（閃斷，或新代套用了但還沒驗通又抓到同一份）
+        write_fetch_state(cfg, "ok")
+        _, failures = read_backoff(cfg)
+        write_backoff(cfg, now + cfg["fetch_min"], failures)
+        if verified is None or verified["generation"] != generation or verified["fingerprint"] != fp:
+            log("unverified_retry")
+        return None
+    reverted = verified is not None and generation == verified["generation"]
+    if reverted and fp != verified["fingerprint"]:
+        record_failure(cfg, "invalid", event="follow_invalid")           # 規則 4（同代改欄位）
+        return None
+    if applied is not None and generation == applied["generation"]:
+        record_failure(cfg, "invalid", event="follow_invalid")           # 規則 4（同代改欄位）
+        return None
+    target = apply_gateway(cfg, fields, now)                              # 規則 3／5
+    if target is None:
+        record_failure(cfg, "unreachable")
+        return None
+    write_fetch_state(cfg, "ok")
+    _, failures = read_backoff(cfg)
+    write_backoff(cfg, now + cfg["fetch_min"], failures)
+    log("gateway_reverted_to_verified" if reverted else "gateway_updated")
+    return target
+
+
+def daemon():
+    path = config_path()
+    cfg = load_config(path) if path else None
+    if cfg is None:
+        log("config_missing")
+        return EXIT_CONFIG_MISSING
+    rt = Runtime()
+
+    def on_signal(signum, frame):
+        rt.request_shutdown()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    if cfg["github_partial"]:
+        log("config_partial")
+        write_fetch_state(cfg, "config_partial")
+    target = choose_target(cfg)
+    while True:
+        if rt.shutdown:
+            return 0
+        if target is None:
+            target = acquire(cfg, rt)
+            if target is None:
+                return 0 if rt.shutdown else EXIT_FAILED
+        outcome = run_session(cfg, rt, target)
+        if outcome == "shutdown":
+            return 0
+        if outcome == "spawn_fail":
+            return EXIT_FAILED
+        target = acquire(cfg, rt)
+        if target is None:
+            return 0 if rt.shutdown else EXIT_FAILED
+
+
+def probe_once():
+    """一次端對端探針；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。
+    嚴格只讀：不建立或改寫任何狀態檔、不打 GitHub、不寫 log。"""
+    path = config_path()
+    cfg = load_config(path) if path else None
+    if cfg is None:
+        return EXIT_PROBE_UNAVAILABLE
+    if shutil.which(cfg["ssh_path"]) is None:
+        return EXIT_PROBE_UNAVAILABLE
+    target = choose_target(cfg, write=False, notify=False)
+    if target is None:
+        return EXIT_PROBE_UNAVAILABLE
+    return EXIT_PROBE_OK if probe_healthy(cfg, target) else EXIT_PROBE_FAIL
+
+
+def main():
+    if sys.argv[1:] == ["--probe-once"]:
+        return probe_once()
+    if sys.argv[1:] == ["--fetch-check"]:
+        return fetch_check()
+    return daemon()
 
 
 if __name__ == "__main__":

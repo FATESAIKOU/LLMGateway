@@ -303,3 +303,26 @@ def test_follow_fingerprint_golden(box):
     follow(box)
     data = json.loads(Path(box.state('gateway.json')).read_text())
     assert lm.follow_fingerprint(data) == '73d0194f7c979828b6da5f50f5bf40722637ae923471e173dc5794c969a344dd'
+
+
+@pytest.mark.parametrize('kind', ['garbage', 'wrong_shape', 'oversize', 'symlink', 'directory', 'unreadable'])
+def test_bad_verified_watermark_is_invalid_or_unreadable_never_first_start(box, kind):
+    # 與 llmgateway-tunnel 的 read_verified 同語意：只有不存在才是首次（ok, None）
+    follow(box)
+    path = box.state('.tunnel_generation')
+    l = Layout.from_env(box.env)
+    assert l.tunnel_follow_state() == ('ok', None)
+    if kind == 'garbage': box.write(path, 'corrupt')
+    elif kind == 'wrong_shape': box.write(path, json.dumps({'generation': '1', 'fingerprint': 'zz'}))
+    elif kind == 'oversize': box.write(path, ' ' * 70000)
+    elif kind == 'symlink':
+        box.write(box.state('elsewhere'), json.dumps({'generation': 1, 'fingerprint': 'a' * 64}))
+        os.symlink(box.state('elsewhere'), path)
+    elif kind == 'directory': os.mkdir(path)
+    else:
+        box.write(path, json.dumps({'generation': 1, 'fingerprint': 'a' * 64}))
+        os.chmod(path, 0)
+    try:
+        assert l.tunnel_follow_state() == (('unreadable' if kind == 'unreadable' else 'invalid'), None)
+    finally:
+        if kind == 'unreadable': os.chmod(path, 0o600)

@@ -4,6 +4,10 @@ After=llmgateway.service
 
 [Service]
 Type=simple
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/llmgateway
+PrivateTmp=true
 User=llmgw
 # 設定檔在 /etc/llmgateway/tunnel.env（新版面）；LGW_TUNNEL_ENV 是程式的覆寫點。
 Environment=LGW_TUNNEL_ENV=/etc/llmgateway/tunnel.env
