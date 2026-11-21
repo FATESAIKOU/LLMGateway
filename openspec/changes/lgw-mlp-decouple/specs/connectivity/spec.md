@@ -20,8 +20,8 @@
 - **THEN** `llmgwctl check` 回報 `fail`（退出碼非 `0`）並指出處置方式（確認為上游回退時執行 `llmgwctl follow-reset`；`auth_failed` 換好 token 後執行 `llmgwctl follow-reset --fetch-state`），`llmgwctl status` 顯示對應狀態而不洩漏 IP、金鑰或 token
 
 #### Scenario: 隧道運行中異常、設定半套、缺金鑰或認證失敗時不靜默通過
-- **WHEN** `llmgateway-tunnel.service` 仍在運行中，但 follow 檔為 `missing`／`invalid`／`regressed`，或最近抓取為 `auth_failed`／`config_partial`，或金鑰檔缺漏／無讀權（`credential_unreadable`）
-- **THEN** `llmgwctl check` 回報 `todo`（附固定警示原因，如 `auth_failed` 提示 token 可能失效請執行 `llmgateway-tunnel --fetch-check` 並於換妥後跑 `llmgwctl follow-reset --fetch-state`）而不靜默全綠通過
+- **WHEN** `llmgateway-tunnel.service` 仍在運行中，但 follow 檔為 `missing`／`invalid`／`regressed`，或最近抓取為 `auth_failed`／`config_partial`／`regressed`／`invalid`／`hostkey_missing`，或金鑰檔缺漏／無讀權（`credential_unreadable`）
+- **THEN** `llmgwctl check` 回報 `todo`（附固定警示原因，如 `auth_failed` 提示 token 可能失效請執行 `llmgateway-tunnel --fetch-check` 並於換妥後跑 `llmgwctl follow-reset --fetch-state`；`regressed`／`invalid`／`hostkey_missing` 提示現存連線靠最後已知位址維持、需人工確認 `NODE_GATEWAY`）而不靜默全綠通過
 
 #### Scenario: 非 root 無權限讀取狀態目錄時不誤報缺失
 - **WHEN** 非 root 呼叫者因 `STATE_DIR` 權限限制無法讀取 follow 檔而執行 `llmgwctl status` 或 `check`
@@ -62,7 +62,7 @@
 - **THEN** 新連線因 `ExitOnForwardFailure=yes` 立即失敗結束並重試，不在「沒有公開成功」的狀態下繼續跑
 
 #### Scenario: 惡意或格式無效欄位與帳號不符時拒收且不執行 ssh
-- **WHEN** `NODE_GATEWAY` 的 `tunnel_user` 或 `ip` 以 `-` 開頭、含 IPv6 zone id（`%`）、尾端換行或為 JSON 整數、`tunnel_user` 與本機設定不符、`port`／`generation` 為布林值或越界／超長，或 `host_key` 含換行、第三欄、非標準 padding 或無效 wire-format blob
+- **WHEN** `NODE_GATEWAY` 的 `tunnel_user` 或 `ip` 以 `-` 開頭、含 IPv6 zone id（`%`）、尾端換行或為 JSON 整數、`ip` 為最後一個 label 全為數字的主機名（如 `16909060`、`0x7f.1`、`1.2.3`，即使 `inet_aton` 可解析）、`tunnel_user` 與本機設定不符、`port`／`generation` 為布林值或越界／超長，或 `host_key` 含換行、第三欄、非標準 padding 或無效 wire-format blob
 - **THEN** 守護程式拒收並記錄對應無效事件、不更新 follow 檔亦不帶入 `ssh` 子行程執行，保留最後已知位址以退出碼 `1` 結束重試
 
 #### Scenario: host_key 缺漏或不符合時 fail-closed 拒連
