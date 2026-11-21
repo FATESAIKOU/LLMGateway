@@ -17,9 +17,10 @@
 服務只做這幾件事：list、resolve、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`POST /v1/subscriptions/{id}/cooldown`）。單筆取回 key 的 `GET /v1/subscriptions/{id}?agent=` 已於 #48 移除，現在一律 404；要拿 key 改用 resolve 回的 `env`。冷卻只是提示，resolve 不因冷卻拒絕（冷卻資訊在 `meta`／`list` 的 `cooldown`、`model_cooldowns`；要不要等、換哪個模型由呼叫方決定）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
 
 - `lgwd` 只綁放服務那台的 `127.0.0.1:<API 埠>`（預設 8480），不綁任何對外或容器網路的介面。
-- 隧道守護 `llmgateway-tunnel.service` 用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：
+- 隧道守護 `llmgateway-tunnel.service`（**可選**：沒有它 `lgwd` 照常運作，`llmgwctl start`／`stop`／`restart`／`check`／`upgrade` 都不依賴它）用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：
   - `127.0.0.1:4710` → `lgwd` 的 API；
-  - `127.0.0.1:4711` → 放服務那台的 sshd（管理用：手動升級、維護）。
+  - `127.0.0.1:4711` → 放服務那台的 sshd（管理用：手動升級、維護）。`4711` **一律保留**，不支援關閉（`REMOTE_SSH=off` 會被拒，結束碼 `78`）。
+- **連線健康時不碰 GitHub**：只有 ssh 連線斷掉、端對端探針連續失敗，或完全沒有可用位址時，才在同一個行程內唯讀抓取 MyLinuxPool 的 `NODE_GATEWAY`（會合點的新位址與主機金鑰），嚴格驗證後寫入本機並立刻重連；抓不到就沿用最後已知位址、以結束碼 `1` 讓 systemd 重開。這是 `connectivity` 規格「不依賴 MyLinuxPool」的**唯一例外**（只唯讀 `NODE_GATEWAY` 的位址欄位），細節與 token 見第 7 節。
 - 客戶端（Mac、worker 的 sidecar、手機）**自備通道**：把會合點的 4710 轉發到自己機器的 loopback（本機埠預設 4710），再直接打 `http://127.0.0.1:<本機埠>`。LLMGateway 不提供連線程式（見第 4 節）。
 - key 的正本是 private repo `FATESAIKOU/LLMGateway-keys` 的 `keys.env.enc`（加密檔）。放服務那台以 `llmgw` 身分使用 `gh` 拉取、解密、驗證後原子換掉 `keys.env`；`lgwd` 發現檔案變更後自動重讀。使用前提：以 `llmgw` 身分登入過 `gh`。
 - 管理指令全面統一為 `llmgwctl`（封裝於 `/usr/local/bin/llmgwctl`，或在當版目錄執行 `python3 -m lgwctl`）。
@@ -33,8 +34,9 @@
 - 作業系統：Linux，具備 systemd（system 層管理）。
 - 工具需求：`python3`（3.10 以上，僅使用標準函式庫）、`git`、`curl`、`ssh`、`ssh-keygen`、`openssl`，以及金鑰同步所需的 `gh`（GitHub CLI）。
 - 獨立服務帳號：`llmgw`（不能加入 `docker` 群組，確保隔離性）。
-- `gh` 登入：由本人親自以 `llmgw` 身分登入（`sudo -u llmgw -i` 後執行 `gh auth login`，使用瀏覽器登入，不放 token 檔）。
-- 隧道金鑰：維持在 `~llmgw/.ssh/`（私鑰 `~llmgw/.ssh/id_llmgw_tunnel`、known_hosts 檔 `~llmgw/.ssh/known_hosts_rendezvous`）。私鑰絕不離開該台機器。
+- `gh` 登入：由本人親自以 `llmgw` 身分登入（`sudo -u llmgw -i` 後執行 `gh auth login`，使用瀏覽器登入，不放 token 檔）。這條只管 `LLMGateway-keys` 金鑰同步，**另有一個受控例外**，見下一條。
+- **`NODE_GATEWAY` 讀取用 token 檔（受控例外，#221；可選，只在要讓隧道跟隨 MLP 輪換時才放）**：一把 GitHub fine-grained PAT，只授權 `FATESAIKOU/MyLinuxPool` 的 `Variables: Read-only`（這是最小授權，但**仍可讀該 repo 全部 Actions variables**，含其他 `NODE_*` 的位址拓樸，不含 Secrets）；檔案 `/etc/llmgateway/mlp-gateway.token`（`root:root`、`0600`），以 systemd drop-in `LoadCredential` 交給隧道守護，不給 `llmgw` 直接讀。平穩期（連線一直健康）token 可能悄悄到期，直到下一次輪換才發現，需靠 `TOKEN_EXPIRES_AT` 與人工 `--fetch-check` 降低風險。完整規格、建立與換 token 流程見 7.2。
+- 隧道金鑰：維持在 `~llmgw/.ssh/`（私鑰 `~llmgw/.ssh/id_llmgw_tunnel`、known_hosts 檔 `~llmgw/.ssh/known_hosts_rendezvous`）。私鑰絕不離開該台機器。跟隨輪換後，連線改用 `/var/lib/llmgateway/.tunnel_known_hosts`（程式依 `NODE_GATEWAY` 的 `host_key` 產生）；`known_hosts_rendezvous` 只在沒有有效位址檔時當最後已知位址用（觀察期後可清，見 7.6）。
 
 ### 1.2 檔案系統版面配置（Layout）
 
@@ -47,12 +49,15 @@
 | `/opt/llmgateway/previous` | `root:root` symlink | 指向上一版版本的符號連結（供 rollback 使用） |
 | `/etc/llmgateway/llmgateway.env` | `root:llmgw` 0640 | 服務設定檔（例如 `LGW_API_PORT=8480`） |
 | `/etc/llmgateway/tunnel.env` | `root:llmgw` 0640 | 隧道設定檔（`RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS` 等） |
+| `/etc/llmgateway/mlp-gateway.token` | `root:root` 0600 | （可選）`NODE_GATEWAY` 讀取用唯讀 PAT，單行（見 7.2） |
+| `/etc/systemd/system/llmgateway-tunnel.service.d/credential.conf` | `root:root` 0644 | （可選）drop-in `LoadCredential=`；由 `llmgwctl tunnel-apply --new-dropin` 放（見 7.3），出貨 unit 不含 |
 | `/etc/llmgateway/keys.pass` | `root:llmgw` 0640 | 單行解密密碼（`LLMGW_KEYS_PASSWORD=...`，透過 systemd `LoadCredential` 傳遞） |
 | `/var/lib/llmgateway/keys.env` | `llmgw:llmgw` 0600 | 解密後的五把金鑰環境變數檔 |
 | `/var/lib/llmgateway/llm.db` | `llmgw:llmgw` 0600 | SQLite 資料庫（冷卻紀錄與稽核） |
 | `/var/lib/llmgateway/.keysync.sha` | `llmgw:llmgw` 0600 | 上次套用的金鑰 blob sha 記錄 |
 | `/var/lib/llmgateway/.keysync.status`| `llmgw:llmgw` 0644 | 金鑰同步狀態檔（時間戳與成敗原因，不含值） |
-| `/var/lib/llmgateway-ctl/` | `root:root` 0700 | 遷移與控制狀態目錄（`.cutover.state`、`.cutover.lock`） |
+| `/var/lib/llmgateway/gateway.json`、`.tunnel_known_hosts`、`.tunnel_generation`、`.tunnel_fetch_state`、`.tunnel_fetch_backoff`、`.tunnel_token_meta` | `llmgw:llmgw` 0600 | 隧道跟隨狀態（位址檔、私用 known_hosts、已驗證水位、最近抓取分類與退避、token 到期標頭；不含 token，見 7.1） |
+| `/var/lib/llmgateway-ctl/` | `root:root` 0700 | 遷移與控制狀態目錄（`.cutover.state`、`.cutover.lock`）；`tunnel-apply` 的 `.tunnel-apply.lock`、`.tunnel-apply.state` 與備份目錄 `tunnel-apply.bak/` |
 | `/etc/systemd/system/` | `root:root` 0644 | 系統層 unit：`llmgateway.service`、`llmgateway-tunnel.service` |
 | `/usr/local/bin/llmgwctl` | `root:root` 0755 | 管理指令 wrapper 腳本（自動切進 current 執行） |
 
@@ -245,6 +250,9 @@ ssh -N -i ~/.ssh/<能登入 sshproxy 的金鑰> -o StrictHostKeyChecking=yes \
 curl -s http://127.0.0.1:4710/v1/subscriptions
 ```
 
+> [!NOTE]
+> **Mac 轉發指引現況（Q-MLP-E）**：MLP 目前**尚未**提供基於 `NODE_GATEWAY` 的 Mac 轉發指令，所以這裡仍是上面的手動寫法。隧道跟隨輪換只更新**服務端**；輪換後會合點位址與主機金鑰變了，Mac 這條通道的 `<跳板機>`／`<埠>` 與 `known_hosts_rendezvous` 要自己更新（或沿用 MLP 的 worker 通道）。MLP 提供指令後再改寫這一節。worker 的 sidecar 維持綁會合點的 `127.0.0.1:4710`，不用改。
+
 ### 4.2 Python 客戶端程式庫（`lgw.client`）
 
 ```python
@@ -273,7 +281,20 @@ llmgwctl check [--no-remote] [--tag <tag>]
 - `0`：全部正常通過。
 - `1`：確定失敗（unit 未運行、探針非 200、gh 認證失效等）。
 - `2`：存在需人工介入處理之 `todo`。
-參數 `--no-remote` 可略過跨會合點之遠端探針。
+參數 `--no-remote` 可略過跨會合點之遠端探針（隧道相關項目一併不列）。
+
+**隧道是可選的**：機器上沒有 `llmgateway-tunnel.service` 也沒設定隧道時，`check` 不列任何隧道項目，其餘項目全通過即回 `0`。只要隧道 unit 存在或已設定隧道，`check`／`status` 就照常檢查（除非 `--no-remote`）。
+
+隧道有設定位址追蹤（`FOLLOW_FILE` 或任何 `GATEWAY_*` 鍵）時，`check` 另列：
+
+| 項目 | 內容與判法 |
+|---|---|
+| `tunnel-follow` | **follow 六態**：`unconfigured`（沒設追蹤，不列）、`ok`（顯示 `ok (gen=<n>)`，`<n>` 是已驗證水位，尚未驗通顯示 `pending`）、`missing`（位址檔不在）、`invalid`（位址檔壞掉、是 symlink／過大，或同代但欄位與已驗證指紋不符）、`regressed`（位址檔 `generation` 低於已驗證水位）、`unreadable`（非 root 讀不到 `0700` 的狀態目錄，顯示「需 root 或 llmgw 才能讀」，**不會誤報 `missing`**） |
+| `tunnel-fetch` | **最近抓取分類**：`ok`、`regressed`、`invalid`、`hostkey_missing`、`auth_failed`、`rate_limited`、`unreachable`、`config_partial`、`credential_unreadable`（沒抓過顯示 `none`） |
+| `tunnel-token` | token 到期：`ok`、`expiry_unknown`（沒有可用日期，不告警）、`expiry_due`（剩 ≤ `TOKEN_EXPIRY_WARN_DAYS`，預設 7 天，或已到期）、`expiry_invalid`（`TOKEN_EXPIRES_AT` 格式不合，或到期資訊無效）、`unreadable` |
+| `tunnel-credential` | `GATEWAY_GITHUB_KEY_FILE` 讀不到或沒權限時 `todo`（提示檢查路徑、權限或 drop-in `LoadCredential`） |
+
+等級：隧道**未 `active`** 時，`tunnel-follow` 為 `missing`／`invalid`／`regressed`，或抓取分類為 `regressed`／`invalid`／`hostkey_missing`／`auth_failed`，一律 `fail`（結束碼 `1`），訊息含處置（確認為上游回退時 `llmgwctl follow-reset`；`auth_failed` 換好 token 後 `llmgwctl follow-reset --fetch-state`）。隧道**仍 `active`** 時同樣的情況降為 `todo`（現存連線靠最後已知位址維持，需人工確認 `NODE_GATEWAY`；`auth_failed` 提示跑 `llmgateway-tunnel --fetch-check`），不會靜默全綠。`config_partial`、`credential_unreadable`、`expiry_due`、`expiry_invalid`（`TOKEN_EXPIRES_AT 格式不合`）、`unreadable` 皆為 `todo`（結束碼 `2`）。輸出只含這些固定字串，不含位址、金鑰或 token。
 
 ### 5.2 檢視版本與運行狀態（`status`）
 
@@ -284,6 +305,7 @@ llmgwctl status
 ```
 
 印出目前 `current` 與 `previous` 的版本 tag，以及兩個 system unit（`llmgateway.service`、`llmgateway-tunnel.service`）的 active 狀態。
+- 隧道存在或已設定時另有幾列：`llmgateway-tunnel.service`（active 狀態）、`tunnel-follow`（follow 六態，正常為 `ok (gen=<n>)`）、`tunnel-fetch`（最近抓取分類）、`tunnel-token`（到期狀態）、`list-remote`（經會合點探針：`ok`／`fail`／`todo`）。沒有設定追蹤（也沒有抓取紀錄）時不列 `tunnel-follow`／`tunnel-fetch`／`tunnel-token` 三列；`--no-remote` 不列任何隧道相關列。非 root 讀不到狀態目錄時顯示 `unreadable（需 root 或 llmgw 才能讀）`。
 - 若需檢視遷移階段狀態，可查看 `/var/lib/llmgateway-ctl/.cutover.state` 或 transient unit 紀錄（`journalctl -u lgw-cutover` / `lgw-rollback`）。
 - 若需檢視詳細金鑰同步狀態，請查看 `/var/lib/llmgateway/.keysync.status` 或執行 `llmgwctl check`。
 
@@ -436,6 +458,28 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 > 出廠政策是所有實例共用的一份（同一份 `policy/default.json`），所以 worker 實例的 `GET /v1/subscriptions` 也會對 `antigravity` 顯示 `available: true`、`usage.status` 為 `not_applicable`——那是「沒有憑證但恆算已部署」，不是「這台可以用」。worker 誤用時會拿到 200 與空的 `env`，直到 agy 在該台找不到而失敗（503）才會發現。Gateway 沒有呼叫方／主機概念，也不做應用層認證（只有 loopback＋SSH 轉發），因此「只給 Mac」只能靠部署與自律（worker 的 sidecar 不要求 agy），不能寫成擋得住。
 
 
+### 5.10 啟動、停止與重啟服務（`start`／`stop`／`restart`）
+
+```bash
+sudo llmgwctl start
+sudo llmgwctl stop
+sudo llmgwctl restart
+```
+
+只管 `llmgateway.service`（不碰隧道），以 root／`sudo` 執行（背後是 `systemctl`）。`start` 與 `restart` 之後會等本機 `GET /v1/subscriptions` 回 200 才回 `0`；冪等：已 active 且本機 200 時再 `start` 不重啟、回 `0`；已停止時再 `stop` 回 `0`。其他情況（起不來、等不到 200）回 `1`。
+
+### 5.11 重設隧道跟隨狀態（`follow-reset`）
+
+```bash
+sudo llmgwctl follow-reset                # 清 .tunnel_generation、.tunnel_fetch_backoff、.tunnel_fetch_state
+sudo llmgwctl follow-reset --fetch-state  # 只清 .tunnel_fetch_state 與 .tunnel_fetch_backoff，保留已驗證水位
+```
+
+- **需 root**：非 root 印「`follow-reset 需要 root 權限`」並回 `1`。
+- 預設模式會連已驗證水位（`.tunnel_generation`）一起清掉：只在**人工確認 `NODE_GATEWAY` 的回退是合法**（`tunnel-follow` 為 `regressed` 而非被竄改）時用，用完通常要 `sudo systemctl restart llmgateway-tunnel`。
+- `--fetch-state` 用在換好 token、清掉 `auth_failed` 告警（或 `--fetch-check` 成功後 `check` 仍紅）：**不動**世代水位與位址檔 `FOLLOW_FILE`。
+- 兩種模式都不動 `FOLLOW_FILE`、不重啟任何 unit；狀態目錄不存在時回 `0`。
+
 ## 6. 故障排除
 
 ### 6.1 不需要設定 `XDG_RUNTIME_DIR` 或 `DBUS`
@@ -467,10 +511,277 @@ cat /var/lib/llmgateway/.keysync.status
 
 ### 6.4 隧道持續重開或斷線
 
-- 檢查 `/etc/llmgateway/tunnel.env` 設定值是否正確。
-- 檢查 `~llmgw/.ssh/id_llmgw_tunnel` 是否存在且權限為 `0600`。
-- 檢查 `~llmgw/.ssh/known_hosts_rendezvous` 是否包含正確之會合點主機金鑰。
-- 確認會合點上的 4710 或 4711 埠是否殘留舊連線佔用。
+先看 `sudo llmgwctl check` 與 `llmgwctl status` 的 `tunnel-follow`／`tunnel-fetch`／`tunnel-token` 列（第 5.1 節），再看 `journalctl -u llmgateway-tunnel -n 100`（只有固定事件名，見 7.1），依下表處理，詳細處置見 7.5：
+
+| 現象 | 可能原因與處置 |
+|---|---|
+| 結束碼 `78`、journal 有 `config_missing`，unit 停在 failed 不再重開 | 設定缺（`IDENTITY`、本機使用者、靜態位址與 GitHub 來源兩者皆無且沒有有效 `FOLLOW_FILE`），或 `REMOTE_SSH=off`／其他無效值、未授權的 API base。修好 `/etc/llmgateway/tunnel.env` 後手動 `sudo systemctl restart llmgateway-tunnel`（`RestartPreventExitStatus=78` 不會自己重開） |
+| 反覆 `probe_fail`→`restart`→`fetch_*` | 連線斷了正在找新位址；看 `fetch_ok`／`gateway_updated` 有沒有出現。抓不到時按 `tunnel-fetch` 分類處理 |
+| `fetch_auth_failed` | token 失效、被撤銷或權限不對：`--fetch-check`，換 token（7.2） |
+| `fetch_rate_limited`／`fetch_skipped` | 限流或退避期間，守護自己會重試（`60s`～`900s`），不用處理 |
+| `credential_unreadable` | token 檔缺或沒權限，或 drop-in 沒生效（`daemon-reload` 後 `systemctl show llmgateway-tunnel -p LoadCredential`） |
+| `follow_regressed`／`follow_invalid`／`hostkey_missing` | 位址檔或 `NODE_GATEWAY` 被回退、同代改欄位或 `host_key` 有問題：人工確認 `NODE_GATEWAY`，確認回退後 `sudo llmgwctl follow-reset`（7.5） |
+| `gateway_updated` 後反覆 `tunnel_up` 又斷 | 先查 `NODE_GATEWAY` 的 `host_key` 是否仍是上一代金鑰（7.5） |
+| `check` 的 `list-remote` 是 `todo`（`無法探`） | 探針回 `2`：設定不能用、找不到 `ssh`，或位址檔有效但私用 `.tunnel_known_hosts` 缺或不符（探針只讀，不會重寫；起守護程式一次就會重寫）。不是會合點壞掉 |
+| `check` 的 `list-remote` 是 `fail` | 經會合點不是 200：看隧道是否 active、本機 `127.0.0.1:<API 埠>` 是否 200 |
+
+仍須檢查的老項目：
+
+- `/etc/llmgateway/tunnel.env` 設定值是否正確；`~llmgw/.ssh/id_llmgw_tunnel` 是否存在且權限為 `0600`。
+- 沒有有效位址檔、走靜態位址時，`~llmgw/.ssh/known_hosts_rendezvous` 是否包含正確的會合點主機金鑰。
+- 會合點上的 4710 或 4711 埠是否殘留舊連線佔用（`ExitOnForwardFailure=yes` 會讓新連線立刻失敗重試；舊埠釋放依設計估計需 60–120 秒）。
+- 設定變更的切換一律走 `llmgwctl tunnel-apply`（7.3），不要手動改了就重啟。
+
+## 7. 隧道跟隨 MLP 輪換與 `NODE_GATEWAY` 讀取（#221）
+
+本節是 LLMGateway 與 MyLinuxPool（MLP）脫鉤後的隧道運作與本人在 `<服務主機>` 要做的動作。標記「**未在真機驗證，P4 第一次執行時逐步確認**」的指令，代表只有真的 systemd／root／真機才跑得起來，沒在沙箱實跑過；第一次執行時請一步一步確認輸出，不要整段貼上。
+
+> [!IMPORTANT]
+> 本節的「切換」（7.3）與「觀察」（7.5）是**本人動作**，不是自動流程。上線前先確認有**不經隧道的進場方式**（雲端 Web Console、本機終端或區網 SSH）：`4711` 是唯一的遠端管理入口，切換時它會中斷。
+
+### 7.1 運作方式、設定鍵與結束碼
+
+**狀態機（確定性，連線健康時完全不碰 GitHub）**：
+
+1. 啟動：有效的本機位址檔（`FOLLOW_FILE`）優先；沒有就用初始 `RENDEZVOUS` ＋ `KNOWN_HOSTS`（最後已知位址）直接連，不先打 GitHub。
+2. 健康期間只跑 `ssh -W` 端對端探針（`GET /v1/subscriptions` 要 200），零 GitHub 請求。
+3. `ssh` 退出、探針連續失敗達 `PROBE_FAILS`（預設 3），或完全沒有可用位址時，**同一行程內**才去抓 `NODE_GATEWAY`（`GATEWAY_SOURCE_*` 三個鍵都填才啟用）。抓取前先看持久化退避（`.tunnel_fetch_backoff`）與 `Retry-After`／`X-RateLimit-Reset`，期間記 `fetch_skipped` 不打 GitHub。
+4. 抓到後嚴格驗證（`ip`、`port`、`tunnel_user`、`host_key`、`generation`），通過才原子寫 `FOLLOW_FILE` 與私用 `.tunnel_known_hosts`，**立刻同行程重連**；首次探針 200 之後才把 `generation` 寫進 `.tunnel_generation`（已驗證水位）並把連敗歸零。
+5. 抓不到、被拒或驗證不過：寫抓取分類、保留最後已知位址，以結束碼 `1` 結束，由 systemd 10 秒後重開。
+
+`4710`（API）與 `4711`（管理 SSH）**一律同時轉發**：`REMOTE_SSH` 未設、留空或 `4711` 都是 `4711`；**不支援 `off`**（`REMOTE_SSH=off` 會被當成無效設定，結束碼 `78`）。
+
+**`/etc/llmgateway/tunnel.env` 設定鍵**（`KEY=VALUE`；程式優先讀環境變數 `LGW_TUNNEL_ENV` 指向的檔）：
+
+| 組別 | 鍵 | 說明 |
+|---|---|---|
+| 輸入①（連線） | `IDENTITY`（必填） | 隧道私鑰路徑（`~llmgw/.ssh/id_llmgw_tunnel`） |
+| | `RENDEZVOUS`、`TUNNEL_USER` | 本機 SSH 使用者＝`RENDEZVOUS` 的 `user@` 或 `TUNNEL_USER`，至少一個；兩個都設必須相同。`NODE_GATEWAY.tunnel_user` 只拿來比對，不會覆蓋本機帳號 |
+| | `RENDEZVOUS`、`KNOWN_HOSTS` | 初始位址（`[user@]host:port`）與其 known_hosts：沒有有效 `FOLLOW_FILE` 時用的最後已知位址基準 |
+| 輸入②（位址來源） | `GATEWAY_SOURCE_REPO` | `FATESAIKOU/MyLinuxPool` |
+| | `GATEWAY_SOURCE_PATH` | `actions/variables/NODE_GATEWAY` |
+| | `GATEWAY_GITHUB_KEY_FILE` | token 檔路徑（`/etc/llmgateway/mlp-gateway.token`）。即使用 drop-in `LoadCredential` 也要填，三個鍵缺一就不啟用 |
+| | `FOLLOW_FILE`（選填） | 預設 `/var/lib/llmgateway/gateway.json`（`0600`）。**必須位於 `/var/lib/llmgateway` 之下**，否則要在 drop-in 補 `ReadWritePaths`（見 7.2） |
+| | `TOKEN_EXPIRES_AT`（選填） | token 到期日，給 `llmgwctl check`／`status` 告警用（守護程式本身不讀）。建議寫 `YYYY-MM-DD` 或 `YYYY-MM-DDTHH:MM:SSZ`；其他格式（例如 `2026-12-31 00:00:00 UTC`）會被判為格式不合 |
+| | `TOKEN_EXPIRY_WARN_DAYS`（選填） | 告警門檻天數，預設 `7`（`llmgwctl` 讀） |
+| 埠與時間 | `REMOTE_API=4710`、`REMOTE_SSH=4711`、`LOCAL_API=8480` | 預設值如左 |
+| | `PROBE_INTERVAL=60`、`PROBE_FAILS=3` | 探針間隔（秒）與連敗門檻 |
+| | `SSH_PATH=ssh`、`SSH_CONNECT_TIMEOUT=10`、`SERVER_ALIVE_INTERVAL=30`、`SERVER_ALIVE_COUNT_MAX=3` | ssh 連線參數 |
+| | `FETCH_TIMEOUT=10`、`FETCH_MIN_INTERVAL=60`、`FETCH_BACKOFF_MAX=900` | 抓取逾時與退避（`60s`×2ⁿ，上限 `900s`） |
+
+只填部分 `GATEWAY_*` 鍵（靜態位址仍有效）時守護程式**不停機**，記 `config_partial` 並照靜態位址連線；`check` 會是 `todo`。舊的只有靜態三鍵（`RENDEZVOUS`、`IDENTITY`、`KNOWN_HOSTS`）的 `tunnel.env` 原樣可用。
+
+**結束碼**：
+
+| 對象 | 碼 | 意思 |
+|---|---|---|
+| 守護程式 | `0` | 收到 SIGTERM／SIGINT 正常結束 |
+| | `1` | 執行期失敗（連不上且抓不到、被拒、`ssh` 起不來…）；systemd 10 秒後重開 |
+| | `78` | 設定本身不能啟動（缺 `IDENTITY`、缺本機使用者、靜態位址與 GitHub 來源兩者皆無且沒有有效 `FOLLOW_FILE`、參數非法含 `REMOTE_SSH=off`、未授權的 API base）。unit 的 `RestartPreventExitStatus=78` 讓它**不會**反覆重開；修好設定後要手動 `systemctl restart llmgateway-tunnel` |
+| `--probe-once` | `0`／`1`／`2` | HTTP 200／不是 200 或沒回應／無法探（設定不能用、找不到 `ssh`、或 `FOLLOW_FILE` 有效但私用 `.tunnel_known_hosts` 缺或不符）。嚴格只讀：不寫檔、不打 GitHub、**不重寫** `.tunnel_known_hosts` |
+| `--fetch-check` | `0`／`1`／`78` | 可用／抓取或格式失敗（印分類，不印位址與 token）／設定不能用（沒啟用 GitHub 來源也是 `78`）。嚴格只讀、只打一次 GitHub、不寫任何狀態檔 |
+
+**狀態檔（`/var/lib/llmgateway/`，`llmgw` 擁有、`0600`、不含 token）**：
+
+| 檔案 | 內容 |
+|---|---|
+| `gateway.json`（`FOLLOW_FILE`） | 目前套用的位址、`ssh_port`、`tunnel_user`、`host_key`、`generation` |
+| `.tunnel_known_hosts` | 由 `FOLLOW_FILE` 產生的私用 known_hosts（單行） |
+| `.tunnel_generation` | 已驗證水位（`generation`＋指紋），首次探針 200 後才寫 |
+| `.tunnel_fetch_state` | 最近一次抓取分類：`ok`、`regressed`、`invalid`、`hostkey_missing`、`auth_failed`、`rate_limited`、`unreachable`、`config_partial`、`credential_unreadable` |
+| `.tunnel_fetch_backoff` | 下次允許抓取時間與連敗次數 |
+| `.tunnel_token_meta` | 最近一次成功抓取的時間與 token 到期標頭（若有） |
+
+**journal 事件**（`journalctl -u llmgateway-tunnel`；只寫固定事件名，不寫位址、IP、token 或 ssh 的 stderr）：`tunnel_up`、`probe_fail`、`restart`、`fetch_ok`、`fetch_skipped`、`fetch_failed`、`fetch_auth_failed`、`fetch_rate_limited`、`fetch_invalid`、`gateway_updated`、`gateway_reverted_to_verified`、`unverified_retry`、`follow_missing`、`follow_invalid`、`follow_regressed`、`verified_invalid`、`verified_unreadable`、`verified_write_failed`、`hostkey_missing`、`config_partial`、`config_missing`、`spawn_fail`。
+
+### 7.2 讀取 `NODE_GATEWAY` 的 token（修訂 §1.1「不放 token 檔」）
+
+**受控例外**：§1.1 的「`gh` 登入不放 token 檔」仍只適用於 `LLMGateway-keys` 金鑰同步。要讓隧道跟隨輪換，需要另放**一把** GitHub fine-grained PAT 檔，規格如下，其他一律不變：
+
+- **建立**（GitHub → Settings → Developer settings → Fine-grained tokens）：
+  - Repository access 選 **Only select repositories**，只勾 `FATESAIKOU/MyLinuxPool`（**不要**勾 `LLMGateway-keys` 或任何其他 repo）。
+  - Repository permissions 只給 **`Variables: Read-only`**（`Metadata: Read-only` 是 GitHub 自動附帶）；不給 `Contents`、`Actions`、`Secrets` 或任何 Write。
+  - **記下到期日**，之後填進 `TOKEN_EXPIRES_AT`。
+  - **已知限度（本人已接受的風險）**：這是 fine-grained PAT 能給的最小授權，但它**仍可讀取該 repo 全部 Actions variables**（含其他 `NODE_*` 的位址拓樸，不含 Secrets），無法限縮到只有 `NODE_GATEWAY`。
+- **放置**：`/etc/llmgateway/mlp-gateway.token`，`root:root`、`0600`，單行純 token。**不要把 token 放進指令列參數或 shell 歷史**，用標準輸入貼：
+
+  ```bash
+  sudo sh -c 'umask 077; cat > /etc/llmgateway/mlp-gateway.token'   # 貼上 token，換行後按 Ctrl-D
+  sudo ls -l /etc/llmgateway/mlp-gateway.token                      # 確認 -rw------- root root
+  ```
+
+  （`umask 077; cat >` 這段已在沙箱用暫存路徑實跑確認權限為 `-rw-------`；`sudo` 與 `root:root` 擁有者在真機才確認。）
+- **讀取方式：drop-in `LoadCredential`**。出貨的 `llmgateway-tunnel.service` **不含** `LoadCredential=`（沒有 token 檔的機器否則重啟隧道會直接啟動失敗）；改由本人在切換時（7.3）以 `tunnel-apply` 放 drop-in `/etc/systemd/system/llmgateway-tunnel.service.d/credential.conf`。程式優先讀 `$CREDENTIALS_DIRECTORY/gateway-token`，否則讀 `GATEWAY_GITHUB_KEY_FILE`；讀不到（缺檔或沒權限；`llmgw` 讀不了 `root:root 0600` 的檔，所以沒放 drop-in 就會是這樣）只算**抓取失敗**（分類 `credential_unreadable`、結束碼 `1`），不會是 `78`。暫存 drop-in 內容：
+
+  ```ini
+  [Service]
+  LoadCredential=gateway-token:/etc/llmgateway/mlp-gateway.token
+  ```
+
+  若 `FOLLOW_FILE` 要放在 `/var/lib/llmgateway` 以外，同一個 drop-in 要再加一行 `ReadWritePaths=<FOLLOW_FILE 所在目錄>`（unit 有 `ProtectSystem=strict`，只有 `/var/lib/llmgateway` 可寫；寫不進去會被記成抓取失敗 `unreachable`、位址永遠換不成）。**預設值最省事：不要自訂 `FOLLOW_FILE`。** 此 drop-in 寫法**未在真機驗證，P4 第一次執行時逐步確認**。
+- **出貨 unit 的加固**：`NoNewPrivileges=true`、`ProtectSystem=strict`、`ReadWritePaths=/var/lib/llmgateway`、`PrivateTmp=true`。`IDENTITY`、`KNOWN_HOSTS`（`~llmgw/.ssh/`）仍是唯讀可讀。
+- **token 不出現在任何輸出**：`check`、`status`、`.tunnel_*` 狀態檔、journal 都不含 token；只有 `Authorization` 標頭在記憶體中用到它。
+
+**平穩期悄悄到期的限制（務必知道）**：連線健康時守護**不碰 GitHub**，所以 token 在平穩無斷線的那幾個月裡過期，**沒有任何訊號**，要到下一次輪換斷線、需要抓位址的那一刻才收到 `401`／`403` 而發現。降低這個風險的做法：
+
+1. **`TOKEN_EXPIRES_AT`**：填進 `tunnel.env`，剩 ≤ 7 天（`TOKEN_EXPIRY_WARN_DAYS` 可調）`llmgwctl check` 回 `todo`；格式不合回 `todo`（`TOKEN_EXPIRES_AT 格式不合`）。
+2. **人工 `--fetch-check`**（建議定期跑、token 到期前一定跑）：用 `llmgw` 身分＋`LoadCredential` 做一次只讀的真實請求，驗 token 能讀 `NODE_GATEWAY`、欄位格式合規：
+
+   ```bash
+   # <臨時設定檔> 先用 /etc/llmgateway/tunnel.env（日常檢查）；7.3 切換前用 tunnel.env.new
+   sudo systemd-run --wait --pipe -p User=llmgw \
+     -p LoadCredential=gateway-token:/etc/llmgateway/mlp-gateway.token \
+     -E LGW_TUNNEL_ENV=/etc/llmgateway/tunnel.env \
+     /opt/llmgateway/current/ops-scripts/llmgateway-tunnel --fetch-check
+   ```
+
+   **必須帶 `-E LGW_TUNNEL_ENV=<設定檔>`**：transient unit 不會繼承 unit 檔的 `Environment=`，不帶就找不到設定而結束碼 `78`。成功輸出（用 mock GitHub 在沙箱實跑，位址與金鑰不會印出）：
+
+   ```
+   fetch_check: ok
+   http_status: 200
+   format: ok
+   generation: <n>
+   expiry_header: present|absent
+   如 check 仍紅請執行 llmgwctl follow-reset --fetch-state
+   ```
+
+   失敗只印 `fetch_check: failed (<分類>)`，結束碼 `1`；沒有啟用 GitHub 來源或設定不能用印 `config_missing`、結束碼 `78`。`systemd-run` 這整條指令**未在真機驗證，P4 第一次執行時逐步確認**（沙箱沒有 systemd，只實跑了 `--fetch-check` 本身）。
+3. **標頭到期日**：每次成功抓取會把 `github-authentication-token-expiration` 記進 `.tunnel_token_meta`；日期 ≤ 抓取當下時間視為 `expiry_unknown`，不誤報。但這只在發生過成功抓取後才有值，不能取代前兩項。
+
+**換 token（或 token 失效後處理）**：
+
+1. 把新 token 放在 `/etc/llmgateway/mlp-gateway.token.new`（同上 `umask 077`），先用 `-p LoadCredential=gateway-token:/etc/llmgateway/mlp-gateway.token.new` 跑一次 `--fetch-check` 確認可用。
+2. 再 `sudo mv /etc/llmgateway/mlp-gateway.token.new /etc/llmgateway/mlp-gateway.token`。`LoadCredential` 在服務**啟動時**取快照，運行中的隧道仍持有舊 token；要讓它生效就得重啟隧道（4710／4711 會中斷，建議用 7.3 的 `tunnel-apply` 保險來重啟，`--new-env` 帶 `tunnel.env` 的複本）。這一步依 systemd `LoadCredential` 語意推論（與 §5.5 的 `keys.pass` 同理），**未在真機驗證，P4 第一次執行時逐步確認**。
+3. 換好後執行 `sudo llmgwctl follow-reset --fetch-state` 清掉 `auth_failed`（只清 `.tunnel_fetch_state` 與 `.tunnel_fetch_backoff`，**不動** `.tunnel_generation` 水位與 `FOLLOW_FILE`）；`--fetch-check` 成功時也會印這句提示。
+
+### 7.3 切換到跟隨模式（P4，本人動作；必用反向保險）
+
+重啟隧道就會斷掉你走的 `4711`，若新設定寫錯就失聯。所以切換**一律**用 `llmgwctl tunnel-apply`，不要手動改 `tunnel.env` 再重啟。
+
+**`tunnel-apply` 流程**（程式實際行為；需 root；`<ctl>`＝`/var/lib/llmgateway-ctl/`）：
+
+1. 以 `flock`（`<ctl>/.tunnel-apply.lock`）互斥；檢查 `--revert-after`（預設 `10m`，**下限 `5m`**，更短拒收；格式如 `10m`、`600s`）與暫存檔（必須是一般檔，不是 symlink）。
+2. **先備份**到 `<ctl>/tunnel-apply.bak/`（目錄 `0700`、檔 `0600`）：目前的 `tunnel.env`、drop-in `credential.conf`、切換前已存在的 `FOLLOW_FILE`（含預設路徑；新舊路徑不同兩個都記）與 `.tunnel_known_hosts`，逐項記路徑與存在性（原本不存在記為「不存在」）。備份失敗就不切換。
+3. 起獨立 transient unit `lgw-tunnel-apply`，之後的步驟都在裡面做：**前景指令被 SIGHUP／SIGTERM 殺掉（例如 4711 連線被重啟斷開）也會做完**。
+4. **先排保險** `lgw-tunnel-revert.timer`（`--on-active=<revert-after>`）；排不起來就中止，**不套用任何新檔**。
+5. **以複製套用**暫存檔（`--new-env`→`/etc/llmgateway/tunnel.env`；有 `--new-dropin` 才放 drop-in）；`.new` 暫存檔保留，失敗後可重試。
+6. `systemctl daemon-reload`、重啟 `llmgateway-tunnel.service`，然後探針（經會合點 `4710` 要 200）最多等 **180 秒**（正式環境下限 90 秒）。探針回 `rc=2`（無法探）**視為失敗**。
+7. 失敗或逾時立刻還原（備份的 `tunnel.env`；drop-in 原不存在就只刪本次放的 `credential.conf`，目錄是本次新建且已空才 `rmdir`；`FOLLOW_FILE`／`.tunnel_known_hosts` 切換前已存在者還原成切換前內容，本次新建者改名為 `*.reverted-<時間戳>`，不刪），再 `daemon-reload` 並重啟隧道。
+8. 通過時狀態為 `pending-confirm`，指令回 `0`；其餘結果回 `1`。你重連 `<會合點>:4711` 登入、確認後執行 `llmgwctl tunnel-apply --confirm` 取消保險。前景的 `tunnel-apply` 最多追蹤內層約 5 分鐘；逾時會印「還在進行」並回 `1`，那不代表失敗，改看 `journalctl -u lgw-tunnel-apply`。**`--confirm` 之前保險到期（或還原已觸發），`--confirm` 會拒絕並改走還原**，要重來請重新跑 `tunnel-apply --new-env …`。
+
+狀態檔 `<ctl>/.tunnel-apply.state` 的階段名：`apply-scheduled`、`applying`、`pending-confirm`、`confirmed`、`reverted`、`revert-failed`、`aborted`。看進度：`journalctl -u lgw-tunnel-apply -n 100`；保險還原看 `journalctl -u lgw-tunnel-revert`。
+
+> [!WARNING]
+> **`lgw-tunnel-revert.timer` 是 transient timer，重開機後即失效。`tunnel-apply` 窗口內（從下指令到 `--confirm`）切勿重開機。**
+> **4.2 與 4.3 之間（下面步驟 2 到 3）不要改運行中的 `tunnel.env`**：步驟 3 會用暫存檔取代它（備份是在套用前做的，備份的是當下那份）。
+
+**還原失敗**：還原本身失敗時狀態變 `revert-failed`（屬「進行中」，會擋住新的一輪 `tunnel-apply`，備份原樣保留），程式另排 `lgw-tunnel-revert-retry<N>.timer` 每 60 秒重試（最多 5 次）。用盡或排不起來會印固定的人工恢復指引。修好原因後可手動重試：
+
+```bash
+sudo llmgwctl tunnel-apply --retry-revert     # 只在 revert-failed 可用；成功才進 reverted
+```
+
+**切換步驟**（`<服務主機>`；除 `llmgwctl` 子命令的旗標外，`systemd-run`、`systemctl`、`sudo`、檔案擁有者都**未在真機驗證，P4 第一次執行時逐步確認**）：
+
+1. **放 token 與暫存 drop-in**（不直接裝進 `/etc/systemd/system/`，由步驟 3 在備份後套用）：
+
+   ```bash
+   # token：見 7.2（root:root 0600 的 /etc/llmgateway/mlp-gateway.token）
+   printf '[Service]\nLoadCredential=gateway-token:/etc/llmgateway/mlp-gateway.token\n' \
+     | sudo tee /etc/llmgateway/credential.conf.new >/dev/null
+   ```
+
+2. **升級、做暫存設定並先驗 token**（運行中的 `tunnel.env` 與 drop-in 這一步**完全不動**）：
+
+   ```bash
+   sudo llmgwctl upgrade --tag <新版>        # 只重啟 llmgateway.service，不碰正在跑的隧道
+   # 複製成暫存檔；擁有者與權限要和 tunnel.env 一樣（root:llmgw 0640），下一步 llmgw 才讀得到
+   sudo install -m 0640 -o root -g llmgw /etc/llmgateway/tunnel.env /etc/llmgateway/tunnel.env.new
+   sudoedit /etc/llmgateway/tunnel.env.new   # 在暫存檔加入輸入②，見下
+   sudo systemd-run --wait --pipe -p User=llmgw \
+     -p LoadCredential=gateway-token:/etc/llmgateway/mlp-gateway.token \
+     -E LGW_TUNNEL_ENV=/etc/llmgateway/tunnel.env.new \
+     /opt/llmgateway/current/ops-scripts/llmgateway-tunnel --fetch-check
+   ```
+
+   暫存檔要加的鍵（其餘原樣保留，**特別是既有靜態 `RENDEZVOUS`、`KNOWN_HOSTS` 與 `REMOTE_SSH=4711`，觀察期內供 `llmgwctl rollback` 回退相容**；`TUNNEL_USER` 或 `RENDEZVOUS` 的 `user@` 要有本機 SSH 帳號）：
+
+   ```
+   GATEWAY_SOURCE_REPO=FATESAIKOU/MyLinuxPool
+   GATEWAY_SOURCE_PATH=actions/variables/NODE_GATEWAY
+   GATEWAY_GITHUB_KEY_FILE=/etc/llmgateway/mlp-gateway.token
+   TOKEN_EXPIRES_AT=<token 到期日，例 2027-06-30>
+   FOLLOW_FILE=/var/lib/llmgateway/gateway.json
+   ```
+
+   `--fetch-check` 要看到 `fetch_check: ok` 才往下；`failed (auth_failed)`＝token 權限或到期有問題，`failed (credential_unreadable)`＝`LoadCredential` 沒帶到或 token 檔不在。
+
+3. **套用（保險下）**：
+
+   ```bash
+   sudo llmgwctl tunnel-apply --new-env /etc/llmgateway/tunnel.env.new \
+     --new-dropin /etc/llmgateway/credential.conf.new [--revert-after 10m]
+   ```
+
+   指令會斷在你的 `4711` 連線上：這是預期的。等幾分鐘後用第二個終端機重連 `<會合點>:4711`（或用進場備援），看 `journalctl -u lgw-tunnel-apply -n 100`。套用後先 `sudo systemctl daemon-reload`，**再**確認 drop-in 生效（沒有 `daemon-reload` 之前 `show` 看到的是舊值；`tunnel-apply` 本身在套用後已做過一次）：
+
+   ```bash
+   sudo systemctl daemon-reload
+   systemctl show llmgateway-tunnel -p LoadCredential      # 預期含 gateway-token:/etc/llmgateway/mlp-gateway.token
+   ```
+
+4. **驗收後確認**（保險時限內）：
+
+   ```bash
+   sudo llmgwctl check
+   llmgwctl status
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<本機埠>/v1/subscriptions   # 經你自備的 4710 通道，預期 200
+   sudo llmgwctl tunnel-apply --confirm
+   ```
+
+   **切換後第一次輪換之前，`tunnel-follow` 會顯示 `missing`、`check` 為 `todo`（結束碼 `2`）**：這是目前程式的實際行為，不是切換失敗。`FOLLOW_FILE` 只有在第一次連不上而抓到新位址時才會寫出，所以 `gen=<n>` 與 `tunnel-fetch` 的 `ok` 要等第一次真實輪換之後才看得到（沙箱以 `llmgwctl check` 實跑確認過「隧道 active＋`FOLLOW_FILE` 缺」會是 `todo tunnel-follow（follow 檔缺失，現存連線靠最後已知位址維持；需人工確認 NODE_GATEWAY）`）。切換驗收看 `list-remote` 是 `ok`、隧道 `active`、`tunnel-token` 不是 `expiry_due`／`expiry_invalid`。
+
+`llmgwctl tunnel-apply` 的 `--help`（沙箱實跑）旗標只有 `--new-env`、`--new-dropin`、`--revert-after`、`--confirm`、`--retry-revert`；其餘旗標是給 transient unit 內部用的，**不要手打**。
+
+### 7.4 觀察期：保留靜態鍵
+
+切換後到觀察期結束前，`tunnel.env` **保留**原本的靜態 `RENDEZVOUS`、`KNOWN_HOSTS` 與 `REMOTE_SSH=4711`（以及 `~llmgw/.ssh/known_hosts_rendezvous` 檔），原因：
+
+- `llmgwctl rollback` 回退到舊版腳本時，舊腳本只認這幾個靜態鍵。
+- 沒有有效 `FOLLOW_FILE` 時（第一次輪換之前）守護本來就用它們連線；`tunnel-apply` 的探針也靠它們（`FOLLOW_FILE` 缺失時走靜態位址）。
+- 注意：靜態值是切換當時的位址，**輪換過之後就過時了**。觀察期內若已輪換過、之後又要 `llmgwctl rollback`，回退前先人工把靜態 `RENDEZVOUS`／`KNOWN_HOSTS` 改成目前的位址。
+
+### 7.5 第一次真實輪換觀察與退回 SOP
+
+`rotate-gateway` 的 `dry_run` 不動 `NODE_GATEWAY`，端對端只能在**真的輪換**時觀察。下一次 MLP 實際輪換時，由本人（或 MLP PMO）在 `<服務主機>` 看：
+
+```bash
+journalctl -u llmgateway-tunnel --since '<輪換時間>' | grep -E 'probe_fail|restart|fetch_|gateway_|tunnel_up|follow_|hostkey_missing|unverified_retry'
+sudo llmgwctl check
+llmgwctl status
+```
+
+**預期順序**：（`probe_fail` … `restart`，或 ssh 直接掉線）→ `fetch_ok` → `gateway_updated` → `tunnel_up`；沒有 `fetch_auth_failed`／`hostkey_missing`／`follow_regressed`。事後 `status` 應顯示 `tunnel-follow ok (gen=<新代>)`、`tunnel-fetch ok`，`check` 全綠。**RTO 預期約 2–3.5 分鐘**（含會合點上舊埠釋放需 60–120 秒；這是設計估算，**尚未實測**，請記錄實際值）。
+
+| 看到的事件／狀態 | 意思 | 處置 |
+|---|---|---|
+| `gateway_updated` 後反覆 `tunnel_up`→斷線→`unverified_retry`（退避期間內則是 `fetch_skipped`），每約 10 秒一輪 | 新代已套用但連不通 | **先查 `NODE_GATEWAY` 的 `host_key` 是否殘留上一代（舊機）金鑰**（依設計階段對 MLP 輪換腳本的查證：`host_key` 為空時它會保留舊值）；請 MLP 修正後會再抓到更新的 `generation` |
+| `fetch_auth_failed`、`tunnel-fetch auth_failed` | token 失效、被撤銷或權限不對 | 7.2「換 token」流程；換好後 `sudo llmgwctl follow-reset --fetch-state` |
+| `fetch_rate_limited` | GitHub 限流或 `Retry-After` | 等；守護自己依退避重試（`60s`～`900s`） |
+| `follow_regressed`（`tunnel-follow regressed`） | 抓到或本機檔的 `generation` 低於已驗證水位（MLP 回退） | 先**人工確認 `NODE_GATEWAY`** 是否為合法的回退；確認後修好 `NODE_GATEWAY`，`sudo llmgwctl follow-reset`（清 `.tunnel_generation`、`.tunnel_fetch_backoff`、`.tunnel_fetch_state`）並 `sudo systemctl restart llmgateway-tunnel` |
+| `follow_invalid`／`hostkey_missing`／`fetch_invalid` | 同代欄位被改、`host_key` 缺漏或格式不合、欄位驗證不過（含 `tunnel_user` 與本機不符） | 人工確認 `NODE_GATEWAY`，請 MLP 修正；守護保留最後已知位址持續重試，不會連到未通過驗證的位址 |
+| `credential_unreadable` | token 檔缺、沒權限，或 drop-in `LoadCredential` 沒生效 | 7.2；`sudo systemctl daemon-reload` 後 `systemctl show llmgateway-tunnel -p LoadCredential` |
+
+**退回（應急止血）**：若自動跟隨失敗又等不及：
+
+1. 先照上表修好根因（`NODE_GATEWAY`、token）。
+2. 想立刻回到靜態位址：把 `FOLLOW_FILE` 改名移開（例如 `sudo mv /var/lib/llmgateway/gateway.json /var/lib/llmgateway/gateway.json.bad`），然後 `sudo systemctl restart llmgateway-tunnel`；沒有有效 `FOLLOW_FILE` 時守護退回 `tunnel.env` 的靜態 `RENDEZVOUS`／`KNOWN_HOSTS`（前提是靜態值仍是正確位址；否則先手動更新它們）。此退回步驟**未在真機驗證，P4 第一次執行時逐步確認**。
+3. 真的要退回舊版：`sudo llmgwctl rollback`（依賴觀察期內保留的靜態鍵，見 7.4）。
+
+### 7.6 觀察期結束（清舊靜態鍵）
+
+確認不需要 `llmgwctl rollback` 回舊版後，才清理：從真機 `tunnel.env` 移除過時靜態鍵（`KNOWN_HOSTS`；`RENDEZVOUS` 若 `TUNNEL_USER` 已設也可移除，**但本機 SSH 使用者必須仍由 `TUNNEL_USER` 或 `RENDEZVOUS` 提供**）與 `~llmgw/.ssh/known_hosts_rendezvous` 檔，通知 MLP PMO 關閉 `MLP#1511`。清完這一步觀察期才算結束，之後舊版 `rollback` 不再可行。修改 `tunnel.env` 請同樣走 `tunnel-apply`（`--new-env`），讓保險在重啟隧道時守著。**觀察期結束前，不要對真機執行清理舊設定的後續版本 `llmgwctl upgrade`**（repo 側的文件與腳本清理排在觀察期之後）。
 
 ---
 
