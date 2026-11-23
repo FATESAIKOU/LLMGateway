@@ -145,6 +145,8 @@ class ZeroPollingAndRotationTests(StateBase):
         self.assertEqual(self.github.request_count, 0)
         self.h.set_fake("tunnel_die", "1")                  # 舊連線斷掉
         self.assertTrue(wait_until(lambda: "gateway_updated" in self.h.stderr(), 10))
+        # gateway_updated 先記錄、之後才啟動第二次 ssh：高負載下第二個 argv 可能晚於事件出現
+        self.assertTrue(wait_until(lambda: len(self.tunnel_argvs()) == 2, 10))
         pid = self.h.proc.pid
         self.assertIsNone(self.h.proc.poll(), "同一個行程內重連，不是結束後讓 systemd 重開")
         self.assertEqual(self.github.request_count, 1)
