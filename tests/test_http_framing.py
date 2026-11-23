@@ -22,8 +22,10 @@ from lgwd import auth
 from lgwd.http import make_api_server
 
 try:  # python3 -m pytest
+    from .auth_fakes import principal_all_entry
     from .test_http import FakeService
 except ImportError:  # python3 -m unittest discover -s tests
+    from auth_fakes import principal_all_entry
     from test_http import FakeService
 
 HOST = "127.0.0.1"
@@ -45,7 +47,7 @@ class FakeGate:
 
     def authenticate(self, **kwargs):
         self.authenticate_calls += 1
-        return auth.passed("test")
+        return auth.passed("test", principal_all_entry())
 
 
 def req(method, target, extra=(), body=b"", version="HTTP/1.0"):

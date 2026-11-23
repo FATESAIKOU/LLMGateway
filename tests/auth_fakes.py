@@ -12,6 +12,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import MappingProxyType
+
+from lgwd.auth_registry import OPS, PrincipalEntry
+from lgwd.policy import AGENTS, ROLES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VECTORS = json.loads(
@@ -45,6 +49,35 @@ def principal(**over) -> dict:
     }
     base.update(over)
     return base
+
+
+def principal_all(**over) -> dict:
+    """B 的預設權限（REPORT-D3-arch §2.1「B 預設值」；worker 與 Mac 都用這一份）。
+
+    五種操作全給、`resolve_agents` 是完整的 `AGENTS`、每個 `ROLES` 角色都給全部
+    `AGENTS`，效果等同「不限制」，但名冊仍然逐項列舉（未列＝拒絕，沒有萬用字元）。
+    既有 enforce 端到端夾具用它；`principal()`（D2 parser 的窄值）保留給 parser 測試。
+    """
+    base = {
+        "ops": list(OPS),
+        "resolve_agents": list(AGENTS),
+        "roles": {role: list(AGENTS) for role in ROLES},
+    }
+    base.update(over)
+    return base
+
+
+def principal_all_entry() -> PrincipalEntry:
+    """`principal_all()` 的不可變解析結果（給 `auth.passed` 的 `permissions` 參數）。
+
+    形狀與 `parse_registry` 對 `principal_all()` 的產物相同（`tests/test_auth_authz.py`
+    有一條測試直接比對這兩者，避免兩份定義漂移）。
+    """
+    return PrincipalEntry(
+        ops=frozenset(OPS),
+        resolve_agents=tuple(AGENTS),
+        roles=MappingProxyType({role: tuple(AGENTS) for role in ROLES}),
+    )
 
 
 def key(key_id: str = "w1-tunnel-a", *, raw: bytes = VALID_A, status: str = "active",

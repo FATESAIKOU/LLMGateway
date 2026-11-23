@@ -61,6 +61,13 @@
   ``.authenticate`` 在建立伺服器時就是 ``ValueError``（中-2）。``/healthz`` 不呼叫 gate。
   429 加 ``Retry-After``；enforce 的 401 body 對所有 reason 逐 byte 相同、不加
   ``WWW-Authenticate``。off 只在建立伺服器時記一行 ``auth mode=off``（C-607）。
+- 授權（#222 D3a；C-901～C-909）：驗章與 ``accept`` 之後、``apply`` 與業務之前，五條
+  業務路由都先呼叫 ``lgwd.auth_authz.authorize``。權限只讀 PASS ``Verdict`` 帶的
+  ``permissions``（C-905：驗章時那一份名冊快照），``agent``／``role`` 取自 service
+  實際使用的**同一份** query 解析結果（C-909；這裡只解析一次，``_respond`` 共用）。
+  enforce 回 403 ``forbidden``（所有授權 reason 的 body 逐 byte 相同、不加標頭）、
+  warn 記 ``outcome=forbidden`` 後照舊處理、off 完全不呼叫；``/healthz`` 與 404 不經
+  授權。query 形狀錯（重複的已知參數）不判授權，維持業務的 400（C-902）。
 """
 
 from __future__ import annotations
@@ -74,6 +81,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import auth as auth_mod
 from . import framing
+from .auth_authz import authorize
 from .errors import ApiError, bad_request, body_too_large, not_found
 
 _LOG = logging.getLogger("lgwd.http")
@@ -232,6 +240,26 @@ def _roles_query(query: str) -> dict:
     return _query(query, _ROLES_PARAMS)
 
 
+def _route_params(route, query: str):
+    """回 `(解析後的 query dict 或 None, ApiError 或 None)`（C-909）。
+
+    只有 resolve／roles 有 query 參數；五條業務路由的其他三條回 `(None, None)`。這裡
+    是 gated 路徑**唯一**一次解析：授權用這個 dict，`_respond` 也用同一份（不重新
+    解析，避免兩次結果不同）。形狀錯（重複的已知參數）時回 `({}, exc)`：授權不判
+    （C-902），等 apply 之後由業務回 400。
+    """
+    if route[0] == "resolve":
+        parse = _resolve_query
+    elif route[0] == "roles":
+        parse = _roles_query
+    else:
+        return None, None
+    try:
+        return parse(query), None
+    except ApiError as exc:
+        return {}, exc
+
+
 def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
     """依 service 產生 handler 類別（service 是 RegistryService 或測試替身）。
 
@@ -381,6 +409,8 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                     return
                 # warn：記不可判定，照舊處理。
             verdict = None
+            params = None
+            parse_error = None
             try:
                 raw = self._read_gated_body(length, template, method, path)
                 if raw is None:  # 已回應（enforce 503）或已關閉（warn）
@@ -395,8 +425,25 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                 if permit:
                     self._framing_sem.release()
             if verdict is not None:
+                if verdict.outcome == auth_mod.OUTCOME_PASS:
+                    # C-907：驗章與 accept 之後、apply／業務之前授權。C-909：agent／
+                    # role 與 service 用同一份解析結果（`_route_params` 只解析一次，
+                    # 下面 `_respond` 共用）；授權自己不再解析 query。
+                    params, parse_error = _route_params(route, query)
+                    reason = authorize(
+                        verdict.permissions, route[0],
+                        agent=params.get("agent") if params is not None else None,
+                        role=route[1] if route[0] == "roles" else None)
+                    if reason is not None:
+                        # 換成 forbidden：apply 是模式對應與事件記錄的唯一一處。
+                        verdict = auth_mod.forbidden(verdict.principal, reason)
                 # 號誌先放、再決定要回應什麼（REPORT-D2c-arch §2.2）。
                 if self._apply_verdict(verdict, template, method=method, log_path=path):
+                    return
+                if parse_error is not None:
+                    # C-902：query 形狀錯不判授權，維持與 off 相同的業務 400。
+                    _LOG.info("%s %s -> %s", method, path, parse_error.status)
+                    _send_json(self, parse_error.status, parse_error.body())
                     return
             if route[0] == "cooldown":
                 try:
@@ -407,7 +454,7 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                     return
             else:
                 body = _UNREAD
-            self._respond(method, path, route, query, body)
+            self._respond(method, path, route, query, body, params=params)
 
         def _read_gated_body(self, length: int, template: str,
                              method: str, path: str):
@@ -423,8 +470,13 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                     method=method, log_path=path, close_on_warn=True)
                 return None
 
-        def _respond(self, method: str, path: str, route, query: str, body=_UNREAD):
-            """路由 → service → 回應（含錯誤對應與 log）。off 與 gated 共用。"""
+        def _respond(self, method: str, path: str, route, query: str, body=_UNREAD,
+                     params=None):
+            """路由 → service → 回應（含錯誤對應與 log）。off 與 gated 共用。
+
+            ``params`` 是 gated 路徑已經解析好的 query dict（C-909：與授權用同一份）；
+            ``None`` 時照 off 的舊路徑自己解析。
+            """
             try:
                 if route[0] == "healthz":
                     # 不碰 service 的任何屬性、不讀 body、不寫 DB、不進稽核。
@@ -434,7 +486,7 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                 elif route[0] == "usage":
                     status, payload = 200, service.list_usage_summary()
                 elif route[0] == "resolve":
-                    q = _resolve_query(query)
+                    q = _resolve_query(query) if params is None else params
                     payload = service.resolve(
                         q.get("agent"), q.get("provider"),
                         model=q.get("model"),
@@ -444,7 +496,7 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                     )
                     status = 200
                 elif route[0] == "roles":
-                    q = _roles_query(query)
+                    q = _roles_query(query) if params is None else params
                     payload = service.role_candidates(
                         route[1], q.get("agent"), q.get("data"))
                     status = 200

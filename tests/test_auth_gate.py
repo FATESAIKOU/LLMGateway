@@ -25,7 +25,7 @@ from lgwd.auth_registry import parse_registry
 from lgwd.auth_replay import ACCEPTED, DENIED, Accept, rate_limited
 from lgwd.auth_db import StoreBusy
 from lgwd.clock import FakeClock
-from tests.auth_fakes import REPO_ROOT
+from tests.auth_fakes import REPO_ROOT, principal_all_entry
 from tests.auth_signer import Signer, b64url, key_entry, registry_bytes
 
 NOW = datetime(2026, 11, 23, 12, 0, 0, tzinfo=timezone.utc)
@@ -429,7 +429,7 @@ class C603ApplyTableTests(unittest.TestCase):
             auth.OUTCOME_UNAVAILABLE: (auth.ACTION_RESPOND, auth.ACTION_CONTINUE),
         }
         verdicts = {
-            auth.OUTCOME_PASS: auth.passed("p"),
+            auth.OUTCOME_PASS: auth.passed("p", principal_all_entry()),
             auth.OUTCOME_DENY: auth.denied(auth.REASON_MALFORMED),
             auth.OUTCOME_RATE_LIMITED: auth.limited(9),
             auth.OUTCOME_UNAVAILABLE: auth.unavailable(auth.REASON_BUSY),
@@ -469,7 +469,8 @@ class C603ApplyTableTests(unittest.TestCase):
         log = auth.AuthLog(sink=lines.append)
         auth.apply("warn", auth.denied(auth.REASON_BAD_SIGNATURE),
                    route="/v1/resolve", log=log)
-        auth.apply("warn", auth.passed("p"), route="/v1/resolve", log=log)
+        auth.apply("warn", auth.passed("p", principal_all_entry()),
+                   route="/v1/resolve", log=log)
         self.assertEqual(len(lines), 2)
         self.assertIn("mode=warn", lines[0])
         self.assertIn("outcome=deny", lines[0])
@@ -481,7 +482,7 @@ class C603ApplyTableTests(unittest.TestCase):
     def test_C603_off_does_not_log(self):
         lines = []
         log = auth.AuthLog(sink=lines.append)
-        auth.apply("off", auth.passed("p"), log=log)
+        auth.apply("off", auth.passed("p", principal_all_entry()), log=log)
         auth.apply("off", auth.denied(auth.REASON_MISSING), log=log)
         self.assertEqual(lines, [])
 
@@ -491,7 +492,9 @@ class C604UnauthorizedBodyTests(unittest.TestCase):
 
     def test_C604_all_reasons_are_identical(self):
         bodies = set()
-        for reason in sorted(auth.REASONS):
+        # 授權原因（forbidden_op／forbidden_agent／forbidden_role）屬於 `forbidden`
+        # 結果（D3a／C-906），不在 401 的這張表裡；它們的 body 由下面 D3a 的測試鎖住。
+        for reason in sorted(auth.REASONS - auth.AUTHORIZATION_REASONS):
             action = auth.apply("enforce", auth.denied(reason))
             self.assertEqual(action.status, 401)
             self.assertEqual(action.headers, (), msg="401 不得帶任何額外標頭")
@@ -508,6 +511,8 @@ class C604UnauthorizedBodyTests(unittest.TestCase):
                 "expired", "water", "bad_signature", "replay", "rate_limited",
                 "busy", "store_unavailable", "verifier_unavailable",
                 "registry_unavailable",
+                # D3a／C-906：三個授權原因加進白名單（只屬於 `forbidden` 結果）。
+                "forbidden_op", "forbidden_agent", "forbidden_role",
             },
         )
 
