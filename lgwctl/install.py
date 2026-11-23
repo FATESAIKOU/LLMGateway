@@ -19,7 +19,7 @@ import os
 import pwd
 import stat
 
-from . import atomic, probe, release, units
+from . import atomic, capability, probe, release, units
 from . import run as runmod
 from .layout import (
     DEFAULT_API_PORT,
@@ -322,7 +322,7 @@ def _step_enable(layout, report) -> bool:
     return True
 
 
-def _step_service(layout, report) -> bool:
+def _step_service(layout, report, mode: str) -> bool:
     if units.is_active(layout, SERVICE_NAME):
         report.ok("start", f"{SERVICE_NAME} 已在跑（不動它）")
         # 低-11：LoadCredential 是啟動時的快照；keys.pass 填／改完要 restart
@@ -338,8 +338,10 @@ def _step_service(layout, report) -> bool:
         return False
     # systemctl start 回 0 只代表啟動被接受（Type=exec 也只保到 exec 成功）；
     # app 層壞掉（policy 壞、keys.env 壞、埠展開成空）會 crash-loop，
-    # 再用本機 list 確認一次，不然會「印 ok start、其實沒起來」（中-7）。
-    if not probe.wait_local_ok(layout, min(layout.list_wait, INSTALL_WAIT_CAP)):
+    # 再用本機探針確認一次，不然會「印 ok start、其實沒起來」（中-7）。
+    # 探針模式跟著這一版的能力旗標（#246）：這一版是 old 就先探 /healthz、
+    # 404 才退回 list。
+    if not probe.wait_local_ok(layout, min(layout.list_wait, INSTALL_WAIT_CAP), mode=mode):
         report.fail("start",
                     f"{SERVICE_NAME} 起了但本機 list 不是 200"
                     f"（{layout.journalctl} -u {SERVICE_NAME}）")
@@ -464,6 +466,11 @@ def run(layout, *, tag: str, repo: str | None = None, report: Report | None = No
     tag_dir = release.fetch(layout, tag, repo, report)
     if tag_dir is None:
         return report.exit_code(todo_ok=True)
+    # K-3：切 current **之前**驗這一版的能力旗標（#246）。旗標決定探針用 old
+    # 還是 new；損毀／讀不到就在這裡停手，不切 current、不動 unit。
+    cap = capability.read(tag_dir)
+    if not capability.precheck(report, cap):
+        return report.exit_code(todo_ok=True)
     try:
         old_tag = release.switch_current(layout, tag)
     except OSError as exc:
@@ -483,7 +490,7 @@ def run(layout, *, tag: str, repo: str | None = None, report: Report | None = No
         return report.exit_code(todo_ok=True)
     if not _step_enable(layout, report):
         return report.exit_code(todo_ok=True)
-    if not _step_service(layout, report):
+    if not _step_service(layout, report, cap.mode):
         return report.exit_code(todo_ok=True)
     if layout.tunnel_configured():
         ready, missing = layout.tunnel_config_state()

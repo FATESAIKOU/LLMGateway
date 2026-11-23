@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os
 
-from . import units, probe
+from . import capability, units, probe
 from .layout import SERVICE_NAME, TUNNEL_SERVICE_NAME
 
 LABEL_WIDTH = 25
@@ -28,7 +28,7 @@ def run(layout, *, out=None, no_remote=False) -> int:
                     fetch = "unreadable（需 root 或 llmgw 才能讀）"
                 rows.extend((("tunnel-follow", follow), ("tunnel-fetch", fetch),
                              ("tunnel-token", layout.tunnel_token_state())))
-            level, _ = probe.remote(layout)
+            level, _ = probe.remote(layout, mode=capability.current(layout).mode)
             rows.append(("list-remote", level))
     for label, value in rows:
         out(f"{label:<{LABEL_WIDTH}} {value}")

@@ -120,14 +120,23 @@ exit 0
 """
 
 FAKE_CURL = """#!/usr/bin/env bash
-# 假 curl：印出 http 碼；連續值放 $LGW_FAKE/curl_codes（一次一行）。
+# 假 curl：印出 http 碼。控制方式（先看依路徑的，再看舊的全域介面）：
+#   $LGW_FAKE/curl_codes.<key>：這個路徑的連續回碼（一次一行）。
+#   $LGW_FAKE/curl_code.<key>：這個路徑的固定回碼。
+#     key＝URL 的路徑去掉開頭的 "/" 後把 "/" 換成 "_"（healthz、v1_subscriptions）。
+#   $FAKE_CURL_CODE／$LGW_FAKE/curl_codes：不分路徑的舊介面（既有測試靠這個）。
 fake="${LGW_FAKE:?}"
 printf 'curl %s\\n' "$*" >> "${fake}/curl.log"
 if [[ "${FAKE_CURL_RC:-0}" != "0" ]]; then
     exit "${FAKE_CURL_RC}"
 fi
-code="${FAKE_CURL_CODE:-200}"
-codes="${fake}/curl_codes"
+url=""
+for a in "$@"; do url="$a"; done
+path="${url#*://}"
+path="${path#*/}"
+key="${path//\\//_}"
+code=""
+codes="${fake}/curl_codes.${key}"
 if [[ -s "$codes" ]]; then
     code="$(head -n 1 "$codes")"
     if [[ "$(wc -l < "$codes")" -gt 1 ]]; then
@@ -135,6 +144,21 @@ if [[ -s "$codes" ]]; then
         mv "${codes}.next" "$codes"
     else
         : > "$codes"
+    fi
+elif [[ -f "${fake}/curl_code.${key}" ]]; then
+    code="$(cat "${fake}/curl_code.${key}")"
+fi
+if [[ -z "$code" ]]; then
+    code="${FAKE_CURL_CODE:-200}"
+    codes="${fake}/curl_codes"
+    if [[ -s "$codes" ]]; then
+        code="$(head -n 1 "$codes")"
+        if [[ "$(wc -l < "$codes")" -gt 1 ]]; then
+            tail -n +2 "$codes" > "${codes}.next"
+            mv "${codes}.next" "$codes"
+        else
+            : > "$codes"
+        fi
     fi
 fi
 printf '%s' "$code"
@@ -207,8 +231,16 @@ FAKE_TUNNEL = """#!/usr/bin/env bash
 fake="${LGW_FAKE:?}"
 printf 'probe %s\\n' "$*" >> "${fake}/probe.log"
 printf 'tunnel-env %s\\n' "${LGW_TUNNEL_ENV:-}" >> "${fake}/probe.log"
+# #246：llmgwctl 用環境變數傳模式（argv 維持恰好 --probe-once）；
+# 這裡把值記下來，測試才驗得到「有沒有傳、傳了什麼」。
+printf 'api-mode %s\\n' "${LGW_PROBE_API_MODE:-}" >> "${fake}/probe.log"
 exit "${FAKE_PROBE_RC:-0}"
 """
+
+
+def url_key(path: str) -> str:
+    """假 curl 分路徑控制檔的 key：去掉開頭的 ``/``、``/`` 換成 ``_``。"""
+    return path.lstrip("/").replace("/", "_")
 
 
 def current_user() -> str:
@@ -403,6 +435,27 @@ class Sandbox:
     def curl_codes(self, codes) -> None:
         self.write(os.path.join(self.fake, "curl_codes"),
                    "".join(f"{code}\n" for code in codes))
+
+    def curl_code(self, path: str, code) -> None:
+        """只對某個 URL 路徑回這個碼（#246：healthz 與 list 要分開設）。"""
+        self.write(os.path.join(self.fake, "curl_code." + url_key(path)), f"{code}\n")
+
+    def curl_codes_for(self, path: str, codes) -> None:
+        """某個 URL 路徑的連續回碼（一次一行）。"""
+        self.write(os.path.join(self.fake, "curl_codes." + url_key(path)),
+                   "".join(f"{code}\n" for code in codes))
+
+    def set_capabilities(self, version_dir: str, text=None) -> str | None:
+        """寫／移除某一版的能力旗標（``deploy/capabilities.json``，#246）。
+
+        ``text=None`` 表示移除（回滾到沒有這個檔的舊版＝missing＝old）。
+        """
+        path = os.path.join(version_dir, "deploy", "capabilities.json")
+        if text is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return None
+        return self.write(path, text)
 
     # -- 造一版（不經 git）--------------------------------------------------
 

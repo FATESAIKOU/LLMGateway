@@ -1,6 +1,8 @@
 """HTTP 層（design 決定 6、5a）。由 test 實作。
 
-- make_api_server(service, host, port) → ThreadingHTTPServer。只有五個路由：
+- make_api_server(service, host, port) → ThreadingHTTPServer。只有六條路由（五條
+  業務＋健康檢查，後者不碰 service）：
+  GET  /healthz                               → {"status": "ok"}（#246；探針用）
   GET  /v1/subscriptions                      → service.list_subscriptions()
   GET  /v1/usage                              → service.list_usage_summary()
                                               （usage-overview；C-5～C-9，用量一覽）
@@ -9,8 +11,12 @@
                                               → service.resolve(...)（design 決定 1～3）
   GET  /v1/roles/{role}?agent=[&data=]        → service.role_candidates(role, agent, data)
                                               （#100；spec role-allocation）
-  其他路徑與方法一律 404（含 GET 以外對 /v1/usage 的方法）。沒有應用層認證（本人選 (a)）；
-  存取控制只靠 SSH。
+  其他路徑與方法一律 404（含 GET 以外對 /v1/usage 與 /healthz 的方法）。沒有應用層
+  認證（本人選 (a)）；存取控制只靠 SSH。
+- ``/healthz`` 只證明行程活著、能回應（而且 lgwd 已經過了啟動時的 policy／keys／
+  DB 初始化）：body 固定 ``{"status": "ok"}``（16 bytes、只有一個鍵），不加版本、
+  tag、模式、時間、主機名或任何額外標頭，也不讀 service、不讀 body、不寫 DB、
+  不進稽核表。它**不代表** DB 此刻可寫（#246、H-2～H-4）。
 - JSON 解析失敗或 body 不是物件 → 400；ApiError → 對應狀態碼＋body()；204 不帶 body。
 - body 超過 1 MB 直接回 413，不讀 body。
 - resolve 與 roles 的 query 用 parse_qs 的 form 解碼（design 決定 1）：空白值＝沒給
@@ -93,7 +99,12 @@ def _send_empty(handler: BaseHTTPRequestHandler, status: int) -> None:
 
 
 def _match_route(method: str, path: str):
-    """回 ("list",) ｜ ("usage",) ｜ ("cooldown", id) ｜ ("resolve",) ｜ ("roles", role) ｜ None。"""
+    """回 ("healthz",) ｜ ("list",) ｜ ("usage",) ｜ ("cooldown", id) ｜ ("resolve",)
+    ｜ ("roles", role) ｜ None。"""
+    if path == "/healthz":
+        # 健康檢查（#246）：只認 GET；query 不參與路由（/healthz?x=1 也是 200），
+        # /healthz/ 與 /v1/healthz 落到下面的 404。
+        return ("healthz",) if method == "GET" else None
     if path == "/v1/subscriptions":
         return ("list",) if method == "GET" else None
     if path == "/v1/usage":
@@ -174,7 +185,10 @@ def _api_handler(service):
                 _send_json(self, 404, not_found().body())
                 return
             try:
-                if route[0] == "list":
+                if route[0] == "healthz":
+                    # 不碰 service 的任何屬性、不讀 body、不寫 DB、不進稽核。
+                    status, payload = 200, {"status": "ok"}
+                elif route[0] == "list":
                     status, payload = 200, service.list_subscriptions()
                 elif route[0] == "usage":
                     status, payload = 200, service.list_usage_summary()

@@ -3,7 +3,7 @@
 ## Purpose
 讓 LLMGateway 的服務與客戶端只依賴「一台連得到的 Linux 機器＋SSH」（會合點）就能連上，不依賴 MyLinuxPool 的 `pool-tunnel` 與其他 `NODE_*` 設定：服務端自己用 ssh reverse tunnel 把埠公開到會合點並維持健康，客戶端自備本機通道（sidecar 直接 curl 本機 port）。**唯一例外**：僅在斷線恢復（連不上或無可用位址）時，服務端隧道守護才可唯讀讀取 MyLinuxPool 的 `NODE_GATEWAY`（限位址相關欄位 `ip`、`port`、`host_key`、`generation`，並比對 `tunnel_user`），用來跟隨會合點輪換；連線健康時不碰它。
 
-> v5（2026-10-12）：`客戶端連線程式`搬到下面的 REMOVED；新增`客戶端自備通道`。服務端隧道守護、探針、會合點三條不變。
+> v5（2026-10-12）：`客戶端連線程式`搬到下面的 REMOVED；新增`客戶端自備通道`。服務端隧道守護、探針、會合點三條不變。探針已於 #246 改為 `/healthz`（依版本內的能力旗標 `deploy/capabilities.json` 決定 old／new；old 先探 `/healthz`、404 才退回 `/v1/subscriptions`）。
 
 > v6（2026-11-21，#221）：隧道守護改為可選，並可在斷線恢復時唯讀讀取 `NODE_GATEWAY` 跟隨輪換（見 Purpose 的唯一例外）；新增服務本體啟停（`start`／`stop`／`restart`／`follow-reset`）與無隧道獨立生命週期。
 

@@ -1,7 +1,11 @@
-"""upgrade：抓新 tag → policy dry-run（新 tag 的 loader）→ 切 current → 換 unit
-＋daemon-reload → 只 restart 服務 → 等本機 list 200；unit／reload／restart／list
-任何一步不對就把 current、previous 與 unit 檔一起切回切換前、非零結束（#35 spec、
-中-2）。rollback：切回 previous、restart、跑 check。
+"""upgrade：抓新 tag → policy dry-run（新 tag 的 loader）→ 能力旗標檢查（#246）
+→ 切 current → 換 unit ＋daemon-reload → 只 restart 服務 → 等本機探針 200；
+unit／reload／restart／探針任何一步不對就把 current、previous 與 unit 檔一起切回
+切換前、非零結束（#35 spec、中-2）。rollback：切回 previous、restart、跑 check。
+
+本機探針的模式跟著「這一版」的能力旗標（``deploy/capabilities.json``）：新 tag 是
+``new`` 就只打 ``/healthz``，是 ``old``（含缺檔）就先打 ``/healthz``、404 才退回
+list。rollback 讀的是 previous 目錄的旗標；回滾是救急，旗標損毀**不擋**。
 
 升級只碰 ``llmgateway.service``，不碰隧道單位（隧道承載管理連線，重啟會斷線）；
 成功後只留 current 與 previous 兩版。unit 檔是版本的一部分：升級時換成新 tag 的
@@ -12,7 +16,7 @@ from __future__ import annotations
 
 import os
 
-from . import check, probe, release, run as runmod, units
+from . import capability, check, probe, release, run as runmod, units
 from .layout import SERVICE_NAME, TAG_PATTERN, TAG_RE
 from .report import Report
 
@@ -108,6 +112,12 @@ def upgrade(layout, *, tag: str, repo: str | None = None,
     if not _dry_run_policy(layout, tag_dir, report):
         return report.exit_code(todo_ok=True)
 
+    # K-3（#246）：切 current **之前**驗新 tag 的能力旗標。損毀／讀不到就停手
+    # （不切 current、不動 unit、不 restart）；缺檔是正常的（舊 tag 沒有這個檔）。
+    cap = capability.read(tag_dir)
+    if not capability.precheck(report, cap):
+        return report.exit_code(todo_ok=True)
+
     old_current = layout.current_tag()
     old_previous = layout.previous_tag()
     try:
@@ -135,8 +145,8 @@ def upgrade(layout, *, tag: str, repo: str | None = None,
         return _rollback_after_switch(layout, saved_units, old_current, old_previous,
                                       restart=True, report=report)
 
-    if not probe.wait_local_ok(layout, layout.list_wait):
-        report.fail("list", "本機 list 不是 200")
+    if not probe.wait_local_ok(layout, layout.list_wait, mode=cap.mode):
+        report.fail("list", "本機探針不是 200")
         return _rollback_after_switch(layout, saved_units, old_current, old_previous,
                                       restart=True, report=report)
 
@@ -175,6 +185,17 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
         return 1
 
     saved_units = units.snapshot_units(layout)
+    # #246 K-3：回滾是救急，旗標壞掉**不擋**（照樣切回），探針一律照這一版的
+    # 旗標決定模式；損毀時是 old，之後 check 的 list-local 會照實報 fail。
+    cap = capability.read(previous_dir)
+    if cap.state == "invalid":
+        report.todo("capabilities", "損毀（照樣回滾，探針用 old）")
+    elif cap.state == "unreadable":
+        report.todo("capabilities", "讀不到（照樣回滾，探針用 old）")
+    elif cap.state == "missing":
+        report.ok("capabilities", "無（old）")
+    else:
+        report.ok("capabilities", "new")
     # 失敗回復要用「切換前」的兩個 link（previous 是換之前的 previous）。
     try:
         release.write_link(layout, layout.current_link, layout.tag_dir(previous))
@@ -196,5 +217,5 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
     if not _restart_service(layout, report):
         return _rollback_after_switch(layout, saved_units, old_current, previous,
                                       restart=True, report=report)
-    probe.wait_local_ok(layout, layout.list_wait)
+    probe.wait_local_ok(layout, layout.list_wait, mode=cap.mode)
     return check.run(layout, report=report, no_remote=no_remote)

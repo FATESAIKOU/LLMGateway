@@ -6,9 +6,12 @@
   （system 層，不需要任何環境變數）；unit 檔不存在（rc 4）一律 ``fail``（沒裝）；
   隧道那條在「設定還沒填」且還裝著時算 todo（本人才要動），裝了沒跑就照實 fail。
 - ``tag``（只有 ``--tag`` 時）：裝的版本是不是指定的那個。
-- ``list-local``：本機 ``GET /v1/subscriptions`` 要 200。
-- ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``）；
-  ``--no-remote`` 時整項不列。
+- ``list-local``：本機探針。先 ``GET /healthz`` 要 200；模式是 ``old`` 且得 404
+  時才退回 ``GET /v1/subscriptions``（要 200）。模式由 ``current`` 的能力旗標
+  （``deploy/capabilities.json``）決定；旗標損毀／讀不到時照樣以 old 探，但等級
+  至少 fail／todo，detail 寫明原因。
+- ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``，模式以
+  環境變數 ``LGW_PROBE_API_MODE`` 傳）；``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
   （key 拉取可能被關閉或還沒跑過）；``ok:false``→fail；``ok:true`` 但 ``ts``
   超過 3 個 interval（預設 30 分鐘，``LLMGW_KEYSYNC_STALE`` 可調）沒更新→fail。
@@ -27,7 +30,7 @@ import os
 import re
 import time
 
-from . import probe, units
+from . import capability, probe, units
 from . import run as runmod
 from .layout import KEYS_REPO, TUNNEL_SERVICE_NAME, SERVICE_NAME
 from .report import Report
@@ -157,12 +160,28 @@ def _check_tag(layout, report, tag: str) -> None:
 
 
 def _check_list_local(layout, report) -> None:
-    level, detail = probe.local_code(layout)
+    """本機探針；模式的來源是 ``current`` 的能力旗標（#246）。
+
+    旗標 ``invalid``／``unreadable`` 時照樣以 ``old`` 探（old 對新舊服務都判得
+    活），但等級至少 fail（損毀）或 todo（讀不到），detail 寫明原因，免得損毀的
+    旗標被一個 ok 蓋掉。項目名維持 ``list-local``（D1 不改輸出介面）。
+    """
+    cap = capability.current(layout)
+    level, detail = probe.local_code(layout, mode=cap.mode)
+    if cap.state == "invalid":
+        report.fail("list-local", f"能力旗標損毀（以 old 探：{detail}）")
+        return
+    if cap.state == "unreadable":
+        if level == "ok":
+            report.todo("list-local", f"能力旗標讀不到（以 old 探：{detail}）")
+        else:
+            report.add(level, "list-local", f"能力旗標讀不到（以 old 探：{detail}）")
+        return
     report.add(level, "list-local", detail)
 
 
 def _check_list_remote(layout, report) -> None:
-    level, detail = probe.remote(layout)
+    level, detail = probe.remote(layout, mode=capability.current(layout).mode)
     report.add(level, "list-remote", detail)
 
 

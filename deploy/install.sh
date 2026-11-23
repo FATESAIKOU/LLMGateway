@@ -237,17 +237,34 @@ check_unit() {
     local port code
     port="$(check_port)"
     code=""
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/v1/subscriptions" 2>/dev/null)"
+    # 本機探針（#246）：一律 old——user 層是遷移前的舊佈局，不會跑 enforce；old
+    # 對新舊服務都能判活（先打 /healthz，404 才退回 list）。遠端那段不改（user
+    # 層的腳本沒設 LGW_PROBE_API_MODE，舊腳本會忽略它，等同 old）。
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/healthz" 2>/dev/null)"
     rc=$?
     if [[ "$rc" -ne 0 ]]; then
         log INFO "llmgateway: curl 連不上或逾時（rc=${rc}）"
         return 2
     fi
-    if [[ "$code" != "200" ]]; then
-        log INFO "llmgateway: 本機 list 探針回 ${code}，不是 200"
+    if [[ "$code" == "404" ]]; then
+        # 舊服務沒有 /healthz：退回 list（只有 404 才退回；401／503 一律算失敗）。
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/v1/subscriptions" 2>/dev/null)"
+        rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            log INFO "llmgateway: curl 連不上或逾時（rc=${rc}）"
+            return 2
+        fi
+        if [[ "$code" != "200" ]]; then
+            log INFO "llmgateway: 本機 list 探針回 ${code}，不是 200"
+            return 1
+        fi
+        log INFO "llmgateway: 本機 list 探針回 200（old 退回）"
+    elif [[ "$code" != "200" ]]; then
+        log INFO "llmgateway: 本機 healthz 探針回 ${code}，不是 200"
         return 1
+    else
+        log INFO "llmgateway: 本機 healthz 探針回 200"
     fi
-    log INFO "llmgateway: 本機 list 探針回 200"
 
     # 經會合點：用隧道守護同一份設定與 ssh 參數再探一次端對端。
     local probe_bin="${BIN_DIR}/${TUNNEL_BIN}" probe_rc

@@ -169,7 +169,7 @@ llmgwctl cutover --tag lgw-vX.Y.Z [--revert-after 10m] [--no-remote] [--old-home
   2. **最新資料同步**：在舊服務停止後、啟動新服務前，再次對舊 `llm.db` 進行一致快照（帶入 prepare 至切換間的最新冷卻與稽核），並同步較新的 `keys.env` 與 `.keysync.sha`。
   3. 啟用並啟動新版兩個 system unit：`llmgateway.service`、`llmgateway-tunnel.service`。
 - **停損順序與條件（失敗立即自動回舊版）**：
-  1. 本機 list 200 探針（最多等 60 秒）。
+  1. 本機探針（`/healthz`；模式依能力旗標，見 §5.12）200（最多等 60 秒）。
   2. 隧道 active 探針（最多等 30 秒）。
   3. 經會合點遠端探針（重試 3 次，間隔 10 秒；`--no-remote` 可略過）。
   4. 等待新版第一次 key 拉取結果寫入（最多等 90 秒）。
@@ -245,9 +245,10 @@ ssh -N -i ~/.ssh/<能登入 sshproxy 的金鑰> -o StrictHostKeyChecking=yes \
   -p <埠> -L 127.0.0.1:4710:127.0.0.1:4710 sshproxy@<跳板機>
 ```
 
-測試連線：
+測試連線（#246 起服務有 `/healthz`：只證明行程活著、能回應，不讀 DB）：
 ```bash
-curl -s http://127.0.0.1:4710/v1/subscriptions
+curl -s http://127.0.0.1:4710/healthz          # {"status": "ok"}
+curl -s http://127.0.0.1:4710/v1/subscriptions  # 業務資料（不是探針）
 ```
 
 > [!NOTE]
@@ -282,6 +283,14 @@ llmgwctl check [--no-remote] [--tag <tag>]
 - `1`：確定失敗（unit 未運行、探針非 200、gh 認證失效等）。
 - `2`：存在需人工介入處理之 `todo`。
 參數 `--no-remote` 可略過跨會合點之遠端探針（隧道相關項目一併不列）。
+
+`list-local`／`list-remote` 的探針模式由 `current` 的能力旗標決定（#246，見
+§5.12）：`new` 只探 `GET /healthz`；`old` 先探 `/healthz`、404 才退回
+`GET /v1/subscriptions`。旗標損毀／讀不到時照樣以 `old` 探，但 `list-local`
+至少是 `fail`／`todo`，detail 會寫「能力旗標損毀／讀不到（以 old 探：…）」。
+`/healthz` 只證明行程活著、能回應（lgwd 已過啟動時的 policy／keys／DB 初始化），
+**不代表 DB 此刻可寫**——這一項比以前的 list 探針弱，是 #246 接受下來的取捨；
+DB 與 key 的健康仍看 `keysync`／`policy` 與業務回應。
 
 **隧道是可選的**：機器上沒有 `llmgateway-tunnel.service` 也沒設定隧道時，`check` 不列任何隧道項目，其餘項目全通過即回 `0`。只要隧道 unit 存在或已設定隧道，`check`／`status` 就照常檢查（除非 `--no-remote`）。
 
@@ -466,7 +475,7 @@ sudo llmgwctl stop
 sudo llmgwctl restart
 ```
 
-只管 `llmgateway.service`（不碰隧道），以 root／`sudo` 執行（背後是 `systemctl`）。`start` 與 `restart` 之後會等本機 `GET /v1/subscriptions` 回 200 才回 `0`；冪等：已 active 且本機 200 時再 `start` 不重啟、回 `0`；已停止時再 `stop` 回 `0`。其他情況（起不來、等不到 200）回 `1`。
+只管 `llmgateway.service`（不碰隧道），以 root／`sudo` 執行（背後是 `systemctl`）。`start` 與 `restart` 之後會等本機探針（`GET /healthz`；模式依能力旗標，見 §5.12）回 200 才回 `0`；冪等：已 active 且本機探針 200 時再 `start` 不重啟、回 `0`；已停止時再 `stop` 回 `0`（`stop` 不探針）。其他情況（起不來、等不到 200）回 `1`。
 
 ### 5.11 重設隧道跟隨狀態（`follow-reset`）
 
@@ -479,6 +488,54 @@ sudo llmgwctl follow-reset --fetch-state  # 只清 .tunnel_fetch_state 與 .tunn
 - 預設模式會連已驗證水位（`.tunnel_generation`）一起清掉：只在**人工確認 `NODE_GATEWAY` 的回退是合法**（`tunnel-follow` 為 `regressed` 而非被竄改）時用，用完通常要 `sudo systemctl restart llmgateway-tunnel`。
 - `--fetch-state` 用在換好 token、清掉 `auth_failed` 告警（或 `--fetch-check` 成功後 `check` 仍紅）：**不動**世代水位與位址檔 `FOLLOW_FILE`。
 - 兩種模式都不動 `FOLLOW_FILE`、不重啟任何 unit；狀態目錄不存在時回 `0`。
+
+### 5.12 能力旗標（`deploy/capabilities.json`）
+
+探針要打哪個路徑**不是猜的，也不是由部署器決定**，而是讀版本目錄裡的追蹤檔
+`/opt/llmgateway/current/deploy/capabilities.json`（#246）：
+
+```json
+{"schema": 1, "probe": "healthz"}
+```
+
+- 這個檔是 **tag 內容的一部分**：`current`／`previous` 由 symlink＋`os.replace`
+  原子切換，所以旗標跟著版本一起換，不需要任何新的寫入步驟；`install`／
+  `upgrade`／`rollback`／`cutover`／`deploy/install.sh` 都**不寫、不改**它（只切
+  `current`）。開發者要把探針改成 `/healthz` 時，在同一個 PR 提交這個檔。
+- 解析只有四種結果：`ok`（格式正確）、`missing`（檔案不在，**舊 tag 的正常狀態**）、
+  `unreadable`（權限等讀不到）、`invalid`（其他任何形狀：多餘的鍵、`schema` 不是
+  整數 1、未知的 `probe`、重複鍵、超過 4 KiB、最後一段是 symlink、是目錄…）。
+- 模式：**只有 `ok` 才是 `new`，其他三態一律 `old`**。
+  - `new`：只探 `GET /healthz`；非 200（含 404）就是失敗，**不退回 list**。
+  - `old`：先探 `GET /healthz`，**只有**拿到 404 才退回 `GET /v1/subscriptions`
+    （200 才算健康）。old 對新舊服務都能正確判活，所以異常一律降為 old——
+    寧可多打一個 404，也不要讓隧道因為誤判而反覆重建（4710 反覆中斷）。
+- 誰讀：
+  - `llmgwctl` 的 `check`／`status`／`start`／`restart`／`install`／`upgrade`／
+    `rollback`／`tunnel-apply` 與遷移指令：探「新服務」時讀 `current`（install／
+    upgrade 是讀**要切過去的那個 tag**），而 `rollback-to-user` 探的是 **user 層的
+    舊服務**，一律寫死 `old`。
+  - `deploy/install.sh` 的 `--check`：**一律 old**（user 層是遷移前的舊佈局，
+    不會跑新的認證模式）。
+  - 隧道守護：每次探針之前重讀一次這個檔（同批的另一半；在那之前守護照舊探
+    list，效果等同 old）。
+- **旗標有問題時的反應**：`check` 的 `list-local` 會以 old 探，但等級至少
+  `fail`（`invalid`）或 `todo`（`unreadable`），detail 寫「能力旗標損毀／讀不到
+  （以 old 探：…）」；`upgrade`／`install` 在**切 `current` 之前**就 `fail
+  capabilities` 停手（不切版、不動 unit）；`rollback` 是救急，旗標損毀**照樣
+  回滾**，之後 `check` 會照實報 fail。**不要手動改這個檔來「修好」探針**——
+  它跟著版本走，手改會在下一次切版時被換掉。
+
+> [!IMPORTANT]
+> **停損 SOP（升級中斷的空窗）**：`upgrade` 切完 `current`、還沒重啟服務的那幾
+> 秒，`current` 已是新版、跑的還是舊服務。這段空窗本來就有，但 #246 之後它也會
+> 影響隧道（新版旗標是 `new`，舊服務沒有 `/healthz`）。空窗只有幾秒，遠低於
+> 隧道的連敗門檻（`PROBE_FAILS`＝3 × 60 秒），正常不會重建。
+> 若看到 `llmgwctl check` 的 `list-local fail（healthz 回 404）`，或
+> `journalctl -u llmgateway-tunnel` 一直出現 `probe_fail`／`restart`：
+> **立刻 `sudo llmgwctl restart`（讓服務跟上 `current`）或 `sudo llmgwctl
+> rollback`**；不要手動改 `deploy/capabilities.json`，也不要手動 restart 隧道
+> 去繞過。
 
 ## 6. 故障排除
 
@@ -544,7 +601,7 @@ cat /var/lib/llmgateway/.keysync.status
 **狀態機（確定性，連線健康時完全不碰 GitHub）**：
 
 1. 啟動：有效的本機位址檔（`FOLLOW_FILE`）優先；沒有就用初始 `RENDEZVOUS` ＋ `KNOWN_HOSTS`（最後已知位址）直接連，不先打 GitHub。
-2. 健康期間只跑 `ssh -W` 端對端探針（`GET /v1/subscriptions` 要 200），零 GitHub 請求。
+2. 健康期間只跑 `ssh -W` 端對端探針（`GET /v1/subscriptions` 要 200），零 GitHub 請求。（#246 起探針改成先打 `GET /healthz`，模式由能力旗標決定，見 §5.12；隧道守護那一半與 `LGW_CAPABILITIES_FILE` 同批上線，在那之前照舊探 list。）
 3. `ssh` 退出、探針連續失敗達 `PROBE_FAILS`（預設 3），或完全沒有可用位址時，**同一行程內**才去抓 `NODE_GATEWAY`（`GATEWAY_SOURCE_*` 三個鍵都填才啟用）。抓取前先看持久化退避（`.tunnel_fetch_backoff`）與 `Retry-After`／`X-RateLimit-Reset`，期間記 `fetch_skipped` 不打 GitHub。
 4. 抓到後嚴格驗證（`ip`、`port`、`tunnel_user`、`host_key`、`generation`），通過才原子寫 `FOLLOW_FILE` 與私用 `.tunnel_known_hosts`，**立刻同行程重連**；首次探針 200 之後才把 `generation` 寫進 `.tunnel_generation`（已驗證水位）並把連敗歸零。
 5. 抓不到、被拒或驗證不過：寫抓取分類、保留最後已知位址，以結束碼 `1` 結束，由 systemd 10 秒後重開。
@@ -736,7 +793,7 @@ sudo llmgwctl tunnel-apply --retry-revert     # 只在 revert-failed 可用；�
    ```bash
    sudo llmgwctl check
    llmgwctl status
-   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<本機埠>/v1/subscriptions   # 經你自備的 4710 通道，預期 200
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<本機埠>/healthz   # 經你自備的 4710 通道，預期 200
    sudo llmgwctl tunnel-apply --confirm
    ```
 
