@@ -1,4 +1,4 @@
-# 設計：作者提案，待審查與本人裁定
+# 設計：作者提案；未決 2、4 已由本人裁定（MyPMO PR #509，2026-11-22），其餘待審查與本人裁定
 
 ## 現況與一手證據
 
@@ -11,7 +11,7 @@
 ```text
  [MLP 控制面] --核驗公鑰（帶外）--> [LGW 管理員/本地名冊]
  [worker / Mac 私鑰]                       |
-      | HTTPSIG 或原始 Ed25519 簽 HTTP       v
+      | SSHSIG（ssh-keygen -Y sign）簽 HTTP  v
       +-- SSH 本機轉發 --> [會合點 loopback 4710] <-- SSH 反向轉發 -- [lgwd]
                                可見明文                         | 驗章/nonce/授權
  [無簽名健康探針] -------------同一通道----------------------->|--> policy --> env
@@ -21,32 +21,57 @@
 
 ## 身分、名冊、生命週期
 
-建議 worker 沿用其本機 OpenSSH `ssh-ed25519` 隧道金鑰（MLP `docs/POOL_RUNTIME_SPEC.md:169-171,662-666（MLP origin/master 6d6c178）`；`shared-configs/pool-runtime/files/pool-tunnel:577-595`）；Mac 必須登記專用 Ed25519 應用公鑰，不共用 SSH／ssh-agent 的隧道鑰。私鑰只在持有端簽署；名冊的 principal 是不可冒用的管理指定穩定 ID，每把 fingerprint 唯一映射一個 principal，可有輪替中的多把。不要信 header 自稱的 node 名。MLP worker 公鑰登錄 `POOL_WORKERS[]`、provider 用 `NODE_<NAME>`（MLP `docs/KEY-DESIGN.md:51-58`）；worker 重建時才新產、單純重啟保留（MLP `entrypoint.sh:46-61`），不是每次重啟都換。MLP 文件歷史設計與 entrypoint 描述註冊次序有落差，以實際部署的建立流程待 MLP 確認。
+**本人已裁定（未決 2）**：worker 沿用其本機建 sshproxy 隧道的 OpenSSH `ssh-ed25519` 金鑰蓋章（MLP `docs/POOL_RUNTIME_SPEC.md:169-171,662-666（MLP origin/master 6d6c178）`；`shared-configs/pool-runtime/files/pool-tunnel:577-595`）；Mac 另發專用 `ssh-ed25519` 應用金鑰，不共用 SSH／一般 ssh-agent 的隧道鑰。同一把鑰同時用於 SSH userauth 與 LGW 簽章，兩者靠 SSHSIG 的魔數與 namespace 分隔（見「域分隔與管理工具」）；代價寫在「威脅、驗證與四點」的殘餘風險。名冊的公鑰欄是 OpenSSH 公鑰行的型別與 base64（`ssh-ed25519 AAAA…`，不含註解），worker 的值由管理員從 MLP 的 `NODE_*` 隧道公鑰人工核驗後匯入（不是 LGW 執行期讀取，見下段）。私鑰只在持有端簽署；名冊的 principal 是不可冒用的管理指定穩定 ID，每把 fingerprint 唯一映射一個 principal，可有輪替中的多把。不要信 header 自稱的 node 名。MLP worker 公鑰登錄 `POOL_WORKERS[]`、provider 用 `NODE_<NAME>`（MLP `docs/KEY-DESIGN.md:51-58`）；worker 重建時才新產、單純重啟保留（MLP `entrypoint.sh:46-61`），不是每次重啟都換。MLP 文件歷史設計與 entrypoint 描述註冊次序有落差，以實際部署的建立流程待 MLP 確認。
 
 LGW 名冊獨立由授權管理員透過受審核帶外流程驗證來源、匯出公鑰並原子安裝於本地；不直接抓取 `NODE_*`／`POOL_WORKERS[]`，既有名冊的執行期驗章不依賴 MLP 可用性，也不新增 GitHub token。**若 LGW 直接依賴這些資料就違反 #221 connectivity 對其他 NODE_* 的禁令**；人工輸入的本地獨立授權資料不是服務對 MLP 設定的執行期依賴，但其管理作業仍有來源依賴，需審查此詮釋。名冊版本單調、格式嚴驗、所有權與權限限管理者寫入；原子替換後由 lgwd 自行偵測並載入（機制見「域分隔與管理工具」），驗證成功才生效，錯誤保留最後有效快照並告警。已驗證的快照同時落盤在信任庫；重啟時名冊檔與信任庫快照走與執行中 reload **同一套判斷**（見「reload 機制」的「重啟」條），名冊檔沒通過就沿用信任庫裡的已驗證快照並告警。enforce 只有在名冊檔與信任庫快照都無效時才拒絕啟動。信任庫或防重放庫缺檔一律當成遺失、不自動建空庫（見「庫的建立與遺失」）。快照包含 principal、key ID、public key、權限、狀態及世代；禁重複 key ID／同公鑰多身分。撤銷一律在新世代把該 key 標 `revoked`，並永久保留其 key ID 與 fingerprint，不得從名冊移除；lgwd 載入時另把已撤銷的 key ID／fingerprint 寫進持久墓碑表。墓碑、名冊世代水位與最後一份已驗證快照放在**信任庫** `auth-trust.sqlite`（同一 transaction 提交），與可丟棄的防重放庫 `auth-replay.sqlite` 分開，理由見「信任庫與防重放庫分開」。之後任何世代（較高世代、reset-generation 或 recover-store 之後亦同）若缺少墓碑列、把它改回有效、或以新 key ID 重用同一公鑰，整份名冊拒絕載入並告警，避免較高世代讓已撤銷鑰復活；載入成功後即拒絕該鍵，並保留防回退水位；公鑰不是密碼，但不在一般日誌輸出。沒有自動同步就沒有宣稱的撤銷時限，監控待處理變更，失效前暫不再發憑證須靠操作決策。
 
 重建順序：舊 worker 停用或標風險→新容器本機生成私鑰→MLP 公鑰登記完成→管理員核驗並加入 LGW 快照→`auth-registry install` 回 0（status 顯示已載入這份名冊的內容雜湊）→新 worker 簽章驗收→舊 key 在下一世代標 `revoked`（永久保留，不移除）；新鍵尚未匯入時 enforce 明確 401，重試並告警，絕不回退免認證。若舊鍵疑似洩露先撤銷而非重疊，接受中斷；若只是計畫輪替可短時間雙鍵並設定截止。不可用舊已撤銷快照恢復。維修 VM 共用金鑰（MLP `profiles/provider/repair/repair-tunnel-launch:370-375` 只證實 fallback 使用身分路徑；共用事實由 #222 轉述，需 MLP 確認）無法區分 VM：建議另發各 VM 專用身分，或將共用鍵當單一低權限群組且不得聲稱單機歸責；不授權即拒絕。
 
+**名冊公鑰驗證（F1，#240 併入 #242）**：名冊 parser 內只有一個驗證函式（D2 實作，例如 `validate_ed25519_pubkey(blob) -> bytes`），規則：公鑰 blob 必須恰好是 `string "ssh-ed25519"`＋`string(32 bytes)`、沒有多餘 bytes（拒絕 RSA、ECDSA、`sk-*` 安全金鑰與 `*-cert-v01` 證書）；32 bytes 必須是規範編碼（去掉符號位元後的 y < 2^255−19；y 為 1 或 2^255−20 時 x＝0，符號位元必須為 0）；不得是 8 個小階點之一（規範編碼下恰 8 個 32-byte 常數，D2 以常數表比對並附向量，不需曲線運算）。不在曲線上的點不另擋：`ssh-keygen` 解不開，任何簽章都驗不過。混階點（真公鑰＋小階分量）不擋：沒有私鑰的人無法替它造出能驗過的簽章，而登記它要管理員核驗；這是已知的取捨，`[L]A` 檢查需要曲線運算，D2 不做。`auth-registry check`、`install`、lgwd 啟動載入、背景 reload、重啟判斷、`reset-generation`、`rebuild-trust` 都經同一個 parser，所以都用同一個函式，D5 不另寫一份。唯一性（同公鑰多 key ID）與墓碑比對都比驗證後的 32 bytes；因為非規範編碼一律拒絕，同一點不會以兩種 bytes 出現。
+
+為什麼選 C 仍需要這一條（2026-11-23 離線實測，OpenSSH 9.6p1，只用臨時產生的測試金鑰，暫存目錄用完即刪；原始輸出見 REPORT-242-arch）：把小階公鑰寫進 `allowed_signers`，以 R＝單位元、S＝0 偽造的 SSHSIG，`ssh-keygen -Y verify` 對單位元（y＝1）、其非規範編碼（y＝1＋P）、x＝0 且符號位元為 1 的編碼都回 exit 0 `Good "llmgateway" signature`，對**任意訊息**皆然；order-2 點（y＝P−1）在 h 為偶數時同樣通過。三種單位元編碼的 SHA256 fingerprint 互不相同，所以只比 fingerprint 的唯一性與墓碑也會被繞過。同一次實測也發現 `ssh-keygen` 接受 S＋L 的延展簽章（只擋 S 的最高 3 位元），所以防重放只認 `(key_id, nonce)`、不得以簽章 bytes 當重放鍵；lgwd 的信封預解析另擋 S ≥ L（見「SSHSIG 驗章」）。
+
 ## 協定與選項
 
-建議先以原始 Ed25519 HTTP request-signature v1 作為可審查的候選，搭配 `cryptography`；**本人尚未選定**。spec 因此只寫方案中立的「節點金鑰簽章 v1」；下列線上格式是 (a)／(b) 的候選，本人選定方案前本 change **不歸檔**（tasks 實作前置）。表中 SSHSIG、HMAC 的 wire format 不相容，若選它們須先修訂本提案的 v1 規格、固定向量與 MLP 協議，不能聲稱可互換。Python stdlib 沒有 Ed25519 原生 API。
+**本人已裁定（未決 4）：選 (c) SSHSIG（`ssh-keygen -Y`），理由是最簡單**；(a)、(b)、(d) 未選，保留在表中供日後重議。下表為裁定前的比較（原型實測見 `docs/prototypes/sign-schemes/COMPARISON.md`）。選 C 後伺服器與客戶端都不新增 Python 套件：伺服器每次驗章開一個 `ssh-keygen` 子行程，客戶端用本機 OpenSSH 的 `ssh-keygen -Y sign` 簽。
 
 | 方案 | 交付與成本 | MLP#1529／跨平台 | 供應鏈與可驗證性 |
 |---|---|---|---|
-| (a) `cryptography` | 新增 Python 及原生相依。伺服端非 `pyproject` 包裝：以部署版本專屬 venv 與經審核 pinned wheel／hash 安裝，unit 指向 venv Python；或 distro 套件，需查各 distro 版本、更新及安全支援，無法保證同 pin。測試安裝、升級、回退與離線可得性。client 用 `lgw[auth]` optional extra。 | 原始 Ed25519 向量易共用；確認 Mac／Linux 支援及相依可得性。 | 成熟函式庫、更新責任和 wheel 來源需審查；驗公開測試向量及相互實作。 |
-| (b) 純 stdlib Ed25519 只驗章 | 無伺服器套件、無 subprocess，但須引入或維護驗證碼；客戶端簽章仍需工具。 | 公鑰格式、原始 wire 可共用，跨 Python 平台容易移植。 | 驗章不處理伺服器祕密，側信道考量不同於簽章；但解析、canonical encoding、曲線與小階點驗證仍可能出錯。須第三方審查及 RFC 8032 正反向測試向量，不能只靠短參考程式。 |
-| (c) `ssh-keygen -Y` SSHSIG | 系統已要求 ssh-keygen；每次請求開 subprocess，有延遲與 timeout／資源管控成本，需限定 binary／環境並確認 `-Y` 最低版本。 | 原生 OpenSSH 金鑰、namespace；Mac／worker 需驗版本與 MLP 同意相同 SSHSIG 格式；相比原始簽章需另定 wire。 | 沿用 OpenSSH 更新供應鏈，避免自寫密碼；離線固定向量測 namespace、格式、版本與失敗狀態。 |
-| (d) 每節點 HMAC | stdlib、無 subprocess；須安全發放、儲存、輪替與撤銷每節點共享祕密。 | 無法共用 MLP#1529 公鑰身分；跨平台容易，但須另建祕密分發。 | HMAC 實作成熟，可測標準向量；Gateway 持有所有 HMAC 祕密，伺服器或備份洩漏會暴露全部節點身分且可偽造請求，訂閱憑證本已在伺服器不代表身分冒用風險相同。 |
+| (a) `cryptography`（**未選**） | 新增 Python 及原生相依。伺服端非 `pyproject` 包裝：以部署版本專屬 venv 與經審核 pinned wheel／hash 安裝，unit 指向 venv Python；或 distro 套件，需查各 distro 版本、更新及安全支援，無法保證同 pin。測試安裝、升級、回退與離線可得性。client 用 `lgw[auth]` optional extra。 | 原始 Ed25519 向量易共用；確認 Mac／Linux 支援及相依可得性。 | 成熟函式庫、更新責任和 wheel 來源需審查；驗公開測試向量及相互實作。 |
+| (b) 純 stdlib Ed25519 只驗章（**未選；照現狀不可選**：原型實作約 2–3 req/s，遠低於 50 req/s 目標；要第三方審查與完整正反向量；客戶端仍需另一套簽章工具。重新開放要另開單附成本估計） | 無伺服器套件、無 subprocess，但須引入或維護驗證碼；客戶端簽章仍需工具。 | 公鑰格式、原始 wire 可共用，跨 Python 平台容易移植。 | 驗章不處理伺服器祕密，側信道考量不同於簽章；但解析、canonical encoding、曲線與小階點驗證仍可能出錯。須第三方審查及 RFC 8032 正反向測試向量，不能只靠短參考程式。 |
+| (c) `ssh-keygen -Y` SSHSIG（**已選**；資源限制與失敗分類見「SSHSIG 驗章」） | 系統已要求 ssh-keygen；每次請求開 subprocess，有延遲與 timeout／資源管控成本，需限定 binary／環境並確認 `-Y` 最低版本。 | 原生 OpenSSH 金鑰、namespace；Mac／worker 需驗版本與 MLP 同意相同 SSHSIG 格式；相比原始簽章需另定 wire。 | 沿用 OpenSSH 更新供應鏈，避免自寫密碼；離線固定向量測 namespace、格式、版本與失敗狀態。 |
+| (d) 每節點 HMAC（**未選**） | stdlib、無 subprocess；須安全發放、儲存、輪替與撤銷每節點共享祕密。 | 無法共用 MLP#1529 公鑰身分；跨平台容易，但須另建祕密分發。 | HMAC 實作成熟，可測標準向量；Gateway 持有所有 HMAC 祕密，伺服器或備份洩漏會暴露全部節點身分且可偽造請求，訂閱憑證本已在伺服器不代表身分冒用風險相同。 |
 
-D2 的 off 不可載入或檢查新相依，缺少它不得影響原本啟動；warn 缺相依須告警但放行，enforce 才 fail closed。實施 venv 路徑前須本人核准並驗證 rollback；不宣稱 distro 已有套件。mTLS 有憑證及端到端伺服器驗證優勢，代價是 PKI 與部署；SSH certificate 若作 HTTP 簽章的短期憑證也可行，需獨立驗證其 CA、principal、時效及撤銷，不能以「SSH 通道不傳身分」否決。
+D2 的 off 不得執行或檢查 `ssh-keygen`，缺少它不得影響原本啟動；warn 缺工具或自測失敗須告警但放行，enforce 才 fail closed（拒絕啟動）。選 C 後不再有 `cryptography` 相依、venv 或 wheel 交付；原 F5（Mac／worker 的 cryptography 安裝實測）不再需要，改為 D4 確認各端 OpenSSH 支援 `-Y sign`。mTLS 有憑證及端到端伺服器驗證優勢，代價是 PKI 與部署；SSH certificate 若作 HTTP 簽章的短期憑證也可行，需獨立驗證其 CA、principal、時效及撤銷，不能以「SSH 通道不傳身分」否決。
 
 簽章不加密回應、不認證伺服器；會合點或本機轉發遭控制可讀改流量及憑證，惡意代理還可搶先轉送簽過的請求。若此風險不可接受須另議端到端 TLS 與伺服器身分。
 
-線上格式固定，不讓兩端自行正規化：所有標頭各且僅一次，`X-LGW-Auth-Version: 1`、`X-LGW-Key-Id`（名冊配置的 ASCII `[A-Za-z0-9._-]{1,64}`）、`X-LGW-Timestamp`（十進位 Unix 秒，無前導零）、`X-LGW-Nonce`（32 個密碼學隨機 bytes 的無 padding base64url）、`X-LGW-Signature`（64 bytes 簽章的無 padding base64url）。簽入 ASCII 八行、每行以 LF 結尾：（1）`LGW-HTTP-SIG-V1`；（2）固定 audience `llmgateway`；（3）key ID；（4）timestamp；（5）nonce；（6）HTTP 大寫 method；（7）原始 origin-form request-target（完整 query，ASCII 原始百分號編碼，禁 fragment、CR/LF、非 ASCII、絕對 URI）；（8）實際 body bytes 的小寫 SHA-256 hex。版本標頭本身未簽入，但第一行已綁定 v1，驗證器必須要求標頭為 1 且只出現一次；對這些 bytes 以 Ed25519 簽名。GET 禁止非零 Content-Length，空 body hash 為空 bytes hash；POST 先序列化一次，簽的 bytes 即送出的 bytes。拒絕重複標頭、畸形編碼、超限 body、Content-Length 歧義／Transfer-Encoding、非 origin-form；不得在簽後改寫 URL／body，禁 redirect 重送簽章。簽名綁完整 query 防篡改；固定 audience 防跨服務重放，MLP sidecar 必須用不同 audience，即使沿用同一把 key。固定向量在實作 PR 與跨 repo 測試交付。
+線上格式固定，不讓兩端自行正規化：所有標頭各且僅一次，`X-LGW-Auth-Version: 1`、`X-LGW-Key-Id`（名冊配置的 ASCII `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`；首字不得是 `-` 或 `.`，也不含 `allowed_signers` 的樣式字元 `*?!,"` 與空白）、`X-LGW-Timestamp`（十進位 Unix 秒，無前導零）、`X-LGW-Nonce`（32 個密碼學隨機 bytes 的無 padding base64url）、`X-LGW-Signature`（SSHSIG 二進位 blob——即 `ssh-keygen -Y sign` 輸出 armor 去掉 BEGIN／END 行後的 base64 解碼結果——的無 padding base64url；`ssh-ed25519` 的 blob 固定 180 bytes，編碼後固定 240 字元，長度不符即 401；解碼後再編碼必須與原字串相同）。簽入 ASCII 八行、每行以 LF 結尾：（1）`LGW-HTTP-SIG-V1`；（2）固定 audience `llmgateway`；（3）key ID；（4）timestamp；（5）nonce；（6）HTTP 大寫 method；（7）原始 origin-form request-target（完整 query，ASCII 原始百分號編碼，禁 fragment、CR/LF、非 ASCII、絕對 URI）；（8）實際 body bytes 的小寫 SHA-256 hex。版本標頭本身未簽入，但第一行已綁定 v1，驗證器必須要求標頭為 1 且只出現一次；客戶端以 `ssh-keygen -Y sign -n llmgateway -f <金鑰>` 對這八行 bytes 簽（訊息從 stdin 給，SSHSIG 內部以 SHA-512 雜湊後簽 Ed25519）。namespace 固定 `llmgateway`，與第二行 audience 相同；MLP sidecar 必須用不同的 namespace 與 audience（例如 `mlp-sidecar`，由 MLP 定）。GET 禁止非零 Content-Length，空 body hash 為空 bytes hash；POST 先序列化一次，簽的 bytes 即送出的 bytes。拒絕重複標頭、畸形編碼、超限 body、Content-Length 歧義／Transfer-Encoding、非 origin-form；不得在簽後改寫 URL／body，禁 redirect 重送簽章。簽名綁完整 query 防篡改；固定 audience 與 namespace 防跨服務重放，MLP sidecar 必須用不同值，即使沿用同一把 key。固定 SSHSIG 向量（公鑰、八行訊息、簽章；產生後丟棄私鑰）在 D2 交付，與 MLP 的互拒向量在跨 repo 前置交付。
+
+**SSHSIG 驗章（F3）**：
+
+- **信封預解析（lgwd 自己做，不開子行程）**：解 `X-LGW-Signature` 得 180 bytes，依序要求：魔數 `SSHSIG`、版本 1、公鑰 blob 與該 key ID 在快照中的 blob **逐 byte 相同**、namespace＝`llmgateway`、reserved 為空、雜湊演算法＝`sha512`、簽章型別＝`ssh-ed25519`、簽章 64 bytes 且 S < L、沒有多餘 bytes。任一不符就 401，不開子行程。這一步讓「別把鑰冒用 key ID」「別的 namespace」「畸形簽章」在 fork 前就確定是 401，也讓之後子行程的輸出只剩兩種正常結果（見分類表）。
+- **allowed_signers**：每次名冊快照載入成功時，由快照的**有效** key 產生 `/var/lib/llmgateway/allowed_signers.<世代>`（同目錄暫存檔＋fsync＋rename，llmgw 0600），每行 `<key ID> namespaces="llmgateway" ssh-ed25519 <base64>`；已撤銷 key 不寫入。實測：沒有 `namespaces=` 的行接受任何 namespace，所以每行都要帶。檔名帶世代、由快照物件持有，請求用自己讀到的那份快照的檔；舊檔在沒有在途請求後刪除，避免換快照時在途請求讀到新檔而誤判。
+- **子行程**：絕對路徑（設定 `auth_sshkeygen_path`，預設 `/usr/bin/ssh-keygen`；啟動時確認擁有者為 root、群組與其他人不可寫）；argv 陣列、`shell=False`、`close_fds=True`；環境只給 `LC_ALL=C`、`PATH=/usr/bin:/bin`、`HOME=<私有目錄>`，不傳 `SSH_AUTH_SOCK`；`-I` 取快照中該 entry 的 key ID 字串、`-n` 是常數 `llmgateway`，都不取請求的 bytes（請求的 key ID 只用來精確查表）。八行訊息走 stdin。簽章檔：lgwd 把預解析過的 blob 重新包成 armor，以 `mkstemp` 寫進私有目錄 `/var/lib/llmgateway/sshsig/`（llmgw 0700，啟動時清空殘檔），`finally` 刪除；D2 可改用 pipe（`-s /dev/fd/N`＋`pass_fds`）免暫存檔，須附測試。stdout／stderr 各最多讀 4 KiB。
+- **時間與並發**：子行程數由號誌限制（預設 16，不超過預驗章並發上限 32）；等號誌與執行合計單次期限 2 秒（實測單次約 4 ms），逾時 SIGKILL、回收、算 503，不算 401。
+- **CPU／記憶體／fd 上限**：多執行緒下不用 `preexec_fn`。每個子行程經固定路徑的 `prlimit`（util-linux）設 `RLIMIT_CPU`、`RLIMIT_AS`、`RLIMIT_NOFILE` 後 exec `ssh-keygen`（數值由 D2 實測定，建議 CPU 2 秒、AS 256 MiB、NOFILE 32）；整個服務另由 systemd unit 的 `TasksMax`、`MemoryMax`、`LimitNOFILE` 兜底。D2 若證明 `prlimit` 不可用，改以 unit 層上限為唯一手段，須在 D2 報告寫明。
+- **分類表（OpenSSH 9.6p1，`LC_ALL=C`，2026-11-23 實測；預解析通過之後）**：
+
+  | 子行程結果 | 分類 |
+  |---|---|
+  | exit 0，stdout 為 `Good "llmgateway" signature for <key ID> with ED25519 key SHA256:<fp>`，且 key ID 與 fp 都等於快照值 | 通過 |
+  | exit 255，stderr 恰為 `Signature verification failed: incorrect signature` | 驗簽失敗＝401 |
+  | exit 255 且 stderr 為空（實測：allowed_signers 壞掉、principal 或公鑰不在檔內都長這樣；預解析後不該由請求造成） | 工具或設定故障＝503 |
+  | `Unable to open allowed keys file`、`Couldn't read signature file`、`Couldn't parse signature`、`namespace does not match`、`key is not permitted for use in signature namespace`（預解析與 lgwd 自己產生的檔已排除請求造成的可能） | 503 |
+  | 逾時、exec 失敗（`OSError`）、被訊號結束、其他 exit code、表外字樣 | 503 |
+
+  503 在 enforce 回 `auth_unavailable`、告警（聚合、限速）；warn 記不可判定、照舊處理。stderr 原文不進日誌，只記分類。這類失敗發生在入庫前，簽章本身若有效即屬殘餘風險 R1 第 3 類。分類表以版本為鍵固定在程式內；新版本先跑啟動自測（下一條），自測與表一致才使用，否則依模式處理。
+- **啟動檢查（warn／enforce；off 完全不做）**：(1) `auth_sshkeygen_path` 存在且可執行；(2) 版本：讀同套件 `/usr/bin/ssh -V` 的版本字串，低於最低版本 **OpenSSH 9.6** 就失敗（9.6p1 是唯一實測、分類表依據的版本；SSHSIG 本身自 8.1 起有，但較舊版本沒有實測分類表，不支援）；讀不到版本時以自測為準並告警；(3) `-Y verify` 能力與分類表自測：用 D2 交付的固定向量與獨立的自測 allowed_signers，正確簽章必須分類為「通過」、R 改一個 bit 的簽章（仍通過預解析）必須分類為 401；自測直接呼叫子行程，結果也記入啟動日誌（只記分類）。實際執行子行程，不只檢查檔案存在。失敗時 enforce 拒絕啟動、warn 告警並標示不可判定。執行中背景執行緒（同名冊輪詢）每次也 stat `ssh-keygen`，`(mtime_ns, size, ino)` 改變（例如套件升級）就重跑自測；失敗時 enforce 的驗章一律 503、warn 不可判定，直到自測再通過。
+- **持續率（D2 驗收）**：設計原有的「並發 32、持續 10 分鐘、接受 ≥50 req/s、零假 503、等鎖 p99 < 1 秒」改為在**含每請求 fork／exec `prlimit`＋`ssh-keygen`** 的完整 HTTP＋SQLite 路徑上量，附 load average。原型短測約 1–1.6 千 req/s（只含驗章），推論可達標；未達標時先調號誌與期限，仍不達標回報架構師，不改方案。
 
 伺服器的驗證分兩段。
 
-**一、交易外（不持鎖，只計算）**：驗格式與大小 → 查名冊快照 → 以當下時鐘粗篩 ±60 秒（只為早拒，不是最終判斷）→ 驗簽。任何一步失敗即 401，不碰持久庫。
+**一、交易外（不持鎖，只計算）**：驗格式與大小 → 查名冊快照 → 以當下時鐘粗篩 ±60 秒（只為早拒，不是最終判斷）→ SSHSIG 信封預解析 → `ssh-keygen -Y verify`（見「SSHSIG 驗章」）。任何一步判為驗證失敗即 401；驗章工具故障或逾時在 enforce 回 503（warn 不可判定）。都不碰持久庫。
 
 **二、防重放交易（唯一寫入點，序列化）**：
 
@@ -82,12 +107,12 @@ D2 的 off 不可載入或檢查新相依，缺少它不得影響原本啟動；
 - **R1　任何已驗簽（或簽章本身有效）、但沒入庫就被拒的簽章**：只有 INSERT 成功的簽章才被記成「用過」。凡是簽章有效（伺服器已驗過，或被交易外的時窗粗篩先擋下而還沒驗）、卻在入庫前被拒的簽章，若被會合點截存，日後只要落入時窗、`ts > H[key]`、而且這次入庫成功，就可被代送一次（每則至多一次，內容是該客戶端原本要做的事，可能是 resolve）。三類：
   1. **時鐘**：客戶端時鐘跑到未來；伺服器時鐘落後（i，待伺服器時間追上或校正後）；伺服器跳到未來後在 60 秒內就校正（ii）。
   2. **配額**（429）：不需任何時鐘故障，該 key 的配額一空出來、簽章仍在時窗內就能代送。
-  3. **忙碌逾時或儲存不可寫**（503）：儲存恢復後、簽章仍在時窗內就能代送。
+  3. **忙碌逾時、儲存不可寫或驗章工具故障**（503）：恢復後、簽章仍在時窗內就能代送。
   `ts ≤ H[key]` 被拒的簽章不屬此類：`H` 只會上升（除 R2 的人工重設），它永遠不會再被接受。接受 R1 的理由：要消除它，就得把被拒的簽章也入庫，配額與故障時的寫入就無法拒絕；而會合點本來就能搶先轉送簽過的請求（見「協定與選項」），R1 沒有給它新的能力，只是延後：每則簽章總共仍至多執行一次（第一次被拒、沒有執行）。
 - **R2　`reset-key-water` 的代價**：見 (iii)-3。
 - **R3　共用時間來源**：(iii)、(iv) 可能同時影響全部 key；Gateway 與客戶端是否共用時間來源，列入給 MLP 的問題 7。
 
-認證失敗（缺／未知／撤銷／格式／過期／錯簽／重放）統一 401 `{"error":"unauthorized"}`，不回具體原因或公鑰，回應內容一致但不保證時序一致（key ID 非祕密）；已驗證但權限不足 403 `{"error":"forbidden"}`，現有業務 policy 的 403 保留；已驗證但超過每 key 配額 429 `{"error":"rate_limited"}`。enforce 驗章系統不可用 503 `{"error":"auth_unavailable"}`；不回憑證。僅安全事件記固定原因分類、時間、路由模板、結果、已驗證 principal（不記標頭、簽章、nonce、query、body、私鑰或 env）；聚合與速率限制日誌避免灌爆。已實作方法的未知路徑仍 404；HEAD／OPTIONS 等未實作方法目前為 501。這不是網路限流，防 DoS 要另議。
+認證失敗（缺／未知／撤銷／格式／過期／錯簽／重放）統一 401 `{"error":"unauthorized"}`，不回具體原因或公鑰，回應內容一致但不保證時序一致（key ID 非祕密）；已驗證但權限不足 403 `{"error":"forbidden"}`，現有業務 policy 的 403 保留；已驗證但超過每 key 配額 429 `{"error":"rate_limited"}`。enforce 驗章系統不可用（防重放庫不可寫、`ssh-keygen` 逾時或故障、執行中自測失敗）503 `{"error":"auth_unavailable"}`；不回憑證。僅安全事件記固定原因分類、時間、路由模板、結果、已驗證 principal（不記標頭、簽章、nonce、query、body、私鑰或 env）；聚合與速率限制日誌避免灌爆。已實作方法的未知路徑仍 404；HEAD／OPTIONS 等未實作方法目前為 501。這不是網路限流，防 DoS 要另議。
 
 ## 授權
 
@@ -98,7 +123,7 @@ D2 的 off 不可載入或檢查新相依，缺少它不得影響原本啟動；
 ```text
 client                lgwd / nonce庫                    policy
   |-- 簽章請求 ---------->|                               |
-  |                       |-- 格式、名冊、粗篩時間、驗簽  |
+  |                       |-- 格式、名冊、粗篩時間、SSHSIG 預解析、ssh-keygen 驗簽（工具故障 -> 503）
   |<-- 401 失敗 ----------|                               |
   |                       |-- 交易：時窗+H[key]+重放+配額(429)+INSERT nonce；期限後仍不可寫 -> 503
   |<-- 401 重放 ----------|                               |
@@ -120,20 +145,24 @@ client                lgwd / nonce庫                    policy
        /var/lib/llmgateway/.auth-registry.status -> lgwd 寫：已載入世代與雜湊、最近嘗試的雜湊、ok/錯誤分類、輪詢心跳
        /var/lib/llmgateway/auth-store.lock -> lgwd 執行期獨佔 flock（寫入 CLI 拿不到就拒絕）
        /var/lib/llmgateway/auth-audit.log  -> 寫入 CLI 的審計（root:root 0600，附加式）
+       /var/lib/llmgateway/allowed_signers.<世代> -> lgwd 由已驗證快照產生（llmgw 0600，每行 namespaces="llmgateway"）
+       /var/lib/llmgateway/sshsig/          -> 驗章暫存簽章檔的私有目錄（llmgw 0700，用後即刪）
+       auth_sshkeygen_path（預設 /usr/bin/ssh-keygen）     [設定；啟動自測與最低版本 9.6]
        auth-store init --confirm                               [首次建兩庫；需 root、停服務；任一庫已存在就拒絕]
        auth-registry check|install|status                      [install 需 root]
        auth-registry reset-generation --confirm <名冊>         [需 root、停服務；水位與快照同一 transaction 換掉]
        auth-registry rebuild-trust --confirm <名冊>            [需 root、停服務]
        auth-replay status / recover-store --confirm / reset-key-water --confirm  [寫入者需 root、停服務]
        llmgwctl check: api-local(/healthz) + auth-local(簽章 list；非 root → todo)
-客戶端: Client(base_url, ..., signer=...) / LGW_AUTH_KEY_ID + LGW_AUTH_KEY_FILE
+客戶端: Client(base_url, ..., signer=...) / LGW_AUTH_KEY_ID + LGW_AUTH_KEY_FILE（OpenSSH 私鑰檔；或公鑰檔＋SSH_AUTH_SOCK 由 agent 簽）
+       signer = ssh-keygen -Y sign -n llmgateway -f <檔>（訊息走 stdin，armor 轉成 X-LGW-Signature）
 HTTP: X-LGW-Auth-Version / Key-Id / Timestamp / Nonce / Signature
 探針: GET /healthz       業務: 既有五條 /v1/*，新標頭
 ```
 
-以上為**提議介面**，不是現存指令。設定檔提供 `auth_replay_db`、`--auth-replay-db`／`LGWD_AUTH_REPLAY_DB` 與 `auth_trust_db`、`--auth-trust-db`／`LGWD_AUTH_TRUST_DB`（兩者不得是同一檔，啟動時檢查），以及 `auth_replay_per_key_max`（預設 600）；私鑰路徑不傳金鑰值、不可寫 log，客戶端無 signer 預設維持舊行為。off 預設、完全不驗且記 aggregate off；warn 有名冊、驗簽／授權並記 would-deny，但所有結果按舊業務處理，明示仍會洩漏憑證；enforce 全部五條先驗章與授權。warn 的名冊、驗章相依或 replay store 缺失／壞掉均不得阻止啟動或業務，必須記 `auth_unavailable` 與驗證不可判定，不能誤報驗證成功；enforce 啟動須有效名冊（或信任庫的已驗證快照）、可用驗章相依、已存在且庫識別一致的 replay store 與信任庫，否則拒絕啟動；lgwd 在任何模式都不自行建庫（見「庫的建立與遺失」）。管理者以部署設定切換並觀測無簽、錯簽、拒絕、健康、授權結果（無敏感值）。當 warn 無法識別未簽呼叫者時，以部署清單和協同升級確認，不能靠零錯誤推斷所有客戶端已遷移。
+以上為**提議介面**，不是現存指令。設定檔提供 `auth_replay_db`、`--auth-replay-db`／`LGWD_AUTH_REPLAY_DB` 與 `auth_trust_db`、`--auth-trust-db`／`LGWD_AUTH_TRUST_DB`（兩者不得是同一檔，啟動時檢查），`auth_replay_per_key_max`（預設 600），以及 `auth_sshkeygen_path`（預設 `/usr/bin/ssh-keygen`）、子行程號誌（預設 16）與單次期限（預設 2 秒）；私鑰路徑不傳金鑰值、不可寫 log，客戶端無 signer 預設維持舊行為。off 預設、完全不驗且記 aggregate off；warn 有名冊、驗簽／授權並記 would-deny，但所有結果按舊業務處理，明示仍會洩漏憑證；enforce 全部五條先驗章與授權。warn 的名冊、驗章工具（`ssh-keygen` 缺失、版本不足或自測失敗）或 replay store 缺失／壞掉均不得阻止啟動或業務，必須記 `auth_unavailable` 與驗證不可判定，不能誤報驗證成功；enforce 啟動須有效名冊（或信任庫的已驗證快照）、可用且自測通過的 `ssh-keygen`、已存在且庫識別一致的 replay store 與信任庫，否則拒絕啟動；lgwd 在任何模式都不自行建庫（見「庫的建立與遺失」）。管理者以部署設定切換並觀測無簽、錯簽、拒絕、健康、授權結果（無敏感值）。當 warn 無法識別未簽呼叫者時，以部署清單和協同升級確認，不能靠零錯誤推斷所有客戶端已遷移。
 
-每個探針針對目標端點以受控設定明確標為 old 或 new；部署器以已安裝版本的能力清單設定，不從網路 404 推測版本。遠端 MLP 的 probe 必須由該部署負責者同步設定，版本與設定不一致就停止切換；切版／回退須將這項設定納入交易及演練，避免錯把新服務當舊服務。先釋出同時提供 `/healthz` 與 off 的服務；更新 LGW 本機／遠端 probe、install、upgrade、rollback、MLP capability 與手動 SOP，僅部署器明確標示的舊服務且 healthz 回 404 時暫用 list；更新 MLP sidecar 的自有 urllib signer、Mac／手機及直接 client，所有路徑完成簽章與權限後進 warn，核對真實操作與清單，再切 enforce。不得在新服務 enforce 時因業務認證失敗重建 #221 通道；真正 `/healthz` 連續失敗仍按既有門檻重建；端到端 200 仍經同一 4710 到新 `/healthz`。老服務回滾時探針要受控切回舊 list；新 enforce 不可用 list 當免認證探針。認證限制會影響舊版 client：升 `lgw` 0.1.0→0.2.0（建議）、發新版 tag 與 MLP pin，獨立簽章 wire v1；resolve `schema`／`env_schema` 不變，HTTP `/v1` 不變。`lgw/client.py:_send` 加選填 signer，序列化一次後簽五種方法，明確呈現 401/403/429/503 並保留 Result 不洩密（429 依 `Retry-After` 由呼叫方決定是否重簽重試，client 不自動重試）；不得在認證失敗自動重送無簽版本。sidecar 不使用該 client，必須獨立修改或採共用 signer；是否共用 package 由 MLP 決定。
+每個探針針對目標端點以受控設定明確標為 old 或 new；部署器以已安裝版本的能力清單設定，不從網路 404 推測版本。遠端 MLP 的 probe 必須由該部署負責者同步設定，版本與設定不一致就停止切換；切版／回退須將這項設定納入交易及演練，避免錯把新服務當舊服務。先釋出同時提供 `/healthz` 與 off 的服務；更新 LGW 本機／遠端 probe、install、upgrade、rollback、MLP capability 與手動 SOP，僅部署器明確標示的舊服務且 healthz 回 404 時暫用 list；更新 MLP sidecar 的自有 urllib signer、Mac／手機及直接 client，所有路徑完成簽章與權限後進 warn，核對真實操作與清單，再切 enforce。不得在新服務 enforce 時因業務認證失敗重建 #221 通道；真正 `/healthz` 連續失敗仍按既有門檻重建；端到端 200 仍經同一 4710 到新 `/healthz`。老服務回滾時探針要受控切回舊 list；新 enforce 不可用 list 當免認證探針。認證限制會影響舊版 client：升 `lgw` 0.1.0→0.2.0（建議）、發新版 tag 與 MLP pin，獨立簽章 wire v1；resolve `schema`／`env_schema` 不變，HTTP `/v1` 不變。`lgw/client.py:_send` 加選填 signer（呼叫本機 `ssh-keygen -Y sign`，不新增 Python 相依），序列化一次後簽五種方法，明確呈現 401/403/429/503 並保留 Result 不洩密（429 依 `Retry-After` 由呼叫方決定是否重簽重試，client 不自動重試）；不得在認證失敗自動重送無簽版本。sidecar 不使用該 client，必須獨立修改或採共用 signer；是否共用 package 由 MLP 決定。
 
 回退按操作手冊：保留 4710/4711 與現有通道，先確認可用管理路徑與新健康探針、告警並記錄風險，受控從 enforce 降 warn 或 off；此即恢復免認證，不能視為安全措施。若懷疑盜鑰，先撤銷並換鑰，不為便利降級；無安全回退就維持拒絕並升報。版本回退須確保探針相容與不恢復過期名冊；別在自動失敗處理中降級。
 
@@ -148,20 +177,29 @@ HTTP: X-LGW-Auth-Version / Key-Id / Timestamp / Nonce / Signature
 
 攻擊者包括可連 4710 的任一 worker 內程序、其他 node、會合點及被攻破 worker。未持有授權私鑰者無法偽造有效請求；持鑰或有簽章代理存取權的程序、同機其他有權讀私鑰使用者、已侵入節點、惡意會合點、竊得 resolve 回應者仍能取用其權限內的憑證；不提供 confidentiality、前向安全、抗 DoS 或已發憑證撤回。
 
+**沿用隧道鑰後的重評（未決 2 已裁定）**：
+
+- **R4　同機持鑰程序都能簽**：worker 上任何讀得到隧道私鑰檔、或能連到持有它的 ssh-agent socket 的程序，都能替 LGW 簽章；ssh-agent 會替任何資料簽名、不限 namespace，是簽章 oracle。依現有同機權限推論，可能涵蓋 worker 內所有 agent（未決 1 的第二項風險不變，MLP 問題 6 實測）。另發專用鑰在同 uid 下也擋不住，所以這項不因沿用而變大，只是不再有「換鑰可隔離」的選項。
+- **R5　一把鑰兩種能力**：隧道鑰外洩＝同時失去 SSH 通道與 LGW 身分。處置要同時做：MLP 撤 sshproxy 授權、LGW 名冊標 revoked；兩邊不連動，任一邊漏做都留洞。worker 重建換鑰時兩邊也要同時更新（見 MLP 問題 2、8）。
+- **R6　agent 轉發**：若建隧道的 SSH 連線開了 `ForwardAgent`，會合點（或其上任何能拿到轉發 socket 的程序）就能透過轉發的 agent 簽出 `llmgateway` namespace 的 SSHSIG，等於拿到該 worker 的 LGW 身分。要求：隧道連線必須 `ForwardAgent no`（MLP 問題 8 確認）。不轉發時，會合點只看得到 SSH userauth 簽章，那份簽章資料不以 `SSHSIG` 魔數開頭，不能當 LGW 簽章用（OpenSSH `PROTOCOL.sshsig` 明寫的分隔目的）。
+- **R7　OpenSSH 驗章寬鬆處**：實測 `ssh-keygen` 9.6p1 接受小階公鑰的偽造簽章與 S＋L 延展簽章。前者靠名冊公鑰驗證擋（只有管理員能登記，且登記路徑都會擋）；後者靠防重放只認 `(key_id, nonce)` 與預解析擋 S ≥ L。若名冊驗證被繞過（例如有人直接改 allowed_signers 檔），整個身分保證失效；該檔只由 lgwd 從已驗證快照產生、llmgw 0600。
+- **跨協定**：worker 簽 LGW 請求只產生 `llmgateway` namespace 的 SSHSIG；它不能被當成 SSH userauth 或 MLP sidecar（不同 namespace）的簽章，反之亦然。
+
 1. 頂尖專家：將驗章、授權與傳輸分層；fail closed、跨重啟防重放、嚴格 canonicalization、雙鍵輪替與可觀測回退均為安全邊界，明確寫出伺服器認證和共用 key 的缺口。
 2. 一手資料：以上逐行引用本 repo、MLP `origin/master` 和四張工單；現況是靜態讀碼實證，沒有真機推斷為已測事實。
-3. 方法工具：離線 fake clock、臨時自產 Ed25519 key／名冊、loopback HTTP、獨立 SQLite、受控 request bytes 及跨實作固定向量；不使用真鑰或服務。
+3. 方法工具：離線 fake clock、臨時自產 `ssh-ed25519` key／名冊、固定 SSHSIG 向量（含小階、非規範、延展、別 namespace、別把鑰的負向向量）、loopback HTTP、獨立 SQLite、受控 request bytes 及跨實作固定向量；不使用真鑰或服務。
 4. 怎麼證明有用：實作後 fake 環境測五個端點 off/warn/enforce、合法簽章成功、無簽／錯鑰／改 query／body／重複 header／過期／撤銷皆拒絕、並行及重啟重放拒絕、到期前一刻重放與清除交錯仍至多一次、時窗與水位邊界向量、高並行無假 503 與持續請求率目標、每 key 配額（429、過期列不計入、單 key 灌量不影響他 key、重放先於配額、配額拒絕的簽章日後至多一次）、兩庫缺檔或庫識別不符時 enforce 拒絕啟動且不建空庫、enforce 的 store failure fail closed（時鐘回撥只回 401，不 503）、warn 故障照舊處理、角色／agent 拒絕、輪換與 reload 原子性（背景輪詢偵測、閒置時也載入、同世代同內容為無變更、壞檔沿用舊快照且退避、還原成已載入內容時 status 回到 ok、status 只在狀態變化時寫並有輪詢心跳、重啟與執行中用同一套判斷：同世代內容被改動後重啟仍拒絕並沿用信任庫快照）、已撤銷 key 在較高世代被移除或改回有效時整份拒絕、時鐘五情況（伺服器落後、伺服器跳未來再校正不需換鑰且無 503、主從同跳未來時所有故障期間有流量的 key 同時受影響且可批次重設、聯合回撥、replay 庫遺失後 recover-store 且墓碑仍在）、warn 期間的伺服器時鐘錯誤切 enforce 後不造成全體停擺、非 root 的 check 為 todo（結束碼 2）與 usage 在 enforce 結束碼 1 且不無簽重送、舊客戶端 warn／新 client 舊服務、健康與回退不重建通道，斷言不洩密。V-0 真機：**待本人授權**後在指定維護窗用測試身分經 4710 測上述正負案例、輪換及探針，事前備可用管理通道與回退；本設計不執行。
 
 ## 給 MLP PM 的問題
 
-1. #1529 能否以同一 OpenSSH Ed25519 公鑰、key ID 與不同 audience 共用簽章格式及固定向量？sidecar 端重放存儲與時鐘要如何支援？
+1. #1529 能否以同一把隧道鑰、同一 SSHSIG 格式與**不同的 namespace 與 audience**（請 MLP 定值，例如 `mlp-sidecar`）共用固定向量，並交付互拒向量？sidecar 端重放存儲與時鐘要如何支援？
 2. 誰核驗與轉交 POOL_WORKERS／NODE 公鑰及撤銷，發佈延遲與故障升報 SLA？新 worker 建立的實際註冊先後及舊鍵何時刪除？
 3. Mac、手機、維修 VM 各有哪些身分與可用私鑰，repair 是否實際共用，能否發各機專鑰？
 4. 請列 sidecar、capability probe、PM／手動 curl、Actions 等全部呼叫與版本 pin，誰改、何時完成，是否能先部署 `/healthz` 相容探針？
-5. MLP 是否願意共用 signer 套件與 cryptography 相依或 SSHSIG？在所有平台如何保護 key、校時、回傳 401/403？
+5. MLP 是否願意共用 signer（呼叫 `ssh-keygen -Y sign`）？各平台（worker 映像、Mac）的 OpenSSH 是否都支援 `-Y sign`（客戶端不受伺服器最低版本 9.6 約束）？如何保護 key、校時、回傳 401/403？
 6. worker 私鑰屬於哪個 uid？sidecar 和 agent 是否同 uid、是否能讀 key 或 ssh-agent socket？能否以獨立 uid／受限簽章 daemon 與呼叫者授權隔離？被攻破 sidecar 或 daemon 能否變成替 agent 簽章的代理？請實測而非假設。
 7. 每週每 worker 的重建頻率及 P95、上游公鑰登記延遲？跨重建持久鑰、受認證單向推送或短期 CA 憑證何者可行，誰值班，能承諾什麼撤銷及 401 空窗？Gateway 主機與各 worker／Mac 的時間來源是否共用（同一 NTP、同一宿主時鐘）？這決定時鐘事故 (iii)、(iv) 會不會一次影響全部 key。
+8. 沿用隧道鑰的取得與換鑰時序：LGW 名冊要的公鑰，是否就是 `NODE_<NAME>` 裡的 `tunnel_public_key`（或 `POOL_WORKERS[]` 的對應欄）？由誰、以什麼帶外方式（例如本人在 Mac 上比對 fingerprint）交給 LGW 管理員人工匯入？worker 重建產生新隧道鑰時，新公鑰在 MLP 登記、sshproxy 授權生效、LGW 名冊新世代載入三者的先後與預期延遲為何？舊隧道鑰在 sshproxy 撤銷的時點，能否通知 LGW 同步標 revoked？隧道的 SSH 連線是否確定 `ForwardAgent no`？隧道鑰是私鑰檔還是載入 ssh-agent？
 
 ## 維運成本與中間選項
 
@@ -171,9 +209,9 @@ HTTP: X-LGW-Auth-Version / Key-Id / Timestamp / Nonce / Signature
 
 ## 域分隔與管理工具
 
-原始 Ed25519 標籤加 audience 和每項長度／字元限制作跨協定域分隔；現行 SSH userauth 的二進位前綴不同，但這是推論而非形式證明。SSHSIG 的 namespace 是替代做法；LGW、MLP sidecar 與其他服務必須使用不同 audience／namespace，互拒固定向量涵蓋兩服務。ssh-agent 是簽章 oracle，可存取 socket 的程序可能借用；Mac 應用金鑰不得同時用於 SSH 或放入一般共用 ssh-agent，是否提供隔離 signer 須另議。worker 若共用 tunnel key，同機讀鑰或 agent socket 的程序仍可簽；sidecar 或簽章 daemon 若被攻破或缺少呼叫者授權可被當代理，uid 隔離本身並不足夠。
+跨協定域分隔靠 SSHSIG：簽章資料以魔數 `SSHSIG` 開頭並綁 namespace，這是 OpenSSH 為「同一把鑰同時用於 SSH 與檔案／資料簽章」明寫的分隔機制（`PROTOCOL.sshsig`），SSH userauth 的簽章資料不以此開頭；八行裡的 `LGW-HTTP-SIG-V1` 與 audience 是第二層。LGW 固定 namespace `llmgateway`，MLP sidecar 與其他服務必須用不同 namespace 與 audience，互拒固定向量涵蓋兩服務；驗章端以預解析與 allowed_signers 的 `namespaces="llmgateway"` 兩處都擋。ssh-agent 是簽章 oracle，可存取 socket 的程序可借用（R4）；Mac 應用金鑰不得同時用於 SSH 或放入一般共用 ssh-agent，是否提供隔離 signer 須另議。worker 沿用 tunnel key（已裁定），同機讀鑰或 agent socket 的程序仍可簽；sidecar 或簽章 daemon 若被攻破或缺少呼叫者授權可被當代理，uid 隔離本身並不足夠。
 
-`llmgwctl usage` 呼叫 list／roles 等業務端點，`check` 的已簽章 list 也一樣；enforce 下兩者須以已登記、唯讀權限（list、usage、必要 roles，不給 resolve／cooldown）的本機管理 principal 簽章。建議由 root 建置專用應用私鑰，存 `/etc/llmgateway/local-admin-signing-key`，root:root 0600，只有 root 執行的管理命令讀取；一般使用者不得藉 setuid 代理或被賦予讀取權。保護私鑰不能防 root／同 uid 已遭攻破；安裝前核驗權限及以正式 principal 測試。**非 root 的行為（對齊 connectivity「非 root 無權限降為無法確認而不誤報」）**：讀不到管理私鑰時，客戶端就是沒有 signer，送出無簽請求，不做「先簽、失敗再無簽重送」。`llmgwctl check`：`api-local`（本機 `/healthz`，免簽）照舊判 ok/fail；`auth-local` 在非 root 時一律 `todo`「需 root 才能做已簽章檢查」，不試打業務端點、不報 fail；root 時 enforce 的 401／403／503 或 `H[key]` 在未來報 `fail`，warn 不可判定報 `todo`，off 報 ok 並註明「未啟用認證」。結束碼語意不變（0 全好、1 有 fail、2 只有 todo），所以非 root 在 enforce 下最好是 2，不會被誤當故障。`llmgwctl usage`：off／warn 任何使用者照舊可用；enforce 下只有 root（或本人另行核准的受限 signer）可用，非 root 收到 401 時結束碼 1 並印「enforce 下需 sudo 執行」，不印原因細節或金鑰路徑內容。這是**功能迴歸**（現在任何使用者都能跑 usage），已寫入 proposal；若本人不接受，替代選項是把私鑰設為 root:llmgw-ops 0640 給一個維運群組（等於該群組全體可借用該身分），列入未決第 5 項。純存活探針及 install／upgrade／rollback 的 `/healthz` 免簽，舊版按版本規則 list。
+`llmgwctl usage` 呼叫 list／roles 等業務端點，`check` 的已簽章 list 也一樣；enforce 下兩者須以已登記、唯讀權限（list、usage、必要 roles，不給 resolve／cooldown）的本機管理 principal 簽章。建議由 root 建置專用 `ssh-ed25519` 應用私鑰（`ssh-keygen -t ed25519`，無密語，不載入 ssh-agent），存 `/etc/llmgateway/local-admin-signing-key`，root:root 0600，只有 root 執行的管理命令讀取；一般使用者不得藉 setuid 代理或被賦予讀取權。保護私鑰不能防 root／同 uid 已遭攻破；安裝前核驗權限及以正式 principal 測試。**非 root 的行為（對齊 connectivity「非 root 無權限降為無法確認而不誤報」）**：讀不到管理私鑰時，客戶端就是沒有 signer，送出無簽請求，不做「先簽、失敗再無簽重送」。`llmgwctl check`：`api-local`（本機 `/healthz`，免簽）照舊判 ok/fail；`auth-local` 在非 root 時一律 `todo`「需 root 才能做已簽章檢查」，不試打業務端點、不報 fail；root 時 enforce 的 401／403／503 或 `H[key]` 在未來報 `fail`，warn 不可判定報 `todo`，off 報 ok 並註明「未啟用認證」。結束碼語意不變（0 全好、1 有 fail、2 只有 todo），所以非 root 在 enforce 下最好是 2，不會被誤當故障。`llmgwctl usage`：off／warn 任何使用者照舊可用；enforce 下只有 root（或本人另行核准的受限 signer）可用，非 root 收到 401 時結束碼 1 並印「enforce 下需 sudo 執行」，不印原因細節或金鑰路徑內容。這是**功能迴歸**（現在任何使用者都能跑 usage），已寫入 proposal；若本人不接受，替代選項是把私鑰設為 root:llmgw-ops 0640 給一個維運群組（等於該群組全體可借用該身分），列入未決第 5 項。純存活探針及 install／upgrade／rollback 的 `/healthz` 免簽，舊版按版本規則 list。
 
 名冊 CLI 提議 `llmgwctl auth-registry check <file>`：離線驗 schema、唯一性、墓碑（已撤銷 key 必須仍在且為 revoked），顯示 fingerprint、世代、內容雜湊與變更摘要。`install <file>` 需 root：先跑同一套 check，再以「同目錄暫存檔＋fsync＋rename」原子安裝到 `/etc/llmgateway/auth-registry.json`（root:llmgw 0640）。名冊的增刪與撤銷都走 install，lgwd 不必停。
 
@@ -221,12 +259,12 @@ HTTP: X-LGW-Auth-Version / Key-Id / Timestamp / Nonce / Signature
 
 時鐘事故的處理已併入「協定與選項」的 `H[key]` 段；不採用「時鐘事故後換全部鑰並隔離 120 秒」的做法：它的換鑰理由只在 nonce 已遺失時成立，與「保留 nonce」自相矛盾。現在換鑰只在 `H[key]` 落在未來（情況 iii，也可改用等待或有審計的 `reset-key-water`）或 replay 庫遺失且無法確認當時時鐘（情況 v）時，且只換受影響的 key；受影響的範圍是「故障期間有流量的 key」，共用時間來源時可能是全部。
 
-## 未決（選項與建議；共六項，與 proposal「建議與代價」表一一對應）
+## 未決（選項與建議；共六項，與 proposal「建議與代價」表一一對應；2、4 已裁定）
 
 1. 本人：能否接受會合點看到憑證明文，以及 worker 裡任何能讀或借用金鑰的程式仍能拿到其允許的憑證（同 uid 下可能是所有 agent，隔離未證實）？建議：明確接受這兩項殘餘風險再往下做；若不能接受會合點明文，先另設端到端 TLS 與服務端身分，不以此簽章設計聲稱已解決；agent 隔離另議每角色身分。
-2. 本人：worker 重用隧道鍵或另發應用鍵？建議：先請 MLP 實測 uid／agent 存取再定；Mac 一律使用獨立應用鍵（硬規則，不改須重新審查）。
+2. **已裁定（本人 2026-11-22，MyPMO PR #509）**：worker 沿用建 sshproxy 隧道的那把金鑰；Mac 另發專用鑰（硬規則，不改須重新審查）。域分隔靠 SSHSIG namespace，不與 SSH userauth 混用。未選：worker 另發專用鑰。後果見殘餘風險 R4–R6 與 MLP 問題 8。
 3. 本人：人工名冊、跨重建持久鑰、MLP 單向推送、或管理 CA 短期憑證？建議：先測重建頻率與人工分鐘、訂責任人與 401 空窗上限，再選；未有可接受 SLA 不上 enforce。
-4. 本人：選 cryptography＋venv／distro、stdlib 驗章、SSHSIG 或 HMAC？建議：先以 cryptography 做固定向量與交付原型，並和 MLP 比較 SSHSIG；選定前不實作、不歸檔。
+4. **已裁定（本人 2026-11-22，MyPMO PR #509）**：C，`ssh-keygen -Y`（SSHSIG），理由是最簡單。未選：A `cryptography`、B 純 stdlib 驗章（照現狀不可選）、D 每節點 HMAC。後果：每次驗章一個子行程（實測約 4 ms），401／503 靠固定的 stderr 分類表，伺服器依賴 OpenSSH ≥ 9.6、客戶端依賴能用的 `ssh-keygen -Y sign`（見「SSHSIG 驗章」）。
 5. PMO／本人：principal 權限矩陣（含 cooldown 可影響所有訂閱的粗粒度；可選新增每訂閱範圍，需改介面），以及 enforce 下 `llmgwctl usage` 誰能用。建議：最小發權逐項裁定；管理 principal 不含 resolve；usage 在 enforce 下只給 root（sudo），不開維運群組。
 6. PMO／本人：warn 觀察期、enforce 啟用與緊急降級時間上限。建議：以客戶清冊驗收而非只看天數；臨時降級到 warn／off 滿 N=1 小時告警，實際 N 與升報對象由本人定。
 

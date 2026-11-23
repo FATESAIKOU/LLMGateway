@@ -1,11 +1,11 @@
 ## Purpose
 
-以可撤銷的節點金鑰身分保護 LLMGateway 業務 HTTP 介面，限制未授權的訂閱憑證取得與狀態修改，並透過可觀測的分階段切換和獨立健康檢查保留現有通道。簽章方案由本人選定；選定前本 change 不歸檔。
+以可撤銷的節點金鑰身分保護 LLMGateway 業務 HTTP 介面，限制未授權的訂閱憑證取得與狀態修改，並透過可觀測的分階段切換和獨立健康檢查保留現有通道。簽章方案依本人裁定（MyPMO PR #509）採 OpenSSH SSHSIG（`ssh-keygen -Y`）。
 
 ## ADDED Requirements
 
 ### Requirement: HTTP 呼叫身分
-服務 SHALL 對五個既有業務路由提供本人選定方案的節點金鑰簽章 v1 驗證，簽入固定 audience、key ID、時間、隨機 nonce、method、原始含 query 的 request-target 與實際 body 雜湊。enforce MUST 拒絕缺漏、畸形、過期、未知、撤銷或驗簽失敗之請求並在業務處理前統一回 401，不洩漏原因。
+服務 SHALL 對五個既有業務路由驗證節點金鑰簽章 v1：客戶端以 OpenSSH SSHSIG、固定 namespace `llmgateway` 簽署八行簽章資料，簽入固定 audience、key ID、時間、隨機 nonce、method、原始含 query 的 request-target 與實際 body 雜湊。SSHSIG 內含的公鑰 MUST 與該 key ID 在名冊的公鑰完全相同，namespace MUST 為 `llmgateway`。enforce MUST 拒絕缺漏、畸形、過期、未知、撤銷或驗簽失敗之請求並在業務處理前統一回 401，不洩漏原因。
 
 #### Scenario: 已授權身分的完整請求
 - **WHEN** 已登記的 key 簽署合法且未過期的新請求
@@ -23,12 +23,20 @@
 - **WHEN** enforce 收到重複認證標頭、歧義 Content-Length 或絕對 URI request-target
 - **THEN** 拒絕請求，不執行業務或發放憑證
 
+#### Scenario: 別的 namespace 或別把鑰的簽章
+- **WHEN** 八行內容正確，但 SSHSIG 的 namespace 不是 `llmgateway`（例如 MLP sidecar 的 namespace），或簽章內含的公鑰是另一把已登記 key 而標頭寫這把 key ID
+- **THEN** enforce 回 401，不執行業務
+
 ### Requirement: 重放與故障
-服務 SHALL 在驗簽後、執行業務前以跨重啟持久、原子唯一的 key ID 與 nonce 防止重放。時窗、該 key 清除水位與記錄 nonce MUST 在同一個序列化的寫入 transaction 內、以同一個伺服器時間判斷；時窗為整數秒 `|now−ts|≤60`，timestamp MUST 大於清除水位。nonce MUST 保留超過其 timestamp 加 60 秒才可清除，清除與水位更新同一 transaction。MUST NOT 以伺服器時間水位讓全體停擺。資料庫忙碌 MUST 重試至期限才算不可寫；enforce 的持久庫不可用或容量不足 MUST fail closed；warn MUST 記錄不可判定並保持舊業務行為。
+服務 SHALL 在驗簽後、執行業務前以跨重啟持久、原子唯一的 key ID 與 nonce 防止重放；MUST NOT 以簽章 bytes 判斷是否重放。時窗、該 key 清除水位與記錄 nonce MUST 在同一個序列化的寫入 transaction 內、以同一個伺服器時間判斷；時窗為整數秒 `|now−ts|≤60`，timestamp MUST 大於清除水位。nonce MUST 保留超過其 timestamp 加 60 秒才可清除，清除與水位更新同一 transaction。MUST NOT 以伺服器時間水位讓全體停擺。資料庫忙碌 MUST 重試至期限才算不可寫；enforce 的持久庫不可用或容量不足 MUST fail closed；warn MUST 記錄不可判定並保持舊業務行為。
 
 #### Scenario: 同一簽章並行重放
 - **WHEN** 多個執行緒或重啟後再次收到同一有效簽章
 - **THEN** 至多一次通過驗證，其餘回 401
+
+#### Scenario: 改寫簽章 bytes 後重放
+- **WHEN** 已記錄的請求以同一 key ID 與 nonce、但改寫過仍可驗過的簽章 bytes 重送
+- **THEN** 回 401，業務不再執行
 
 #### Scenario: 到期前一刻重放與清除交錯
 - **WHEN** 已記錄的簽章在其 timestamp 加 60 秒前一刻被重送，同時清除執行緒正在清除到期 nonce
@@ -105,6 +113,36 @@
 - **WHEN** enforce 啟動且名冊檔無效、也沒有已驗證快照
 - **THEN** 服務拒絕啟動並告警，不默默降級
 
+### Requirement: 名冊公鑰格式
+名冊公鑰 MUST 是 `ssh-ed25519` 型別、恰 32 bytes 的規範編碼（y 小於 2^255−19；x 為 0 的點符號位元為 0），且 MUST NOT 是 Ed25519 的 8 個小階點之一；其他型別、證書與安全金鑰型別 MUST 拒絕。含任一不合格公鑰的名冊 MUST 整份拒絕。檢查、安裝、啟動載入、背景重讀、重啟、世代重置與信任庫重建 MUST 呼叫同一個驗證函式；唯一性與墓碑比對用驗證後的 bytes。驗章用的 allowed_signers MUST 只由已驗證快照的有效 key 原子產生，principal 欄為 key ID，每行帶 `namespaces="llmgateway"`。
+
+#### Scenario: 小階或非規範公鑰
+- **WHEN** 名冊含小階點公鑰（例如單位元或 order-2 點）、y 不小於 2^255−19 的非規範編碼，或 x 為 0 卻設符號位元的編碼
+- **THEN** 名冊檢查與安裝結束碼 1；服務載入時整份拒絕、沿用最後有效快照並告警
+
+#### Scenario: 同一點換編碼繞過墓碑
+- **WHEN** 新世代以新 key ID 登記已撤銷公鑰的另一種編碼
+- **THEN** 該編碼不是規範編碼，整份名冊拒絕，已撤銷 key 仍回 401
+
+#### Scenario: allowed_signers 只含有效 key
+- **WHEN** 服務載入一份含已撤銷 key 的有效名冊
+- **THEN** 產生的 allowed_signers 不含已撤銷 key，且每行都限定 namespace `llmgateway`
+
+### Requirement: SSHSIG 驗章子行程
+服務 SHALL 以固定絕對路徑的 `ssh-keygen -Y verify` 驗章：argv 陣列、不經 shell、最小環境且 `LC_ALL=C`；`-I` 取自快照、`-n` 為常數，MUST NOT 取自請求。簽章暫存檔 MUST 放在只有服務帳號可讀寫的私有目錄並用後即刪。子行程並發由號誌限制，單次逾時。只有結束碼 0 且輸出指名預期 key 才算通過；只有固定的驗簽失敗字樣算 401；逾時、無法執行與其他輸出在 enforce MUST 回 503，warn 記不可判定。stderr 原文 MUST NOT 進日誌。
+
+#### Scenario: 驗章工具逾時或失效
+- **WHEN** enforce 下 `ssh-keygen` 逾時、無法執行，或輸出不在分類表內
+- **THEN** 回 503 `auth_unavailable`，不回 401，不執行業務
+
+#### Scenario: 驗簽失敗
+- **WHEN** 簽章格式正確、公鑰相符，但簽章值不正確
+- **THEN** 回 401，不執行業務
+
+#### Scenario: 信封不合不必開子行程
+- **WHEN** 簽章解不開、長度不符、內含公鑰或 namespace 不符
+- **THEN** 不啟動 `ssh-keygen`，直接回 401
+
 ### Requirement: 每 key 防重放配額
 服務 SHALL 在防重放 transaction 內限制每把 key 尚在保留期的紀錄數，只計 timestamp 不早於伺服器現在減 65 秒的列，待清除的過期列 MUST NOT 計入。重放判斷 MUST 先於配額。超過上限時 enforce MUST 回 429、不寫入、不執行業務；warn 記錄預計拒絕、不寫入並照舊處理。單一 key 達上限 MUST NOT 使其他 key 被拒絕。因配額、時窗或儲存不可用而未入庫的有效簽章，日後至多被接受一次。
 
@@ -136,11 +174,19 @@
 - **THEN** 回 403 且不執行業務操作
 
 ### Requirement: 漸進切換和觀測
-服務 SHALL 提供 off、warn、enforce；off 維持現況，warn 驗證並記錄預計拒絕但保留原業務行為，enforce 才拒絕。日誌 MUST NOT 包含金鑰、簽章、nonce、query、body 或憑證；錯誤不得觸發自動免認證回退。
+服務 SHALL 提供 off、warn、enforce；off 維持現況，warn 驗證並記錄預計拒絕但保留原業務行為，enforce 才拒絕。off MUST NOT 執行或檢查驗章工具。warn／enforce 啟動時 MUST 實際執行驗章工具並以固定 SSHSIG 向量自測（正確簽章通過、改壞的簽章歸為驗簽失敗），且檢查最低 OpenSSH 版本；enforce 在工具缺失、版本不足或自測失敗時 MUST 拒絕啟動，warn MUST 告警並標示不可判定、照舊處理。日誌 MUST NOT 包含金鑰、簽章、nonce、query、body 或憑證；錯誤不得觸發自動免認證回退。
 
 #### Scenario: 舊客戶端在 warn
 - **WHEN** 未簽章的舊客戶端在 warn 模式呼叫
 - **THEN** 記錄預計拒絕並按舊業務規則處理
+
+#### Scenario: off 缺驗章工具
+- **WHEN** off 模式啟動時找不到 `ssh-keygen`
+- **THEN** 服務照常啟動與處理，不執行、不檢查驗章工具
+
+#### Scenario: enforce 驗章工具不可用
+- **WHEN** enforce 啟動時 `ssh-keygen` 不存在、版本低於最低版本，或固定向量自測失敗
+- **THEN** 服務拒絕啟動並告警；warn 下則告警、標示不可判定並照舊啟動
 
 #### Scenario: enforce 驗證失敗
 - **WHEN** enforce 模式認證失敗
