@@ -13,12 +13,20 @@
 
 輸出不含 key：這裡只讀 list／roles 的公開欄位，也刻意不碰 get／resolve。
 連不上、list 非 200、roles 404 都回可讀訊息與非 0 結束碼，不丟 traceback。
+
+已簽章呼叫（#222 D4b；C-710～C-712、C-714）：只有 ``warn``／``enforce`` 模式才
+建簽章（``off`` 與 0.1.0 完全相同），私鑰照 :mod:`lgwctl.local_auth` 的檢查（root:root
+0600、一般檔、不跟隨 symlink）。root 讀不到私鑰時在 stderr 說明固定原因後**送出
+一次無簽請求**（design：沒有 signer 就是沒有 signer），**不會**先簽、失敗再改送無簽，
+也不重試。非 root 不印原因（design :262：不印原因細節或金鑰路徑內容）；enforce 下
+收到 401 時結束碼 1 並印「enforce 下需 sudo 執行」，不印額度。
 """
 
 from __future__ import annotations
 
 import sys
 
+from . import local_auth
 from lgw.client import Client
 
 WINDOWS = ("session", "weekly")
@@ -139,6 +147,50 @@ def _error(err, text: str) -> int:
     return 1
 
 
+def _signer(layout, err):
+    """依模式建管理 principal 的簽章（C-710～C-712、C-714）。
+
+    ``off``／模式讀不到或讀不懂時**不建**（與 0.1.0 完全相同，也不碰私鑰）。warn／enforce
+    下私鑰不合格就是「沒有 signer」：root 在 stderr 說明固定原因後照舊送一次無簽
+    請求；非 root 不印原因（design :262）。之後**不做**「簽章失敗再改送無簽」。
+    """
+    if layout.auth_mode() not in ("warn", "enforce"):
+        return None
+    signer, reason = local_auth.build_signer(layout)
+    if signer is None and layout.euid == 0:
+        err("llmgwctl: {0}；送出無簽請求".format(
+            local_auth.detail(reason, layout.local_admin_key_path)))
+    return signer
+
+
+def _call_error(layout, err, result, what: str, *, signed: bool) -> int | None:
+    """共同失敗分類；回結束碼，或 None 代表不是這裡處理的錯（呼叫方照舊判）。
+
+    `signed` 是「這次請求有沒有管理 principal 的簽章」：root 沒簽章又收到 401 時，
+    真正的原因是私鑰不可用（原因已印在上一行），不能說成「principal 未登記／已撤銷／
+    時鐘偏差」（#271 L-5）。
+    """
+    if result.unreachable:
+        return _error(err, "連不上本機 Gateway（unreachable）；服務沒跑或埠不對")
+    if result.error == "signer_unavailable":
+        reason = result.data.get("reason") if isinstance(result.data, dict) else None
+        return _error(
+            err, f"管理私鑰讀到了但簽章失敗（{reason or 'signer_error'}）；未送出請求")
+    if result.status == 401:
+        if layout.euid != 0:
+            # C-712：不印原因細節或金鑰路徑內容。
+            return _error(err, "enforce 下需 sudo 執行（管理 principal 只用 root 的私鑰）")
+        if not signed:
+            return _error(
+                err, f"{what} 回 401：未簽章（管理私鑰不可用，原因見上一行）")
+        return _error(
+            err,
+            f"{what} 失敗（status=401, error=unauthorized）；管理 principal 可能未登記、"
+            "已撤銷或時鐘偏差",
+        )
+    return None
+
+
 def run(layout, *, role=None, agent=None, data=None, out=None, err=None,
         client=None) -> int:
     """印出額度表；回結束碼（0 成功、1 服務錯誤、2 參數不合法）。"""
@@ -155,13 +207,18 @@ def run(layout, *, role=None, agent=None, data=None, out=None, err=None,
         err("llmgwctl: --data 只在有 --role 時有意義")
         return 2
 
+    signer = None
     if client is None:
-        client = Client(f"http://127.0.0.1:{layout.api_port()}")
+        url = f"http://127.0.0.1:{layout.api_port()}"
+        signer = _signer(layout, err)
+        # off／沒有 signer 時與 0.1.0 的呼叫形狀完全相同（不多傳關鍵字參數）。
+        client = Client(url) if signer is None else Client(url, signer=signer)
 
     listed_result = client.list()
     if not listed_result.ok:
-        if listed_result.unreachable:
-            return _error(err, "連不上本機 Gateway（unreachable）；服務沒跑或埠不對")
+        code = _call_error(layout, err, listed_result, "list", signed=signer is not None)
+        if code is not None:
+            return code
         return _error(
             err,
             f"list 失敗（status={listed_result.status}, error={listed_result.error}）",
@@ -177,8 +234,9 @@ def run(layout, *, role=None, agent=None, data=None, out=None, err=None,
 
     roles_result = client.roles(role, agent, data=data)
     if not roles_result.ok:
-        if roles_result.unreachable:
-            return _error(err, "連不上本機 Gateway（unreachable）；服務沒跑或埠不對")
+        code = _call_error(layout, err, roles_result, "roles", signed=signer is not None)
+        if code is not None:
+            return code
         if roles_result.status == 404:
             return _error(
                 err,

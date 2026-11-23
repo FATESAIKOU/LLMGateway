@@ -108,6 +108,16 @@ ENV_TUNNEL_ENV = "LGW_TUNNEL_ENV"
 ENV_KEYSYNC_STALE = "LLMGW_KEYSYNC_STALE"
 DEFAULT_KEYSYNC_STALE = 1800.0
 
+# 本機管理 principal（#222 D4b，C-710）：私鑰路徑與 key ID 的預設值寫死；測試與
+# 部署用這兩個變數覆寫（值與 lgwd 的 LGWD_AUTH_* 分開，因為這裡是「操作者端」）。
+LOCAL_ADMIN_KEY_NAME = "local-admin-signing-key"
+ENV_LOCAL_ADMIN_KEY = "LLMGW_LOCAL_ADMIN_KEY"
+ENV_LOCAL_ADMIN_KEY_ID = "LLMGW_LOCAL_ADMIN_KEY_ID"
+DEFAULT_LOCAL_ADMIN_KEY_ID = "llmgwctl-local-admin"
+#: lgwd 的認證模式（design :262；與 lgwd 同一份來源 llmgateway.env）。
+ENV_AUTH_MODE = "LGWD_AUTH_MODE"
+AUTH_MODES = ("off", "warn", "enforce")
+
 
 def parse_env_text(text: str) -> dict:
     """``KEY=VALUE`` 文字的解析（``parse_env_file`` 讀到的內容走同一套規則）。
@@ -469,6 +479,37 @@ class Layout:
 
     def tunnel_values(self) -> dict:
         return parse_env_file(self.tunnel_env_file)
+
+    def auth_mode(self) -> str:
+        """lgwd 的認證模式（``llmgateway.env`` 的 ``LGWD_AUTH_MODE``）。
+
+        沒設或空字串回 ``off``（與 lgwd 的 ``env_of``／``AuthConfig`` 預設一致）；值不
+        在 off／warn／enforce 時回 ``unknown``；**讀不到檔案回 ``unreadable``**——
+        ``llmgateway.env`` 是 ``root:llmgw 0640``，非 root 正常讀不到，把它當成
+        「沒設＝off」會讓 `check` 誤報「未啟用認證」的 ok（#271 中-1／L-4）。
+        """
+        try:
+            values = parse_env_file(self.env_file, raise_permission=True)
+        except PermissionError:
+            return "unreadable"
+        raw = values.get(ENV_AUTH_MODE)
+        if raw is None or raw.strip() == "":
+            return "off"
+        value = raw.strip().lower()
+        return value if value in AUTH_MODES else "unknown"
+
+    @property
+    def local_admin_key_path(self) -> str:
+        """本機管理 principal 的私鑰路徑（C-710；預設寫死，``LLMGW_LOCAL_ADMIN_KEY`` 可覆寫）。"""
+        override = self.env.get(ENV_LOCAL_ADMIN_KEY)
+        if override:
+            return override
+        return os.path.join(self.etc_dir, LOCAL_ADMIN_KEY_NAME)
+
+    @property
+    def local_admin_key_id(self) -> str:
+        """名冊裡對應管理私鑰的 key ID（``LLMGW_LOCAL_ADMIN_KEY_ID`` 可覆寫）。"""
+        return self.env.get(ENV_LOCAL_ADMIN_KEY_ID) or DEFAULT_LOCAL_ADMIN_KEY_ID
 
     def tunnel_configured(self) -> bool:
         values = self.tunnel_values()

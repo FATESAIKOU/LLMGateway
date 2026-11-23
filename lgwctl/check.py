@@ -10,6 +10,12 @@
   時才退回 ``GET /v1/subscriptions``（要 200）。模式由 ``current`` 的能力旗標
   （``deploy/capabilities.json``）決定；旗標損毀／讀不到時照樣以 old 探，但等級
   至少 fail／todo，detail 寫明原因。
+- ``auth-local``（#222 D4b；C-711）：本機管理 principal 的已簽章 ``list``。
+  ``off``（或沒設）→ ok 並註明未啟用認證；``llmgateway.env`` 讀不到 → todo「認證
+  模式讀不到」（不是 off）；非 root → todo「需 root 才能做已簽章檢查」且不打業務
+  端點；root 時以 :mod:`lgwctl.local_auth` 的私鑰簽章（權限不符就是沒有 signer，
+  也不改送無簽）：enforce 的 401／403／429／503 與簽章失敗為 fail、warn 一律
+  todo（warn 不拒絕，無法確認）、連不上照實 fail／todo。
 - ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``，模式以
   環境變數 ``LGW_PROBE_API_MODE`` 傳）；``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
@@ -30,7 +36,7 @@ import os
 import re
 import time
 
-from . import capability, probe, units
+from . import capability, local_auth, probe, units
 from . import run as runmod
 from .layout import KEYS_REPO, TUNNEL_SERVICE_NAME, SERVICE_NAME
 from .report import Report
@@ -185,6 +191,76 @@ def _check_list_remote(layout, report) -> None:
     report.add(level, "list-remote", detail)
 
 
+def _auth_failure_text(result) -> str:
+    """已簽章 list 失敗的一句話（固定分類；不含金鑰、簽章或 nonce）。"""
+    if result.error == "signer_unavailable":
+        reason = result.data.get("reason") if isinstance(result.data, dict) else None
+        return "簽章失敗（未送出請求）：{0}".format(reason or "signer_error")
+    if result.status == 401:
+        return "已簽章 list 回 401 unauthorized（管理 principal 未登記、已撤銷或時鐘偏差）"
+    if result.status == 403:
+        return "已簽章 list 回 403 forbidden（管理 principal 沒有 list 權限）"
+    if result.status == 429:
+        return "已簽章 list 回 429 rate_limited"
+    if result.status == 503:
+        return "已簽章 list 回 503 auth_unavailable（驗章工具或庫不可用）"
+    return "已簽章 list 失敗（status={0}, error={1}）".format(result.status, result.error)
+
+
+def _check_auth_local(layout, report) -> None:
+    """``auth-local``（C-711）：以本機管理 principal 簽章打一次 list。
+
+    判定順序（設計上的優先序：off 沒有已簽章檢查這回事，先處理）：
+
+    1. ``off``（或 ``llmgateway.env`` 沒設／空字串）→ ok「未啟用認證」，不碰私鑰；
+    2. ``llmgateway.env`` 讀不到 → todo「認證模式讀不到」（不能當成 off）；
+    3. 模式讀不懂 → todo（不假裝是 off）；
+    4. 非 root → todo「需 root 才能做已簽章檢查」，**不打業務端點**；
+    5. 私鑰不合格／讀不到 → enforce 為 fail、warn 為 todo；**不重送、不改送無簽**；
+    6. enforce：200 為 ok，401／403／429／503 與連不上為 fail；
+    7. warn：一律 todo（warn 不拒絕請求，通過也不代表管理 principal 有效）。
+    """
+    from lgw.client import Client
+
+    mode = layout.auth_mode()
+    if mode == "off":
+        report.ok("auth-local", "未啟用認證")
+        return
+    if mode == "unreadable":
+        report.todo("auth-local", "認證模式讀不到（llmgateway.env 需 root 或 llmgw 才讀得）")
+        return
+    if mode == "unknown":
+        report.todo("auth-local", "認證模式讀不懂（llmgateway.env 的 LGWD_AUTH_MODE）")
+        return
+    if layout.euid != 0:
+        report.todo("auth-local", "需 root 才能做已簽章檢查")
+        return
+    signer, reason = local_auth.build_signer(layout)
+    if signer is None:
+        # C-710／C-714：沒有 signer 就不簽、不送、不改送無簽。
+        text = local_auth.detail(reason, layout.local_admin_key_path)
+        if mode == "enforce":
+            report.fail("auth-local", text)
+        else:
+            report.todo("auth-local", text)
+        return
+    result = Client("http://127.0.0.1:{0}".format(layout.api_port()), signer=signer).list()
+    if result.ok:
+        if mode == "enforce":
+            report.ok("auth-local", "已簽章 list 200")
+        else:
+            report.todo("auth-local", "warn 模式不拒絕請求，無法確認已簽章呼叫（list 200）")
+        return
+    if result.unreachable:
+        text = "連不上本機 Gateway（unreachable）"
+    else:
+        text = _auth_failure_text(result)
+    if mode == "enforce":
+        report.fail("auth-local", text)
+    else:
+        report.todo("auth-local", text)
+
+
 def _check_keysync(layout, report) -> None:
     """``.keysync.status``（lgwd 寫的）：不存在→todo；ok:false→fail；
     ok:true 但 ts 超過 ``keysync_stale``（預設 30 分鐘，3 個 interval）→fail。"""
@@ -291,6 +367,7 @@ def run(layout, *, report: Report | None = None, no_remote: bool = False,
     if tag:
         _check_tag(layout, report, tag)
     _check_list_local(layout, report)
+    _check_auth_local(layout, report)
     if tunnel_present:
         _check_follow(layout, report, tunnel_state == "active")
         _check_list_remote(layout, report)
