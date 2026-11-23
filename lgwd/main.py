@@ -8,7 +8,7 @@
   policy 只在啟動時讀（換政策要重啟）。
 - 內建 key 拉取計時（#35 T2，見 lgwd/keysync.py）：背景執行緒每 interval 秒跑一次
   ops-scripts/key-sync；interval 0 或 script 不可用＝關閉。失敗與逾時不影響 API。
-- SIGTERM 正常關閉（含計時執行緒）。
+- SIGTERM／SIGINT 正常關閉（含計時執行緒）。
 """
 
 from __future__ import annotations
@@ -20,7 +20,9 @@ import os
 import signal
 import sys
 import threading
+import time
 from dataclasses import dataclass, replace as _dc_replace
+from .auth import AuthConfig, StartupRefused, open_runtime
 from .clock import Clock, SystemClock
 from .http import make_api_server
 from .keys import KeyFileError, KeyStore
@@ -53,6 +55,10 @@ ENV_KEYSYNC_INTERVAL = "LGW_KEYSYNC_INTERVAL"
 ENV_KEYSYNC_TIMEOUT = "LGW_KEYSYNC_TIMEOUT"
 ENV_USAGE_CLAUDE_CWD = "LGW_USAGE_CLAUDE_CWD"
 
+# 停止時最多等這麼久讓「在途請求」做完再關庫（#263 高-1）。比單一請求的內部期限
+# 長（讀 body 10 秒＋等號誌 1 秒＋驗章 2 秒＋accept 5 秒）；idle／慢連線不等。
+INFLIGHT_DRAIN_SECONDS = 20.0
+
 
 @dataclass
 class Config:
@@ -67,6 +73,7 @@ class Config:
     keysync_timeout: float = DEFAULT_KEYSYNC_TIMEOUT
     # Claude 取用量子行程的固定工作目錄（部署時事先 trust；#60）。None＝沒設定→取用量回 unknown。
     usage_claude_cwd: str | None = None
+    auth: AuthConfig = AuthConfig()
 
 
 def _parse_port(text: str) -> int:
@@ -110,6 +117,8 @@ def load_config(argv: list[str] | None = None, env=None) -> Config:
     parser.add_argument("--keysync-interval", default=None)
     parser.add_argument("--keysync-timeout", default=None)
     parser.add_argument("--usage-claude-cwd", default=None)
+    for flag in ("mode", "registry", "state-dir", "sshkeygen-path", "per-key-max", "verify-concurrency", "verify-timeout"):
+        parser.add_argument("--auth-" + flag, default=None)
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     api_host = args.api_host or env_of(ENV_API_HOST) or DEFAULT_API_HOST
@@ -138,7 +147,31 @@ def load_config(argv: list[str] | None = None, env=None) -> Config:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"bad config value: {exc}") from exc
 
+    def auth_value(name, default):
+        value = getattr(args, "auth_" + name)
+        if value is not None:
+            return value
+        return env_of("LGWD_AUTH_" + name.upper()) or default
+
+    try:
+        defaults = AuthConfig()
+        timeout = float(auth_value("verify_timeout", defaults.verify_timeout))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("auth verify timeout must be positive and finite")
+        auth = AuthConfig(
+            mode=auth_value("mode", defaults.mode),
+            registry_path=auth_value("registry", defaults.registry_path),
+            state_dir=auth_value("state_dir", defaults.state_dir),
+            sshkeygen_path=auth_value("sshkeygen_path", defaults.sshkeygen_path),
+            per_key_max=int(auth_value("per_key_max", defaults.per_key_max)),
+            verify_concurrency=int(auth_value("verify_concurrency", defaults.verify_concurrency)),
+            verify_timeout=timeout,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"bad auth config: {exc}") from exc
+
     return Config(
+        auth=auth,
         db=args.db or env_of(ENV_DB) or DEFAULT_DB,
         policy_path=args.policy or env_of(ENV_POLICY) or DEFAULT_POLICY_PATH,
         keys_path=args.keys or env_of(ENV_KEYS) or DEFAULT_KEYS_PATH,
@@ -197,11 +230,76 @@ def _stat_stamp(path: str):
     return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 
+class _Inflight:
+    """在途請求計數（#263 高-1）：數的是「已進入 handler._dispatch 的請求」。
+
+    閒置連線、只送一半標頭的連線都還沒進到 ``_dispatch``，所以不算在途——停止時
+    不必等它們（D1 的 ``daemon_threads=True`` 本來就不等）。計數器掛在 server
+    物件上（``server.inflight``），handler 進出 ``_dispatch`` 時加一減一。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._count = 0
+
+    def enter(self) -> None:
+        with self._cond:
+            self._count += 1
+
+    def leave(self) -> None:
+        with self._cond:
+            self._count -= 1
+            if self._count <= 0:
+                self._cond.notify_all()
+
+    @property
+    def count(self) -> int:
+        with self._cond:
+            return self._count
+
+    def wait_idle(self, timeout: float) -> bool:
+        """等計數歸零，最多 ``timeout`` 秒；回 True 表示歸零了。"""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._count > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return True
+
+
+def _track_inflight(server) -> _Inflight:
+    """讓 server 的 handler 在每筆請求進出 ``_dispatch`` 時計數（#263 高-1）。
+
+    不改 ``lgwd/http.py``：``make_api_server`` 每次呼叫都產生新的 handler 類別，
+    所以在這裡換成它的子類別，只影響這個 server（測試自己建的 server 不受影響）。
+    連線執行緒維持 ``daemon_threads=True``（與 D1 相同），``server_close()`` 因此
+    不會 join 閒置／慢連線的執行緒。
+    """
+    inflight = _Inflight()
+    server.inflight = inflight
+    base = server.RequestHandlerClass
+
+    class _CountedHandler(base):
+        def _dispatch(self, method):
+            tracker = self.server.inflight
+            tracker.enter()
+            try:
+                return super()._dispatch(method)
+            finally:
+                tracker.leave()
+
+    server.RequestHandlerClass = _CountedHandler
+    return inflight
+
+
 class Gateway:
     """組裝並啟停服務；請求前偵測 key 檔變動，SIGTERM 時呼叫 stop()。"""
 
     def __init__(self, config: Config, clock: Clock | None = None,
-                 usage_deps: UsageDeps | None = None):
+                 usage_deps: UsageDeps | None = None, auth_runtime=None):
+        self._auth_runtime = auth_runtime
         self._config = config
         self._clock = clock or SystemClock()
         policy = load_policy(config.policy_path)  # 不合法直接丟，服務不啟動
@@ -218,7 +316,11 @@ class Gateway:
         self._usage = self._make_usage(policy, usage_deps)
         self._service = RegistryService(config.db, policy, keys, self._clock, usage=self._usage)
         self._current = _Current(self, self._service)
-        self.api_server = make_api_server(self._current, config.api_host, config.api_port)
+        self.api_server = make_api_server(self._current, config.api_host, config.api_port,
+                                          gate=auth_runtime.gate if auth_runtime else None)
+        # 停止時只等「在途請求」，不等閒置／慢連線；連線執行緒維持 daemon
+        # （與 D1 相同，#263 高-1：設成 False 會讓 server_close() 無限期 join）。
+        self._inflight = _track_inflight(self.api_server)
         self.keysync = make_keysync(config)  # 關閉時是 None
         self._thread: threading.Thread | None = None
 
@@ -271,14 +373,23 @@ class Gateway:
         if self.keysync is not None:
             self.keysync.stop()  # 先叫停 key 拉取，再關 API
         try:
-            self.api_server.shutdown()
+            self.api_server.shutdown()  # 不再接受新連線
         except Exception:  # 關閉中出錯不擋後面
             pass
-        self.api_server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        # 最多等 N 秒讓已進來的請求做完，才關兩庫、放鎖（#263 高-1）。超過上限還在
+        # 跑的請求之後碰到已關閉的庫只會得到例外，gate 會把它轉成 UNAVAILABLE
+        # （fail-closed）；鎖在兩庫關閉之後才放，下一個 lgwd 不會同時寫庫。
+        if not self._inflight.wait_idle(INFLIGHT_DRAIN_SECONDS):
+            _LOG.warning(
+                "inflight requests still running after %.0f s, closing anyway",
+                INFLIGHT_DRAIN_SECONDS)
+        self.api_server.server_close()
         self._service.close()
+        if self._auth_runtime is not None:
+            self._auth_runtime.stop()
 
     def reload_keys(self) -> bool:
         """重讀 key 檔；失敗沿用舊的、記 log（不含值）。回 True 表示重讀成功。"""
@@ -322,26 +433,49 @@ def main(argv: list[str] | None = None) -> int:
         return int(exc.code or 0)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    runtime = None
     try:
-        gateway = Gateway(config)
+        if config.auth.mode != "off":
+            runtime = open_runtime(config.auth, SystemClock())
+            runtime.start()
+        gateway = Gateway(config, auth_runtime=runtime)
+    except StartupRefused as exc:
+        print(f"lgwd: cannot start authentication: {exc.store or ''} {exc.message}", file=sys.stderr)
+        return 78
     except (PolicyError, KeyFileError, OSError) as exc:
+        if runtime is not None:
+            runtime.stop()
         print(f"lgwd: cannot start: {exc}", file=sys.stderr)
         return 2
+    except BaseException:
+        # 低-1（#263）：其他未預期例外也要先收掉已啟動的 watcher／purge 執行緒，
+        # 再照原樣往上丟（結束碼由 Python 決定）。
+        if runtime is not None:
+            runtime.stop()
+        raise
     stop = threading.Event()
 
-    def on_term(signum, frame):
-        _LOG.info("received SIGTERM, shutting down")
+    def on_signal(signum, frame):
+        # #263 修正第 2 輪：SIGTERM 與 SIGINT 共用同一個 handler，且一路安裝到
+        # gateway.stop() 跑完、行程退出為止，**不還原預設行為**。收尾期間重複收到的
+        # 訊號只會再 set 一次事件（事件已設就什麼都不做），不會加速也不會打斷收尾
+        # ——尤其不會讓行程在鎖還沒放、兩庫還沒關時以預設處置被殺掉。
+        # 只有第一次訊號寫 log：signal handler 裡動 logging 有鎖的風險，收尾期間
+        # 越少做事越好。
+        if not stop.is_set():
+            _LOG.info("received %s, shutting down", signal.Signals(signum).name)
         stop.set()
 
-    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
     gateway.start()
     host, port = gateway.addr[:2]
     _LOG.info("serving api=%s:%s", host, port)
     try:
         while not stop.wait(0.5):
             pass
-    except KeyboardInterrupt:
-        pass
     finally:
+        # 這裡到 return 之前都不碰 signal.signal：handler 保持安裝，第二次 SIGTERM
+        # 落在收尾中時只會再 set 一次事件（見上）。
         gateway.stop()
     return 0
