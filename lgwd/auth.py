@@ -16,7 +16,9 @@
 - `AuthRuntime`：持有鎖、兩庫、watcher、verifier、purge timer 與 `AuthGate`；
   `start()`／`stop()`（停止順序見 `stop` 的 docstring，API server 的 shutdown 由 6b 在
   呼叫 `stop()` 之前做）。
-- `Verdict`／`Action`／`apply(mode, verdict)`：C-603 的模式對應只在一處。
+- `Verdict`／`Action`／`apply(mode, verdict)`：C-603 的模式對應只在一處；D3a 起
+  `Verdict` 多帶驗章時那一份 `permissions`（C-905），並新增 `forbidden` 結果與三個
+  授權 reason（C-906：enforce 403／warn 照舊／off 不呼叫）。
 - `AuthGate.authenticate(...)`：C-602 的 gate 流程，回 `Verdict`。
 - `AuthLog`：C-607 的 60 秒聚合；off 只在啟動記一行 `auth mode=off`（`http.make_api_server`）。
 
@@ -60,8 +62,9 @@ from lgwd.auth_db import (
     acquire_store_lock,
     check_store_identity,
 )
+from lgwd.auth_authz import FORBIDDEN_AGENT, FORBIDDEN_OP, FORBIDDEN_REASONS, FORBIDDEN_ROLE
 from lgwd.auth_paths import AuthPaths, auth_paths, now_seconds
-from lgwd.auth_registry import ID_PATTERN, Registry
+from lgwd.auth_registry import ID_PATTERN, PrincipalEntry, Registry
 from lgwd.auth_reload import RegistryWatcher
 from lgwd.auth_replay import ACCEPTED, DENIED, RATE_LIMITED, PurgeTimer, ReplayStore
 from lgwd.auth_trust import TrustStore
@@ -69,6 +72,7 @@ from lgwd.clock import Clock
 from lgwd.errors import (
     ApiError,
     auth_unavailable,
+    forbidden as forbidden_error,
     rate_limited,
     unauthorized,
 )
@@ -88,7 +92,10 @@ OUTCOME_PASS = "pass"
 OUTCOME_DENY = "deny"
 OUTCOME_RATE_LIMITED = "rate_limited"
 OUTCOME_UNAVAILABLE = "unavailable"
-OUTCOMES = (OUTCOME_PASS, OUTCOME_DENY, OUTCOME_RATE_LIMITED, OUTCOME_UNAVAILABLE)
+#: 已驗章（含 accept）但 principal 權限不足（D3a；設計 :152 的 403）。
+OUTCOME_FORBIDDEN = "forbidden"
+OUTCOMES = (OUTCOME_PASS, OUTCOME_DENY, OUTCOME_RATE_LIMITED, OUTCOME_UNAVAILABLE,
+            OUTCOME_FORBIDDEN)
 
 REASON_FRAMING = "framing"
 REASON_MISSING = "missing"
@@ -104,6 +111,11 @@ REASON_BUSY = "busy"
 REASON_STORE_UNAVAILABLE = "store_unavailable"
 REASON_VERIFIER_UNAVAILABLE = "verifier_unavailable"
 REASON_REGISTRY_UNAVAILABLE = "registry_unavailable"
+# 授權（D3a）：三個原因的常數在 `lgwd.auth_authz`（判斷的唯一來源），這裡只轉出同名
+# 模組常數，讓 `auth.REASON_*` 的命名維持一致。
+REASON_FORBIDDEN_OP = FORBIDDEN_OP
+REASON_FORBIDDEN_AGENT = FORBIDDEN_AGENT
+REASON_FORBIDDEN_ROLE = FORBIDDEN_ROLE
 
 #: `reason` 只能是這些值（design :154）；`pass` 時是空字串。白名單外的值不得進日誌。
 REASONS = frozenset({
@@ -121,7 +133,13 @@ REASONS = frozenset({
     REASON_STORE_UNAVAILABLE,
     REASON_VERIFIER_UNAVAILABLE,
     REASON_REGISTRY_UNAVAILABLE,
+    REASON_FORBIDDEN_OP,
+    REASON_FORBIDDEN_AGENT,
+    REASON_FORBIDDEN_ROLE,
 })
+
+#: 三個授權原因（只屬於 `forbidden` 結果；`deny` 等結果不得使用）。
+AUTHORIZATION_REASONS = frozenset(FORBIDDEN_REASONS)
 
 #: 簽章資料的固定前綴與 audience（design「線上格式」）。
 SIG_LINE_1 = "LGW-HTTP-SIG-V1"
@@ -249,22 +267,28 @@ class AuthConfig:
 
 @dataclass(frozen=True)
 class Verdict:
-    """一次請求的認證結論（C-602）。
+    """一次請求的認證／授權結論（C-602、C-906）。
 
-    - `outcome`：`pass`／`deny`／`rate_limited`／`unavailable`。
+    - `outcome`：`pass`／`deny`／`rate_limited`／`unavailable`／`forbidden`。
     - `reason`：design :154 的白名單值；`pass` 時是空字串。
-    - `principal`：只在 `pass` 有值（D3 的掛點；D2 不傳進 service，C-608）。
+    - `principal`：`pass` 與 `forbidden` 有值（都是驗章已通過的 principal；`forbidden`
+      帶它是為了 warn 的 would-deny 日誌與 D3b 的稽核，不是自稱身分）。
     - `retry_after`：只在 `rate_limited` 有值（秒）。
+    - `permissions`：只在 `pass` 有值；是驗章時那一份名冊快照的不可變
+      `PrincipalEntry`（C-905）。`authorize` 只讀這個欄位，不再讀 watcher／AuthState。
 
     建構時就驗不變式：表外的 `reason`、`pass` 帶 reason、非 `rate_limited` 帶
-    `retry_after` 都丟 `ValueError`。這樣「`Reject.kind`／`Outcome.value` 直接漏進日誌」
-    在型別層就不可能發生。
+    `retry_after`、`pass` 缺 `permissions`、`forbidden` 的原因不是三個授權原因、
+    `forbidden` 缺 principal，或非 `pass` 帶 `permissions`，都丟 `ValueError`。這樣
+    「`Reject.kind`／`Outcome.value` 直接漏進日誌」與「授權拿到別人的權限」在型別層
+    就不可能發生。
     """
 
     outcome: str
     reason: str = ""
     principal: str | None = None
     retry_after: int = 0
+    permissions: PrincipalEntry | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
@@ -274,11 +298,25 @@ class Verdict:
                 raise ValueError("a pass verdict has no reason")
             if not isinstance(self.principal, str) or not self.principal:
                 raise ValueError("a pass verdict needs a verified principal")
+            if not isinstance(self.permissions, PrincipalEntry):
+                raise ValueError("a pass verdict needs the verification-time permissions")
             if self.retry_after:
                 raise ValueError("a pass verdict has no retry_after")
             return
+        if self.outcome == OUTCOME_FORBIDDEN:
+            if self.reason not in FORBIDDEN_REASONS:
+                raise ValueError("forbidden uses one of the authorization reasons")
+            if not isinstance(self.principal, str) or not self.principal:
+                raise ValueError("a forbidden verdict carries the verified principal")
+            if self.retry_after:
+                raise ValueError("a forbidden verdict has no retry_after")
+            if self.permissions is not None:
+                raise ValueError("only a pass verdict carries permissions")
+            return
         if self.reason not in REASONS:
             raise ValueError("reason is not on the whitelist")
+        if self.reason in FORBIDDEN_REASONS:
+            raise ValueError("authorization reasons belong to the forbidden outcome")
         if self.outcome == OUTCOME_RATE_LIMITED:
             if self.reason != REASON_RATE_LIMITED:
                 raise ValueError("rate_limited uses the rate_limited reason")
@@ -288,11 +326,13 @@ class Verdict:
             raise ValueError("only rate_limited carries retry_after")
         if self.principal is not None:
             raise ValueError("only a pass verdict carries a principal")
+        if self.permissions is not None:
+            raise ValueError("only a pass verdict carries permissions")
 
 
-def passed(principal: str) -> Verdict:
-    """驗證全部通過（含 `accept` 的 ACCEPTED）。"""
-    return Verdict(OUTCOME_PASS, "", principal=principal)
+def passed(principal: str, permissions: PrincipalEntry) -> Verdict:
+    """驗證全部通過（含 `accept` 的 ACCEPTED）；帶驗章時那一份權限（C-905）。"""
+    return Verdict(OUTCOME_PASS, "", principal=principal, permissions=permissions)
 
 
 def denied(reason: str) -> Verdict:
@@ -308,6 +348,11 @@ def limited(retry_after: int) -> Verdict:
 def unavailable(reason: str) -> Verdict:
     """503 類（驗章工具、allowed_signers、庫、號誌、名冊不可用）。"""
     return Verdict(OUTCOME_UNAVAILABLE, reason)
+
+
+def forbidden(principal: str, reason: str) -> Verdict:
+    """403 類（已驗章、已 accept，但 principal 權限不足；C-902 的三個原因）。"""
+    return Verdict(OUTCOME_FORBIDDEN, reason, principal=principal)
 
 
 ACTION_CONTINUE = "continue"
@@ -345,6 +390,9 @@ def apply(mode: str, verdict: Verdict, *, route: str = "-", log: "AuthLog | None
     - `pass` → continue（warn／enforce 都一樣；off 不呼叫 gate）。
     - `deny` → enforce 401 `unauthorized`（固定 body、不加 `WWW-Authenticate`）；warn 記
       would-deny 後 continue。
+    - `forbidden`（D3a／C-906）→ enforce 403 `forbidden`（**所有授權 reason 的 body 都
+      逐 byte 相同**，不加任何標頭）；warn 記 would-deny（`outcome=forbidden`）後
+      continue，業務結果不變。
     - `rate_limited` → enforce 429 `rate_limited` 加 `Retry-After`；warn 記 would-deny 後
       continue。
     - `unavailable` → enforce 503 `auth_unavailable`；warn 記不可判定後 continue（唯一
@@ -362,6 +410,8 @@ def apply(mode: str, verdict: Verdict, *, route: str = "-", log: "AuthLog | None
         if verdict.outcome == OUTCOME_UNAVAILABLE and close_on_warn:
             return CLOSE
         return CONTINUE
+    if verdict.outcome == OUTCOME_FORBIDDEN:
+        return Action(ACTION_RESPOND, 403, forbidden_error())
     if verdict.outcome == OUTCOME_DENY:
         return Action(ACTION_RESPOND, 401, unauthorized())
     if verdict.outcome == OUTCOME_RATE_LIMITED:
@@ -648,7 +698,14 @@ class AuthGate:
         except Exception:  # 任何未預期錯誤也絕不當成 PASS
             return unavailable(REASON_STORE_UNAVAILABLE)
         if accepted.outcome == ACCEPTED:
-            return passed(entry.principal)
+            # C-905：權限來自驗章時那一份名冊快照（`registry` 是本請求 `_acquire`
+            # 取到的同一份），不是 watcher 的最新快照。
+            permissions = registry.principals.get(entry.principal)
+            if permissions is None:
+                # 名冊 parser 保證 key 的 principal 在 principals 裡；走得到這裡代表
+                # 名冊物件不一致，fail-closed（不當成 PASS）。
+                return unavailable(REASON_REGISTRY_UNAVAILABLE)
+            return passed(entry.principal, permissions)
         if accepted.outcome == RATE_LIMITED:
             return limited(accepted.retry_after)
         if accepted.outcome == DENIED:
@@ -1064,6 +1121,7 @@ __all__ = [
     "ACTION_CONTINUE",
     "ACTION_RESPOND",
     "AUDIENCE",
+    "AUTHORIZATION_REASONS",
     "AuthConfig",
     "AuthGate",
     "AuthLog",
@@ -1087,6 +1145,7 @@ __all__ = [
     "MODE_WARN",
     "OUTCOMES",
     "OUTCOME_DENY",
+    "OUTCOME_FORBIDDEN",
     "OUTCOME_PASS",
     "OUTCOME_RATE_LIMITED",
     "OUTCOME_UNAVAILABLE",
@@ -1094,6 +1153,9 @@ __all__ = [
     "REASON_BAD_SIGNATURE",
     "REASON_BUSY",
     "REASON_EXPIRED",
+    "REASON_FORBIDDEN_AGENT",
+    "REASON_FORBIDDEN_OP",
+    "REASON_FORBIDDEN_ROLE",
     "REASON_FRAMING",
     "REASON_MALFORMED",
     "REASON_MISSING",
@@ -1111,6 +1173,7 @@ __all__ = [
     "apply",
     "build_signing_message",
     "denied",
+    "forbidden",
     "limited",
     "open_runtime",
     "passed",

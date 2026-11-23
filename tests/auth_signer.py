@@ -20,9 +20,9 @@ import subprocess
 import time
 
 try:  # python3 -m pytest
-    from .auth_fakes import principal as _principal
+    from .auth_fakes import principal_all as _principal
 except ImportError:  # python3 -m unittest discover -s tests
-    from auth_fakes import principal as _principal
+    from auth_fakes import principal_all as _principal
 
 SSH_KEYGEN = "/usr/bin/ssh-keygen"
 NAMESPACE = "llmgateway"

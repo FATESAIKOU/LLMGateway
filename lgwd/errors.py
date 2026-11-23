@@ -15,6 +15,8 @@
 - 403 agent_not_allowed：agent 不在該筆的 agents 裡（resolve 的選把步驟 3 同用）
 - 403 model_not_allowed：resolve 的 model 不被任何候選的 models.allow 涵蓋
 - 403 privacy_not_allowed：resolve 宣告的 data 高於所有候選的 privacy（步驟 3.5）
+- 403 forbidden：已驗章但 principal 權限不足（#222 D3a；所有授權 reason 的 body 逐 byte
+  相同，不加任何標頭）。業務 policy 的三個 403 保留原 body，只有通過授權才會走到。
 - 401 unauthorized：應用層認證失敗（warn／enforce；所有 reason 的 body 逐 byte 相同，
   不加 WWW-Authenticate；#222 D2 PR-6）
 - 404 not_found：不存在的 id 或未知路徑（resolve 的未知 provider／未知 subscription 同用）
@@ -77,6 +79,12 @@ def model_not_allowed() -> ApiError:
 # 403：resolve 宣告的 data 高於所有候選的 privacy（隱私不足；政策拒絕，不代選）
 def privacy_not_allowed() -> ApiError:
     return ApiError(403, "privacy_not_allowed")
+
+
+# 403：已驗章但 principal 權限不足（#222 D3a；C-906）。所有授權 reason 的 body 逐 byte
+# 相同：只帶固定碼，不帶操作、agent、role 或原因。
+def forbidden() -> ApiError:
+    return ApiError(403, "forbidden")
 
 
 # 401：應用層認證失敗（#222 D2 PR-6；C-603／C-604）。所有 reason 的 body 逐 byte
