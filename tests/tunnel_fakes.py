@@ -314,7 +314,13 @@ class Relay:
 
 
 FAKE_SSH = """#!/usr/bin/env bash
-# 假 ssh：把每個 argv 以 [..] 記下；行為由 $FAKE_DIR 內的控制檔決定
+# 假 ssh：把每個 argv 以 [..] 記下；行為由 $FAKE_DIR 內的控制檔決定。
+# 探針（-W）會把 stdin 的請求行記成 `request: <請求行>`；回哪個碼看
+# `$FAKE_DIR/probe.<path-key>`（path-key＝請求路徑去掉開頭的 /、其餘 / 換成 _，
+# 例如 /healthz → healthz、/v1/subscriptions → v1_subscriptions），沒有這個檔
+# 時回落到既有的 `$FAKE_DIR/probe`（既有測試只設 probe，行為不變）。
+# 值：200（預設）、none（不回應就結束）、hang（睡 30 秒，讓呼叫方逾時）、
+# fail（ssh 直接以非 0 結束、不輸出），或其他三位數狀態碼。
 printf 'argv:' >> "${FAKE_DIR:?}/ssh.log"
 for a in "$@"; do printf ' [%s]' "$a" >> "$FAKE_DIR/ssh.log"; done
 printf '\\n' >> "$FAKE_DIR/ssh.log"
@@ -326,11 +332,20 @@ for arg in "$@"; do
     esac
 done
 if [[ "$mode" == "probe" ]]; then
-    cat > /dev/null
-    code="$(cat "$FAKE_DIR/probe" 2>/dev/null || echo 200)"
+    request="$(cat)"
+    request_line="${request%%$'\\n'*}"
+    read -r _ path _ <<< "$request_line"
+    key="${path#/}"
+    key="${key//\\//_}"
+    printf 'request: %s\\n' "$request_line" >> "$FAKE_DIR/ssh.log"
+    code_file="$FAKE_DIR/probe.$key"
+    [[ -f "$code_file" ]] || code_file="$FAKE_DIR/probe"
+    code="$(cat "$code_file" 2>/dev/null || echo 200)"
     case "$code" in
         200) printf 'HTTP/1.0 200 OK\\r\\n\\r\\n' ;;
         none) ;;
+        hang) exec sleep 30 ;;
+        fail) exit 255 ;;
         *) printf 'HTTP/1.0 %s X\\r\\n\\r\\n' "$code" ;;
     esac
     exit 0

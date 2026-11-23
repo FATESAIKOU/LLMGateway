@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # llmgateway-tunnel：伺服器端的隧道守護（design 決定 3；#221 脫鉤設計 §4）。
 # 用自己的金鑰與自己的 SSH 連線，把本機 API 埠與本機 sshd 以 reverse tunnel
-# 公開到會合點的 127.0.0.1；定時經會合點做端對端探針（GET /v1/subscriptions，
-# 只有 HTTP 200 算健康）。連線斷掉、公開失敗或連續探針失敗：同一個行程內
+# 公開到會合點的 127.0.0.1；定時經會合點做端對端探針（#246 起先打 GET /healthz：
+# new 只認 200；old 只有拿到 404 才退回 GET /v1/subscriptions，200 才算健康）。
+# 連線斷掉、公開失敗或連續探針失敗：同一個行程內
 # （受退避限制）向 GitHub 抓 MLP 的 NODE_GATEWAY 取得新位址與主機金鑰，嚴格
 # 驗證後原子寫入本機狀態並立刻重連；抓不到就保留最後已知位址、以 1 結束，
 # 由 systemd 重開（llmgateway-tunnel.service）。健康時完全不碰 GitHub。
@@ -20,6 +21,14 @@
 #     LOCAL_API=8480、PROBE_INTERVAL=60、PROBE_FAILS=3、SSH_PATH=ssh、
 #     SSH_CONNECT_TIMEOUT=10、SERVER_ALIVE_INTERVAL=30、SERVER_ALIVE_COUNT_MAX=3、
 #     FETCH_TIMEOUT=10、FETCH_MIN_INTERVAL=60、FETCH_BACKOFF_MAX=900。
+#   能力旗標（#246，探針要打哪個路徑；不是設定檔的鍵）：環境變數
+#     LGW_CAPABILITIES_FILE 指向版本目錄裡的 deploy/capabilities.json（system unit
+#     設成 /opt/llmgateway/current/deploy/capabilities.json）。沒設就是 missing，
+#     也就是 old：先探 /healthz、404 才退回 list。每次探針之前都重讀一次（只讀
+#     ≤4 KiB），不把模式快取在啟動時——upgrade 不重啟隧道，必須跟著 current 走。
+#     這個環境變數在守護程式裡被忽略（免得寫死的值凍住模式）；只有
+#     --probe-once 用它。旗標 invalid／unreadable 時每條連線只記一次
+#     capability_invalid，然後以 old 探。
 # 狀態目錄 STATE_DIR 預設 /var/lib/llmgateway（環境變數 LGW_STATE_DIR 可覆寫，測試用）。
 # token：優先讀 $CREDENTIALS_DIRECTORY/gateway-token，否則讀 GATEWAY_GITHUB_KEY_FILE；
 # 讀不到（含沒權限）只算抓取失敗（credential_unreadable、結束碼 1），不是 78。
@@ -33,18 +42,25 @@
 # unverified_retry、fetch_ok、fetch_failed、fetch_auth_failed、fetch_rate_limited、
 # fetch_invalid、fetch_skipped、follow_missing、follow_invalid、follow_regressed、
 # verified_invalid、verified_unreadable、verified_write_failed、hostkey_missing、
-# probe_fail、restart、config_missing、config_partial、spawn_fail）；
+# probe_fail、restart、config_missing、config_partial、spawn_fail、
+# capability_invalid）；
 # 不寫設定值、主機名、IP、token、不寫 ssh 的 stderr 原文。
 #
 # 用法：
 #   llmgateway-tunnel               當守護程式跑。
 #   llmgateway-tunnel --probe-once  只跑一次端對端探針就結束（給 llmgwctl check 用）：
 #                                   0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行
-#                                   （設定不能用、找不到 ssh、私用 known_hosts 未就緒）。
+#                                   （設定不能用、找不到 ssh、私用 known_hosts 未就緒、
+#                                   LGW_PROBE_API_MODE 不是恰好 old／new）。
+#                                   模式：有 LGW_PROBE_API_MODE 就用它（呼叫方明確
+#                                   指定，舊腳本會忽略這個變數）；沒有就讀
+#                                   LGW_CAPABILITIES_FILE（沒設＝old）。
 #                                   嚴格只讀：不寫任何檔、不打 GitHub、不寫 log。
 #   llmgateway-tunnel --fetch-check 人工驗 token 與 NODE_GATEWAY（單次請求）：
 #                                   0＝可用、1＝抓取或格式失敗、78＝設定不能用。
 #                                   只讀、不寫任何狀態檔、不印位址／金鑰／token。
+#   其他任何 argv 一律結束碼 2（不起守護程式、不寫檔、不寫 log、不連線）：
+#   舊版的 main() 遇到不認得的參數會直接起第二條隧道（#246 K-8 的硬化）。
 import base64
 import binascii
 import datetime
@@ -73,6 +89,8 @@ ENV_CONFIG = "LGW_TUNNEL_ENV"
 ENV_STATE_DIR = "LGW_STATE_DIR"
 ENV_API_BASE = "LGW_GATEWAY_API_BASE"
 ENV_ALLOW_INSECURE = "LGW_ALLOW_INSECURE_API_BASE"
+ENV_CAPABILITIES_FILE = "LGW_CAPABILITIES_FILE"
+ENV_PROBE_API_MODE = "LGW_PROBE_API_MODE"
 DEFAULT_STATE_DIR = "/var/lib/llmgateway"
 GITHUB_API_BASE = "https://api.github.com"
 DEFAULTS = {
@@ -96,6 +114,10 @@ EXIT_PROBE_OK = 0
 EXIT_PROBE_FAIL = 1
 EXIT_PROBE_UNAVAILABLE = 2
 PROBE_REQUEST = b"GET /v1/subscriptions HTTP/1.0\r\n\r\n"
+HEALTH_REQUEST = b"GET /healthz HTTP/1.0\r\n\r\n"
+PROBE_MODES = ("old", "new")
+CAPABILITY_MAX_BYTES = 4096
+CAPABILITY_EVENT = "capability_invalid"
 MAX_STATE_BYTES = 65536
 MAX_RESPONSE_BYTES = 65536
 RETRY_AFTER_CEILING = 3600.0
@@ -311,6 +333,118 @@ def load_config(path):
     if cfg["static"] is None and not cfg["github"] and read_follow(cfg)[0] != "ok":
         return None
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# 能力旗標（deploy/capabilities.json）：探針要用 old 還是 new（#246 K-1／K-5）
+# ---------------------------------------------------------------------------
+#
+# 規則與 lgwctl/capability.py 完全相同（T-9 用同一張向量表比對兩邊）：一般檔、
+# ≤4096 bytes、UTF-8 JSON、頂層 object 的鍵恰好是 schema 與 probe、schema 是
+# 整數 1（True 不算）、probe 是 "healthz"；其他任何形狀都是 invalid。四態
+# ok／missing／unreadable／invalid，只有 ok 是 new，其餘一律 old。開檔時跟隨
+# 路徑上的 symlink（current），但最後一段用 O_NOFOLLOW。
+
+class Capability:
+    """一次讀取的結果：``state`` 是四態之一，``mode`` 是 new／old。"""
+
+    __slots__ = ("state", "mode")
+
+    def __init__(self, state, mode):
+        self.state = state
+        self.mode = mode
+
+    def __eq__(self, other):
+        return isinstance(other, Capability) \
+            and (self.state, self.mode) == (other.state, other.mode)
+
+    def __repr__(self):
+        return "Capability(%r, %r)" % (self.state, self.mode)
+
+
+CAPABILITY_MISSING = Capability("missing", "old")
+CAPABILITY_UNREADABLE = Capability("unreadable", "old")
+CAPABILITY_INVALID = Capability("invalid", "old")
+CAPABILITY_OK = Capability("ok", "new")
+
+
+class _DuplicateKey(ValueError):
+    """JSON 物件有重複的鍵（json 預設只留最後一個，這裡一律算 invalid）。"""
+
+
+def _no_duplicate_keys(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise _DuplicateKey()
+        seen.add(key)
+    return dict(pairs)
+
+
+def parse_capability(raw):
+    """把旗標檔的位元組解析成四態（不做 I/O；與 lgwctl.capability 一致）。"""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return CAPABILITY_INVALID
+    try:
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except (ValueError, RecursionError):
+        return CAPABILITY_INVALID
+    if not isinstance(data, dict) or set(data) != {"schema", "probe"}:
+        return CAPABILITY_INVALID
+    schema = data["schema"]
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema != 1:
+        return CAPABILITY_INVALID
+    probe = data["probe"]
+    if not isinstance(probe, str) or probe != "healthz":
+        return CAPABILITY_INVALID
+    return CAPABILITY_OK
+
+
+def read_capability(path):
+    """讀旗標檔；**不丟例外**（任何問題都折成四態之一）。
+
+    ``path`` 是 None／空字串（沒設 LGW_CAPABILITIES_FILE）時算 missing，也就是
+    old——不寫死 /opt/... 當預設，免得 user 層的腳本誤讀 system 層的旗標。
+    """
+    if not path:
+        return CAPABILITY_MISSING
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return CAPABILITY_MISSING
+    except PermissionError:
+        return CAPABILITY_UNREADABLE
+    except OSError:
+        # ELOOP（最後一段是 symlink）、ENOTDIR、EACCES 以外的 OSError…
+        return CAPABILITY_INVALID
+    try:
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            return CAPABILITY_UNREADABLE
+        if not stat.S_ISREG(info.st_mode):
+            return CAPABILITY_INVALID
+        if info.st_size > CAPABILITY_MAX_BYTES:
+            return CAPABILITY_INVALID
+        try:
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                raw = fh.read(CAPABILITY_MAX_BYTES + 1)
+        except PermissionError:
+            return CAPABILITY_UNREADABLE
+        except OSError:
+            return CAPABILITY_INVALID
+    finally:
+        os.close(fd)
+    if len(raw) > CAPABILITY_MAX_BYTES:
+        return CAPABILITY_INVALID
+    return parse_capability(raw)
+
+
+def capability_path():
+    """LGW_CAPABILITIES_FILE（絕對路徑）；沒設／空字串回 None（＝missing＝old）。"""
+    return (os.environ.get(ENV_CAPABILITIES_FILE) or "").strip() or None
 
 
 # ---------------------------------------------------------------------------
@@ -687,7 +821,20 @@ def probe_argv(cfg, target):
     ] + _ssh_common(cfg, target)
 
 
-def probe_healthy(cfg, target):
+def http_status(out):
+    """回應第一行要是 ``HTTP/`` 開頭、第二個 token 是 3 位數字；否則回 None。"""
+    status_line = out.split(b"\n", 1)[0].strip()
+    parts = status_line.split()
+    if len(parts) < 2 or not parts[0].startswith(b"HTTP/"):
+        return None
+    token = parts[1]
+    if len(token) != 3 or not token.isdigit():
+        return None
+    return int(token)
+
+
+def _probe_status(cfg, target, request, timeout):
+    """送一個請求；回狀態碼或 None（連不上、逾時、格式不合）。"""
     argv = probe_argv(cfg, target)
     try:
         proc = subprocess.Popen(
@@ -697,20 +844,39 @@ def probe_healthy(cfg, target):
             stderr=subprocess.DEVNULL,
         )
     except OSError:
-        return False
-    timeout = max(2.0, min(cfg["probe_interval"], 30.0))
+        return None
     try:
-        out, _ = proc.communicate(PROBE_REQUEST, timeout=timeout)
+        out, _ = proc.communicate(request, timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             pass
+        return None
+    return http_status(out)
+
+
+def probe_healthy(cfg, target, mode):
+    """端對端探針（#246 P-2）：先 ``GET /healthz``，new 只認 200。
+
+    old 只有在拿到 404 時才第二次送 ``GET /v1/subscriptions``，200 才算健康。
+    兩次共用同一個期限（``max(2.0, min(probe_interval, 30.0))``）：第二次只能用
+    剩下的時間，剩不到 1 秒就算失敗，探針節奏不會被拉長。
+    """
+    if mode not in PROBE_MODES:
+        raise ValueError("mode 只能是 old 或 new：%r" % (mode,))
+    deadline = time.monotonic() + max(2.0, min(cfg["probe_interval"], 30.0))
+    code = _probe_status(cfg, target, HEALTH_REQUEST,
+                         deadline - time.monotonic())
+    if code == 200:
+        return True
+    if mode == "new" or code != 404:
         return False
-    status_line = out.split(b"\n", 1)[0].strip()
-    parts = status_line.split()
-    return len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1] == b"200"
+    remaining = deadline - time.monotonic()
+    if remaining < 1.0:
+        return False
+    return _probe_status(cfg, target, PROBE_REQUEST, remaining) == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1031,7 +1197,13 @@ def run_session(cfg, rt, target):
         flagged = False
         while not stop.wait(delay):
             delay = cfg["probe_interval"]
-            if probe_healthy(cfg, target):
+            # #246 K-5：每次探之前都重讀旗標（upgrade 不重啟隧道，必須跟著 current
+            # 走）；daemon 不看 LGW_PROBE_API_MODE。invalid／unreadable 時每條連線
+            # 只記一次 capability_invalid，然後以 old 探。
+            capability = read_capability(capability_path())
+            if capability.state in ("invalid", "unreadable"):
+                note(CAPABILITY_EVENT)
+            if probe_healthy(cfg, target, capability.mode):
                 fails = 0
                 if not recorded:
                     result = mark_verified(cfg, applied)
@@ -1190,7 +1362,18 @@ def daemon():
 
 def probe_once():
     """一次端對端探針；回 0＝HTTP 200、1＝不是 200 或沒回應、2＝無法執行。
-    嚴格只讀：不建立或改寫任何狀態檔、不打 GitHub、不寫 log。"""
+    嚴格只讀：不建立或改寫任何狀態檔、不打 GitHub、不寫 log。
+
+    模式（#246 K-5／K-7）：有 LGW_PROBE_API_MODE 時值必須恰好是 old 或 new
+    （呼叫方明確指定；舊腳本會忽略這個變數），其他值結束碼 2 且不做任何連線；
+    沒有時讀 LGW_CAPABILITIES_FILE（沒設＝old）。"""
+    env_mode = os.environ.get(ENV_PROBE_API_MODE)
+    if ENV_PROBE_API_MODE in os.environ:
+        if env_mode not in PROBE_MODES:
+            return EXIT_PROBE_UNAVAILABLE
+        mode = env_mode
+    else:
+        mode = read_capability(capability_path()).mode
     path = config_path()
     cfg = load_config(path) if path else None
     if cfg is None:
@@ -1200,15 +1383,20 @@ def probe_once():
     target = choose_target(cfg, write=False, notify=False)
     if target is None:
         return EXIT_PROBE_UNAVAILABLE
-    return EXIT_PROBE_OK if probe_healthy(cfg, target) else EXIT_PROBE_FAIL
+    return EXIT_PROBE_OK if probe_healthy(cfg, target, mode) else EXIT_PROBE_FAIL
 
 
 def main():
-    if sys.argv[1:] == ["--probe-once"]:
+    argv = sys.argv[1:]
+    if not argv:
+        return daemon()
+    if argv == ["--probe-once"]:
         return probe_once()
-    if sys.argv[1:] == ["--fetch-check"]:
+    if argv == ["--fetch-check"]:
         return fetch_check()
-    return daemon()
+    # #246 K-8：不認得的 argv 一律結束碼 2，不起守護程式、不寫檔、不寫 log、
+    # 不連線（舊版遇到多一個參數就會起第二條隧道）。
+    return EXIT_PROBE_UNAVAILABLE
 
 
 if __name__ == "__main__":

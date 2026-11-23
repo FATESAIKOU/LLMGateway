@@ -517,8 +517,9 @@ sudo llmgwctl follow-reset --fetch-state  # 只清 .tunnel_fetch_state 與 .tunn
     舊服務**，一律寫死 `old`。
   - `deploy/install.sh` 的 `--check`：**一律 old**（user 層是遷移前的舊佈局，
     不會跑新的認證模式）。
-  - 隧道守護：每次探針之前重讀一次這個檔（同批的另一半；在那之前守護照舊探
-    list，效果等同 old）。
+  - 隧道守護：每次探針之前重讀一次這個檔（system unit 以 `LGW_CAPABILITIES_FILE`
+    指向 `current` 的旗標；user 層沒設，一律 old）。升級後隧道尚未重啟時，仍跑
+    舊腳本、探 list（效果等同 old）；要等隧道重啟才換成新腳本（見 R-4）。
 - **旗標有問題時的反應**：`check` 的 `list-local` 會以 old 探，但等級至少
   `fail`（`invalid`）或 `todo`（`unreadable`），detail 寫「能力旗標損毀／讀不到
   （以 old 探：…）」；`upgrade`／`install` 在**切 `current` 之前**就 `fail
@@ -581,6 +582,7 @@ cat /var/lib/llmgateway/.keysync.status
 | `gateway_updated` 後反覆 `tunnel_up` 又斷 | 先查 `NODE_GATEWAY` 的 `host_key` 是否仍是上一代金鑰（7.5） |
 | `check` 的 `list-remote` 是 `todo`（`無法探`） | 探針回 `2`：設定不能用、找不到 `ssh`，或位址檔有效但私用 `.tunnel_known_hosts` 缺或不符（探針只讀，不會重寫；起守護程式一次就會重寫）。不是會合點壞掉 |
 | `check` 的 `list-remote` 是 `fail` | 經會合點不是 200：看隧道是否 active、本機 `127.0.0.1:<API 埠>` 是否 200 |
+| journal 出現 `capability_invalid` | `LGW_CAPABILITIES_FILE` 指的旗標檔損毀或讀不到：守護以 `old` 探、不會因此重建，但 `check` 會報 `list-local` fail／todo。不要手改 `deploy/capabilities.json`；確認 `current` 指到正確版本，必要時 `sudo llmgwctl upgrade`／`rollback` 重切（見 §5.12） |
 
 仍須檢查的老項目：
 
@@ -601,7 +603,7 @@ cat /var/lib/llmgateway/.keysync.status
 **狀態機（確定性，連線健康時完全不碰 GitHub）**：
 
 1. 啟動：有效的本機位址檔（`FOLLOW_FILE`）優先；沒有就用初始 `RENDEZVOUS` ＋ `KNOWN_HOSTS`（最後已知位址）直接連，不先打 GitHub。
-2. 健康期間只跑 `ssh -W` 端對端探針（`GET /v1/subscriptions` 要 200），零 GitHub 請求。（#246 起探針改成先打 `GET /healthz`，模式由能力旗標決定，見 §5.12；隧道守護那一半與 `LGW_CAPABILITIES_FILE` 同批上線，在那之前照舊探 list。）
+2. 健康期間只跑 `ssh -W` 端對端探針（`GET /v1/subscriptions` 要 200），零 GitHub 請求。（#246 起探針改成先打 `GET /healthz`，模式由能力旗標決定，見 §5.12；隧道守護每次探前重讀旗標，system unit 經 `LGW_CAPABILITIES_FILE` 指向 `current` 的旗標，user 層一律 old；升級後隧道尚未重啟時仍跑舊腳本、探 list。）
 3. `ssh` 退出、探針連續失敗達 `PROBE_FAILS`（預設 3），或完全沒有可用位址時，**同一行程內**才去抓 `NODE_GATEWAY`（`GATEWAY_SOURCE_*` 三個鍵都填才啟用）。抓取前先看持久化退避（`.tunnel_fetch_backoff`）與 `Retry-After`／`X-RateLimit-Reset`，期間記 `fetch_skipped` 不打 GitHub。
 4. 抓到後嚴格驗證（`ip`、`port`、`tunnel_user`、`host_key`、`generation`），通過才原子寫 `FOLLOW_FILE` 與私用 `.tunnel_known_hosts`，**立刻同行程重連**；首次探針 200 之後才把 `generation` 寫進 `.tunnel_generation`（已驗證水位）並把連敗歸零。
 5. 抓不到、被拒或驗證不過：寫抓取分類、保留最後已知位址，以結束碼 `1` 結束，由 systemd 10 秒後重開。
@@ -635,8 +637,24 @@ cat /var/lib/llmgateway/.keysync.status
 | 守護程式 | `0` | 收到 SIGTERM／SIGINT 正常結束 |
 | | `1` | 執行期失敗（連不上且抓不到、被拒、`ssh` 起不來…）；systemd 10 秒後重開 |
 | | `78` | 設定本身不能啟動（缺 `IDENTITY`、缺本機使用者、靜態位址與 GitHub 來源兩者皆無且沒有有效 `FOLLOW_FILE`、參數非法含 `REMOTE_SSH=off`、未授權的 API base）。unit 的 `RestartPreventExitStatus=78` 讓它**不會**反覆重開；修好設定後要手動 `systemctl restart llmgateway-tunnel` |
-| `--probe-once` | `0`／`1`／`2` | HTTP 200／不是 200 或沒回應／無法探（設定不能用、找不到 `ssh`、或 `FOLLOW_FILE` 有效但私用 `.tunnel_known_hosts` 缺或不符）。嚴格只讀：不寫檔、不打 GitHub、**不重寫** `.tunnel_known_hosts` |
+| `--probe-once` | `0`／`1`／`2` | HTTP 200／不是 200 或沒回應／無法探（設定不能用、找不到 `ssh`、`FOLLOW_FILE` 有效但私用 `.tunnel_known_hosts` 缺或不符、或 `LGW_PROBE_API_MODE` 不是恰好 `old`／`new`）。嚴格只讀：不寫檔、不打 GitHub、**不重寫** `.tunnel_known_hosts` |
 | `--fetch-check` | `0`／`1`／`78` | 可用／抓取或格式失敗（印分類，不印位址與 token）／設定不能用（沒啟用 GitHub 來源也是 `78`）。嚴格只讀、只打一次 GitHub、不寫任何狀態檔 |
+
+**探針與能力旗標（#246）**：守護程式**每次探針之前**都重讀
+`LGW_CAPABILITIES_FILE`（system unit 設為
+`/opt/llmgateway/current/deploy/capabilities.json`），決定這次要走 `new` 還是
+`old`；沒設就是 `old`（user 層與 `deploy/install.sh` 的檢查都是這樣）。
+
+- `new`：只打 `GET /healthz`；非 200（含 404）就是失敗，**不退回 list**。
+- `old`：先打 `/healthz`，**只有**拿到 404 才退回 `GET /v1/subscriptions`，200
+  才算健康。兩次請求共用同一個期限，第二次剩不到 1 秒就算失敗。
+- 旗標是 `invalid`／`unreadable` 時照樣以 `old` 探，並在**每條連線**只記一次
+  `capability_invalid`（不洗版）。旗標載體、四態與升級中的停損 SOP 見 §5.12。
+- daemon **忽略** `LGW_PROBE_API_MODE`（免得寫死的值凍住模式）；只有
+  `--probe-once` 用它：值必須恰好是 `old`／`new`，其他值結束碼 `2` 且不連線；
+  沒有這個變數時才讀旗標檔。
+- 腳本收到不認得的 argv 一律結束碼 `2`：不起守護程式、不寫檔、不寫 log、不連線
+  （舊版 `main()` 遇到多一個參數會直接起第二條隧道，搶 4710／4711）。
 
 **狀態檔（`/var/lib/llmgateway/`，`llmgw` 擁有、`0600`、不含 token）**：
 
@@ -649,7 +667,7 @@ cat /var/lib/llmgateway/.keysync.status
 | `.tunnel_fetch_backoff` | 下次允許抓取時間與連敗次數 |
 | `.tunnel_token_meta` | 最近一次成功抓取的時間與 token 到期標頭（若有） |
 
-**journal 事件**（`journalctl -u llmgateway-tunnel`；只寫固定事件名，不寫位址、IP、token 或 ssh 的 stderr）：`tunnel_up`、`probe_fail`、`restart`、`fetch_ok`、`fetch_skipped`、`fetch_failed`、`fetch_auth_failed`、`fetch_rate_limited`、`fetch_invalid`、`gateway_updated`、`gateway_reverted_to_verified`、`unverified_retry`、`follow_missing`、`follow_invalid`、`follow_regressed`、`verified_invalid`、`verified_unreadable`、`verified_write_failed`、`hostkey_missing`、`config_partial`、`config_missing`、`spawn_fail`。
+**journal 事件**（`journalctl -u llmgateway-tunnel`；只寫固定事件名，不寫位址、IP、token 或 ssh 的 stderr）：`tunnel_up`、`probe_fail`、`restart`、`capability_invalid`、`fetch_ok`、`fetch_skipped`、`fetch_failed`、`fetch_auth_failed`、`fetch_rate_limited`、`fetch_invalid`、`gateway_updated`、`gateway_reverted_to_verified`、`unverified_retry`、`follow_missing`、`follow_invalid`、`follow_regressed`、`verified_invalid`、`verified_unreadable`、`verified_write_failed`、`hostkey_missing`、`config_partial`、`config_missing`、`spawn_fail`。
 
 ### 7.2 讀取 `NODE_GATEWAY` 的 token（修訂 §1.1「不放 token 檔」）
 

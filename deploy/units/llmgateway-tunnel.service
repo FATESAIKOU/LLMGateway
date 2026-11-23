@@ -11,6 +11,8 @@ PrivateTmp=true
 User=llmgw
 # 設定檔在 /etc/llmgateway/tunnel.env（新版面）；LGW_TUNNEL_ENV 是程式的覆寫點。
 Environment=LGW_TUNNEL_ENV=/etc/llmgateway/tunnel.env
+# 能力旗標跟著 current 一起切（#246）；隧道守護每次探針前重讀，不用重啟。
+Environment=LGW_CAPABILITIES_FILE=/opt/llmgateway/current/deploy/capabilities.json
 ExecStart=/opt/llmgateway/current/ops-scripts/llmgateway-tunnel
 Restart=always
 RestartSec=10
