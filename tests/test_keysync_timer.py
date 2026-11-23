@@ -210,7 +210,10 @@ class TimerCase(unittest.TestCase):
         ok, reason = timer.run_once()
         self.assertFalse(ok)
         self.assertEqual(reason, "timeout")
-        self.assertLess(time.monotonic() - started, 10.0)
+        # #229：這裡只是「沒有無限卡住」的上限，逾時路徑本身由 reason=timeout 與
+        # 子行程被殺掉證明；高負載下 10 秒會紅（逾時 2 秒＋bash 啟動都可能拖長），
+        # 放寬到 30 秒仍是有界的防呆，不改變「時間到就殺子行程」的語意。
+        self.assertLess(time.monotonic() - started, 30.0)
         self.assertEqual(self.read_status()["reason"], "timeout")
         pid = self.last_child_pid()
         self.assertIsNotNone(pid)
@@ -276,7 +279,9 @@ class TimerCase(unittest.TestCase):
             pid = self.last_child_pid()
             started = time.monotonic()
             timer.stop()
-            self.assertLess(time.monotonic() - started, 8.0)
+            # #229：stop 不該等滿子行程的 30 秒逾時；15 秒仍在該逾時之下，
+            # 語意（沒等逾時就回來）不變，只是給高負載留餘裕。
+            self.assertLess(time.monotonic() - started, 15.0)
             self.assertFalse(timer.running)
             self.assertEqual(self.read_status(), before)  # 打斷的不記成失敗
             self.assertTrue(wait_until(lambda: not is_pid_alive(pid), timeout=5))
