@@ -20,7 +20,8 @@
 
 錯誤：一律是固定分類字串（`kind`／`reason`），訊息不含輸入值、不含公鑰全文、不含
 key ID；呼叫端（PR-4 的 status 檔、D5 的 CLI）只依這些字串分類。只 import 標準
-函式庫與 `lgwd.policy`（`AGENTS`／`ROLES` 的唯一來源）；不 import HTTP／main 模組或
+函式庫、`lgwd.auth_paths`（`MAX_GENERATION` 的唯一來源，後者只 import `lgwd.clock`）
+與 `lgwd.policy`（`AGENTS`／`ROLES` 的唯一來源）；不 import HTTP／main 模組或
 sqlite 驅動，也不做任何曲線運算（小階點用常數表，獨立推導只在測試）。
 """
 
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
+from lgwd.auth_paths import MAX_GENERATION  # `generation` 範圍的唯一來源（C-203）
 from lgwd.policy import AGENTS, ROLES
 
 #: 名冊檔大小上限（design「名冊檔格式」；C-207）。
@@ -45,9 +47,6 @@ MAX_REGISTRY_BYTES = 1024 * 1024
 
 #: 名冊 schema 版本（design G-1；改版本要升版並另審）。
 SCHEMA_VERSION = 1
-
-#: `generation` 的範圍（design：1～2^53−1；C-203）。
-MAX_GENERATION = 2**53 - 1
 
 #: principal ID 與 key ID 的格式（design「名冊檔格式」；C-203）。
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")

@@ -5,7 +5,8 @@
 
 - **lgwd 永不建庫**：`open_rw` 只用 `file:<path>?mode=rw` URI，缺檔丟 `StoreMissing`
   而且呼叫後檔案仍然不存在（不能用會靜默建空庫的 `sqlite3.connect(path)`）。
-  唯一會建庫的是 `create_stores`（給測試與 D5 的 `auth-store init`），lgwd 不呼叫它。
+  唯一會建庫的是 `create_store`（單庫）與 `create_stores`（兩庫；給測試與 D5 的
+  `auth-store init`），lgwd 的守護行程不呼叫它們。
 - **每次開啟**都設 `journal_mode=WAL`、`synchronous=FULL` 並讀回驗證，
   `isolation_level=None`；交易一律明確 `BEGIN IMMEDIATE`。
 - **單寫者**：一個 `AuthDb` 一條連線一把行程內鎖；忙碌（行程內鎖或
@@ -32,6 +33,8 @@ DEFAULT_BUSY_TIMEOUT = 5.0
 
 IDENTITY_KEY = "identity"
 IDENTITY_BYTES = 16  # 128 位元庫識別
+SCHEMA_KEY = "schema"
+META_SCHEMA_VERSION = 1  # `meta.schema`：之後改表才有依據（低-3-3）
 
 
 class StoreError(Exception):
@@ -339,6 +342,7 @@ CREATE TABLE IF NOT EXISTS snapshot (
 
 
 def _remove_store_files(path: str) -> None:
+    """刪掉這個路徑的所有檔案（主檔與 `-wal`／`-shm`）；只給「本次建出的檔」用。"""
     for name in (path, path + "-wal", path + "-shm"):
         try:
             os.unlink(name)
@@ -356,41 +360,89 @@ def _same_file_paths(trust: str, replay: str) -> bool:
         return False
 
 
+def _open_error_kind(exc: OSError) -> str:
+    """`os.open` 的 OSError 分類（沿用 `UNAVAILABLE_KINDS` 的字串）。"""
+    if exc.errno in (errno.ENOENT, errno.EACCES, errno.ENOTDIR, errno.ELOOP):
+        return "missing"
+    if exc.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+        return "full"
+    if exc.errno == errno.EIO:
+        return "io"
+    return "unknown"
+
+
+def create_store(path: str, schema: str, identity: str) -> None:
+    """以 `O_EXCL` 原子建立**一個**庫，寫 schema、庫識別與 `meta.schema`（低-3-3）。
+
+    這是全 repo 唯一一份「建庫」的實作（中-4）：`create_stores` 與 D5 的管理程式庫
+    都呼叫它，不再各寫一份 `O_EXCL`／schema／`meta` 的程式碼（分歧就會建出不一致的
+    庫）。`lgwd` 的守護行程（`main`／`http`／`auth*`）永不呼叫它。
+
+    `O_EXCL` 讓「已存在」的檢查與建檔是同一個動作，沒有「先檢查、再依 umask 建檔」
+    的窗口；已存在（含 symlink）一律 `StoreExists`。建好後才以 `mode=rw` 連上去寫
+    schema，所以失敗時呼叫端只知道「本次建出的檔」是哪幾個。
+    """
+    try:
+        fd = os.open(
+            os.fspath(path),
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except FileExistsError:
+        raise StoreExists("store already exists") from None
+    except OSError as exc:
+        raise StoreUnavailable(_open_error_kind(exc)) from None
+    os.close(fd)
+    try:
+        try:
+            conn = sqlite3.connect(
+                _uri(path, "rw"), uri=True, isolation_level=None, check_same_thread=False, timeout=0
+            )
+        except sqlite3.Error as exc:
+            raise error_from(exc) from None
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.executescript(schema)
+            conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (IDENTITY_KEY, identity))
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                (SCHEMA_KEY, str(META_SCHEMA_VERSION)),
+            )
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            raise error_from(exc) from None
+        finally:
+            conn.close()
+    except BaseException:
+        # 這個檔是本次 `O_EXCL` 建出來的：失敗就只清掉它（含 sidecar），不留半套。
+        _remove_store_files(path)
+        raise
+    os.chmod(path, 0o600)
+
+
 def create_stores(trust_path: str, replay_path: str) -> str:
     """建信任庫與防重放庫、寫同一個 128 位元隨機庫識別；回傳該識別（hex）。
 
     任一庫已存在、或兩條路徑指到同一個檔就拒絕。給測試與 D5 的 `auth-store init`
-    用；lgwd 本身永不呼叫。建立失敗會把已建出的檔案清掉，不留半套。
+    用；lgwd 本身永不呼叫。兩庫都以 `O_EXCL` 原子建檔（低-3-3）；建立失敗**只清掉
+    本次建出的檔**，既有的檔（含另一個行程搶先建好的那一庫）不動。單庫的實作只有
+    `create_store` 一份（中-4）。
     """
     trust = os.path.abspath(os.fspath(trust_path))
     replay = os.path.abspath(os.fspath(replay_path))
     if _same_file_paths(trust, replay):
         raise StoreExists("trust and replay stores must be different files")
-    for path in (trust, replay):
-        if os.path.exists(path):
-            raise StoreExists("store already exists")
     identity = os.urandom(IDENTITY_BYTES).hex()
+    created: list[str] = []
     try:
         for path, schema in ((trust, TRUST_SCHEMA), (replay, REPLAY_SCHEMA)):
-            # 契約允許的例外：只有這裡能建庫（lgwd 永不呼叫 create_stores）。
-            try:
-                conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=0)
-            except sqlite3.Error as exc:
-                raise error_from(exc) from None
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.executescript(schema)
-                conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (IDENTITY_KEY, identity))
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error as exc:
-                raise error_from(exc) from None
-            finally:
-                conn.close()
-            os.chmod(path, 0o600)
+            # 契約允許的例外：只有建庫路徑能建庫（lgwd 守護行程永不呼叫）。
+            create_store(path, schema, identity)
+            created.append(path)
     except BaseException:
-        _remove_store_files(trust)
-        _remove_store_files(replay)
+        for path in created:
+            _remove_store_files(path)
         raise
     return identity
 
@@ -471,7 +523,9 @@ __all__ = [
     "LockHandle",
     "LockUnavailable",
     "META_SCHEMA",
+    "META_SCHEMA_VERSION",
     "REPLAY_SCHEMA",
+    "SCHEMA_KEY",
     "StoreBusy",
     "StoreError",
     "StoreExists",
@@ -482,6 +536,7 @@ __all__ = [
     "acquire_store_lock",
     "check_store_identity",
     "classify_message",
+    "create_store",
     "create_stores",
     "error_from",
     "open_rw",
