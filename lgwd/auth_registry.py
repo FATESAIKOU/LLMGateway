@@ -6,6 +6,10 @@
 
 對外介面：
 - `validate_ed25519_pubkey(blob) -> bytes`：唯一的公鑰驗證函式，回傳驗證後的 32 bytes。
+- `ssh_public_key_blob(public_key32) -> bytes`：由驗證後的 32 bytes 重建規範的 OpenSSH
+  公鑰 blob（D2 PR-5 的預解析／allowed_signers 與 D5 的 fingerprint 共用這一份）。
+- `fingerprint(public_key32) -> str`：`base64(sha256(公鑰 blob))` 去掉 padding（OpenSSH
+  的 `SHA256:` fingerprint）。只 import hashlib／base64，不帶進子行程或 spool。
 - `parse_registry(raw) -> Registry`：嚴格解析 design「名冊檔格式」schema 1。
 - `read_registry_file(path, *, owner_uid=0) -> bytes`：只做檔案檢查與限量讀取，回傳原始
   bytes（不解析；內容好壞由呼叫端決定）。
@@ -142,6 +146,37 @@ def validate_ed25519_pubkey(blob: bytes) -> bytes:
     if raw in SMALL_ORDER_PUBKEYS:
         raise InvalidPublicKey(REASON_SMALL_ORDER)
     return raw
+
+
+def ssh_public_key_blob(public_key32) -> bytes:
+    """由驗證後的 32 bytes 重建規範的 OpenSSH 公鑰 blob（C-201；D2 PR-5 共用）。
+
+    `validate_ed25519_pubkey` 只接受規範編碼，所以重建的 blob 與名冊裡原本的 blob 逐
+    byte 相同；SSHSIG 的預解析用它和信封內的公鑰比對（C-501）。長度不是 32 bytes 時
+    以 `invalid_length` 拒絕。這是唯一一份實作：`lgwd.sshsig` 與 D5 的 fingerprint
+    都呼叫它，不另外再寫一份。
+    """
+    if not isinstance(public_key32, (bytes, bytearray, memoryview)):
+        raise InvalidPublicKey(REASON_INVALID_LENGTH)
+    raw = bytes(public_key32)
+    if len(raw) != 32:
+        raise InvalidPublicKey(REASON_INVALID_LENGTH)
+    return (
+        len(_ED25519_TYPE).to_bytes(4, "big")
+        + _ED25519_TYPE
+        + len(raw).to_bytes(4, "big")
+        + raw
+    )
+
+
+def fingerprint(public_key32) -> str:
+    """`base64(sha256(ssh_public_key_blob(public_key32)))` 去掉 padding（C-504）。
+
+    與 `ssh-keygen -l` 印出的 `SHA256:` 後半逐字相同（`tests/test_auth_registry.py`
+    用真的 `ssh-keygen -l` 對固定向量比對）。只依賴 hashlib 與 base64。
+    """
+    digest = hashlib.sha256(ssh_public_key_blob(public_key32)).digest()
+    return base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
 @dataclass(frozen=True)
