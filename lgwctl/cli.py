@@ -83,6 +83,29 @@ def build_parser() -> argparse.ArgumentParser:
                               "subscriptions[].agents")
     p_usage.add_argument("--data", default=None,
                          help="資料等級（public／general／real）；只在有 --role 時用")
+
+    # 認證名冊與防重放（#222 D5b；#270）。路徑由 llmgateway.env 的 LGWD_AUTH_* 推導。
+    p_auth_reg = sub.add_parser(
+        "auth-registry", help="名冊 check／install／status（#222 D5b）")
+    auth_reg = p_auth_reg.add_subparsers(dest="auth_registry_command", required=True)
+    p_auth_check = auth_reg.add_parser(
+        "check", help="離線驗名冊（公鑰、唯一性、墓碑）；--against-trust 需 root")
+    p_auth_check.add_argument("file", help="候選名冊檔")
+    p_auth_check.add_argument("--against-trust", action="store_true",
+                              help="與信任庫比對世代水位、墓碑與內容雜湊（需 root）")
+    p_auth_install = auth_reg.add_parser(
+        "install", help="原子安裝名冊並等 lgwd 載入確認（需 root；不必停 lgwd）")
+    p_auth_install.add_argument("file", help="候選名冊檔")
+    p_auth_install.add_argument("--timeout", type=float, default=30.0,
+                                help="等載入確認的秒數（預設 30）")
+    p_auth_install.add_argument("--no-wait", action="store_true",
+                                help="寫完就回 0（印明未確認載入，不得宣告撤銷完成）")
+    auth_reg.add_parser("status", help="讀 lgwd 的 status 檔（唯讀；不用 root）")
+
+    p_auth_replay = sub.add_parser(
+        "auth-replay", help="防重放庫的唯讀觀測（#222 D5b）")
+    auth_replay = p_auth_replay.add_subparsers(dest="auth_replay_command", required=True)
+    auth_replay.add_parser("status", help="列各 key 的清除水位 H（需 root；唯讀）")
     return parser
 
 
@@ -169,4 +192,9 @@ def main(argv=None, env=None) -> int:
         return sync.run(layout, report=report)
     if args.command == "usage":
         return usage.run(layout, role=args.role, agent=args.agent, data=args.data)
+    if args.command in ("auth-registry", "auth-replay"):
+        from . import auth_cli
+        if args.command == "auth-registry":
+            return auth_cli.run_registry(layout, args)
+        return auth_cli.run_replay(layout, args)
     raise AssertionError(f"unhandled command: {args.command}")

@@ -69,6 +69,30 @@ class LockUnavailable(StoreError):
     """鎖檔開不了或不能鎖（權限、唯讀檔案系統等）；與 `LockBusy` 型別不同。"""
 
 
+#: 庫處於「上次未正常關閉」的可見說法（`StoreUnclean`；唯讀一律不開這種庫）。
+UNCLEAN_STORE_MESSAGE = (
+    "庫上次未正常關閉（有 -wal、沒有 -shm）；"
+    "先啟動 lgwd 讓它回復，或在 lgwd 停止時跑寫入指令後再查"
+)
+
+
+class StoreUnclean(StoreUnavailable):
+    """有 `-wal` 卻沒有 `-shm`：上次未正常關閉（唯讀路徑直接回 2，不開庫、不建檔）。
+
+    這種狀態只有上一次 lgwd／寫入指令沒有正常結束時才會出現。唯讀者用 `mode=ro`
+    硬開時 SQLite 會替它建出 `-shm`；那會讓 lgwd 與唯讀者各用一份 WAL 索引（架構
+    實跑：已提交的資料會掉，`integrity_check` 照樣 ok）。所以 `open_ro` 直接拒絕，
+    由 lgwd 啟動（rw 開庫會回收 WAL）或管理員處理。
+
+    繼承 `StoreUnavailable`：既有的「打不開」分類（結束碼 2）照樣接得到；訊息是
+    上面那句固定的中文說明（`kind="unclean"`）。
+    """
+
+    def __init__(self):
+        StoreError.__init__(self, UNCLEAN_STORE_MESSAGE)
+        self.kind = "unclean"
+
+
 # --- 錯誤分類（design「錯誤分類」表；以訊息字串，不用 sqlite_errorcode） ---
 
 _BUSY_MESSAGES = ("database is locked", "database table is locked")
@@ -106,9 +130,13 @@ def error_from(exc: sqlite3.Error) -> StoreError:
     return StoreUnavailable(kind)
 
 
-def _uri(path: str, mode: str) -> str:
-    """`file:<path>?mode=rw|ro`；只做最小百分號編碼（`?`、`#`、`%` 不能原樣進 URI）。"""
-    return "file:{0}?mode={1}".format(quote(os.fspath(path), safe="/"), mode)
+def _uri(path: str, mode: str, *, immutable: bool = False) -> str:
+    """`file:<path>?mode=rw|ro`；只做最小百分號編碼（`?`、`#`、`%` 不能原樣進 URI）。
+
+    `immutable=True` 只給 `open_ro` 在沒有 `-wal` 的乾淨庫上用（見 `open_ro`）。
+    """
+    suffix = "&immutable=1" if immutable else ""
+    return "file:{0}?mode={1}{2}".format(quote(os.fspath(path), safe="/"), mode, suffix)
 
 
 def _path_is_absent(path: str) -> bool:
@@ -271,6 +299,42 @@ def open_rw(path: str, *, busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
         conn.close()
         raise
     return db
+
+
+def open_ro(path: str, *, busy_timeout: float = DEFAULT_BUSY_TIMEOUT) -> AuthDb:
+    """以唯讀開**既有**庫（唯一的唯讀開庫點；D5a～D5c 都用這一份）。
+
+    依開庫前的檔案狀態分三種（REPORT-270-archreview §1 的定案；`#270` 中-1）：
+
+    - **沒有 `-wal`**（lgwd 已正常停止、交易完整回寫）：`mode=ro&immutable=1`。
+      不取鎖、不建檔；lgwd 若在讀取期間剛好啟動，新交易只會寫進它自己的 `-wal`。
+    - **`-wal` 與 `-shm` 都在**（lgwd 執行中，或上次未正常結束但檔案都在）：
+      `mode=ro`。兩個檔都已存在，開庫不會建檔；`immutable=1` 會忽略 WAL 裡的
+      已提交資料（實測），所以不採用。
+    - **有 `-wal`、沒有 `-shm`（主檔存在）**：丟 `StoreUnclean`（結束碼 2），**不開庫、
+      不建檔、不刪檔、不取鎖**。用 `mode=ro` 硬開會建出 `-shm`，讓 lgwd 與唯讀者
+      各用一份 WAL 索引而掉已提交的資料（架構實跑；見 `StoreUnclean`）。主檔本身
+      不在時照舊算 `StoreMissing`（沒有庫可開，孤兒 sidecar 由寫入指令留證／收拾）。
+
+    缺檔丟 `StoreMissing`（不會把檔案建出來）。不改 `journal_mode`／`synchronous`
+    （唯一寫入者是 lgwd；唯讀連線也不能寫 PRAGMA）。
+    """
+    target = os.path.abspath(os.fspath(path))
+    wal = target + "-wal"
+    if (os.path.exists(target) and os.path.exists(wal)
+            and not os.path.exists(target + "-shm")):
+        raise StoreUnclean()
+    immutable = not os.path.exists(wal)
+    try:
+        conn = sqlite3.connect(_uri(target, "ro", immutable=immutable), uri=True,
+                               isolation_level=None, check_same_thread=False, timeout=0)
+    except sqlite3.Error as exc:
+        if classify_message(str(exc)) == "missing":
+            if _path_is_absent(target):
+                raise StoreMissing("store file is missing") from None
+            raise StoreUnavailable("missing") from None
+        raise error_from(exc) from None
+    return AuthDb(conn, path=target, busy_timeout=busy_timeout)
 
 
 # --- 兩庫的庫識別（REPORT-D2a 低-3-5；C-303／C-605） ---
@@ -531,6 +595,7 @@ __all__ = [
     "StoreExists",
     "StoreMissing",
     "StoreUnavailable",
+    "StoreUnclean",
     "TRUST_SCHEMA",
     "UNAVAILABLE_KINDS",
     "acquire_store_lock",
@@ -539,5 +604,6 @@ __all__ = [
     "create_store",
     "create_stores",
     "error_from",
+    "open_ro",
     "open_rw",
 ]
