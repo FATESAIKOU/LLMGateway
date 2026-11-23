@@ -83,8 +83,9 @@ EMPTY_TRUST_STATE = TrustState(generation=None, snapshot_raw=None, snapshot_hash
 class TrustStore:
     """信任庫的唯一讀寫介面；一個行程一條連線（`auth_db.open_rw`，lgwd 不建庫）。
 
-    寫入只有 `commit`：它在一個 `BEGIN IMMEDIATE` 交易內寫世代水位、補墓碑、換快照，
-    交易成功才把新的 `TrustState` 回給呼叫端（呼叫端據此換記憶體快照，C-402）。
+    寫入只有 `commit` 與 D5 CLI 專用的 `reset_to`（後者只差在不在交易內檢查世代
+    是否增加，見該方法的 docstring）：兩者都在一個 `BEGIN IMMEDIATE` 交易內寫世代
+    水位、補墓碑、換快照，交易成功才把新的 `TrustState` 回給呼叫端（C-402）。
     """
 
     def __init__(self, path: str | None = None, *, db: AuthDb | None = None,
@@ -186,6 +187,56 @@ class TrustStore:
             )
             # 回傳值就在交易內組出來（不再另外讀一次）：提交已經成功，這一讀若失敗會讓
             # 呼叫端誤以為沒提交、記憶體快照停在舊世代。
+            tombstones = tuple(
+                (str(row[0]), bytes(row[1]))
+                for row in cur.execute(
+                    "SELECT key_id, key FROM tombstones ORDER BY key_id"
+                ).fetchall()
+            )
+        return TrustState(registry.generation, raw, hash, tombstones)
+
+    # --- 只給 D5 CLI 的例外路徑（不改上面的世代守門） ---
+
+    def reset_to(self, registry: Registry, raw: bytes, hash: str) -> TrustState:
+        """把世代水位**與**已驗證快照在同一個交易內一起換掉；回傳新的 `TrustState`。
+
+        **這是繞過防回退的入口，只給 `auth-registry reset-generation` 用，而且只能在
+        lgwd 停止時呼叫**（呼叫端必須先取 `auth-store.lock` 的 `LOCK_EX`）。它與
+        `commit` 的差別只有一處：
+        **不檢查新世代是否大於目前水位**（reset-generation 的用途就是把誤設過高的
+        水位換回可信的較低世代），其餘完全相同——同一個交易、墓碑只
+        `INSERT OR IGNORE`、快照寫入後才回傳。
+
+        `commit` 的世代守門**不得**為了這個用途放寬：一般 reload／install 仍然只能
+        往上，否則撤銷與防回退的保證會一起失效（REPORT-D45-arch §②）。
+        """
+        if not isinstance(registry, Registry):
+            raise TypeError("registry must be a Registry")
+        raw = bytes(raw)
+        expected = content_hash(raw)
+        if hash != expected:
+            raise ValueError("content hash does not match the raw bytes")
+        with self._db.txn() as cur:
+            for key in registry.keys:
+                if key.status == "revoked":
+                    cur.execute(
+                        "INSERT OR IGNORE INTO tombstones (key_id, key) VALUES (?, ?)",
+                        (key.key_id, key.public_key),
+                    )
+            cur.execute(
+                "INSERT INTO snapshot (id, generation, content_hash, raw)"
+                " VALUES (1, ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET"
+                "  generation = excluded.generation,"
+                "  content_hash = excluded.content_hash,"
+                "  raw = excluded.raw",
+                (registry.generation, hash, raw),
+            )
+            cur.execute(
+                "INSERT INTO generation (id, generation) VALUES (1, ?)"
+                " ON CONFLICT(id) DO UPDATE SET generation = excluded.generation",
+                (registry.generation,),
+            )
             tombstones = tuple(
                 (str(row[0]), bytes(row[1]))
                 for row in cur.execute(
