@@ -295,6 +295,13 @@ CREATE INDEX IF NOT EXISTS nonces_key_ts ON nonces (key_id, ts);
 
 # 信任庫的表格由 PR-4（lgwd/auth_trust.py）使用：世代水位、撤銷墓碑、已驗證快照。
 # PR-3 只負責把它們一起建出來，兩庫寫同一個庫識別（C-303）。改動須協調 PR-4。
+#
+# PR-4 起（C-402、REPORT-D2a 低-3-4／低-3）：
+# - 墓碑只增不減，公鑰存驗證後的 32 bytes BLOB（`typeof(key) = 'blob'` ＋
+#   `length(key) = 32`），直接餵 `auth_registry.check_tombstones`；32 個字元的 TEXT
+#   也過不了。`create_stores` 用 `IF NOT EXISTS`，改動只影響新建的庫（目前沒有部署中的庫）。
+# - 世代只有一個來源：`snapshot.generation`；`generation` 表是同一交易內同步的鏡像，
+#   只給外部讀者看，lgwd 的判斷不用它。
 TRUST_SCHEMA = META_SCHEMA + """
 CREATE TABLE IF NOT EXISTS generation (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -302,7 +309,7 @@ CREATE TABLE IF NOT EXISTS generation (
 );
 CREATE TABLE IF NOT EXISTS tombstones (
     key_id TEXT PRIMARY KEY,
-    key TEXT NOT NULL
+    key BLOB NOT NULL CHECK (typeof(key) = 'blob' AND length(key) = 32)
 );
 CREATE TABLE IF NOT EXISTS snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 1),
