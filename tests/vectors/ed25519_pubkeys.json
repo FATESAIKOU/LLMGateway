@@ -1,0 +1,139 @@
+{
+  "schema": 1,
+  "note": "名冊公鑰（F1）向量：blob_b64 是 OpenSSH 公鑰 blob（string \"ssh-ed25519\" + string(32)）的標準 base64；public_key 是名冊的 public_key 欄位值。expect=ok 時 validate_ed25519_pubkey 回傳 blob 的後 32 bytes；其餘為固定拒絕原因。小階點的推導只在 tests/test_auth_registry.py 內（test-only 曲線運算），lgwd 只比常數表。私鑰不在這裡，也沒有任何私鑰被產生或保存。",
+  "public_key_vectors": [
+    {
+      "name": "valid_ed25519_a",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4N",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4N",
+      "expect": "ok",
+      "source": "docs/prototypes/sign-schemes/vectors.json public_hex"
+    },
+    {
+      "name": "valid_ed25519_b",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+      "expect": "ok",
+      "source": "RFC 8032 7.1 vector 1 public key"
+    },
+    {
+      "name": "identity_y1",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "identity_y1_plus_p",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIO7///////////////////////////////////////9/",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO7///////////////////////////////////////9/",
+      "expect": "noncanonical_y",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "zero_x_sign_bit",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACA",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACA",
+      "expect": "zero_x_with_sign_bit",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "order2_y_p_minus_1",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIOz///////////////////////////////////////9/",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOz///////////////////////////////////////9/",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "order4_x_plus_i",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "order4_x_minus_i",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACA",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACA",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "order8_a",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAICbolY/CsiewRcP0ifLvmPDV36wF08YzObE4AohtU/wF",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICbolY/CsiewRcP0ifLvmPDV36wF08YzObE4AohtU/wF",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "order8_b",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAICbolY/CsiewRcP0ifLvmPDV36wF08YzObE4AohtU/yF",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICbolY/CsiewRcP0ifLvmPDV36wF08YzObE4AohtU/yF",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "order8_c",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIMcXanA9TdhPujwLdg0QZw8qIFP6LDnMxk7H/XeSrAN6",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMcXanA9TdhPujwLdg0QZw8qIFP6LDnMxk7H/XeSrAN6",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "order8_d",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIMcXanA9TdhPujwLdg0QZw8qIFP6LDnMxk7H/XeSrAP6",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMcXanA9TdhPujwLdg0QZw8qIFP6LDnMxk7H/XeSrAP6",
+      "expect": "small_order_point",
+      "source": "docs/prototypes/sign-schemes/run_vectors.py negative cases / test-only curve derivation"
+    },
+    {
+      "name": "rsa",
+      "blob_b64": "AAAAB3NzaC1yc2EAAAADAQABAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "public_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "expect": "not_ssh_ed25519",
+      "source": "C-201"
+    },
+    {
+      "name": "ecdsa",
+      "blob_b64": "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "expect": "not_ssh_ed25519",
+      "source": "C-201"
+    },
+    {
+      "name": "sk_ed25519",
+      "blob_b64": "AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4N",
+      "public_key": "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4N",
+      "expect": "not_ssh_ed25519",
+      "source": "C-201"
+    },
+    {
+      "name": "ed25519_cert",
+      "blob_b64": "AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4NAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "public_key": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4NAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "expect": "not_ssh_ed25519",
+      "source": "C-201"
+    },
+    {
+      "name": "one_extra_byte",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4NAA==",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4NAA==",
+      "expect": "invalid_length",
+      "source": "C-201"
+    },
+    {
+      "name": "one_byte_short",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4=",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILRT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4=",
+      "expect": "invalid_length",
+      "source": "C-201"
+    },
+    {
+      "name": "key_length_31",
+      "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAH7RT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4=",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAH7RT5bhF56Z1gG0oqOaqTSdP23h6fBaSsYcAkJPBj/4=",
+      "expect": "invalid_length",
+      "source": "C-201"
+    }
+  ]
+}
