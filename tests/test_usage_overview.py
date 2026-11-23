@@ -11,7 +11,6 @@ import re
 import socket
 import tempfile
 import threading
-import time
 import unittest
 import urllib.error
 import urllib.request
@@ -37,6 +36,17 @@ UTC = _dt.timezone.utc
 USAGE_KEYS = {"status", "source", "fetched_at", "stale", "reason", "note", "session", "weekly"}
 USD_KEYS = {"weekly_used_usd", "weekly_used_usd_fetched_at"}
 ROW_KEYS = {"id", "kind"} | USAGE_KEYS | USD_KEYS
+
+
+class _HeldGate(threading.Event):
+    """只能由測試釋放的 gate：忽略 FakeFetcher 給的 `gate.wait(10)` 逾時（#229）。
+
+    牆鐘斷言（一覽在 2 秒內回來）在高負載下會紅；改成「gate 在整個呼叫期間
+    不釋放」的確定性證明：呼叫若同步等取用量完成，就會一直卡在這裡。
+    """
+
+    def wait(self, timeout=None):
+        return super().wait()
 
 
 class Harness(unittest.TestCase):
@@ -70,6 +80,34 @@ class Harness(unittest.TestCase):
 
     def row(self, summary, sub_id):
         return {item["id"]: item for item in summary["subscriptions"]}[sub_id]
+
+    def call_while_usage_blocked(self, fn, *args, **kwargs):
+        """在 fetcher 卡在 gate 時呼叫 fn（背景執行緒），回傳結果（#229）。
+
+        確定性證明「呼叫不等取用量完成」：gate 在整個呼叫期間保持未釋放，
+        fn 若同步等取用量就會卡住、join 逾時，下面的斷言轉紅；不看牆鐘秒數。
+        """
+        gate = self.fetcher.gate
+        self.assertIsNotNone(gate, "先設定 self.fetcher.gate")
+        box = {}
+
+        def target():
+            try:
+                box["value"] = fn(*args, **kwargs)
+            except BaseException as exc:      # 原樣帶回，由呼叫端決定怎麼斷言
+                box["error"] = exc
+
+        thread = threading.Thread(target=target, name="usage-blocked-call", daemon=True)
+        thread.start()
+        # addCleanup 後進先出：先登記 join、再登記 set，清理時才不會 join 在 set 之前
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(gate.set)
+        thread.join(30)
+        self.assertFalse(thread.is_alive(),
+                         "呼叫卡在取用量上：fetcher 的 gate 未釋放，代表它在等取用量完成")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
 
 
 class HttpHarness(Harness):
@@ -190,12 +228,11 @@ class CanaryTest(Harness):
 class FailureIsolationTest(Harness):
     def test_C9_卡住的取用量不拖慢一覽(self):
         service = self.build()
-        self.fetcher.gate = threading.Event()
-        self.addCleanup(self.fetcher.gate.set)   # 測試結束前放開，讓執行緒收乾淨
-        started = time.monotonic()
-        summary = service.list_usage_summary()
-        self.assertLess(time.monotonic() - started, 2.0)
-        self.assertTrue(self.fetcher.entered.wait(2))  # 確實觸發了一次
+        self.fetcher.gate = _HeldGate()
+        # 取用量卡在 gate 上；一覽仍要在這段期間內回來（否則上面會逾時轉紅）
+        summary = self.call_while_usage_blocked(service.list_usage_summary)
+        self.assertTrue(self.fetcher.entered.wait(5))  # 確實觸發了一次
+        self.assertEqual(self.fetcher.calls, 1)
         row = self.row(summary, "ollama-cloud")
         self.assertEqual((row["status"], row["reason"]), ("unknown", "not_fetched_yet"))
         self.fetcher.gate.set()

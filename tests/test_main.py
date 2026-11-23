@@ -601,7 +601,9 @@ class UsageGatewayTest(unittest.TestCase):
         grandchild = int(pidfile.read_text())
         started = time.monotonic()
         gw.stop()
-        self.assertLess(time.monotonic() - started, 15)
+        # #229：收乾淨的證明是下面「每個子行程都結束、孫行程死掉、清單為空」；
+        # 這裡只防無限卡住，高負載下 15 秒太緊，放寬到 60 秒不改變語意。
+        self.assertLess(time.monotonic() - started, 60)
         for proc in procs:
             self.assertIsNotNone(proc.poll())
         for _ in range(100):

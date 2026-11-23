@@ -9,7 +9,6 @@ import logging
 import sqlite3
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -2418,6 +2417,17 @@ CREATE TABLE IF NOT EXISTS audit (
 SHAPE = {"status", "source", "fetched_at", "stale", "reason", "note", "session", "weekly", "pipes"}
 
 
+class _HeldGate(threading.Event):
+    """只能由測試釋放的 gate：忽略 FakeFetcher 給的 `gate.wait(10)` 逾時（#229）。
+
+    牆鐘斷言（resolve 在 2 秒內回來）在高負載下會紅；改成「gate 在整個呼叫期間
+    不釋放」的確定性證明：呼叫若同步等取用量完成，就會一直卡在這裡。
+    """
+
+    def wait(self, timeout=None):
+        return super().wait()
+
+
 class UsageRegistryCase(RegistryCase):
     """真 RegistryService＋真 UsageService＋假 fetcher（#60 tasks 6.x）。"""
 
@@ -2444,6 +2454,35 @@ class UsageRegistryCase(RegistryCase):
 
     def settle(self):
         self.assertTrue(self.usage.wait_idle())
+
+    def call_while_usage_blocked(self, fn, *args, **kwargs):
+        """在 fetcher 卡在 gate 時呼叫 fn（背景執行緒），回傳 fn 的結果（#229）。
+
+        確定性證明「呼叫不等取用量完成」：gate 在整個呼叫期間保持未釋放，
+        fn 若同步等取用量就會卡住、join 逾時，下面的斷言轉紅；不看牆鐘秒數，
+        所以不受機器負載影響。fn 的例外原樣帶回給呼叫端。
+        """
+        gate = self.ollama.gate
+        self.assertIsNotNone(gate, "先設定 self.ollama.gate")
+        box = {}
+
+        def target():
+            try:
+                box["value"] = fn(*args, **kwargs)
+            except BaseException as exc:      # 原樣帶回，由呼叫端決定怎麼斷言
+                box["error"] = exc
+
+        thread = threading.Thread(target=target, name="usage-blocked-call", daemon=True)
+        thread.start()
+        # addCleanup 後進先出：先登記 join、再登記 set，清理時才不會 join 在 set 之前
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(gate.set)
+        thread.join(30)
+        self.assertFalse(thread.is_alive(),
+                         "呼叫卡在取用量上：fetcher 的 gate 未釋放，代表它在等取用量完成")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
 
     def item(self, sub):
         return _by_id(self.list_items())[sub]
@@ -2566,16 +2605,16 @@ class ListUsageTest(UsageRegistryCase):
         self.assertEqual(self.ollama.calls, 0)
 
     def test_取用量卡住時list照回_內容除usage外一致(self):
-        self.ollama.gate = threading.Event()
-        self.addCleanup(self.ollama.gate.set)
+        self.ollama.gate = _HeldGate()
         baseline = [{k: v for k, v in i.items() if k not in ("usage", "available_again_at")}
-                    for i in self.list_items()]
-        started = time.monotonic()
-        items = self.list_items()
-        self.assertLess(time.monotonic() - started, 2.0)
+                    for i in self.call_while_usage_blocked(self.list_items)]
+        # 取用量執行緒卡在 gate 上；list 仍要在這段期間內回來（否則上面會逾時轉紅）
+        items = self.call_while_usage_blocked(self.list_items)
         self.assertEqual([{k: v for k, v in i.items() if k not in ("usage", "available_again_at")}
                           for i in items], baseline)
         self.assertEqual(_by_id(items)["ollama-cloud"]["usage"]["reason"], "not_fetched_yet")
+        self.assertTrue(self.ollama.entered.wait(5))
+        self.assertEqual(self.ollama.calls, 1)      # 確實觸發了一次（不是「沒觸發所以沒卡」）
 
     def test_取用量拋例外時list照回(self):
         self.ollama.outcome = RuntimeError("boom")
@@ -2638,12 +2677,14 @@ class ResolveUsageTest(UsageRegistryCase):
         self.assertNotIn("available_again_at", res["meta"])
 
     def test_成功resolve觸發一次_不等(self):
-        self.ollama.gate = threading.Event()
-        self.addCleanup(self.ollama.gate.set)
-        started = time.monotonic()
-        for _ in range(5):
-            self.resolve("opencode", "ollama-cloud")
-        self.assertLess(time.monotonic() - started, 2.0)
+        self.ollama.gate = _HeldGate()
+
+        def resolve_five_times():
+            for _ in range(5):
+                self.resolve("opencode", "ollama-cloud")
+
+        # 取用量卡在 gate 上時 5 次 resolve 都要回來；同步等取用量就會逾時轉紅
+        self.call_while_usage_blocked(resolve_five_times)
         self.assertTrue(self.ollama.entered.wait(5))
         self.assertEqual(self.ollama.calls, 1)
 
@@ -2705,14 +2746,18 @@ class ResolveUsageTest(UsageRegistryCase):
         for broken in (RuntimeError("boom"), "hang"):
             with self.subTest(broken=repr(broken)):
                 if broken == "hang":
-                    self.ollama.gate = threading.Event()
-                    self.addCleanup(self.ollama.gate.set)
+                    self.ollama.gate = _HeldGate()
                 else:
                     self.ollama.outcome = broken
                 self.build()
-                started = time.monotonic()
-                got = self.resolve("opencode", "ollama-cloud")
-                self.assertLess(time.monotonic() - started, 2.0)
+                if broken == "hang":
+                    # 取用量卡在 gate 上：resolve 仍要回來（否則上面會逾時轉紅）
+                    calls_before = self.ollama.calls
+                    got = self.call_while_usage_blocked(
+                        self.resolve, "opencode", "ollama-cloud")
+                    self.assertEqual(self.ollama.calls, calls_before + 1)   # 卡住的取用量真的被觸發
+                else:
+                    got = self.resolve("opencode", "ollama-cloud")
                 self.assertEqual(got["env"], baseline["env"])
                 self.assertEqual({k: v for k, v in got["meta"].items() if k != "usage"},
                                  {k: v for k, v in baseline["meta"].items() if k != "usage"})
