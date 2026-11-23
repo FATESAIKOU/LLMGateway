@@ -28,30 +28,110 @@
 - cooldown(id, until, model=None) → POST /v1/subscriptions/{id}/cooldown，body
   {"until": RFC 3339 UTC}（有給 model 時多一個 "model"）；成功 204。model 是供應商
   自己的模型 id（不帶 agent 前綴）；沒有 model 即整把冷卻。
-- 沒有應用層認證（design 決定 5a），所以不帶任何認證標頭。
+- 應用層認證依模式（#222 D4a）：`Client(..., signer=...)` 給一個
+  `lgw.signer.Signer` 就對五個方法都簽（五個 `X-LGW-*` 標頭）；`signer=None`
+  （預設）不帶任何認證標頭，行為與 0.1.0 相同（off 相容）。
+  - 簽的是**實際送出**的 request-target（`request.selector`：`urllib.parse.quote`
+    之後、含 query，**也含 base_url 的路徑前綴**，例如 base_url 是
+    `http://host/prefix` 時簽 `/prefix/v1/subscriptions`）與 **實際送出**的 body
+    bytes（只 `json.dumps` 一次；GET 為空 bytes）。
+  - signer 出錯（找不到 ssh-keygen、逾時、私鑰有密語、armor 不是 180 bytes）回
+    `Result(ok=False, error="signer_unavailable", data={"reason": ...})`，**不送出**
+    任何請求，也不改送無簽版本。
+  - `signer=None` 與有 signer 都**不跟隨 redirect**（3xx 原樣回 `error="redirect"`，
+    這是 0.2.0 的行為變更）；401 也不改送無簽請求、任何錯誤都不自動重試。
 - 回 Result：ok、status、data、error、unreachable。連不上或逾時回 unreachable=True、
   不丟例外；400／403／404／409 照實回狀態碼與 error。error 可能是：
   - 服務回的碼：bad_request｜invalid_until｜until_out_of_range｜
     agent_not_allowed｜model_not_allowed｜privacy_not_allowed｜no_model｜not_found｜
     not_deployed｜no_candidate｜body_too_large；
+  - 認證（C-706）：401 `unauthorized`（data 另含 `server_date` 與
+    `clock_skew_s`＝伺服器 Date 減本機時間，供呼叫方提示可能時鐘偏差，client 不自動
+    調時）｜403 `forbidden`｜429 `rate_limited`（data 的 `retry_after` 是
+    `Retry-After` 的整數秒）｜503 `auth_unavailable`；
   - cooling：**只有舊版 Gateway 會回**（legacy；新 Gateway 不再因冷卻拒絕，200 的
     meta 帶 cooldown／model_cooldowns 當提示）。本 client 對它照實回狀態碼與 until，
     呼叫方要保留判讀；
   - resolve 的非 2xx 回覆把 body 裡 error 以外的欄位（until、missing）放進
     Result.data（錯誤回覆沒有 env）；
-  - 客戶端判讀的：unreachable（連不上或逾時）｜bad_response（回覆不是 JSON 物件）。
+  - 客戶端判讀的：unreachable（連不上或逾時）｜bad_response（回覆不是 JSON 物件）｜
+    redirect（3xx，不跟隨）｜signer_unavailable（簽章失敗，未送出）。
 - Result 的 repr 不印 data（resolve 的 env 有憑證值）；不要 log／print 整個 Result。
-- 只用標準函式庫（urllib）；不引用 subprocess、herdr、agora。
+- 只用標準函式庫（urllib）；不引用 subprocess、herdr、agora（簽章子行程在
+  `lgw.signer`，由呼叫方注入）。
 """
 
 from __future__ import annotations
 
+import email.utils
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import timezone
 from http.client import HTTPException
+
+from .signer import SignerError
+
+#: 伺服器狀態碼對應的固定 error（body 沒有 error 時使用；C-706）。
+_STATUS_ERRORS = {
+    401: "unauthorized",
+    403: "forbidden",
+    429: "rate_limited",
+    503: "auth_unavailable",
+}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟隨 redirect：3xx 交給 `_finish` 原樣回（C-705，所有呼叫都適用）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _server_clock(headers) -> dict:
+    """401 的 `server_date`／`clock_skew_s`（伺服器 Date 減本機時間）。
+
+    讀不到或解析不了 Date 時兩個都是 None；client 不自動調時（C-706）。
+    """
+    raw = headers.get("Date") if headers is not None else None
+    local_now = int(time.time())
+    if not raw:
+        return {"server_date": None, "clock_skew_s": None}
+    try:
+        parsed = email.utils.parsedate_to_datetime(str(raw))
+    except (TypeError, ValueError):
+        return {"server_date": str(raw), "clock_skew_s": None}
+    if parsed is None:
+        return {"server_date": str(raw), "clock_skew_s": None}
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return {"server_date": str(raw), "clock_skew_s": int(parsed.timestamp()) - local_now}
+
+
+def _retry_after(headers, body: dict):
+    """429 的 `Retry-After`（整數秒）；沒有或不是整數時退回 body 的值，再不行是 None。"""
+    raw = headers.get("Retry-After") if headers is not None else None
+    if raw is not None:
+        try:
+            return int(str(raw).strip())
+        except ValueError:
+            pass
+    value = body.get("retry_after")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _status_data(status: int, headers, body: dict) -> dict:
+    """依狀態碼附上呼叫方需要的欄位（C-706）。"""
+    if status == 401:
+        return _server_clock(headers)
+    if status == 429:
+        return {"retry_after": _retry_after(headers, body)}
+    return {}
 
 
 @dataclass
@@ -74,11 +154,17 @@ class Client:
     """只用 urllib 打五個呼叫（list／usage／resolve／登錄冷卻／roles）；網路問題一律回 unreachable，不丟例外。
 
     base_url 不得含憑證；v0 只傳 loopback URL（例如 http://127.0.0.1:4710）。
+    base_url 可以帶路徑前綴（例如反向代理的 `http://127.0.0.1:4710/lgw`）：前綴
+    也算在簽的 request-target 裡（簽的是 urllib 實際送出的 `request.selector`）。
     """
 
-    def __init__(self, base_url: str, timeout: float = 10):
+    def __init__(self, base_url: str, timeout: float = 10, *,
+                 signer=None):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._signer = signer
+        # signer=None 也一樣不跟隨 redirect（C-705；0.2.0 的變更）。
+        self._opener = urllib.request.build_opener(_NoRedirect())
 
     def __repr__(self) -> str:
         return "Client(base_url={0!r}, timeout={1!r})".format(
@@ -90,45 +176,73 @@ class Client:
     def _send(self, method: str, path: str, body: dict | None,
               error_data: bool = False) -> Result:
         url = self._base_url + path
-        headers: dict[str, str] = {}  # 無應用層認證，不帶任何認證標頭
         data = None
         if body is not None:
+            # 只序列化一次：簽的 bytes 就是送出的 bytes（C-702）。
             data = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # 先建 Request，再簽它的 selector：那是 urllib 實際送出的 request-target
+        # （含 base_url 的路徑前綴與 query），簽的與送的同源（C-702）。
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if self._signer is not None:
+            # 簽章失敗不送出任何請求，也不改送無簽（C-705）；分類固定、不含祕密。
+            try:
+                signature = self._signer.headers(
+                    method=method, target=req.selector,
+                    body=data if data is not None else b"")
+            except SignerError as exc:
+                return Result(ok=False, error="signer_unavailable",
+                              data={"reason": exc.reason})
+            except Exception:
+                return Result(ok=False, error="signer_unavailable",
+                              data={"reason": "signer_error"})
+            for name, value in signature.items():
+                req.add_header(name, value)
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                return self._finish(resp.status, resp.read(), error_data)
+            with self._opener.open(req, timeout=self._timeout) as resp:
+                return self._finish(resp.status, resp.read(), error_data, resp.headers)
         except urllib.error.HTTPError as exc:  # 非 2xx：讀 body 再判（先於 URLError 接）
             try:
                 payload = exc.read()
             except Exception:
                 payload = b""
-            return self._finish(exc.code, payload, error_data)
+            return self._finish(exc.code, payload, error_data, exc.headers)
         except (urllib.error.URLError, OSError, HTTPException):
             return Result(ok=False, unreachable=True, error="unreachable")
 
     @staticmethod
-    def _finish(status: int, payload: bytes, error_data: bool = False) -> Result:
+    def _finish(status: int, payload: bytes, error_data: bool = False,
+                headers=None) -> Result:
+        if 300 <= status < 400:
+            # 不跟隨 redirect：3xx 原樣回（C-705）；不讀 Location、不重送簽章。
+            return Result(ok=False, status=status, error="redirect")
         try:
             text = payload.decode("utf-8") if payload.strip() else ""
             body = json.loads(text) if text else {}
         except (UnicodeDecodeError, ValueError):
-            return Result(ok=False, status=status, error="bad_response")
+            return Result(ok=False, status=status,
+                          error=_STATUS_ERRORS.get(status, "bad_response"),
+                          data=_status_data(status, headers, {}))
         if not isinstance(body, dict):
-            return Result(ok=False, status=status, error="bad_response")
+            return Result(ok=False, status=status,
+                          error=_STATUS_ERRORS.get(status, "bad_response"),
+                          data=_status_data(status, headers, {}))
         if 200 <= status < 300 and "error" not in body:
             return Result(ok=True, status=status, data=body)
         # 400／403／404／409：狀態碼與錯誤碼照實回（不重寫成拒絕理由）。
-        # resolve 另留呼叫方要用的欄位（until、missing）；env 不放（錯誤回覆沒有）。
-        data = {}
+        # 認證類（401／403／429／503）沿用伺服器回的 error；body 沒有時用固定值。
+        data = _status_data(status, headers, body)
         if error_data:
-            data = {
+            # resolve 另留呼叫方要用的欄位（until、missing）；env 不放（錯誤回覆沒有）。
+            data.update({
                 name: value for name, value in body.items()
                 if name not in ("error", "env")
-            }
-        return Result(ok=False, status=status, data=data,
-                      error=str(body.get("error", status)))
+            })
+        error = body.get("error")
+        if error is None:
+            error = _STATUS_ERRORS.get(status, status)
+        return Result(ok=False, status=status, data=data, error=str(error))
 
     # --- 公開 API（design 決定 6 的路徑） ---
 
