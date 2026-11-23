@@ -906,3 +906,29 @@ repo 側的舊靜態鍵文件與腳本殘留，另開 d 單清理；清理前不
    ```
 3. 舊版升級依賴 `deploy/install.sh --tag <tag>`，無自動 policy dry-run 與 rollback 機制。
 4. 解密密碼存放於 `~/.config/llmgateway/keysync.env`（0600，llmgw 自有）。
+
+### 應用層認證設定
+
+`lgwd` 的認證設定以命令列優先，其次是環境變數，最後是預設值；路徑須為絕對路徑。
+
+| 旗標 | 環境變數 | 預設值 |
+| --- | --- | --- |
+| `--auth-mode` | `LGWD_AUTH_MODE` | `off`（另有 `warn`、`enforce`） |
+| `--auth-registry` | `LGWD_AUTH_REGISTRY` | `/etc/llmgateway/auth-registry.json` |
+| `--auth-state-dir` | `LGWD_AUTH_STATE_DIR` | `/var/lib/llmgateway` |
+| `--auth-sshkeygen-path` | `LGWD_AUTH_SSHKEYGEN_PATH` | `/usr/bin/ssh-keygen` |
+| `--auth-per-key-max` | `LGWD_AUTH_PER_KEY_MAX` | `600`（正整數） |
+| `--auth-verify-concurrency` | `LGWD_AUTH_VERIFY_CONCURRENCY` | `16`（1 至 32） |
+| `--auth-verify-timeout` | `LGWD_AUTH_VERIFY_TIMEOUT` | `2` 秒（正有限數） |
+
+`off` 不啟用認證；`warn` 記錄認證結果並維持原業務行為；`enforce` 要求認證。
+設定錯誤以 2 結束，認證啟動被拒絕以 78 結束。兩庫與鎖檔路徑由狀態目錄推導，
+服務不自行建立認證庫。庫或鎖在 warn 啟動時不可用，修復後須重啟服務。
+
+停止（SIGTERM／SIGINT）時先不再接受新連線，最多等 20 秒讓已進來的請求做完，再關閉
+兩個認證庫並釋放鎖。閒置連線與只送了一半標頭的連線不會讓停止卡住，第二次
+SIGTERM／SIGINT 也不會加速或打斷收尾：兩個訊號共用同一個 handler，而且從註冊後
+一路安裝到停止流程跑完、行程要退出之前，都不還原預設處置；重複的訊號只是再設一次
+停止事件。unit 的 `TimeoutStopSec`（沒設定時 systemd 預設 90 秒）不得小於 30 秒。
+handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）收到 SIGTERM 會照預設
+行為立刻結束，鎖由作業系統釋放，SQLite 的 WAL 不受影響。
