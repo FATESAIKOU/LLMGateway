@@ -1,0 +1,23 @@
+{
+  "request": {
+    "audience": "llmgateway",
+    "key_id": "test-key-236",
+    "timestamp": "1795392000",
+    "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "method": "GET",
+    "target": "/v1/resolve?a=1&b=2",
+    "body_hex": ""
+  },
+  "signing_data": "LGW-HTTP-SIG-V1\nllmgateway\ntest-key-236\n1795392000\nAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\nGET\n/v1/resolve?a=1&b=2\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+  "public_hex": "b453e5b845e7a675806d28a8e6aa4d274fdb787a7c1692b187009093c18ffe0d",
+  "signature_hex": "92f0ac841934fb5b9b5d9dd459a486a280836e0118d1e38f5390ae6c08bd15fd24a963d037d7dda0078f511ac9e41befcd3aeb760a39c980e6255c4c36a72f08",
+  "negative_cases": [
+    "signature bit",
+    "audience",
+    "method",
+    "query order",
+    "body",
+    "namespace (SSHSIG)",
+    "duplicate headers (HTTP layer specification only)"
+  ]
+}
