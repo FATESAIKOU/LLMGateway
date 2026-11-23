@@ -266,6 +266,37 @@ c.cooldown("opencode-zen", "2026-10-18T15:00:00Z",    # 只冷卻一個模型
            model="mimo-v2.6-flash-free")
 ```
 
+`lgw` 0.2.0（#222 D4a）起可以簽章（服務端 warn／enforce 時需要）：
+
+```python
+from lgw import client, signer
+
+s = signer.Signer(key_id="<名冊的 key ID>",
+                  private_key_path="<OpenSSH 私鑰檔>")   # 私鑰檔
+# 或：公鑰檔＋ssh-agent
+# s = signer.Signer(key_id="<名冊的 key ID>", public_key_path="<公鑰檔>",
+#                   agent_sock=os.environ["SSH_AUTH_SOCK"])
+
+c = client.Client("http://127.0.0.1:4710", signer=s)
+c.list()
+```
+
+- 簽的是**實際送出**的 request-target（含 query，**也含 base_url 的路徑前綴**）與
+  **body bytes**；五個 `X-LGW-*` 標頭一次簽好，GET 也簽（空 body 的 SHA-256）。
+- `signer=None` 時行為與 0.1.0 相同（不帶認證標頭）；只多了**不跟隨 redirect**
+  （3xx 原樣回 `error="redirect"`），所有呼叫都適用，這是 0.2.0 的行為變更。
+- 簽章失敗（找不到 `ssh-keygen`、逾時、私鑰有密語、簽章長度不是 240 字元）回
+  `Result(ok=False, error="signer_unavailable")`，**不送出**、也不改送無簽版本。
+- 認證錯誤：401 `unauthorized`（`data` 另附 `server_date` 與 `clock_skew_s`，只提示
+  可能時鐘偏差，不自動調時）、403 `forbidden`、429 `rate_limited`
+  （`data["retry_after"]` 是整數秒）、503 `auth_unavailable`。client **不自動重試**；
+  要重試就整個重新呼叫（新的 nonce）。
+- 另一個 0.2.0 的行為變更（#266 架構審 低-1）：`signer=None` 時，401／403／429／503
+  且回覆不是 JSON 物件或沒有 `error` 鍵，`error` 現在是上列的固定字串（0.1.0 是
+  `bad_response` 或狀態碼字串），`data` 另含 `server_date`／`clock_skew_s`／
+  `retry_after`。狀態碼本身不變，呼叫方若只比對 `ok`／`status` 不受影響。
+- 私鑰只由本機 `ssh-keygen -Y sign -n llmgateway` 使用；`lgw` 不新增 Python 相依。
+
 ---
 
 ## 5. 日常維運與管理指令

@@ -55,7 +55,7 @@ class PyprojectTest(unittest.TestCase):
     def test_project_fields(self):
         project = self.data["project"]
         self.assertEqual(project["name"], "lgw")
-        self.assertEqual(project["version"], "0.1.0")
+        self.assertEqual(project["version"], "0.2.0")
         self.assertEqual(project["requires-python"], ">=3.10")
         self.assertEqual(project.get("dependencies", []), [])
 
