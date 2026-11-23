@@ -44,6 +44,8 @@ import contextlib
 import json
 import os
 import re
+import shutil
+import syslog
 import tempfile
 from dataclasses import dataclass
 from typing import Iterable, Mapping
@@ -422,6 +424,148 @@ def store_write_lock(paths: AuthPaths, owner: Owner | None = None, *,
             handle.release()
 
 
+#: 名冊 install 自己的一把鎖（與 store flock 分開；寫名冊的指令依序取這兩把）。
+INSTALL_LOCK_NAME = "auth-registry-install.lock"
+
+#: 「現在不能做」的 `StoreUnavailable.kind`：權限／唯讀（存在但打不開）。其他
+#: （corrupt／unknown／io／full）交給後面的健康判斷，不擋修復指令（#274 fix1 中-2）。
+_ABORT_UNAVAILABLE_KINDS = frozenset({"readonly", "missing"})
+#: 副本探測判定「原檔回收不了」的 `StoreUnavailable.kind`（一律不中止）。
+_UNRECOVERABLE_KINDS = frozenset({"corrupt", "unknown", "io", "full"})
+
+
+def chown_root_owned(path: str) -> None:
+    """把檔改成 `root:root`（install 鎖的唯一一份實作；`O_NOFOLLOW`）。
+
+    `install` 與 `reset-generation` 都要讓 `auth-registry-install.lock` 是
+    `root:root 0600`（REPORT-270-archreview §3 低-2）：lgwd 被攻破時不能霸占這把鎖。
+    開不了／chown 失敗是 `OSError`，由呼叫端決定是否吞掉。
+    """
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fchown(fd, 0, 0)
+    finally:
+        os.close(fd)
+
+
+def _probe_recoverable(path: str, state_dir: str) -> bool:
+    """在**副本**上試著用 `open_rw` 回收 WAL（原檔與 `-wal` 完全不動）。
+
+    回 `True`：原檔可回收（呼叫端再對原檔跑一次 `open_rw`）。
+    回 `False`：SQLite 判為損毀／未知／I/O 類；原檔留在原狀，交給後面的健康判斷
+    當成損毀，連同 `-wal` 改名 `.broken-<時刻>` 留證後重建。
+    忙碌、權限／唯讀類與 `StoreMissing` 照原樣往上丟（呼叫端轉成「現在不能做」）。
+    """
+    with tempfile.TemporaryDirectory(prefix=".auth-recover-", dir=state_dir) as tmp:
+        copy = os.path.join(tmp, "probe.sqlite")
+        shutil.copyfile(path, copy)
+        shutil.copyfile(path + "-wal", copy + "-wal")
+        try:
+            db = open_rw(copy)
+        except StoreBusy:
+            raise
+        except StoreMissing:
+            raise
+        except StoreUnavailable as exc:
+            if exc.kind in _UNRECOVERABLE_KINDS:
+                return False
+            raise
+        else:
+            db.close()
+            return True
+
+
+def _recover_unclean(paths: AuthPaths) -> None:
+    """持 store flock 回收未正常關閉的 WAL（D5c 前置檢查；#274 fix1 中-2）。
+
+    只有「主檔在、有 `-wal`、沒有 `-shm`」才動作。先用**副本**判斷原檔可不可以回收
+    （原檔與 `-wal` 不碰）：可回收才對原檔跑 `open_rw`，讓 SQLite 回放 WAL 並清掉
+    sidecar。判定損毀／未知／I/O 類時**不中止**、不改名——交給後面的健康判斷，讓
+    `recover-store`／`rebuild-trust` 把壞庫連同 `-wal` 一起改名 `.broken-<時刻>`
+    留證後重建（D5a 既有流程）；只有忙碌與權限／唯讀類（`readonly`、`missing`）才
+    以 2 結束。健康而且只是沒正常關閉的庫照舊被回收，不會被當成損毀（C-829）。
+    """
+    for path in (paths.trust_db, paths.replay_db):
+        wal, shm = sqlite_sidecars(path)
+        if not (os.path.exists(path) and os.path.exists(wal) and not os.path.exists(shm)):
+            continue
+        try:
+            recoverable = _probe_recoverable(path, paths.state_dir)
+        except StoreMissing:
+            # 檔案在檢查與複製之間消失：不再是不正常關閉，交給健康判斷。
+            continue
+        except StoreBusy as exc:
+            raise _store_admin_error(
+                exc, exit_code=2, hint="WAL 回收失敗：庫忙碌，稍後再試"
+            ) from None
+        except StoreUnavailable as exc:
+            if exc.kind in _ABORT_UNAVAILABLE_KINDS:
+                raise _store_admin_error(
+                    exc, exit_code=2, hint="WAL 回收失敗：檢查庫與權限"
+                ) from None
+            continue
+        except FileNotFoundError:
+            # 主檔或 `-wal` 在檢查與複製之間消失：不再是不正常關閉。
+            continue
+        except OSError:
+            raise AdminError(
+                KIND_STORE_UNAVAILABLE,
+                "無法建立 WAL 回收前的副本",
+                exit_code=2,
+                hint="檢查 auth_state_dir 的空間與權限",
+            ) from None
+        if not recoverable:
+            continue
+        try:
+            db = open_rw(path)
+            try:
+                db.read("SELECT name FROM sqlite_master LIMIT 1")
+            finally:
+                db.close()
+        except StoreMissing:
+            continue
+        except StoreBusy as exc:
+            raise _store_admin_error(
+                exc, exit_code=2, hint="WAL 回收失敗：庫忙碌，稍後再試"
+            ) from None
+        except StoreUnavailable as exc:
+            if exc.kind in _ABORT_UNAVAILABLE_KINDS:
+                raise _store_admin_error(
+                    exc, exit_code=2, hint="WAL 回收失敗：檢查庫與權限"
+                ) from None
+            # 副本可回收、原檔卻失敗：交給健康判斷（不擋修復）。
+            continue
+
+
+@contextlib.contextmanager
+def _install_lock(paths: AuthPaths, *, root_owned: bool = False):
+    """取名冊 install 鎖（`LOCK_EX|LOCK_NB`）；拿不到就是 `lock_busy`、結束碼 2。
+
+    呼叫端必須**先**持有 store flock（`with store_write_lock(...), _install_lock(...)`）：
+    固定順序「store flock → install 鎖」，install 只取 install 鎖，所以不會死鎖
+    （REPORT-270-archreview §3）。`root_owned=True`（正式機、非 prefix）時把鎖檔
+    補成 `root:root`，與 `install` 對齊（#274 fix1 agy 低-1）。
+    """
+    try:
+        lock = acquire_store_lock(os.path.join(paths.state_dir, INSTALL_LOCK_NAME))
+    except (LockBusy, LockUnavailable):
+        raise AdminError(
+            KIND_LOCK_BUSY,
+            "名冊 install 鎖不可用（另一個名冊操作正在進行）",
+            exit_code=2,
+            hint="等另一個 install／reset-generation 結束",
+        ) from None
+    try:
+        if root_owned:
+            try:
+                chown_root_owned(lock.path)
+            except OSError:
+                pass   # 擁有者不影響本指令；正式機會在下一次操作再試
+        yield
+    finally:
+        lock.release()
+
+
 # --- 審計（C-807） ---
 
 _MISSING = object()
@@ -455,7 +599,8 @@ class AuditLog:
     欄位固定：`time`（Unix 秒）、`uid`、`sudo_user`、`command`、`args`、`old`、
     `new`。舊／新值只放世代、雜湊、key ID、`H` 與庫識別；`_redact` 會擋下公鑰行
     （含空白）與任何 bytes。寫入是 `O_APPEND` 的一次 `write()`，所以多個行程同時
-    附加也不會交錯（單筆遠小於 PIPE_BUF）。
+    附加也不會交錯（單筆遠小於 PIPE_BUF）。同一份 JSON 也寫進 journal
+    （`ident=llmgwctl-auth`、`facility=LOG_AUTHPRIV`；#274 fix1 低-1）。
     """
 
     def __init__(self, path: str, *, clock: Clock, uid: int | None = None,
@@ -505,6 +650,10 @@ class AuditLog:
             raise AdminError(KIND_AUDIT_FAILED, "審計檔寫入失敗", exit_code=2) from None
         finally:
             os.close(fd)
+        # journal 的 ident 與 facility（#274 fix1 低-1）：審計屬安全歸責，進受限的
+        # authpriv 流，方便 `journalctl -t llmgwctl-auth` 查；內容與檔案那一份相同。
+        syslog.openlog("llmgwctl-auth", 0, syslog.LOG_AUTHPRIV)
+        syslog.syslog(syslog.LOG_NOTICE, payload.decode("utf-8").rstrip("\n"))
         return record
 
 
@@ -741,6 +890,7 @@ def recover_replay(paths: AuthPaths, *, clock: Clock, audit: AuditLog,
       設為 `now ＋ 60`（= 時窗）；墓碑與世代水位完全不動（W-D11）。
     """
     with store_write_lock(paths, owner):
+        _recover_unclean(paths)
         try:
             trust_identity, trust_state = _read_trust(paths)
         except (StoreMissing, StoreUnavailable) as exc:
@@ -845,8 +995,10 @@ def _read_trust_for_rebuild(
     給「降世代」判斷與墓碑搬移用。
 
     全程經 `auth_db.open_ro`、不取 store flock（呼叫端已持鎖，這裡只是讀同一把鎖
-    底下的檔）。`-wal` 在、`-shm` 不在（未正常關閉）時不當成「損毀」：照原樣往上丟
-    `StoreUnclean`，由呼叫端回 2——把可回收的 WAL 當成壞庫改名會掉已提交的資料。
+    底下的檔）。`-wal` 在、`-shm` 不在（未正常關閉）時：呼叫端已先跑過
+    `_recover_unclean`（可回收的先回收、原檔不動地探測）；還讀得到 `StoreUnclean`
+    就是真的回收不了（例如同時損毀），一律當成「讀不出」交給改名留證與重建
+    （#274 fix1 中-2），不再往上丟成「無法執行」。
     """
     try:
         with open_readonly(paths.trust_db) as db:
@@ -857,7 +1009,7 @@ def _read_trust_for_rebuild(
                 for row in db.read("SELECT key_id, key FROM tombstones ORDER BY key_id")
             )
     except StoreUnclean:
-        raise
+        return False, None, None, None, ()
     except (StoreMissing, StoreUnavailable):
         return False, None, None, None, ()
     if not rows:
@@ -904,8 +1056,9 @@ def rebuild_trust(paths: AuthPaths, registry_path: str, *, clock: Clock, audit: 
       要提示接著跑 `recover-store`）。
     - 一定回傳並審計 `ROLLBACK_PROTECTION_LOST`（回退防護已失效，名冊須人工核驗）。
     """
-    raw, registry, digest = _load_registry(registry_path, owner_uid=owner_uid)
     with store_write_lock(paths, owner):
+        raw, registry, digest = _load_registry(registry_path, owner_uid=owner_uid)
+        _recover_unclean(paths)
         try:
             healthy, _, old_generation, old_hash, old_tombstones = _read_trust_for_rebuild(paths)
         except StoreUnclean as exc:
@@ -1017,7 +1170,8 @@ def rebuild_trust(paths: AuthPaths, registry_path: str, *, clock: Clock, audit: 
 
 def reset_generation(paths: AuthPaths, registry_path: str, *, clock: Clock, audit: AuditLog,
                      owner: Owner | None = None, owner_uid: int = 0,
-                     registry_owner: Owner | None = None) -> ResetGenerationResult:
+                     registry_owner: Owner | None = None,
+                     install_lock_root: bool = False) -> ResetGenerationResult:
     """`auth-registry reset-generation`（C-805；design「transaction 與恢復」）。
 
     順序固定：解析名冊 → 照 reload 規則驗墓碑（**不通過就什麼都不改**，W-D8）→
@@ -1028,10 +1182,10 @@ def reset_generation(paths: AuthPaths, registry_path: str, *, clock: Clock, audi
     寫完名冊檔、transaction 之前當機（W-D7）：名冊已是新世代、信任庫仍是舊的，
     lgwd 重啟會拒絕較低世代並沿用舊快照；重跑同一指令即成功（冪等）。
     """
-    raw, registry, digest = _load_registry(registry_path, owner_uid=owner_uid)
     target = os.path.abspath(os.fspath(paths.registry))
     source = os.path.abspath(os.fspath(registry_path))
-    with store_write_lock(paths, owner):
+    with store_write_lock(paths, owner), _install_lock(paths, root_owned=install_lock_root):
+        raw, registry, digest = _load_registry(registry_path, owner_uid=owner_uid)
         try:
             trust = TrustStore(paths.trust_db)
         except StoreMissing:
@@ -1094,15 +1248,38 @@ def reset_generation(paths: AuthPaths, registry_path: str, *, clock: Clock, audi
 
 # --- C-806：reset-key-water ---
 
-def reset_key_water(paths: AuthPaths, *, clock: Clock, audit: AuditLog,
+def _select_water(water: Mapping[str, int], targets: list[str] | None, all_future: bool,
+                  now: int) -> tuple[list[str], list[str]]:
+    """依 `--key`／`--all-future` 選出要動的 key；回 `(選中的 key, 沒 H 的 key)`。"""
+    if all_future:
+        return [key for key, h in water.items() if h > now + WATER_AHEAD_SECONDS], []
+    chosen = list(targets or ())
+    missing = [key for key in chosen if key not in water]
+    return chosen, missing
+
+
+def _key_not_found_error() -> AdminError:
+    return AdminError(
+        KIND_KEY_NOT_FOUND,
+        "指定的 key 沒有 H 列",
+        exit_code=1,
+        hint="先用 auth-replay status 確認 key ID；沒有 H 的 key 不需要重設",
+    )
+
+
+def reset_key_water(paths: AuthPaths, *, clock: Clock, audit: AuditLog | None = None,
                     keys: Iterable[str] | None = None, all_future: bool = False,
-                    owner: Owner | None = None) -> WaterResetResult:
+                    owner: Owner | None = None, dry_run: bool = False) -> WaterResetResult:
     """`auth-replay reset-key-water`（C-806；design 時鐘事故 (iii)-3／(iv)）。
 
     `keys`（一批 key ID）或 `all_future=True`（所有 `H > now＋60` 的 key）擇一；
     兩個都給或都不給是 `invalid_argument`（結束碼 2）。先把伺服器時間與各 key 的
     舊 `H` 放進回傳值與審計（呼叫端據此在動手前印給操作者確認時鐘），再把 `H`
     設為 `now − 65`。找不到的 key 是 `key_not_found`（結束碼 1），什麼都不改。
+
+    `dry_run=True`（#274 fix1 中-1）是**預覽**：不取 store flock、不改庫、不寫審計，
+    用 `auth_db.open_ro` 讀目前的水位，回傳同樣的 `changes`（`old` 是現值、`new`
+    是會設成的值），讓 `llmgwctl` 在沒有 `--confirm` 時印出「目前 H」供確認時鐘。
 
     代價（`RESET_WATER_COST`）一定要印：故障期間被截存、紀錄已清除的簽章各可再
     被代送一次。
@@ -1116,6 +1293,27 @@ def reset_key_water(paths: AuthPaths, *, clock: Clock, audit: AuditLog,
     targets = None if keys is None else [str(key) for key in keys]
     now = now_seconds(clock)
     new_h = now - WATER_RESET_SECONDS
+    if dry_run:
+        try:
+            with open_readonly(paths.replay_db) as db:
+                water = {
+                    str(row[0]): int(row[1])
+                    for row in db.read("SELECT key_id, h FROM water ORDER BY key_id")
+                }
+        except (StoreMissing, StoreUnavailable) as exc:
+            raise _store_admin_error(
+                exc, exit_code=1,
+                hint="replay 庫缺失或打不開：確認不是權限問題後走 recover-store",
+            ) from None
+        chosen, missing = _select_water(water, targets, all_future, now)
+        if missing:
+            raise _key_not_found_error()
+        return WaterResetResult(
+            now=now,
+            changes=tuple(WaterChange(key, water[key], new_h) for key in chosen),
+        )
+    if audit is None:
+        raise TypeError("audit is required unless dry_run=True")
     with store_write_lock(paths, owner):
         try:
             db = open_rw(paths.replay_db)
@@ -1134,18 +1332,9 @@ def reset_key_water(paths: AuthPaths, *, clock: Clock, audit: AuditLog,
                     str(row[0]): int(row[1])
                     for row in cur.execute("SELECT key_id, h FROM water ORDER BY key_id").fetchall()
                 }
-                if all_future:
-                    chosen = [key for key, h in water.items() if h > now + WATER_AHEAD_SECONDS]
-                else:
-                    chosen = list(targets or ())
-                    missing = [key for key in chosen if key not in water]
-                    if missing:
-                        raise AdminError(
-                            KIND_KEY_NOT_FOUND,
-                            "指定的 key 沒有 H 列",
-                            exit_code=1,
-                            hint="先用 auth-replay status 確認 key ID；沒有 H 的 key 不需要重設",
-                        )
+                chosen, missing = _select_water(water, targets, all_future, now)
+                if missing:
+                    raise _key_not_found_error()
                 changes = tuple(WaterChange(key, water[key], new_h) for key in chosen)
                 audit.append(
                     "auth-replay reset-key-water",
@@ -1168,6 +1357,7 @@ __all__ = [
     "AuditLog",
     "AuditValueError",
     "InitResult",
+    "INSTALL_LOCK_NAME",
     "KIND_AUDIT_FAILED",
     "KIND_INVALID_ARGUMENT",
     "KIND_IO_ERROR",
@@ -1197,6 +1387,7 @@ __all__ = [
     "WATER_RESET_SECONDS",
     "WaterChange",
     "WaterResetResult",
+    "chown_root_owned",
     "finalize_permissions",
     "init_stores",
     "inspect_replay",

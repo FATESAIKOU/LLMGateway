@@ -102,10 +102,36 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="寫完就回 0（印明未確認載入，不得宣告撤銷完成）")
     auth_reg.add_parser("status", help="讀 lgwd 的 status 檔（唯讀；不用 root）")
 
+    for name in ("rebuild-trust", "reset-generation"):
+        action = ("信任庫損毀時重建（回退防護會失效）" if name == "rebuild-trust"
+                  else "把名冊世代與信任庫快照降到已核驗的名冊")
+        p = auth_reg.add_parser(
+            name,
+            help="{0}（需 root、lgwd 停止、--confirm）".format(action))
+        p.add_argument("file", help="已核驗的名冊檔")
+        p.add_argument("--confirm", action="store_true", help="確認離線寫入（lgwd 必須已停止）")
+
+    p_auth_store = sub.add_parser("auth-store", help="認證庫管理（#222 D5c）")
+    auth_store = p_auth_store.add_subparsers(dest="auth_store_command", required=True)
+    p = auth_store.add_parser(
+        "init", help="首次建立信任庫與防重放庫（需 root、lgwd 停止、--confirm）")
+    p.add_argument("--confirm", action="store_true", help="確認離線寫入（lgwd 必須已停止）")
+
     p_auth_replay = sub.add_parser(
-        "auth-replay", help="防重放庫的唯讀觀測（#222 D5b）")
+        "auth-replay", help="防重放庫的觀測與修復（#222 D5b／D5c）")
     auth_replay = p_auth_replay.add_subparsers(dest="auth_replay_command", required=True)
     auth_replay.add_parser("status", help="列各 key 的清除水位 H（需 root；唯讀）")
+    p = auth_replay.add_parser(
+        "recover-store", help="重建防重放庫、每把 key 的 H 設為 now＋60（需 root、--confirm）")
+    p.add_argument("--confirm", action="store_true", help="確認離線寫入（lgwd 必須已停止）")
+    p = auth_replay.add_parser(
+        "reset-key-water", help="把選定 key 的 H 設為 now−65（需 root、--confirm）")
+    p.add_argument("--confirm", action="store_true", help="確認離線寫入（lgwd 必須已停止）")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--key", action="append", dest="key",
+                       help="指定 key ID（可重複；先用 auth-replay status 查）")
+    group.add_argument("--all-future", action="store_true",
+                       help="所有 H 在未來（now＋60）的 key")
     return parser
 
 
@@ -192,9 +218,11 @@ def main(argv=None, env=None) -> int:
         return sync.run(layout, report=report)
     if args.command == "usage":
         return usage.run(layout, role=args.role, agent=args.agent, data=args.data)
-    if args.command in ("auth-registry", "auth-replay"):
+    if args.command in ("auth-registry", "auth-replay", "auth-store"):
         from . import auth_cli
         if args.command == "auth-registry":
             return auth_cli.run_registry(layout, args)
-        return auth_cli.run_replay(layout, args)
+        if args.command == "auth-replay":
+            return auth_cli.run_replay(layout, args)
+        return auth_cli.run_store(layout, args)
     raise AssertionError(f"unhandled command: {args.command}")

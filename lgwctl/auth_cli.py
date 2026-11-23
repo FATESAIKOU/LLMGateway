@@ -38,7 +38,7 @@ import sys
 import tempfile
 import time
 
-from lgwd.auth_admin import AdminError, AuditLog
+from lgwd.auth_admin import AdminError, AuditLog, INSTALL_LOCK_NAME, chown_root_owned
 from lgwd.auth_db import (
     LockBusy,
     LockUnavailable,
@@ -80,8 +80,9 @@ POLL_SECONDS = 0.5
 #: status 檔每次心跳都以**舊內容**重寫，比一輪 2 秒的輪詢長一點才不會拿前一版的
 #: 狀態誤回 1（方向安全但訊息誤導）。
 INSECURE_SKEW_SECONDS = 3
-#: install 自己的鎖檔（不取 `auth-store.lock`；design §④）。
-INSTALL_LOCK_NAME = "auth-registry-install.lock"
+#: install 自己的鎖檔（不取 `auth-store.lock`；design §④）。名稱的單一來源在
+#: `lgwd.auth_admin.INSTALL_LOCK_NAME`（D5c 的寫名冊指令取同一把）。
+
 #: 名冊檔的權限（design :264：root:llmgw 0640）。
 REGISTRY_MODE = 0o640
 
@@ -513,15 +514,12 @@ def _chown_install_lock(layout, path: str) -> None:
     """install 鎖檔只給 root 用：正式機改成 `root:root` 0600（低-2）。
 
     擁有者不能是 `llmgw`：lgwd 被攻破時若能霸占這把鎖，就能擋住撤銷用的 install。
-    模式由 `acquire_store_lock` 建成 0600；這裡只補擁有者。
+    模式由 `acquire_store_lock` 建成 0600；這裡只補擁有者。實作與
+    `reset-generation` 共用 `lgwd.auth_admin.chown_root_owned`（#274 fix1 agy 低-1）。
     """
     if layout.prefix or not _is_root(layout):
         return
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        os.fchown(fd, 0, 0)
-    finally:
-        os.close(fd)
+    chown_root_owned(path)
 
 
 def _wait_for_load(paths: AuthPaths, candidate: Candidate, t0: int, timeout: float) -> int:
@@ -706,6 +704,116 @@ def run_replay_status(layout, paths: AuthPaths, args) -> int:
     return 0
 
 
+def _print_admin_error(exc) -> None:
+    """`AdminError` 的固定輸出（訊息、`hint`、鎖尾聲的擁有者失敗）。"""
+    print(str(exc), file=sys.stderr)
+    if exc.hint:
+        print("hint " + exc.hint, file=sys.stderr)
+    owner_error = getattr(exc, "owner_error", None)
+    if owner_error is not None:
+        print("owner_error {0}".format(owner_error), file=sys.stderr)
+
+
+def _preview_key_water(paths, args) -> int:
+    """`auth-replay reset-key-water` 沒有 `--confirm` 時的預覽（#274 fix1 中-1）。
+
+    唯讀（`auth_db.open_ro`）：印伺服器時間與選中 key 目前的 H（`--all-future` 時
+    是 H 在未來的那幾把）與代價，不改庫、不寫審計，以 2 結束，提示確認時鐘後再加
+    `--confirm`。找不到指定的 key 回 1。
+    """
+    from lgwd import auth_admin as admin
+    try:
+        result = admin.reset_key_water(paths, clock=SystemClock(), keys=args.key,
+                                       all_future=args.all_future, dry_run=True)
+    except AdminError as exc:
+        _print_admin_error(exc)
+        return exc.exit_code
+    print("server_time {0}".format(result.now))
+    for change in result.changes:
+        print("key {0} h {1}".format(change.key_id, change.old))
+    if not result.changes:
+        print("（沒有 H 在未來的 key）")
+    print("已選 {0} 把 key；--confirm 會把 H 設為 {1}".format(
+        len(result.changes), result.now - admin.WATER_RESET_SECONDS))
+    print(result.cost)
+    print("確認時鐘已校正後加 --confirm")
+    return 2
+
+
+def run_write(layout, paths, command, args):
+    """五個會寫庫／名冊的指令共用入口（C-818～C-829）。
+
+    順序：非 root → 2；`reset-key-water` 缺 `--confirm` → 唯讀預覽（回 2）；
+    其餘缺 `--confirm` → 2；再交給 `lgwd.auth_admin`（它自己取 store flock、拿不到
+    回 2）。錯誤一律照 `AdminError.exit_code` 結束，印訊息、`hint`，以及鎖尾聲的
+    擁有者失敗（`owner_error`，REPORT-267-archreview2 §4）。所有寫入都經
+    `auth_admin`；審計由它用 `AuditLog` 寫。
+    """
+    from lgwd import auth_admin as admin
+    if not _is_root(layout):
+        return _refuse_non_root(command)
+    if command == "auth-replay reset-key-water" and not args.confirm:
+        return _preview_key_water(paths, args)
+    if not args.confirm:
+        print("{0} 需要 --confirm（離線寫入；先確認 lgwd 已停止）".format(command),
+              file=sys.stderr)
+        return 2
+    owner_uid = os.getuid() if layout.prefix else 0
+    try:
+        owner = None if layout.prefix else _service_ids(layout)
+        clock = SystemClock()
+        audit = AuditLog(paths.audit_log, clock=clock)
+        if command == "auth-store init":
+            result = admin.init_stores(paths, clock=clock, audit=audit, owner=owner,
+                                       owner_uid=owner_uid)
+            print("identity " + result.short_identity)
+            for warning in result.warnings:
+                print(warning)
+        elif command == "auth-replay recover-store":
+            admin.recover_replay(paths, clock=clock, audit=audit, owner=owner)
+            print("每把 key 在 60 秒後才能再簽")
+        elif command == "auth-registry rebuild-trust":
+            result = admin.rebuild_trust(paths, args.file, clock=clock, audit=audit, owner=owner,
+                                         owner_uid=owner_uid)
+            print(result.warning)
+            try:
+                inspection = admin.inspect_stores(paths)
+                if not inspection.identity_match:
+                    print("接著跑 auth-replay recover-store")
+            except AdminError:
+                print("接著跑 auth-replay recover-store")
+        elif command == "auth-registry reset-generation":
+            registry_owner = None if owner is None else (0, owner[1])
+            result = admin.reset_generation(paths, args.file, clock=clock, audit=audit,
+                                            owner=owner, registry_owner=registry_owner,
+                                            owner_uid=owner_uid,
+                                            install_lock_root=owner is not None)
+            print("generation {0} → {1}".format(result.old_generation, result.new_generation))
+        else:
+            result = admin.reset_key_water(paths, clock=clock, audit=audit, owner=owner,
+                                           keys=args.key, all_future=args.all_future)
+            # C-820（#274 fix1 中-1）：印伺服器時間與每把 key 的舊 H→新 H，供確認
+            # 時鐘已校正；代價一定要印。
+            print("server_time {0}".format(result.now))
+            for change in result.changes:
+                print("key {0} h {1} -> {2}".format(
+                    change.key_id, change.old, change.new))
+            print("已重設 {0} 把 key".format(len(result.changes)))
+            print(result.cost)
+        return 0
+    except AdminError as exc:
+        _print_admin_error(exc)
+        return exc.exit_code
+    except (KeyError, OSError) as exc:
+        print("操作無法執行：{0}".format(type(exc).__name__), file=sys.stderr)
+        return 2
+
+
+def run_store(layout, args):
+    paths = _resolve_paths(layout)
+    return 2 if paths is None else run_write(layout, paths, "auth-store init", args)
+
+
 # --- 分派 -------------------------------------------------------------------
 
 
@@ -721,6 +829,8 @@ def run_registry(layout, args) -> int:
         return run_install(layout, paths, args)
     if command == "status":
         return run_status(layout, paths, args)
+    if command in ("rebuild-trust", "reset-generation"):
+        return run_write(layout, paths, "auth-registry " + command, args)
     raise AssertionError("unhandled auth-registry command: {0}".format(command))
 
 
@@ -732,6 +842,8 @@ def run_replay(layout, args) -> int:
     command = args.auth_replay_command
     if command == "status":
         return run_replay_status(layout, paths, args)
+    if command in ("recover-store", "reset-key-water"):
+        return run_write(layout, paths, "auth-replay " + command, args)
     raise AssertionError("unhandled auth-replay command: {0}".format(command))
 
 

@@ -354,7 +354,8 @@ class EnforceCase(unittest.TestCase):
         with mock.patch.object(check, "_check_units", lambda *a, **k: (False, "missing")), \
                 mock.patch.object(check, "_check_keysync", lambda *a, **k: None), \
                 mock.patch.object(check, "_check_policy", lambda *a, **k: None), \
-                mock.patch.object(check, "_check_gh_repo", lambda *a, **k: None):
+                mock.patch.object(check, "_check_gh_repo", lambda *a, **k: None), \
+                mock.patch.object(check, "_check_auth_stores", lambda *a, **k: None):
             rc = check.run(layout, report=report, no_remote=True)
         return rc, report
 
