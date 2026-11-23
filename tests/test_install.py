@@ -573,7 +573,7 @@ exec "$@"
         self.assertIn("經會合點", res_ok.stdout)
 
         curl_log = self.read_log("curl")
-        self.assertIn("/v1/subscriptions", curl_log)
+        self.assertIn("/healthz", curl_log)
         self.assertNotIn("/v1/board", curl_log)
         self.assertNotIn("Authorization", curl_log)
 

@@ -66,7 +66,7 @@ import re
 import stat
 import time
 
-from . import atomic, probe, safefs, units
+from . import atomic, capability, probe, safefs, units
 from . import run as runmod
 from .layout import TUNNEL_SERVICE_NAME, parse_env_text
 from .migrate import (
@@ -564,7 +564,12 @@ def revert_timer_argv(layout, *, revert_after: str, unit: str = REVERT_UNIT, att
 
 def _probe_until_ok(layout, report) -> bool:
     """探針直到 200 或窗口用完。窗口是實際上限：每次探針子行程的逾時＝
-    min(單次逾時, 剩餘窗口)；過了期限即使回 0 也當失敗（保守）。"""
+    min(單次逾時, 剩餘窗口)；過了期限即使回 0 也當失敗（保守）。
+
+    模式跟著 ``current`` 的能力旗標（#246）：新的隧道腳本用環境變數收到模式，
+    舊腳本忽略它、照舊探 list（等同 old）。
+    """
+    mode = capability.current(layout).mode
     deadline = time.monotonic() + probe_wait(layout)
     interval = probe_interval(layout)
     while True:
@@ -572,7 +577,8 @@ def _probe_until_ok(layout, report) -> bool:
         if remaining <= 0:
             report.fail("probe", "等待逾時，經會合點仍不是 200")
             return False
-        rc = probe.remote_rc(layout, timeout=min(runmod.PROBE_TIMEOUT, remaining))
+        rc = probe.remote_rc(layout, mode=mode,
+                             timeout=min(runmod.PROBE_TIMEOUT, remaining))
         if time.monotonic() > deadline:
             report.fail("probe", "探針回來時已超過等待窗口，保守視為失敗")
             return False

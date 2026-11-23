@@ -15,7 +15,7 @@ import argparse
 import os
 import sys
 
-from . import check, install, status, sync, upgrade, usage, units, probe
+from . import capability, check, install, status, sync, upgrade, usage, units, probe
 from .layout import DEFAULT_REPO, Layout, SERVICE_NAME
 from .report import Report
 
@@ -139,10 +139,13 @@ def main(argv=None, env=None) -> int:
         state = units.unit_state(layout, SERVICE_NAME)
         if args.command == "stop":
             return 0 if state == "inactive" or units.stop(layout, SERVICE_NAME) else 1
-        if args.command == "start" and state == "active" and probe.local_ok(layout):
+        # 探針的模式跟著 current 的能力旗標（#246）：已 active 時先看健不健康，
+        # 起完（或重啟完）再等到健康；stop 不探（只看 unit_state）。
+        mode = capability.current(layout).mode
+        if args.command == "start" and state == "active" and probe.local_ok(layout, mode=mode):
             return 0
         action = units.start if args.command == "start" else units.restart
-        return 0 if action(layout, SERVICE_NAME) and probe.wait_local_ok(layout, layout.list_wait) else 1
+        return 0 if action(layout, SERVICE_NAME) and probe.wait_local_ok(layout, layout.list_wait, mode=mode) else 1
     if args.command == "tunnel-apply":
         # 沿用 migrate.py 的鎖與時間格式；晚點才匯入（沒有 migrate.py 時其他子指令不受影響）。
         from . import tunnel_apply

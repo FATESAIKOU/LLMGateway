@@ -4,7 +4,7 @@ from lgwctl.layout import Layout
 
 def test_start_active_healthy_does_not_restart(monkeypatch):
     monkeypatch.setattr(units, 'unit_state', lambda *a: 'active')
-    monkeypatch.setattr(probe, 'local_ok', lambda *a: True)
+    monkeypatch.setattr(probe, 'local_ok', lambda *a, **k: True)
     monkeypatch.setattr(units, 'start', lambda *a: (_ for _ in ()).throw(AssertionError()))
     assert cli.main(['start']) == 0
 

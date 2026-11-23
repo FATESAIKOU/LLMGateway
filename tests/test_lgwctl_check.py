@@ -82,8 +82,10 @@ class CheckTests(unittest.TestCase):
         for name in ("llmgateway.service", "llmgateway-tunnel.service", "list-local",
                      "list-remote", "keysync", "policy", "gh-keys-repo"):
             self.assertTrue(has_line(out, name, "ok"), f"{name}: {out}")
-        # 本機探針打的是 llmgateway.env 的埠與 list 路徑
-        self.assertIn("http://127.0.0.1:8480/v1/subscriptions", self.box.log("curl.log"))
+        # 本機探針打的是 llmgateway.env 的埠與 /healthz（#246：這一版沒有
+        # capabilities.json，模式是 old；/healthz 回 200 就不會再打 list）
+        self.assertIn("http://127.0.0.1:8480/healthz", self.box.log("curl.log"))
+        self.assertNotIn("/v1/subscriptions", self.box.log("curl.log"))
         # 經會合點的探針呼叫當版的 --probe-once，並把設定檔指向新位置
         probe_log = self.box.log("probe.log")
         self.assertIn("probe --probe-once", probe_log)
@@ -97,7 +99,8 @@ class CheckTests(unittest.TestCase):
         self.box.write(self.box.etc("llmgateway.env"), 'LGW_API_PORT="9999"\n')
         rc, out, err = self.check()
         self.assertEqual(rc, 0, out + err)
-        self.assertIn("http://127.0.0.1:9999/v1/subscriptions", self.box.log("curl.log"))
+        # #246：本機探針先打 /healthz（old 退回 list 只有在 /healthz 404 時）
+        self.assertIn("http://127.0.0.1:9999/healthz", self.box.log("curl.log"))
 
     # -- unit ---------------------------------------------------------------
 

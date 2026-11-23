@@ -79,7 +79,7 @@ import sys
 import tempfile
 import time
 
-from . import atomic, check, install, probe, release, units, upgrade
+from . import atomic, capability, check, install, probe, release, units, upgrade
 from . import run as runmod
 from .layout import (
     DEFAULT_API_PORT,
@@ -1683,10 +1683,12 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
         return _stop_loss(layout, old, [f"{TUNNEL_SERVICE_NAME} 起不來"], report)
     report.ok("start", TUNNEL_SERVICE_NAME)
 
-    # (d) 本機 list 200（最多 60 秒）＋隧道真的 active＋經會合點探測（重試）
+    # (d) 本機探針 200（最多 60 秒）＋隧道真的 active＋經會合點探測（重試）
+    # 探針模式跟著 current 的能力旗標（#246）：切到這裡 current 已是新 tag。
+    mode = capability.current(layout).mode
     problems: list[str] = []
     if probe.wait_local_ok(layout, _wait_seconds(layout, ENV_CUTOVER_WAIT,
-                                                 DEFAULT_CUTOVER_WAIT)):
+                                                 DEFAULT_CUTOVER_WAIT), mode=mode):
         report.ok("list-local", "200")
     else:
         report.fail("list-local", "時間內等不到 200")
@@ -1700,7 +1702,7 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
     if no_remote:
         report.skip("list-remote", "--no-remote 略過")
     else:
-        level, detail = _probe_remote_with_retry(layout)
+        level, detail = _probe_remote_with_retry(layout, mode=mode)
         report.add("ok" if level == "ok" else level, "list-remote", detail)
         if level not in ("ok",):
             problems.append("經會合點非 200")
@@ -1757,17 +1759,20 @@ def _confirm_old_units_stopped(layout, report) -> bool:
     return ok
 
 
-def _probe_remote_with_retry(layout) -> tuple:
+def _probe_remote_with_retry(layout, *, mode: str) -> tuple:
     """經會合點的探針：有間隔地重試（中-4），全部失敗才算停損。
 
     新隧道的 ssh 連線／reverse forward 建立要時間，舊隧道剛停時會合點的
     4710／4711 也可能還沒釋放；單次探測會把「還沒連上」判成「切換失敗」。
+
+    ``mode`` 必填（#246）：探新服務時用 ``current`` 的能力旗標，探 user 層的
+    舊服務（``rollback-to-user``）時寫死 ``old``。
     """
     tries = _count_value(layout, ENV_REMOTE_TRIES, DEFAULT_REMOTE_TRIES)
     interval = _wait_seconds(layout, ENV_REMOTE_WAIT, DEFAULT_REMOTE_WAIT)
     level, detail = "fail", ""
     for attempt in range(tries):
-        level, detail = probe.remote(layout)
+        level, detail = probe.remote(layout, mode=mode)
         if level == "ok":
             if tries > 1:
                 detail = f"{detail}（第 {attempt + 1}/{tries} 次）"
@@ -2262,8 +2267,10 @@ def _start_old_units(layout, report) -> bool:
 
 
 def _wait_old_list(layout, report) -> bool:
+    # 這裡探的是 **user 層的舊服務**（遷移回滾），能力旗標描述不了它，一律 old
+    # （#246：old 對新舊服務都能判活；用 new 會因為舊服務沒有 /healthz 而誤判）。
     ok = probe.wait_local_ok(layout, _wait_seconds(layout, ENV_CUTOVER_WAIT,
-                                                   DEFAULT_CUTOVER_WAIT))
+                                                   DEFAULT_CUTOVER_WAIT), mode="old")
     if ok:
         report.ok("list-local", "200（舊服務）")
         return True
@@ -2331,8 +2338,8 @@ def _switch_to_old_tunnel(layout, report, old_service_ok: bool) -> bool:
         _recover_new_tunnel(layout, report)
         return False
 
-    # 經會合點探測回 200
-    level, detail = _probe_remote_with_retry(layout)
+    # 經會合點探測回 200（#246：這裡探的是 user 層舊服務，模式寫死 old）
+    level, detail = _probe_remote_with_retry(layout, mode="old")
     if level not in ("ok",):
         report.fail("probe-old-tunnel", f"舊隧道遠端探針失敗（{detail}）")
         _user_systemctl_outcome(layout, "stop", unit)
@@ -2476,7 +2483,8 @@ def _finalize_locked(layout, *, old_home: str | None, report) -> int:
     # 把舊目錄搬走。低-5：只探本機 list 不夠（隧道壞了、key 拉取掛了也照樣
     # 收），要跑完整 check（含遠端；人在 console 就加 --no-remote 重跑）。
     if not probe.wait_local_ok(layout, _wait_seconds(layout, ENV_CUTOVER_WAIT,
-                                                     DEFAULT_CUTOVER_WAIT)):
+                                                     DEFAULT_CUTOVER_WAIT),
+                               mode=capability.current(layout).mode):
         report.fail("list-local", "不是 200")
         report.fail("finalize", "新版本機 list 不是 200；先別收舊版"
                                 "（要回舊版就跑 llmgwctl rollback-to-user）")
