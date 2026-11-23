@@ -13,9 +13,11 @@
                                               （#100；spec role-allocation）
   其他路徑與方法一律 404（含 GET 以外對 /v1/usage 與 /healthz 的方法）。沒有應用層
   認證（本人選 (a)）；存取控制只靠 SSH。
-- 預驗章 framing（#222 D2 PR-1；C-101～C-108）：``gate`` 只需 ``.mode``
-  （``off``／``warn``／``enforce``），``None`` 等於 off。**off 的行為與 D1 逐 byte
-  相同**（用 ``self.path`` 與 ``_read_json``，包括「Content-Length 壞掉當 0」；
+- 預驗章 framing（#222 D2 PR-1；C-101～C-108）：``gate`` 的 ``.mode``
+  （``off``／``warn``／``enforce``）決定模式，``None`` 等於 off；warn／enforce 的
+  gate 必須有可呼叫的 ``.authenticate``（`lgwd.auth.AuthGate`），只有 ``.mode``
+  的物件在建伺服器時就丟 ``ValueError``（fail-closed；#262 中-2）。**off 的行為與
+  D1 逐 byte 相同**（用 ``self.path`` 與 ``_read_json``，包括「Content-Length 壞掉當 0」；
   C-108 的差分語料鎖住），不設任何新逾時。warn／enforce 下五條業務路由才先過
   ``lgwd.framing.inspect``（原始 request line 的 request-target、標頭名稱須為
   RFC 7230 token、標頭至多一次、Content-Length 形狀、Transfer-Encoding、1 MiB），
@@ -27,7 +29,10 @@
   模式相同）。
 - ``/healthz`` 三種模式都**不套** framing、不取號誌（#247 J-1）：它不讀 body、
   HTTP/1.0 回應後即關連線，沒有走私面；若套用，enforce 與 off 對同一個怪請求的
-  回應會不同，違反「三模式 bytes 相同」與「off 零變化」。
+  回應會不同，違反「三模式 bytes 相同」與「off 零變化」。原文不是 origin-form
+  （``//healthz``、絕對 URI）時也一樣：先用 D1 的來源（``urlsplit(self.path).path``）
+  比對路由，是 ``healthz`` 就直接回應，不經 framing、不記認證日誌（#262 中-3；
+  spec resolve-auth「健康請求不受框架檢查」）。
 - ``/healthz`` 只證明行程活著、能回應（而且 lgwd 已經過了啟動時的 policy／keys／
   DB 初始化）：body 固定 ``{"status": "ok"}``（16 bytes、只有一個鍵），不加版本、
   tag、模式、時間、主機名或任何額外標頭，也不讀 service、不讀 body、不寫 DB、
@@ -47,6 +52,15 @@
   ``unavailable``）；warn 的 would-deny 記成 ``mode=warn outcome=deny``。
   ``route`` 只有原文無法路由時的固定哨兵 ``-`` 不是路由模板（唯一的例外，C-607
   的白名單要列入它）。
+- ``gate`` 若有 ``.authenticate``（`lgwd.auth.AuthGate`）就在號誌持有區段內、讀完 body
+  之後驗章（#222 D2 PR-6a；C-601～C-604）：五個標頭 → 查表 → 粗篩 → 預解析 → 八行 →
+  ``verify`` → ``accept``；``apply(mode, verdict)`` 是模式對應的唯一一處。只有
+  ``permit and framing.ok`` 時才呼叫 ``authenticate``：號誌取不到（warn）或 framing
+  已判不合時，那一筆事件已由 ``apply`` 記過，``verdict`` 維持 ``None`` 照舊處理，
+  不再於號誌外驗章、也不記第二筆事件（#262 中-1）。warn／enforce 的 gate 沒有
+  ``.authenticate`` 在建立伺服器時就是 ``ValueError``（中-2）。``/healthz`` 不呼叫 gate。
+  429 加 ``Retry-After``；enforce 的 401 body 對所有 reason 逐 byte 相同、不加
+  ``WWW-Authenticate``。off 只在建立伺服器時記一行 ``auth mode=off``（C-607）。
 """
 
 from __future__ import annotations
@@ -58,6 +72,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from . import auth as auth_mod
 from . import framing
 from .errors import ApiError, bad_request, body_too_large, not_found
 
@@ -119,7 +134,7 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
 
 
 def _gate_mode(gate) -> str:
-    """gate 只需要 ``.mode``；``None`` 等於 off。不認得的值在建伺服器時就失敗。"""
+    """gate 的 ``.mode``；``None`` 等於 off。不認得的值在建伺服器時就失敗。"""
     if gate is None:
         return "off"
     mode = getattr(gate, "mode", None)
@@ -128,48 +143,13 @@ def _gate_mode(gate) -> str:
     return mode
 
 
-def _log_auth(mode: str, outcome: str, reason: str, template: str) -> None:
-    """一行認證事件；只含固定欄位與路由模板（不記標頭值、簽章、nonce、query、body）。
-
-    ``outcome`` 只用 design 的白名單值（``pass``／``deny``／``rate_limited``／
-    ``unavailable``）：warn 的 would-deny 記成 ``mode=warn outcome=deny``，不另造
-    值。``template`` 是路由模板；原文無法路由時只剩固定哨兵 ``-``（唯一的非模板
-    值）。聚合與 60 秒節流是 PR-6 的 C-607，這裡先留下可觀測、可斷言的最小格式。
-    """
-    _LOG.info("auth mode=%s outcome=%s reason=%s route=%s",
-              mode, outcome, reason, template)
-
-
-def _apply_framing(handler, mode: str, outcome: str, reason: str, template: str, *,
-                   method: str, status: int, error: ApiError, log_path: str,
-                   close_on_warn: bool = False) -> bool:
-    """預驗章結果的模式對應（單一出入口；C-603「只在 apply 一處」由此長出來）。
-
-    一次做完三件事：
-
-    - 一律先記一行認證事件（:func:`_log_auth`）。
-    - ``enforce``：記 access log、照 ``status`` 回應 ``error.body()``，回 True
-      （呼叫端要 return）。``log_path`` 必須**不含 query**；原文不可信時呼叫端
-      傳固定 ``-``（與 ``route=-`` 一致）。
-    - ``warn``：回 False 讓呼叫端照舊處理；``close_on_warn``（body 沒讀完，無法
-      照舊處理）時關閉連線並回 True。
-
-    ``method``／``log_path`` 只給 enforce 的 access log 用，與認證事件分開。
-    """
-    _log_auth(mode, outcome, reason, template)
-    if mode != "enforce":
-        if close_on_warn:
-            handler.close_connection = True
-            return True
-        return False
-    _LOG.info("%s %s -> %s", method, log_path, status)
-    _send_json(handler, status, error.body())
-    return True
-
-
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict,
-               no_cache: bool = False) -> None:
-    """回 JSON；no_cache＝200 的 resolve 加不快取標頭（design 決定 1）。"""
+               no_cache: bool = False, headers=()) -> None:
+    """回 JSON；no_cache＝200 的 resolve 加不快取標頭（design 決定 1）。
+
+    ``headers`` 是額外標頭（目前只有 429 的 ``Retry-After``）；enforce 的 401 **不**加
+    ``WWW-Authenticate``（C-604）。
+    """
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
         handler.send_response(status)
@@ -177,6 +157,8 @@ def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict,
         if no_cache:
             handler.send_header("Cache-Control", "no-store")
             handler.send_header("Pragma", "no-cache")
+        for name, value in headers:
+            handler.send_header(name, value)
         handler.send_header("Content-Length", str(len(raw)))
         handler.end_headers()
         handler.wfile.write(raw)
@@ -250,16 +232,20 @@ def _roles_query(query: str) -> dict:
     return _query(query, _ROLES_PARAMS)
 
 
-def _api_handler(service, mode: str, semaphore):
+def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
     """依 service 產生 handler 類別（service 是 RegistryService 或測試替身）。
 
     ``mode`` 是預驗章 framing 的模式（off／warn／enforce；C-101），``semaphore``
-    是讀 body＋驗章階段的並發上限（C-106）。
+    是讀 body＋驗章的並發上限（C-106），``gate`` 是有 ``.authenticate`` 的認證 gate
+    （warn／enforce 必備，off 為 ``None``；中-2），``auth_log`` 是 ``AuthLog``
+    （C-607 的聚合）。
     """
 
     class ApiHandler(BaseHTTPRequestHandler):
         _framing_mode = mode
         _framing_sem = semaphore
+        _gate = gate
+        _auth_log = auth_log
 
         def handle_one_request(self):
             # C-105：總期限從這個請求的處理開始算；不是每次 recv 重新起算。
@@ -300,27 +286,60 @@ def _api_handler(service, mode: str, semaphore):
                 return
             self._respond(method, path, route, split.query)
 
+        def _authenticate(self, method: str, fr, raw: bytes):
+            """驗章；warn／enforce 的 gate 一定帶可呼叫的 ``authenticate``（中-2）。
+
+            建立伺服器時就擋掉只有 ``.mode`` 的物件，所以這裡不需要（也不應該）靜默
+            跳過——那會讓 enforce 變成 fail-open。
+            """
+            return self._gate.authenticate(
+                method=method, framing=fr, headers=self.headers, body=raw)
+
+        def _apply_verdict(self, verdict, template: str, *, method: str, log_path: str,
+                           close_on_warn: bool = False) -> bool:
+            """`auth.apply` 的唯一呼叫點：continue 回 False，回應／關閉回 True。
+
+            ``log_path`` 必須**不含 query**；原文不可信時呼叫端傳固定 ``-``。
+            """
+            action = auth_mod.apply(
+                self._framing_mode, verdict, route=template, log=self._auth_log,
+                close_on_warn=close_on_warn)
+            if action.kind == auth_mod.ACTION_CONTINUE:
+                return False
+            if action.kind == auth_mod.ACTION_CLOSE:
+                self.close_connection = True
+                return True
+            _LOG.info("%s %s -> %s", method, log_path, action.status)
+            _send_json(self, action.status, action.error.body(), headers=action.headers)
+            return True
+
         def _dispatch_gated(self, method: str):
-            """warn／enforce：原始 request line → 路由 → /healthz → framing → service。"""
-            mode = self._framing_mode
+            """warn／enforce：原文 → 路由 → /healthz → framing → 讀 body → gate → service。"""
             fr = framing.inspect(self.requestline, self.headers)
             if not fr.target_ok:
                 # 原文不是 origin-form：路由無從判斷（判讀原文先於路由）。
+                split = urlsplit(self.path)
+                path, query = split.path, split.query
+                route = _match_route(method, path)
+                if route is not None and route[0] == "healthz":
+                    # 中-3（C-609）：用 D1 的來源比對路由；非 origin-form 的 /healthz
+                    # （//healthz、絕對 URI）仍是健康請求：不經 framing、不取號誌、不
+                    # 呼叫 gate、不記認證日誌，與 off 同一條路。
+                    self._respond(method, path, route, query)
+                    return
                 # 原文不可信，access log 的 path 也記固定 -（中-1-3）。
-                if _apply_framing(
-                        self, mode, "deny", "framing", "-",
-                        method=method, status=401,
-                        error=ApiError(401, "unauthorized"), log_path="-"):
+                if self._apply_verdict(
+                        auth_mod.denied(auth_mod.REASON_FRAMING), "-",
+                        method=method, log_path="-"):
                     return
                 # warn：記 would-deny（mode=warn outcome=deny）後照舊處理
                 # （路由與 body 都退回 D1 的來源）。
-                split = urlsplit(self.path)
-                path, query = split.path, split.query
             else:
                 path, query = fr.path, fr.query
             route = _match_route(method, path)
             if route is not None and route[0] == "healthz":
-                # C-101（J-1）：/healthz 三種模式都走 D1，不套 framing、不取號誌。
+                # C-101（J-1）：/healthz 三種模式都走 D1，不套 framing、不取號誌、不呼叫
+                # gate、不記認證日誌（C-601）。
                 self._respond(method, path, route, query)
                 return
             if route is None:
@@ -335,10 +354,9 @@ def _api_handler(service, mode: str, semaphore):
                 _send_json(self, 413, body_too_large().body())
                 return
             if fr.target_ok and not fr.ok:
-                if _apply_framing(
-                        self, mode, "deny", "framing", template,
-                        method=method, status=401,
-                        error=ApiError(401, "unauthorized"), log_path=path):
+                if self._apply_verdict(
+                        auth_mod.denied(auth_mod.REASON_FRAMING), template,
+                        method=method, log_path=path):
                     return
                 # warn：記 would-deny（mode=warn outcome=deny）後照舊處理
                 # （業務結果不變）。
@@ -357,41 +375,53 @@ def _api_handler(service, mode: str, semaphore):
             permit = self._framing_sem.acquire(timeout=_PERMIT_WAIT_SECONDS)
             if not permit:
                 # C-106：等滿 1 秒仍取不到號誌。
-                if _apply_framing(
-                        self, mode, "unavailable", "busy", template,
-                        method=method, status=503,
-                        error=ApiError(503, "auth_unavailable"), log_path=path):
+                if self._apply_verdict(
+                        auth_mod.unavailable(auth_mod.REASON_BUSY), template,
+                        method=method, log_path=path):
                     return
                 # warn：記不可判定，照舊處理。
+            verdict = None
             try:
-                body = self._read_gated_body(length, template, mode, method, path)
-            except ApiError as exc:
-                _LOG.info("%s %s -> %s", method, path, exc.status)
-                _send_json(self, exc.status, exc.body())
-                return
+                raw = self._read_gated_body(length, template, method, path)
+                if raw is None:  # 已回應（enforce 503）或已關閉（warn）
+                    return
+                # C-601：gate 在號誌持有區段內（含 accept 那一次 SQLite 寫入）。
+                # 中-1：只有 permit and fr.ok 時才驗章——號誌取不到或 framing 已判
+                # 不合時，那一筆事件已記過，verdict 維持 None 照舊處理（不再於號誌
+                # 外驗章、不記第二筆互相矛盾的事件）。
+                if permit and fr.ok:
+                    verdict = self._authenticate(method, fr, raw)
             finally:
                 if permit:
                     self._framing_sem.release()
-            if body is None:  # 已回應（enforce 503）或已關閉（warn）
-                return
+            if verdict is not None:
+                # 號誌先放、再決定要回應什麼（REPORT-D2c-arch §2.2）。
+                if self._apply_verdict(verdict, template, method=method, log_path=path):
+                    return
+            if route[0] == "cooldown":
+                try:
+                    body = _parse_json_body(raw)
+                except ApiError as exc:
+                    _LOG.info("%s %s -> %s", method, path, exc.status)
+                    _send_json(self, exc.status, exc.body())
+                    return
+            else:
+                body = _UNREAD
             self._respond(method, path, route, query, body)
 
-        def _read_gated_body(self, length: int, template: str, mode: str,
+        def _read_gated_body(self, length: int, template: str,
                              method: str, path: str):
-            """在總期限內讀 body（C-105）；回已解析的 dict，已回應／已關閉時回 None。"""
+            """在總期限內讀 body（C-105）；回原始 bytes，已回應／已關閉時回 None。"""
             try:
-                raw = framing.read_body(self.rfile, length, self._framing_deadline,
-                                        sock=self.connection)
+                return framing.read_body(self.rfile, length, self._framing_deadline,
+                                         sock=self.connection)
             except (framing.ReadDeadline, framing.ShortBody):
                 # 逾時／斷線：enforce 回 503，warn 關閉連線（body 沒讀完，無法照舊
                 # 處理）。log 只記不含 query 的 path（中-1-3）。
-                _apply_framing(
-                    self, mode, "unavailable", "framing", template,
-                    method=method, status=503,
-                    error=ApiError(503, "auth_unavailable"),
-                    log_path=path, close_on_warn=True)
+                self._apply_verdict(
+                    auth_mod.unavailable(auth_mod.REASON_FRAMING), template,
+                    method=method, log_path=path, close_on_warn=True)
                 return None
-            return _parse_json_body(raw)
 
         def _respond(self, method: str, path: str, route, query: str, body=_UNREAD):
             """路由 → service → 回應（含錯誤對應與 log）。off 與 gated 共用。"""
@@ -443,17 +473,31 @@ def _api_handler(service, mode: str, semaphore):
     return ApiHandler
 
 
-def make_api_server(service, host: str, port: int, *, gate=None) -> ThreadingHTTPServer:
+def make_api_server(service, host: str, port: int, *, gate=None,
+                    auth_log=None) -> ThreadingHTTPServer:
     """建 /v1/* 的 API 伺服器（尚未 serve_forever）。
 
-    ``gate`` 只需 ``.mode``（``off``／``warn``／``enforce``）；``None`` 等於 off，
-    行為與 D1 逐 byte 相同（#222 D2 PR-1；C-101／C-108）。``/healthz`` 三種模式都
-    不套 framing。號誌上限（C-106）掛在回傳的伺服器上 ``framing_semaphore``，
-    供測試與後續 PR 觀察。
+    ``gate`` 是 ``off``／``warn``／``enforce`` 的物件（讀 ``.mode``）；``None`` 等於
+    off，行為與 D1 逐 byte 相同（#222 D2 PR-1；C-101／C-108）。warn／enforce 的
+    gate **必須**有可呼叫的 ``.authenticate``（`lgwd.auth.AuthGate`）；只有 ``.mode``
+    的物件會在這裡丟 ``ValueError``（fail-closed：接錯物件時建不起伺服器，而不是
+    enforce 靜默放行；#262 中-2）。``/healthz`` 三種模式都不套 framing、不呼叫 gate。
+    號誌上限（C-106）掛在回傳的伺服器上 ``framing_semaphore``；``auth_log`` 是
+    C-607 的聚合（``None`` 就建一個寫 ``lgwd.http``）。off 只在這裡記一行
+    ``auth mode=off``（C-607）。
     """
     mode = _gate_mode(gate)
+    if mode in ("warn", "enforce") and not callable(getattr(gate, "authenticate", None)):
+        # 中-2：安全閘門的預設必須是關，不是開；接錯物件要當場失敗。
+        raise ValueError("gate must provide authenticate() in warn/enforce mode")
     semaphore = threading.BoundedSemaphore(_FRAMING_PERMITS)
-    server = ThreadingHTTPServer((host, port), _api_handler(service, mode, semaphore))
+    if auth_log is None:
+        auth_log = auth_mod.AuthLog(sink=_LOG.info)
+    if mode == "off":
+        _LOG.info("auth mode=off")
+    server = ThreadingHTTPServer(
+        (host, port), _api_handler(service, mode, semaphore, gate, auth_log))
     server.daemon_threads = True  # 測試結束不卡住
     server.framing_semaphore = semaphore
+    server.auth_log = auth_log
     return server

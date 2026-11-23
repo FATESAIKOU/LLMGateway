@@ -771,5 +771,63 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertNotIn("import sqlite3", reload_source)
 
 
+class Low4StatusRetryTests(WatcherTestCase):
+    """PR-4 低-4：status 寫入失敗後下一輪 tick 補寫；`_last_status` 為 None 時也寫。
+
+    `_write_status` 失敗（磁碟滿、目錄暫時不可寫）時只記「待補寫」，下一輪 tick 的任何
+    返回路徑（包括「同一個壞 stamp 等待中」與「stamp 沒變」）都會先補寫最新那一份，
+    不受 60 秒心跳間隔限制；連一次都沒寫成過時也照樣補寫。
+    """
+
+    def test_low4_failed_first_write_is_retried_on_the_next_tick(self) -> None:
+        self.write(self.registry(1))
+        real = auth_reload._atomic_write
+        calls = {"count": 0}
+
+        def flaky(path, data, mode):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise OSError("inject")
+            return real(path, data, mode)
+
+        watcher = self.watcher()
+        with mock.patch.object(auth_reload, "_atomic_write", flaky):
+            self.assertEqual(watcher.load_initial().action, COMMIT_FIRST)
+            self.assertFalse(os.path.exists(self.paths.status),
+                             msg="第一次寫入被注入的 OSError 擋掉")
+            self.assertIsNone(watcher._last_status)
+            self.clock.advance(seconds=5)      # 遠小於 60 秒的心跳間隔
+            self.assertIsNone(watcher.tick())  # 沒有任何狀態變化的一輪
+            self.assertTrue(os.path.exists(self.paths.status))
+        document = self.status()
+        self.assertEqual(document["loaded_generation"], 1)
+        self.assertEqual(document["result"], "ok")
+        self.assertEqual(watcher.status_writes, 1)
+
+    def test_low4_retry_also_happens_while_waiting_on_a_bad_stamp(self) -> None:
+        self.write(self.registry(1))
+        watcher = self.watcher()
+        watcher.load_initial()
+        loaded = self.status()
+
+        def broken(path, data, mode):
+            raise OSError("inject")
+
+        self.write(b"{ not json")
+        with mock.patch.object(auth_reload, "_atomic_write", broken):
+            self.assertEqual(watcher.tick().result, "parse_error")
+            # 寫入失敗：磁碟上的 status 仍是上一份 ok。
+            self.assertEqual(self.status(), loaded)
+            self.clock.advance(seconds=5)
+            watcher.tick()                     # 同一個壞 stamp、等待中
+            self.assertEqual(self.status(), loaded)
+        # 磁碟恢復：下一輪 tick（仍然是同一個壞 stamp）就補寫。
+        self.clock.advance(seconds=5)
+        self.assertIsNone(watcher.tick())
+        document = self.status()
+        self.assertEqual(document["result"], "parse_error")
+        self.assertEqual(document["attempted_hash"], content_hash(b"{ not json"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

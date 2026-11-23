@@ -13,6 +13,9 @@ design「名冊 reload」的實作：
   rename 原子寫；只在「已載入世代／雜湊、最近嘗試的雜湊、結果」改變時寫，心跳每 60 秒
   至多一次。`UNCHANGED` 而目前停在錯誤時要改回 ok（回滾壞名冊是最常見的修復動作）。
   兩種寫入都只由載入路徑（啟動的 `load_initial` 或背景 `tick`）觸發，與請求量無關。
+  寫入失敗（例如磁碟滿）時記下「待補寫」，下一輪 `tick` 的任何返回路徑都會先補寫最新
+  那一份（不受 60 秒心跳間隔限制）；連一次都沒寫成過也照樣補寫，不會永遠沒有 status 檔
+  （低-4）。
   **心跳只代表背景執行緒還活著，與結果無關**：`tick()` 的每一條返回路徑（壞檔留在原地
   等 stamp 變、暫時性錯誤退避等待中、無變化）都會先推進它，否則壞名冊留著時 D5 會誤判
   「輪詢執行緒死了」。
@@ -292,6 +295,8 @@ class RegistryWatcher:
         self._retry_at: float | None = None
         self._backoff = 0.0
         self._last_status: dict | None = None
+        self._current_status: dict | None = None   # 最近一次要寫的文件（不管寫成沒）
+        self._status_pending = False               # 上一次寫入失敗、等下一輪補寫（低-4）
         self._last_heartbeat = 0
 
         self._stop = threading.Event()
@@ -544,35 +549,51 @@ class RegistryWatcher:
             "attempted_hash": attempted,
             "result": result,
         }
+        self._current_status = document
         if self._last_status is not None and all(
             self._last_status.get(key) == value for key, value in document.items()
         ):
-            self._maybe_heartbeat(now)   # 狀態沒變：只可能有心跳
+            self._maybe_heartbeat(now)   # 狀態沒變：只可能有心跳／補寫
             return
         self._write_status(document, now)
 
     def _maybe_heartbeat(self, now: int) -> None:
-        """心跳至多每 `heartbeat_seconds` 秒寫一次；只換 `heartbeat`，其他欄位不變。
+        """心跳至多每 `heartbeat_seconds` 秒寫一次（低-4 也由這裡補寫失敗的 status）。
 
         心跳代表「背景執行緒還活著」，與載入結果無關，所以每一條 tick 返回路徑都會呼叫
-        它（中-3）。還沒有寫過任何 status 時不寫（啟動的第一份由 `_publish` 寫）。
+        它（中-3）。上一輪寫入失敗時，這裡**不受心跳間隔限制**、直接補寫最新的那一份
+        （`_current_status`）：否則磁碟恢復後 status 會一直停在舊世代，直到下一次狀態
+        改變。連一次都沒寫成過（`_last_status` 為 None）時也照樣補寫，不會變成永遠
+        沒有 status 檔。
         """
-        if self._last_status is None:
+        if self._status_pending:
+            if self._current_status is not None:
+                self._write_status(self._current_status, now)
+            return
+        document = self._last_status
+        if document is None:
+            document = self._current_status
+        if document is None:
             return
         if float(now) - float(self._last_heartbeat) >= self.heartbeat_seconds:
-            self._write_status(self._last_status, now)
+            self._write_status(document, now)
 
-    def _write_status(self, document: dict, now: int) -> None:
+    def _write_status(self, document: dict, now: int) -> bool:
+        """寫一份 status；失敗只記型別並標「待補寫」，回 False（低-4）。"""
         payload = dict(document)
         payload["heartbeat"] = int(now)
         try:
             _atomic_write(self.status_path, status_bytes(payload), STATUS_MODE)
         except OSError as exc:
             _LOG.warning("auth registry status write failed: %s", type(exc).__name__)
-            return
+            self._status_pending = True
+            return False
         self._last_status = document
+        self._current_status = document
+        self._status_pending = False
         self._last_heartbeat = int(now)
         self.status_writes += 1
+        return True
 
 
 __all__ = [
