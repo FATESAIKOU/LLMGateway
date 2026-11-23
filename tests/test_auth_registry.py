@@ -674,5 +674,57 @@ class RegistryFileTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "")
 
 
+class PublicKeyBlobAndFingerprintTests(unittest.TestCase):
+    """D2 PR-5 移到 `auth_registry` 的兩個函式：blob 與 fingerprint 只有這一份實作。"""
+
+    SSHSIG_VECTOR = REPO_ROOT / "tests" / "vectors" / "sshsig_v1.json"
+    SSH_KEYGEN = "/usr/bin/ssh-keygen"
+
+    def test_ssh_public_key_blob_rebuilds_canonical_blob(self):
+        self.assertEqual(auth_registry.ssh_public_key_blob(VALID_A), _blob(VALID_A))
+        self.assertEqual(
+            auth_registry.validate_ed25519_pubkey(
+                auth_registry.ssh_public_key_blob(VALID_A)
+            ),
+            VALID_A,
+        )
+
+    def test_ssh_public_key_blob_rejects_non_32_bytes(self):
+        for value in (b"", b"\x00" * 31, b"\x00" * 33):
+            with self.subTest(length=len(value)):
+                with self.assertRaises(InvalidPublicKey) as ctx:
+                    auth_registry.ssh_public_key_blob(value)
+                self.assertEqual(ctx.exception.reason, auth_registry.REASON_INVALID_LENGTH)
+        with self.assertRaises(InvalidPublicKey):
+            auth_registry.ssh_public_key_blob("not bytes")
+
+    def test_fingerprint_matches_ssh_keygen_l(self):
+        vector = json.loads(self.SSHSIG_VECTOR.read_text(encoding="utf-8"))
+        raw = base64.b64decode(vector["public_key"].split()[1])[-32:]
+        expected = auth_registry.fingerprint(raw)
+        self.assertEqual(expected, "aJNFOHQV7gykg5qlLvJszgg3JWG9Kf529FjlcpaG+OI")
+        if not os.path.exists(self.SSH_KEYGEN):
+            self.skipTest("no ssh-keygen")
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".pub", delete=False, encoding="ascii"
+        ) as handle:
+            handle.write(vector["public_key"] + "\n")
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        result = subprocess.run(
+            [self.SSH_KEYGEN, "-l", "-f", path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SHA256:" + expected, result.stdout)
+
+    def test_fingerprint_is_base64_without_padding(self):
+        value = auth_registry.fingerprint(VALID_B)
+        self.assertRegex(value, r"\A[A-Za-z0-9+/]{43}\Z")
+        self.assertNotEqual(value, auth_registry.fingerprint(VALID_C))
+
+
 if __name__ == "__main__":
     unittest.main()
