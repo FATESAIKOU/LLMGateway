@@ -579,7 +579,7 @@ exec "$@"
 
         probe_log = self.read_log("probe-ssh")
         self.assertIn("-W 127.0.0.1:4710", probe_log)
-        self.assertIn("GET /v1/subscriptions HTTP/1.0", probe_log)
+        self.assertIn("GET /healthz HTTP/1.0", probe_log)
 
         # 1: 本機 200 但經會合點不是 200
         res_probe_503 = self.run_install(

@@ -254,7 +254,7 @@ while :; do sleep 0.05; done
         self.assertNotIn("restart", stderr)
         ssh_log = self.read_ssh_log()
         self.assertIn("-W 127.0.0.1:4710", ssh_log)
-        self.assertIn("GET /v1/subscriptions HTTP/1.0", ssh_log)
+        self.assertIn("GET /healthz HTTP/1.0", ssh_log)
         self.assertEqual(self.stop_daemon(), 0)
 
     def test_three_probe_failures_restart_tunnel(self):
@@ -286,7 +286,7 @@ while :; do sleep 0.05; done
         self.assertEqual(res.stderr, "")
         ssh_log = self.read_ssh_log()
         self.assertIn("-W 127.0.0.1:4710", ssh_log)
-        self.assertIn("GET /v1/subscriptions HTTP/1.0", ssh_log)
+        self.assertIn("GET /healthz HTTP/1.0", ssh_log)
         self.assertIn("-i " + FAKE_IDENTITY, ssh_log)
         self.assertIn("-o UserKnownHostsFile=" + FAKE_KNOWN_HOSTS, ssh_log)
         self.assertIn("-o GlobalKnownHostsFile=/dev/null", ssh_log)
