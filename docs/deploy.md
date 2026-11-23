@@ -36,7 +36,7 @@
 - 獨立服務帳號：`llmgw`（不能加入 `docker` 群組，確保隔離性）。
 - `gh` 登入：由本人親自以 `llmgw` 身分登入（`sudo -u llmgw -i` 後執行 `gh auth login`，使用瀏覽器登入，不放 token 檔）。這條只管 `LLMGateway-keys` 金鑰同步，**另有一個受控例外**，見下一條。
 - **`NODE_GATEWAY` 讀取用 token 檔（受控例外，#221；可選，只在要讓隧道跟隨 MLP 輪換時才放）**：一把 GitHub fine-grained PAT，只授權 `FATESAIKOU/MyLinuxPool` 的 `Variables: Read-only`（這是最小授權，但**仍可讀該 repo 全部 Actions variables**，含其他 `NODE_*` 的位址拓樸，不含 Secrets）；檔案 `/etc/llmgateway/mlp-gateway.token`（`root:root`、`0600`），以 systemd drop-in `LoadCredential` 交給隧道守護，不給 `llmgw` 直接讀。平穩期（連線一直健康）token 可能悄悄到期，直到下一次輪換才發現，需靠 `TOKEN_EXPIRES_AT` 與人工 `--fetch-check` 降低風險。完整規格、建立與換 token 流程見 7.2。
-- 隧道金鑰：維持在 `~llmgw/.ssh/`（私鑰 `~llmgw/.ssh/id_llmgw_tunnel`、known_hosts 檔 `~llmgw/.ssh/known_hosts_rendezvous`）。私鑰絕不離開該台機器。跟隨輪換後，連線改用 `/var/lib/llmgateway/.tunnel_known_hosts`（程式依 `NODE_GATEWAY` 的 `host_key` 產生）；`known_hosts_rendezvous` 只在沒有有效位址檔時當最後已知位址用（觀察期後可清，見 7.6）。
+- 隧道金鑰：維持在 `~llmgw/.ssh/`（私鑰 `~llmgw/.ssh/id_llmgw_tunnel`、known_hosts 檔 `~llmgw/.ssh/known_hosts_rendezvous`）。私鑰絕不離開該台機器。跟隨輪換後，連線改用 `/var/lib/llmgateway/.tunnel_known_hosts`（程式依 `NODE_GATEWAY` 的 `host_key` 產生）；`known_hosts_rendezvous` 只在沒有有效位址檔時當最後已知位址用（P5 後已收起，見 7.6）。
 
 ### 1.2 檔案系統版面配置（Layout）
 
@@ -705,7 +705,7 @@ sudo llmgwctl tunnel-apply --retry-revert     # 只在 revert-failed 可用；�
      /opt/llmgateway/current/ops-scripts/llmgateway-tunnel --fetch-check
    ```
 
-   暫存檔要加的鍵（其餘原樣保留，**特別是既有靜態 `RENDEZVOUS`、`KNOWN_HOSTS` 與 `REMOTE_SSH=4711`，觀察期內供 `llmgwctl rollback` 回退相容**；`TUNNEL_USER` 或 `RENDEZVOUS` 的 `user@` 要有本機 SSH 帳號）：
+   暫存檔要加的鍵（其餘原樣保留，**特別是既有靜態 `RENDEZVOUS`、`KNOWN_HOSTS` 與 `REMOTE_SSH=4711`，切換期間保留；P5 清掉靜態鍵之後不再保留，見 7.4、7.6**；`TUNNEL_USER` 或 `RENDEZVOUS` 的 `user@` 要有本機 SSH 帳號）：
 
    ```
    GATEWAY_SOURCE_REPO=FATESAIKOU/MyLinuxPool
@@ -744,13 +744,15 @@ sudo llmgwctl tunnel-apply --retry-revert     # 只在 revert-failed 可用；�
 
 `llmgwctl tunnel-apply` 的 `--help`（沙箱實跑）旗標只有 `--new-env`、`--new-dropin`、`--revert-after`、`--confirm`、`--retry-revert`；其餘旗標是給 transient unit 內部用的，**不要手打**。
 
-### 7.4 觀察期：保留靜態鍵
+### 7.4 靜態鍵（P5 之後已移除）
 
-切換後到觀察期結束前，`tunnel.env` **保留**原本的靜態 `RENDEZVOUS`、`KNOWN_HOSTS` 與 `REMOTE_SSH=4711`（以及 `~llmgw/.ssh/known_hosts_rendezvous` 檔），原因：
+切換後到 P5 之前，`tunnel.env` **保留**原本的靜態 `RENDEZVOUS`、`KNOWN_HOSTS`（以及 `~llmgw/.ssh/known_hosts_rendezvous` 檔）。`REMOTE_SSH=4711`（會合點上轉回本機 sshd 的管理埠）不屬於靜態位址，一直保留。P5 之前保留它們的原因：
 
-- `llmgwctl rollback` 回退到舊版腳本時，舊腳本只認這幾個靜態鍵。
+- `llmgwctl rollback` 若回到 `lgw-v0.8.0` **之前**的版本（隧道腳本不認 `FOLLOW_FILE`／GitHub 抓取），舊腳本只認這幾個靜態鍵；回到 `lgw-v0.8.0`（含）之後的版本不受影響。
 - 沒有有效 `FOLLOW_FILE` 時（第一次輪換之前）守護本來就用它們連線；`tunnel-apply` 的探針也靠它們（`FOLLOW_FILE` 缺失時走靜態位址）。
-- 注意：靜態值是切換當時的位址，**輪換過之後就過時了**。觀察期內若已輪換過、之後又要 `llmgwctl rollback`，回退前先人工把靜態 `RENDEZVOUS`／`KNOWN_HOSTS` 改成目前的位址。
+- 注意：靜態值是切換當時的位址，**輪換過之後就過時了**，不能直接當退路用。
+
+**P5 之後（#221，2026-11-23 於服務主機完成並確認）**：靜態鍵的角色結束，`RENDEZVOUS`、`KNOWN_HOSTS` 已從 `tunnel.env` 移除，`~llmgw/.ssh/known_hosts_rendezvous` 已收起。位址來源只剩 `gateway.json` 與 GitHub 抓取，**沒有靜態後備位址**；本機 SSH 使用者改由 `TUNNEL_USER` 提供（必須存在）。移除的程序與後果見 7.6。
 
 ### 7.5 第一次真實輪換觀察與退回 SOP
 
@@ -773,15 +775,38 @@ llmgwctl status
 | `follow_invalid`／`hostkey_missing`／`fetch_invalid` | 同代欄位被改、`host_key` 缺漏或格式不合、欄位驗證不過（含 `tunnel_user` 與本機不符） | 人工確認 `NODE_GATEWAY`，請 MLP 修正；守護保留最後已知位址持續重試，不會連到未通過驗證的位址 |
 | `credential_unreadable` | token 檔缺、沒權限，或 drop-in `LoadCredential` 沒生效 | 7.2；`sudo systemctl daemon-reload` 後 `systemctl show llmgateway-tunnel -p LoadCredential` |
 
-**退回（應急止血）**：若自動跟隨失敗又等不及：
+**退回（應急止血）**：若自動跟隨失敗又等不及。**P5 之後沒有靜態後備位址**，退回是按根因恢復，不是換回靜態位址：
 
 1. 先照上表修好根因（`NODE_GATEWAY`、token）。
-2. 想立刻回到靜態位址：把 `FOLLOW_FILE` 改名移開（例如 `sudo mv /var/lib/llmgateway/gateway.json /var/lib/llmgateway/gateway.json.bad`），然後 `sudo systemctl restart llmgateway-tunnel`；沒有有效 `FOLLOW_FILE` 時守護退回 `tunnel.env` 的靜態 `RENDEZVOUS`／`KNOWN_HOSTS`（前提是靜態值仍是正確位址；否則先手動更新它們）。此退回步驟**未在真機驗證，P4 第一次執行時逐步確認**。
-3. 真的要退回舊版：`sudo llmgwctl rollback`（依賴觀察期內保留的靜態鍵，見 7.4）。
+2. 按根因恢復：
+   - token 失效、被撤銷或權限不對：7.2「換 token」流程；照 7.2 的流程做完（含用 `tunnel-apply` 保險重啟隧道），再 `sudo llmgwctl follow-reset --fetch-state`。
+   - `NODE_GATEWAY` 殘留舊代金鑰、格式不合：請 MLP 修正；新的一代抓到即可，**不需要** `follow-reset`。
+   - `follow_regressed`（MLP 回退）：先人工確認是否為合法回退，確認並修好來源後才 `sudo llmgwctl follow-reset`（不帶 `--fetch-state` 會清已驗證水位，降低回退檢查），再重啟隧道。
+   - 修好後守護會從 GitHub 重抓。`gateway.json` 缺失或損毀時也會自動取回（需 GitHub 可讀、token 有效、水位相容）；這些條件成立時不必手動改檔。
+   - 仍恢復不了（抓取持續失敗，或水位檔損毀、回退不通過）：由 MLP PMO 提供目前位址與主機金鑰，由 PM 寫成新的 `tunnel.env.new` 並走 `tunnel-apply --new-env`（見 7.6 的保險程序；不要手動只改單一檔）：此時要在 `tunnel.env.new` **暫時加回** `RENDEZVOUS=[user@]host:port` 與 `KNOWN_HOSTS=<檔案路徑>`（檔案內容為 MLP PMO 提供的主機金鑰，必要時由 `known_hosts_rendezvous.retired-*` 取回或重寫；`TUNNEL_USER` 與 `RENDEZVOUS` 的 user 必須相同），否則 `tunnel-apply` 的探針沒有位址可用、必定失敗並自動還原；恢復後再依 7.6 移除。**若 `gateway.json` 格式與水位都合法但位址已過時（例如輪換後 token 又失效、一直抓不到新位址），守護與探針會優先用它而忽略靜態鍵**：要先把它移開（`sudo mv /var/lib/llmgateway/gateway.json /var/lib/llmgateway/gateway.json.bad`），再跑 `tunnel-apply`；注意 `tunnel-apply` 的備份是套用當下才做，保險自動還原時**不會**把這個已移開的檔放回來。這是目前唯一人工注入位址的手段。
+   - 舊做法（**僅適用 P5 之前、靜態鍵仍在且靜態值仍正確的期間**；此步驟未在真機驗證）：把 `FOLLOW_FILE` 改名移開（`sudo mv /var/lib/llmgateway/gateway.json /var/lib/llmgateway/gateway.json.bad`）再重啟，守護才會退回靜態 `RENDEZVOUS`／`KNOWN_HOSTS`。P5 之後這個做法不再退回靜態位址，守護只會去 GitHub 重抓。
+3. 真的要退回舊版：`sudo llmgwctl rollback` 只切版本、安裝該版 unit 並重啟 `llmgateway.service`，不改 `tunnel.env`、不重啟隧道。**回到 `lgw-v0.8.0` 之前的版本在 P5 之後不可行**（舊隧道腳本需要靜態 `RENDEZVOUS`／`KNOWN_HOSTS`；隧道下次重啟會以設定缺漏結束碼 78 失敗，見 7.4、7.6）；回到 `lgw-v0.8.0`（含）之後的版本不受影響。
 
-### 7.6 觀察期結束（清舊靜態鍵）
+### 7.6 P5：清舊靜態鍵（已完成，#221）
 
-確認不需要 `llmgwctl rollback` 回舊版後，才清理：從真機 `tunnel.env` 移除過時靜態鍵（`KNOWN_HOSTS`；`RENDEZVOUS` 若 `TUNNEL_USER` 已設也可移除，**但本機 SSH 使用者必須仍由 `TUNNEL_USER` 或 `RENDEZVOUS` 提供**）與 `~llmgw/.ssh/known_hosts_rendezvous` 檔，通知 MLP PMO 關閉 `MLP#1511`。清完這一步觀察期才算結束，之後舊版 `rollback` 不再可行。修改 `tunnel.env` 請同樣走 `tunnel-apply`（`--new-env`），讓保險在重啟隧道時守著。**觀察期結束前，不要對真機執行清理舊設定的後續版本 `llmgwctl upgrade`**（repo 側的文件與腳本清理排在觀察期之後）。
+觀察期結束後，從 `tunnel.env` 移除過時靜態鍵 `RENDEZVOUS`、`KNOWN_HOSTS`，並收起 `~llmgw/.ssh/known_hosts_rendezvous`。移除的程序（修改 `tunnel.env` 一律走 `tunnel-apply --new-env`，讓保險在重啟隧道時守著）：
+
+1. 在暫存檔刪掉 `RENDEZVOUS=` 與 `KNOWN_HOSTS=` 兩行；`TUNNEL_USER=<本機 SSH 使用者>` 必須存在（本機使用者只能由它提供）。`REMOTE_SSH=4711`、`GATEWAY_*`、`IDENTITY` 等其他鍵原樣保留。
+2. 以 `grep -c` 確認舊兩行真的刪了（預期 0），`TUNNEL_USER` 恰一行；再以 `--fetch-check`（`LGW_TUNNEL_ENV` 指向暫存檔）驗 token。`--fetch-check` 通過**不證明**舊鍵已刪，所以要靠 `grep` 驗。
+3. `sudo llmgwctl tunnel-apply --new-env /etc/llmgateway/tunnel.env.new`：保險下套用，步驟與驗收同 7.3 第 3、4 步；**`tunnel-apply --confirm` 之前不算完成**。
+4. 確認後：`rm /etc/llmgateway/tunnel.env.new`（套用後留著，可能被誤當有效暫存檔重套）；`~llmgw/.ssh/known_hosts_rendezvous` 用 `mv` 收成 `.retired-<時間>`，不用 `rm`（等再過一輪輪換確認沒事後才可真的刪）。守護連線用的是 `/var/lib/llmgateway/.tunnel_known_hosts`，收起舊檔不影響。**不要刪私鑰 `id_llmgw_tunnel`。**
+5. 通知 MLP PMO：「輪換後人工照貼新位址與 `known_hosts_rendezvous`」那一塊作廢（MLP#1511 相關部分由 MLP PMO 決定是否關閉）。**`rotate-gateway` 仍須保留 `TUNNEL_EXTRA_PUBKEYS` 與完整寫入 `NODE_GATEWAY`（含新機 `host_key`）的契約，不可拆。**
+
+**P5 之後的後果**：
+
+- **沒有靜態後備位址**。位址來源只剩 `gateway.json`（有效時啟動就用它）與 GitHub。`gateway.json` 缺失或損毀時，守護會嘗試從 GitHub 取回；只要 GitHub 可讀、token 有效、資料與水位檔相容且可寫入，就能自動恢復。
+- **抓取失敗或水位檔損毀時會連不上**：抓取失敗指 token 失效、被限流、網路不通；水位檔損毀或回退不通過也一樣。守護依退避反覆重啟（程序結束後 10 秒重啟，但 GitHub 請求有退避，不是每 10 秒一次），4710／4711 會斷到原因排除為止，需人工按原因處理（見 7.5 表）。已建立的連線不會因 token 稍後失效而立刻中斷。
+- **token 在平穩期悄悄到期，沒有即時訊號**：要定期看 `sudo llmgwctl check` 的 `tunnel-token`（見 7.3），不要等斷線才查。
+- **`llmgwctl rollback` 回到 `lgw-v0.8.0` 之前的版本不再可行**（舊隧道腳本需要靜態鍵）；回到 `lgw-v0.8.0`（含）之後的版本不受影響。
+- **備份目錄會被下一次 `tunnel-apply` 整個清空重建**：要留的備份先複製出來（root 0600，複製時用 `sudo`）。
+- 舊 `known_hosts_rendezvous` 已收起（`.retired-<時間>`），不是有效的退路。
+
+repo 側的舊靜態鍵文件與腳本殘留，另開 d 單清理；清理前不要對真機執行會清舊設定的 `llmgwctl upgrade`。
 
 ---
 
