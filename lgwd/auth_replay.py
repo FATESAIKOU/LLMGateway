@@ -222,6 +222,20 @@ class ReplayStore:
             )
         return int(rows[0][0])
 
+    # --- 觀測（D5b 的 `auth-replay status`；唯讀） ---
+
+    def water_rows(self) -> list[tuple[str, int]]:
+        """每個有清除水位的 key：`(key_id, H)`，依 key ID 排序（D5b；不印 nonce）。"""
+        rows = self._db.read("SELECT key_id, h FROM water ORDER BY key_id")
+        return [(str(row[0]), int(row[1])) for row in rows]
+
+    def nonce_counts(self) -> dict[str, int]:
+        """每個 key 目前還在庫中的 nonce 列數（D5b 的輸出用；不印 nonce）。"""
+        rows = self._db.read(
+            "SELECT key_id, COUNT(*) FROM nonces GROUP BY key_id ORDER BY key_id"
+        )
+        return {str(row[0]): int(row[1]) for row in rows}
+
     # --- 內部 ---
 
     def _water(self, cur, key_id: str) -> int | None:

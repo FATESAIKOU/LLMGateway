@@ -11,10 +11,10 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import json
 import os
-import shutil
 import stat
 import tempfile
 import unittest
@@ -204,19 +204,9 @@ class AdminTestCase(unittest.TestCase):
             for name in sqlite_sidecars(path):
                 self.assertFalse(os.path.exists(name), msg=name)
 
-    def assert_harmless_sidecars(self) -> None:
-        """唯讀開庫後允許留下的只有 0 byte `-wal` 與 `-shm`，且擁有者等於庫檔（中-1）。"""
-        for path in (self.paths.trust_db, self.paths.replay_db):
-            if not os.path.exists(path):
-                continue
-            info = os.stat(path)
-            for name in sqlite_sidecars(path):
-                if not os.path.exists(name):
-                    continue
-                side = os.stat(name)
-                self.assertEqual((side.st_uid, side.st_gid), (info.st_uid, info.st_gid), name)
-                if name.endswith("-wal"):
-                    self.assertEqual(side.st_size, 0, name)
+    def assert_read_only_left_no_sidecars(self) -> None:
+        """唯讀之後沒有新的 sidecar（`#270` 中-1：`open_ro` 不建檔、不刪檔）。"""
+        self.assert_no_sidecars()
 
     def assert_no_unexpected_state_files(self) -> None:
         """狀態目錄裡除了兩庫、鎖檔、審計與 SQLite sidecar 之外沒有別的檔。"""
@@ -352,8 +342,8 @@ class InspectTests(AdminTestCase):
         self.assertEqual(listing.trust_identity, listing.replay_identity)
         self.assertEqual(inspect_stores(self.paths), listing)
         self.assertEqual(_hashes(self.paths.trust_db, self.paths.replay_db), before)
-        # 唯讀不建庫、不建鎖；SQLite 自己建的 0 byte `-wal`／`-shm` 允許留下（中-1）。
-        self.assert_harmless_sidecars()
+        # 唯讀不建庫、不建鎖、也不留下任何 sidecar（中-1：`open_ro` 不建檔）。
+        self.assert_read_only_left_no_sidecars()
         self.assert_no_unexpected_state_files()
 
     def test_c802_inspect_replay_reads_wal_store_while_writer_runs(self) -> None:
@@ -388,24 +378,39 @@ class InspectTests(AdminTestCase):
         self.assertEqual((ctx.exception.kind, ctx.exception.exit_code), (KIND_STORE_MISSING, 2))
         self.assertFalse(os.path.exists(self.paths.trust_db))
 
-    def test_c802_inspect_returns_2_when_wal_store_cannot_create_shm(self) -> None:
-        """W-D10 反面：目錄不可寫、又沒有 `-shm` 時 `mode=ro` 讀不到 → 2，不改用 rw。"""
-        if os.geteuid() == 0:
-            self.skipTest("root 不受目錄權限限制，無法在本機重現唯讀目錄")
+    def test_c802_inspect_refuses_a_wal_store_without_shm(self) -> None:
+        """W-D10／中-1 第三種狀態：有 `-wal`、沒有 `-shm` → 回 2，不開庫、不建檔、不刪檔。"""
         self.init()
-        ro_dir = os.path.join(self.dir, "ro-state")
-        os.makedirs(ro_dir)
-        target = os.path.join(ro_dir, "auth-replay.sqlite")
-        shutil.copyfile(self.paths.replay_db, target)
-        os.chmod(ro_dir, 0o555)
-        self.addCleanup(os.chmod, ro_dir, 0o755)
-        paths = auth_paths(ro_dir)
-        before = _hash(target)
+        self.set_water({"w1-a": 1000})
+        db = open_rw(self.paths.replay_db)
+        copies = {}
+        try:
+            with db.txn() as cur:
+                cur.execute(
+                    "INSERT INTO nonces (key_id, nonce, ts) VALUES (?, ?, ?)",
+                    ("w1-a", "n1", 1000),
+                )
+            for suffix in ("", "-wal"):
+                with open(self.paths.replay_db + suffix, "rb") as fh:
+                    copies[suffix] = fh.read()
+        finally:
+            db.close()
+        self.assertGreater(len(copies["-wal"]), 0)
+        target_dir = os.path.join(self.dir, "unclean-state")
+        os.makedirs(target_dir)
+        target = os.path.join(target_dir, "auth-replay.sqlite")
+        for suffix, data in copies.items():
+            with open(target + suffix, "wb") as fh:
+                fh.write(data)
+        self.assertFalse(os.path.exists(target + "-shm"))
+        paths = auth_paths(target_dir)
+        before = sorted(os.listdir(target_dir))
         with self.assertRaises(AdminError) as ctx:
             inspect_replay(paths, clock=self.clock)
         self.assertEqual((ctx.exception.kind, ctx.exception.exit_code), (KIND_STORE_UNAVAILABLE, 2))
-        self.assertEqual(_hash(target), before)
-        self.assertEqual(sorted(os.listdir(ro_dir)), ["auth-replay.sqlite"])
+        self.assertIn("未正常關閉", str(ctx.exception))
+        self.assertEqual(sorted(os.listdir(target_dir)), before)
+        self.assertFalse(os.path.exists(target + "-shm"))
 
     def test_c802_inspect_corrupt_store_does_not_fall_back_to_rw(self) -> None:
         with open(self.paths.replay_db, "wb") as fh:
@@ -456,7 +461,7 @@ class RecoverReplayTests(AdminTestCase):
             {"w1-tunnel-a": now + 60, "w1-tunnel-old": now + 60},
         )
         self.assertEqual(inspect_stores(self.paths).tombstone_count, 1)
-        self.assert_harmless_sidecars()
+        self.assert_read_only_left_no_sidecars()
         record = self.audit_lines()[-1]
         self.assertEqual(record["command"], "auth-replay recover-store")
         self.assertEqual(record["new"]["replay_identity"], result.identity)
@@ -778,7 +783,7 @@ class ResetKeyWaterTests(AdminTestCase):
         self.assertEqual(record["command"], "auth-replay reset-key-water")
         self.assertEqual(record["old"]["water"], {"w1-a": self.now + 500})
         self.assertEqual(record["new"]["water"], {"w1-a": self.now - 65})
-        self.assert_harmless_sidecars()
+        self.assert_read_only_left_no_sidecars()
 
     def test_c806_all_future_selects_only_h_above_now_plus_60(self) -> None:
         self.set_water(
@@ -1086,32 +1091,35 @@ class ReadOnlyLockTests(AdminTestCase):
         self.assertEqual(calls, [])
 
     def test_c802_lgwd_can_take_the_lock_right_after_inspect(self) -> None:
-        """中-1：inspect 收 sidecar 的那一刻，另一個 fd 取 `LOCK_EX|LOCK_NB` 一定成功。"""
+        """中-1：inspect 讀完、關閉連線之後，另一個 fd 取 `LOCK_EX|LOCK_NB` 一定成功。"""
         self.init()
         self.set_water({"w1-a": 1000})
         seen = []
-        real = auth_admin._readonly_sidecars
+        real = auth_admin.open_readonly
 
-        def probe(path, existed):
+        @contextlib.contextmanager
+        def probe(path):
+            with real(path) as db:
+                yield db
             handle = acquire_store_lock(self.paths.store_lock)
             try:
                 seen.append("free")
             finally:
                 handle.release()
-            return real(path, existed)
 
-        with mock.patch.object(auth_admin, "_readonly_sidecars", probe):
+        with mock.patch.object(auth_admin, "open_readonly", probe):
             inspect_stores(self.paths)
         self.assertTrue(seen)
         self.assertEqual(set(seen), {"free"})
 
-    def test_c802_inspect_leaves_owned_empty_sidecars_and_a_write_cleans_them(self) -> None:
-        """中-1：不刪 sidecar，但它們是 0 byte `-wal`、擁有者同庫檔，之後寫入清掉。"""
+    def test_c802_inspect_leaves_no_sidecars(self) -> None:
+        """中-1：唯讀開庫不建任何 sidecar；之後的寫入指令也不必替它收拾。"""
         self.init()
         self.set_water({"w1-a": 1000})
+        before = sorted(os.listdir(self.state_dir))
         inspect_replay(self.paths, clock=self.clock)
-        self.assertTrue(os.path.exists(self.paths.replay_db + "-shm"))
-        self.assert_harmless_sidecars()
+        self.assertEqual(sorted(os.listdir(self.state_dir)), before)
+        self.assert_read_only_left_no_sidecars()
         with store_write_lock(self.paths, self.owner):
             pass
         self.assert_no_sidecars()

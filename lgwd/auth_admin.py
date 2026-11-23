@@ -22,11 +22,12 @@
   回傳值裡明示，而且**只給信任庫真的損毀／缺失時用**——健康的信任庫、或「部分讀
   得出但舊水位高於名冊世代」一律拒絕（中-3；降世代走 `reset_generation`、換名冊
   走 `install`）。讀得出的舊墓碑與名冊衝突時也拒絕（不讓已撤銷 key 復活）。
-- **唯讀一律 `mode=ro`、不建檔、不取 store 鎖**：`inspect_*` 不以 `rw` 開庫，缺檔
-  就是 `store_missing`（W-D10）；也**不參與鎖**（中-1），所以一個狀態查詢不會讓
-  同時啟動的 lgwd 拿到 `LockBusy` 而以 78 結束。SQLite 讀 WAL 庫時自己建的
-  `-wal`／`-shm`（`-wal` 是 0 byte，不含未落地的交易）不刪，只把擁有者對齊庫檔
-  （root 才做得到）；之後任何寫入指令在持鎖時由 `_drop_empty_sidecars` 順手清掉。
+- **唯讀一律 `auth_db.open_ro`、不建檔、不取 store 鎖**：`inspect_*` 不以 `rw` 開庫，
+  缺檔就是 `store_missing`（W-D10）；也**不參與鎖**（中-1），所以一個狀態查詢不會讓
+  同時啟動的 lgwd 拿到 `LockBusy` 而以 78 結束。開庫的三種檔案狀態只有
+  `auth_db.open_ro` 一份來源（`#270` 中-1）：沒有 `-wal` 走 `immutable=1`；`-wal`／
+  `-shm` 都在走 `mode=ro`；有 `-wal` 沒有 `-shm` 直接 `StoreUnclean`（結束碼 2，
+  不開庫、不建檔、不刪檔）。唯讀路徑不再建出任何 sidecar。
 - **審計**：`AuditLog` 一行一筆 JSON、`root:root 0600`、`O_APPEND|O_CREAT|
   O_NOFOLLOW`；只記誰、何時、哪個指令、去敏的參數與新舊**摘要**（世代、雜湊、key
   ID、`H`），不記公鑰全文與簽章。每個寫入函式都先寫審計才動庫。
@@ -43,27 +44,24 @@ import contextlib
 import json
 import os
 import re
-import sqlite3
 import tempfile
 from dataclasses import dataclass
 from typing import Iterable, Mapping
-from urllib.parse import quote
 
 from lgwd.auth_db import (
     IDENTITY_BYTES,
     REPLAY_SCHEMA,
     TRUST_SCHEMA,
-    AuthDb,
     LockBusy,
     LockUnavailable,
     StoreBusy,
     StoreExists,
     StoreMissing,
     StoreUnavailable,
+    StoreUnclean,
     acquire_store_lock,
-    classify_message,
     create_store,
-    error_from,
+    open_ro,
     open_rw,
 )
 from lgwd.auth_paths import AuthPaths, now_seconds, sqlite_sidecars
@@ -161,6 +159,9 @@ class AuditValueError(AdminError):
 
 def _store_admin_error(exc: StoreMissing | StoreBusy | StoreUnavailable, *, exit_code: int,
                        hint: str | None = None) -> AdminError:
+    if isinstance(exc, StoreUnclean):
+        # 未正常關閉是「現在不能做」而不是「結果不合格」；固定回 2 並給下一步。
+        return AdminError(KIND_STORE_UNAVAILABLE, str(exc), exit_code=2, hint=UNCLEAN_HINT)
     if isinstance(exc, StoreMissing):
         kind = KIND_STORE_MISSING
     elif isinstance(exc, StoreBusy):
@@ -170,71 +171,26 @@ def _store_admin_error(exc: StoreMissing | StoreBusy | StoreUnavailable, *, exit
     return AdminError(kind, "認證庫不可用", exit_code=exit_code, hint=hint)
 
 
-# --- 唯讀開庫（mode=ro；不建庫、不建檔） ---
+# --- 唯讀開庫（唯一來源：`auth_db.open_ro`） ---
 
-def _uri(path: str, mode: str) -> str:
-    """`file:<path>?mode=rw|ro`；編碼規則與 `auth_db._uri` 相同（`?`、`#`、`%`）。"""
-    return "file:{0}?mode={1}".format(quote(os.fspath(path), safe="/"), mode)
-
-
-def _readonly_sidecars(path: str, existed: Mapping[str, bool]) -> None:
-    """唯讀開庫後，把**這次才出現的** `-wal`／`-shm` 擁有者對齊庫檔（W-D9；中-1）。
-
-    `mode=ro` 開 WAL 庫時 SQLite 會建立 0 byte `-wal` 與 `-shm`。這裡**不取 store
-    flock、也不刪**：
-
-    - 不取鎖：一個唯讀的狀態查詢不得讓同時啟動的 lgwd 拿到 `LockBusy`，以 78 結束
-      （那是 `RestartPreventExitStatus=78` 之後會一直停著的事故；REPORT-D45 §4
-      「唯讀指令在 lgwd 運行或停止時都只讀，不參與鎖」）。
-    - 不刪：0 byte 的 `-wal` 不含任何未落地的交易，對 SQLite 與 lgwd 都無害；之後
-      任何拿到 flock 的寫入指令會由 `_drop_empty_sidecars` 順手清掉。
-
-    唯一做的是把新 sidecar 的擁有者對齊庫檔（root 執行時才做得到），避免留下 root
-    擁有的 `-wal`／`-shm`。非 root 的 `chown` 失敗靜默略過（與其他權限收尾一致）。
-    """
-    try:
-        info = os.stat(path)
-    except OSError:
-        return
-    for name in sqlite_sidecars(path):
-        if existed.get(name, True):
-            # 本來就有：那是別的行程（例如運行中的 lgwd）的檔，不動。
-            continue
-        try:
-            side = os.stat(name)
-        except OSError:
-            continue
-        if side.st_uid != info.st_uid or side.st_gid != info.st_gid:
-            try:
-                os.chown(name, info.st_uid, info.st_gid)
-            except OSError:
-                pass
+#: `StoreUnclean`（有 -wal、沒有 -shm）的下一步；訊息本體在 `auth_db`。
+UNCLEAN_HINT = "先啟動 lgwd 讓它回復；lgwd 停止時跑一次寫入指令後再查"
 
 
 @contextlib.contextmanager
 def open_readonly(path: str):
-    """以 `mode=ro` 開既有庫；缺檔 `StoreMissing`、其他 `StoreUnavailable`（不建檔）。
+    """以 `auth_db.open_ro` 唯讀開既有庫（三種檔案狀態的規則只有那一份）。
 
     **不取 store flock**（中-1）：唯讀指令在 lgwd 運行或停止時都只讀、不參與鎖。
+    不建檔、不刪檔：`-wal` 不在時走 `immutable=1`；`-wal`／`-shm` 都在時走
+    `mode=ro`；有 `-wal` 沒 `-shm` 時 `open_ro` 丟 `StoreUnclean`（結束碼 2）。
+    缺檔 `StoreMissing`、其他 `StoreUnavailable`（都不建檔）。
     """
-    target = os.fspath(path)
-    existed = {name: os.path.exists(name) for name in sqlite_sidecars(target)}
-    try:
-        conn = sqlite3.connect(
-            _uri(target, "ro"), uri=True, isolation_level=None, check_same_thread=False, timeout=0
-        )
-    except sqlite3.Error as exc:
-        if classify_message(str(exc)) == "missing":
-            if not os.path.exists(target):
-                raise StoreMissing("store file is missing") from None
-            raise StoreUnavailable("missing") from None
-        raise error_from(exc) from None
-    db = AuthDb(conn, path=os.path.abspath(target))
+    db = open_ro(path)
     try:
         yield db
     finally:
         db.close()
-        _readonly_sidecars(target, existed)
 
 
 def _read_trust(paths: AuthPaths) -> tuple[str | None, TrustState]:
@@ -391,12 +347,12 @@ def _create_store_pair(trust_path: str, replay_path: str) -> str:
 
 
 def _drop_empty_sidecars(paths: AuthPaths) -> None:
-    """收拾空 `-wal` 與其 `-shm`（呼叫端必須持有 store flock，且沒有自己的連線還開著）。
+    """清掉先前異常結束留下的空 sidecar（防禦用；呼叫端必須持有 store flock）。
 
-    `mode=ro` 讀 WAL 庫時 SQLite 會留下 0 byte 的 `-wal` 與 `-shm`（唯讀路徑不刪，
-    見 `_readonly_sidecars`）；它們不含任何未落地的交易（`-wal` 是空的），所以在
-    獨佔鎖下刪掉是安全的，也滿足 W-D9「不留 root 擁有的 `-wal`／`-shm`」。`-wal` 非
-    空時一律不動（可能有真的資料）。
+    唯讀路徑已不會建檔（`auth_db.open_ro`）；這裡只是收拾更早版本／異常結束留下的
+    0 byte `-wal` 與 `-shm`。它們不含任何未落地的交易，所以在獨佔鎖下刪掉是安全的，
+    也滿足 W-D9「不留 root 擁有的 `-wal`／`-shm`」。`-wal` 非空時一律不動（可能有
+    真的資料）。
     """
     for path in (paths.trust_db, paths.replay_db):
         wal, shm = sqlite_sidecars(path)
@@ -888,7 +844,9 @@ def _read_trust_for_rebuild(
     `(False, None, None, None, ())`；部分壞掉（例如快照壞了）仍盡量回水位與墓碑，
     給「降世代」判斷與墓碑搬移用。
 
-    全程 `mode=ro`、不取 store flock（呼叫端已持鎖，這裡只是讀同一把鎖底下的檔）。
+    全程經 `auth_db.open_ro`、不取 store flock（呼叫端已持鎖，這裡只是讀同一把鎖
+    底下的檔）。`-wal` 在、`-shm` 不在（未正常關閉）時不當成「損毀」：照原樣往上丟
+    `StoreUnclean`，由呼叫端回 2——把可回收的 WAL 當成壞庫改名會掉已提交的資料。
     """
     try:
         with open_readonly(paths.trust_db) as db:
@@ -898,6 +856,8 @@ def _read_trust_for_rebuild(
                 (str(row[0]), bytes(row[1]))
                 for row in db.read("SELECT key_id, key FROM tombstones ORDER BY key_id")
             )
+    except StoreUnclean:
+        raise
     except (StoreMissing, StoreUnavailable):
         return False, None, None, None, ()
     if not rows:
@@ -946,7 +906,10 @@ def rebuild_trust(paths: AuthPaths, registry_path: str, *, clock: Clock, audit: 
     """
     raw, registry, digest = _load_registry(registry_path, owner_uid=owner_uid)
     with store_write_lock(paths, owner):
-        healthy, _, old_generation, old_hash, old_tombstones = _read_trust_for_rebuild(paths)
+        try:
+            healthy, _, old_generation, old_hash, old_tombstones = _read_trust_for_rebuild(paths)
+        except StoreUnclean as exc:
+            raise _store_admin_error(exc, exit_code=2) from None
         if healthy:
             raise AdminError(
                 KIND_TRUST_HEALTHY,
