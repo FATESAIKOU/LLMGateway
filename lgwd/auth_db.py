@@ -270,6 +270,24 @@ def open_rw(path: str, *, busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
     return db
 
 
+# --- 兩庫的庫識別（REPORT-D2a 低-3-5；C-303／C-605） ---
+
+def check_store_identity(trust_db: AuthDb, replay_db: AuthDb) -> bool:
+    """兩庫的 `meta.identity` 都存在且相同（`True`）；任一缺值或不同（`False`）。
+
+    這是「兩庫是不是同一套」的唯讀判斷，啟動時呼叫一次（`auth.open_runtime` 的第 2
+    步）。識別不符無法自動判斷是哪一庫被換過，呼叫端只回「依審計判斷」。
+
+    讀取本身的失敗（`StoreBusy`／`StoreUnavailable`）**照原樣往上丟**，不吞成 `False`：
+    「讀不到」與「不同」是兩種處置（前者可能重試，後者要人工判斷），呼叫端要分得出來。
+    """
+    trust_identity = trust_db.read_identity()
+    replay_identity = replay_db.read_identity()
+    if trust_identity is None or replay_identity is None:
+        return False
+    return trust_identity == replay_identity
+
+
 # --- 建庫（只有測試與 D5 的 auth-store init 用；lgwd 永不呼叫） ---
 
 META_SCHEMA = """
@@ -462,6 +480,7 @@ __all__ = [
     "TRUST_SCHEMA",
     "UNAVAILABLE_KINDS",
     "acquire_store_lock",
+    "check_store_identity",
     "classify_message",
     "create_stores",
     "error_from",

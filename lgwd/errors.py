@@ -15,10 +15,14 @@
 - 403 agent_not_allowed：agent 不在該筆的 agents 裡（resolve 的選把步驟 3 同用）
 - 403 model_not_allowed：resolve 的 model 不被任何候選的 models.allow 涵蓋
 - 403 privacy_not_allowed：resolve 宣告的 data 高於所有候選的 privacy（步驟 3.5）
+- 401 unauthorized：應用層認證失敗（warn／enforce；所有 reason 的 body 逐 byte 相同，
+  不加 WWW-Authenticate；#222 D2 PR-6）
 - 404 not_found：不存在的 id 或未知路徑（resolve 的未知 provider／未知 subscription 同用）
 - 409 not_deployed：key 尚未部署（local-login 的訂閱恆視為已部署，resolve 不會因它回此碼）
 - 409 no_candidate：resolve 的 exclude 排除後沒有候選（沒有恢復時刻）
 - 413 body_too_large：body 超過 1 MB
+- 429 rate_limited：已驗簽但超過該 key 的防重放配額（HTTP 層另加 Retry-After）
+- 503 auth_unavailable：認證相依不可用（驗章工具／allowed_signers／防重放庫）
 - 500 internal：伺服器內部非預期錯誤
 
 沒有冷卻相關的錯誤碼：冷卻只是提示，不是閘門，resolve 不再因冷卻拒絕（design 決定 4）。
@@ -75,6 +79,12 @@ def privacy_not_allowed() -> ApiError:
     return ApiError(403, "privacy_not_allowed")
 
 
+# 401：應用層認證失敗（#222 D2 PR-6；C-603／C-604）。所有 reason 的 body 逐 byte
+# 相同：只帶固定碼，不帶原因、公鑰、key ID；HTTP 層也不加 WWW-Authenticate。
+def unauthorized() -> ApiError:
+    return ApiError(401, "unauthorized")
+
+
 # 404：不存在的 id 或未知路徑
 def not_found() -> ApiError:
     return ApiError(404, "not_found")
@@ -98,3 +108,14 @@ def no_candidate() -> ApiError:
 # 413：body 超過 1 MB
 def body_too_large() -> ApiError:
     return ApiError(413, "body_too_large")
+
+
+# 429：已驗簽但超過該 key 的防重放配額（#222 D2 PR-6；C-603）。`Retry-After` 由
+# HTTP 層依 `Verdict.retry_after` 加上，錯誤物件本身不含那個值。
+def rate_limited() -> ApiError:
+    return ApiError(429, "rate_limited")
+
+
+# 503：認證相依不可用（驗章工具、allowed_signers、防重放庫；C-603）。enforce 才用。
+def auth_unavailable() -> ApiError:
+    return ApiError(503, "auth_unavailable")

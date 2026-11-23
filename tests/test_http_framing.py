@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from lgwd import auth
 from lgwd.http import make_api_server
 
 try:  # python3 -m pytest
@@ -35,10 +36,16 @@ JSON_BODY = b'{"until": "2026-10-11T15:00:00Z"}'
 
 
 class FakeGate:
-    """gate 只需要 .mode（C-101）；本 PR 不實作簽章與名冊。"""
+    """只測 framing 的 gate 替身：``authenticate`` 一律通過（#262 中-2 後 warn／enforce
+    的 gate 必備這個方法；真實的驗章在 PR-6a 的 `lgwd.auth.AuthGate`）。"""
 
     def __init__(self, mode):
         self.mode = mode
+        self.authenticate_calls = 0
+
+    def authenticate(self, **kwargs):
+        self.authenticate_calls += 1
+        return auth.passed("test")
 
 
 def req(method, target, extra=(), body=b"", version="HTTP/1.0"):
@@ -777,6 +784,29 @@ class GateModeTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 with self.assertRaises(ValueError):
                     make_api_server(FakeService(), HOST, 0, gate=FakeGate(mode))
+
+    def test_mode_only_gate_is_rejected_in_warn_and_enforce(self):
+        """中-2：只有 .mode、沒有 authenticate 的 gate 不得靜默 fail-open。"""
+
+        class ModeOnly:
+            def __init__(self, mode):
+                self.mode = mode
+
+        for mode in ("warn", "enforce"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    make_api_server(FakeService(), HOST, 0, gate=ModeOnly(mode))
+
+    def test_gate_none_is_still_off(self):
+        """中-2：``gate=None`` 仍是 off（不因 fail-closed 的檢查被擋）。"""
+        fake = FakeService()
+        server, thread, port = start(fake, None)
+        try:
+            status, _, _ = parse_response(exchange(port, req("GET", "/v1/subscriptions")))
+        finally:
+            stop(server, thread)
+        self.assertEqual(status, 200)
+        self.assertEqual(fake.calls, [("list_subscriptions",)])
 
 
 if __name__ == "__main__":
