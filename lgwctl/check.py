@@ -360,6 +360,77 @@ def _check_gh_repo(layout, report) -> None:
     report.todo("gh-keys-repo", f"無法確認（gh rc={proc.returncode}）")
 
 
+def _check_auth_stores(layout, report) -> None:
+    """`auth-heartbeat`／`auth-water`／`auth-stores`（#222 D5c；C-828）。
+
+    唯讀：status 檔只讀；兩庫一律經 `lgwd.auth_admin.inspect_*`（它用
+    `auth_db.open_ro`），不取 store 鎖、不建檔。``auth-heartbeat`` 看 D2 status 檔
+    的心跳是否超過 180 秒；``auth-water`` 把 `H` 在未來（now＋60）的 key 報 fail；
+    ``auth-stores`` 報兩庫識別不一致或缺失。非 root 讀不到 llmgw 0600 的庫，後兩項
+    記 todo（不是 fail），與 ``auth-local`` 的既有語意一致。
+    """
+    from lgwd.auth_admin import AdminError, inspect_replay, inspect_stores
+    from lgwd.clock import SystemClock
+    from .auth_cli import (paths_for, read_status, _StatusBad, _StatusMissing,
+                           HEARTBEAT_STALE_SECONDS, _is_root)
+
+    names = ("auth-heartbeat", "auth-water", "auth-stores")
+    mode = layout.auth_mode()
+    if mode == "off":
+        for name in names:
+            report.ok(name, "未啟用認證")
+        return
+    if mode == "unreadable":
+        for name in names:
+            report.todo(name, "認證模式讀不到（llmgateway.env 需 root 或 llmgw 才讀得）")
+        return
+    if mode not in ("warn", "enforce"):
+        for name in names:
+            report.todo(name, "認證模式讀不懂（llmgateway.env 的 LGWD_AUTH_MODE）")
+        return
+    try:
+        paths = paths_for(layout)
+    except ValueError:
+        for name in names:
+            report.fail(name, "認證路徑設定錯誤")
+        return
+    try:
+        status = read_status(paths.status)
+        if int(time.time()) - status.heartbeat > HEARTBEAT_STALE_SECONDS:
+            report.fail("auth-heartbeat", "心跳逾時")
+        else:
+            report.ok("auth-heartbeat")
+    except (_StatusBad, _StatusMissing):
+        report.fail("auth-heartbeat", "status 檔不存在或無法讀取")
+    if not _is_root(layout):
+        report.todo("auth-water", "需要 root")
+        report.todo("auth-stores", "需要 root")
+        return
+    try:
+        replay = inspect_replay(paths, clock=SystemClock())
+        if replay.future_keys:
+            report.fail("auth-water", "水位在未來：" + "、".join(replay.future_keys))
+        else:
+            report.ok("auth-water")
+    except AdminError as exc:
+        report.fail("auth-water", _admin_detail(exc))
+    try:
+        stores = inspect_stores(paths)
+        if stores.identity_match:
+            report.ok("auth-stores")
+        else:
+            report.fail("auth-stores", "認證庫缺失或識別不符")
+    except AdminError as exc:
+        report.fail("auth-stores", _admin_detail(exc))
+
+
+def _admin_detail(exc) -> str:
+    """`AdminError` 的一行說明（訊息＋固定的下一步；不含任何值）。"""
+    text = str(exc)
+    hint = getattr(exc, "hint", None)
+    return text if not hint else "{0}；{1}".format(text, hint)
+
+
 def run(layout, *, report: Report | None = None, no_remote: bool = False,
         tag: str | None = None) -> int:
     report = report or Report()
@@ -368,6 +439,7 @@ def run(layout, *, report: Report | None = None, no_remote: bool = False,
         _check_tag(layout, report, tag)
     _check_list_local(layout, report)
     _check_auth_local(layout, report)
+    _check_auth_stores(layout, report)
     if tunnel_present:
         _check_follow(layout, report, tunnel_state == "active")
         _check_list_remote(layout, report)
