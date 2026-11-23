@@ -21,14 +21,14 @@
 
 #### Scenario: 重複標頭或絕對 URI
 - **WHEN** enforce 收到重複認證標頭、歧義 Content-Length 或絕對 URI request-target
-- **THEN** 拒絕請求，不執行業務或發放憑證
+- **THEN** 回 401（與其他認證失敗相同），不執行業務或發放憑證
 
 #### Scenario: 別的 namespace 或別把鑰的簽章
 - **WHEN** 八行內容正確，但 SSHSIG 的 namespace 不是 `llmgateway`（例如 MLP sidecar 的 namespace），或簽章內含的公鑰是另一把已登記 key 而標頭寫這把 key ID
 - **THEN** enforce 回 401，不執行業務
 
 ### Requirement: 重放與故障
-服務 SHALL 在驗簽後、執行業務前以跨重啟持久、原子唯一的 key ID 與 nonce 防止重放；MUST NOT 以簽章 bytes 判斷是否重放。時窗、該 key 清除水位與記錄 nonce MUST 在同一個序列化的寫入 transaction 內、以同一個伺服器時間判斷；時窗為整數秒 `|now−ts|≤60`，timestamp MUST 大於清除水位。nonce MUST 保留超過其 timestamp 加 60 秒才可清除，清除與水位更新同一 transaction。MUST NOT 以伺服器時間水位讓全體停擺。資料庫忙碌 MUST 重試至期限才算不可寫；enforce 的持久庫不可用或容量不足 MUST fail closed；warn MUST 記錄不可判定並保持舊業務行為。
+服務 SHALL 在驗簽後、執行業務前以跨重啟持久、原子唯一的 key ID 與 nonce 防止重放；MUST NOT 以簽章 bytes 判斷是否重放。時窗、該 key 清除水位與記錄 nonce MUST 在同一個序列化的寫入 transaction 內、以同一個伺服器時間判斷；時窗為整數秒 `|now−ts|≤60`，timestamp MUST 大於清除水位。nonce MUST 保留超過其 timestamp 加 60 秒才可清除，清除與水位更新同一 transaction。MUST NOT 以伺服器時間水位讓全體停擺。資料庫忙碌 MUST 重試至期限才算不可寫；enforce 的持久庫不可用或容量不足 MUST fail closed；warn MUST 記錄不可判定並保持舊業務行為。warn 下驗證通過的請求 SHALL 與 enforce 一樣記錄 nonce。
 
 #### Scenario: 同一簽章並行重放
 - **WHEN** 多個執行緒或重啟後再次收到同一有效簽章
@@ -57,6 +57,10 @@
 #### Scenario: 共用時間來源一起跳到未來
 - **WHEN** 客戶端與伺服器共用的時間來源跳到未來後校正，故障期間有流量的多把 key 清除水位都晚於現在加 60 秒
 - **THEN** 這些 key 都回 401 並告警，直到真實時間追上或經有審計的重設；其他 key 不受影響，不回 503
+
+#### Scenario: warn 下通過驗證的請求也入庫
+- **WHEN** warn 模式收到驗證全部通過的請求，之後同一簽章被重送
+- **THEN** 第一次照常處理並記錄 nonce；重送記 would-deny `replay`，業務照舊處理
 
 #### Scenario: 防重放儲存失效
 - **WHEN** enforce 模式下 nonce 持久庫重試至期限仍不可寫，或已損毀
@@ -114,7 +118,7 @@
 - **THEN** 服務拒絕啟動並告警，不默默降級
 
 ### Requirement: 名冊公鑰格式
-名冊公鑰 MUST 是 `ssh-ed25519` 型別、恰 32 bytes 的規範編碼（y 小於 2^255−19；x 為 0 的點符號位元為 0），且 MUST NOT 是 Ed25519 的 8 個小階點之一；其他型別、證書與安全金鑰型別 MUST 拒絕。含任一不合格公鑰的名冊 MUST 整份拒絕。檢查、安裝、啟動載入、背景重讀、重啟、世代重置與信任庫重建 MUST 呼叫同一個驗證函式；唯一性與墓碑比對用驗證後的 bytes。驗章用的 allowed_signers MUST 只由已驗證快照的有效 key 原子產生，principal 欄為 key ID，每行帶 `namespaces="llmgateway"`。
+名冊公鑰 MUST 是 `ssh-ed25519` 型別、恰 32 bytes 的規範編碼（y 小於 2^255−19；x 為 0 的點符號位元為 0），且 MUST NOT 是 Ed25519 的 8 個小階點之一；其他型別、證書與安全金鑰型別 MUST 拒絕。含任一不合格公鑰的名冊 MUST 整份拒絕。檢查、安裝、啟動載入、背景重讀、重啟、世代重置與信任庫重建 MUST 呼叫同一個驗證函式；唯一性與墓碑比對用驗證後的 bytes。驗章用的 allowed_signers MUST 只由已驗證快照的有效 key 原子產生，principal 欄為 key ID，每行帶 `namespaces="llmgateway"`。這些拒絕 MUST 不因 OpenSSH 版本是否已擋而省略。
 
 #### Scenario: 小階或非規範公鑰
 - **WHEN** 名冊含小階點公鑰（例如單位元或 order-2 點）、y 不小於 2^255−19 的非規範編碼，或 x 為 0 卻設符號位元的編碼
@@ -129,7 +133,7 @@
 - **THEN** 產生的 allowed_signers 不含已撤銷 key，且每行都限定 namespace `llmgateway`
 
 ### Requirement: SSHSIG 驗章子行程
-服務 SHALL 以固定絕對路徑的 `ssh-keygen -Y verify` 驗章：argv 陣列、不經 shell、最小環境且 `LC_ALL=C`；`-I` 取自快照、`-n` 為常數，MUST NOT 取自請求。簽章暫存檔 MUST 放在只有服務帳號可讀寫的私有目錄並用後即刪。子行程並發由號誌限制，單次逾時。只有結束碼 0 且輸出指名預期 key 才算通過；只有固定的驗簽失敗字樣算 401；逾時、無法執行與其他輸出在 enforce MUST 回 503，warn 記不可判定。stderr 原文 MUST NOT 進日誌。
+服務 SHALL 以固定絕對路徑的 `ssh-keygen -Y verify` 驗章：argv 陣列、不經 shell、最小環境且 `LC_ALL=C`；`-I` 取自快照、`-n` 為常數，MUST NOT 取自請求。簽章暫存檔 MUST 放在只有服務帳號可讀寫的私有目錄並用後即刪。子行程並發由號誌限制，單次逾時。只有結束碼 0 且 stdout 的 Good 行同時符合快照的 key ID 與 fingerprint 才算通過；只有整份 stderr 等於固定的驗簽失敗形式才算 401；逾時、無法執行與其他輸出在 enforce MUST 回 503，warn 記不可判定。allowed_signers MUST 在換上前讀回自檢，使用前確認未被外部改動，不符即 503。stderr 原文 MUST NOT 進日誌。
 
 #### Scenario: 驗章工具逾時或失效
 - **WHEN** enforce 下 `ssh-keygen` 逾時、無法執行，或輸出不在分類表內
@@ -138,6 +142,14 @@
 #### Scenario: 驗簽失敗
 - **WHEN** 簽章格式正確、公鑰相符，但簽章值不正確
 - **THEN** 回 401，不執行業務
+
+#### Scenario: 結束碼 0 但輸出不符
+- **WHEN** `ssh-keygen` 結束碼 0，但 Good 行的 key ID 或 fingerprint 與快照不同
+- **THEN** 不算通過，enforce 回 503，不執行業務
+
+#### Scenario: allowed_signers 被外部改動或自檢不合
+- **WHEN** 產生的 allowed_signers 讀回後行數、格式或 key 與快照不符，或使用前發現檔案已被改動
+- **THEN** 不用該檔驗章，enforce 回 503 並告警，不回 401
 
 #### Scenario: 信封不合不必開子行程
 - **WHEN** 簽章解不開、長度不符、內含公鑰或 namespace 不符
@@ -174,7 +186,7 @@
 - **THEN** 回 403 且不執行業務操作
 
 ### Requirement: 漸進切換和觀測
-服務 SHALL 提供 off、warn、enforce；off 維持現況，warn 驗證並記錄預計拒絕但保留原業務行為，enforce 才拒絕。off MUST NOT 執行或檢查驗章工具。warn／enforce 啟動時 MUST 實際執行驗章工具並以固定 SSHSIG 向量自測（正確簽章通過、改壞的簽章歸為驗簽失敗），且檢查最低 OpenSSH 版本；enforce 在工具缺失、版本不足或自測失敗時 MUST 拒絕啟動，warn MUST 告警並標示不可判定、照舊處理。日誌 MUST NOT 包含金鑰、簽章、nonce、query、body 或憑證；錯誤不得觸發自動免認證回退。
+服務 SHALL 提供 off、warn、enforce；off 維持現況，warn 驗證並記錄預計拒絕但保留原業務行為，enforce 才拒絕。off MUST NOT 執行或檢查驗章工具。warn／enforce 啟動時 MUST 實際執行驗章工具並以固定 SSHSIG 向量自測（正確簽章通過、改壞的簽章歸為驗簽失敗、principal 不在或 allowed_signers 損壞歸為 503），且檢查最低 OpenSSH 版本；enforce 在工具缺失、版本不足或自測失敗時 MUST 以結束碼 78 拒絕啟動，warn MUST 告警並標示不可判定、照舊處理。名冊與驗章工具在執行中自動恢復，鎖與兩庫要重啟才重試。日誌 MUST NOT 包含金鑰、簽章、nonce、query、body 或憑證；錯誤不得觸發自動免認證回退。
 
 #### Scenario: 舊客戶端在 warn
 - **WHEN** 未簽章的舊客戶端在 warn 模式呼叫
@@ -187,6 +199,10 @@
 #### Scenario: enforce 驗章工具不可用
 - **WHEN** enforce 啟動時 `ssh-keygen` 不存在、版本低於最低版本，或固定向量自測失敗
 - **THEN** 服務拒絕啟動並告警；warn 下則告警、標示不可判定並照舊啟動
+
+#### Scenario: 新版 OpenSSH 改了分類字樣
+- **WHEN** 伺服器的 `ssh-keygen` 版本不低於 9.6，但驗簽失敗或故障的輸出字樣與分類表不同
+- **THEN** 啟動自測失敗：enforce 拒絕啟動、warn 告警並標示不可判定，任何請求都不因新字樣被判 401
 
 #### Scenario: enforce 驗證失敗
 - **WHEN** enforce 模式認證失敗
@@ -212,7 +228,7 @@
 - **THEN** 結束碼 1 並提示需 root，不無簽重送、不印額度
 
 ### Requirement: 無敏感資料的健康檢查
-服務 SHALL 提供免認證 GET `/healthz`，只回固定存活狀態、不回名冊、訂閱或憑證；它只證明 HTTP 存活，不代表可 resolve。
+服務 SHALL 提供免認證 GET `/healthz`，只回固定存活狀態、不回名冊、訂閱或憑證；它只證明 HTTP 存活，不代表可 resolve。`/healthz` MUST NOT 套用預驗章框架檢查、MUST NOT 佔用預驗章並發名額，三種模式的回應 MUST 相同。
 
 #### Scenario: 認證開啟時健康探針
 - **WHEN** enforce 啟用且未簽章探針請求 `/healthz`
@@ -222,6 +238,74 @@
 - **WHEN** enforce 的 `/healthz` 請求帶未知 key 的簽章
 - **THEN** 忽略認證標頭並回固定 200，不代表業務認證可用
 
+#### Scenario: 健康請求不受框架檢查
+- **WHEN** `/healthz` 請求帶 Transfer-Encoding、重複的認證標頭或以 `//` 開頭的路徑
+- **THEN** off、warn、enforce 三種模式的回應 bytes 相同，不因模式出現 401 或任何模式提示
+
 #### Scenario: 探針不揭露業務資料
 - **WHEN** 未簽章呼叫 `/healthz`
 - **THEN** 回應不包含訂閱、身分、金鑰或授權資料
+
+### Requirement: 預驗章請求框架
+服務 SHALL 在 warn／enforce 下、對五條業務路由於驗章前檢查請求框架：request-target 取原始 request line（不用改寫過的路徑），只接受 origin-form；拒絕絕對 URI、HTTP/0.9、`#`、非 ASCII；`Content-Length`、`Transfer-Encoding`、`Host` 與認證標頭各至多一次，Content-Length 須為十進位數字、GET 不得非零，出現 Transfer-Encoding 即拒絕。不合時 enforce MUST 回 401、warn 記預計拒絕並照舊處理。讀 body 共用 10 秒總期限；讀 body 與驗章階段的並發上限為 32，取不到等 1 秒。逾時或取不到名額時 enforce 回 503；warn 記不可判定，取不到名額照舊處理、逾時則關閉連線。off MUST 與既有行為逐 byte 相同。超過 1 MiB 的 body 在各模式都回 413。
+
+#### Scenario: 絕對 URI 或雙斜線路徑
+- **WHEN** enforce 收到 request-target 為 `http://host/v1/resolve` 或 `//v1/resolve` 的業務請求
+- **THEN** 回 401，不執行業務
+
+#### Scenario: 慢速送出的請求
+- **WHEN** warn 或 enforce 下業務請求一個 byte 一個 byte 慢送，超過 10 秒總期限仍未送完
+- **THEN** 連線被切斷；enforce 回 503，不執行業務
+
+#### Scenario: 並發名額用盡
+- **WHEN** enforce 下已有 32 個業務請求在讀 body 或驗章，第 33 個等 1 秒仍取不到名額
+- **THEN** 該請求回 503 `auth_unavailable`；同時間的 `/healthz` 照常 200
+
+#### Scenario: off 不受影響
+- **WHEN** off 模式收到重複 Content-Length、Transfer-Encoding 或絕對 URI 的請求
+- **THEN** 回應與未實作本框架的版本完全相同
+
+### Requirement: 名冊檔格式
+名冊 SHALL 是 UTF-8 JSON，頂層鍵恰為 `schema`（整數 1）、`generation`（正整數）、`principals`、`keys`。每個 principal 的鍵恰為 `ops`（取自 list、usage、roles、resolve、cooldown）、`resolve_agents`（取自既有 agent 白名單）、`roles`（role 對應 agent 陣列）。`ops` 不含 resolve 時 `resolve_agents` 須為空，不含 roles 時 `roles` 須為空物件。每把 key 的鍵恰為 `key_id`、`principal`（須存在）、`public_key`、`status`（active 或 revoked）。任何物件含未列的鍵、重複鍵或超過 1 MiB，MUST 整份拒絕。內容雜湊 SHALL 是原始 bytes 的 SHA-256。名冊檔不是一般檔、擁有者不是 root，或群組／其他人可寫時，MUST 拒絕並沿用快照。
+
+#### Scenario: 未知鍵
+- **WHEN** 名冊的某個 principal 多了一個未定義的鍵
+- **THEN** 整份名冊拒絕、沿用最後有效快照並告警
+
+#### Scenario: 權限欄自相矛盾
+- **WHEN** principal 的 `ops` 不含 resolve，`resolve_agents` 卻非空
+- **THEN** 整份名冊拒絕
+
+#### Scenario: 只改空白
+- **WHEN** 名冊檔被改成與已載入相同世代、只差空白的內容
+- **THEN** 內容雜湊不同，視為同世代異內容而拒絕
+
+#### Scenario: 名冊檔權限過寬
+- **WHEN** 名冊檔對群組或其他人可寫
+- **THEN** 以 `insecure_file` 拒絕載入、沿用快照並告警
+
+### Requirement: 名冊載入狀態檔
+服務 SHALL 在認證狀態目錄寫入名冊載入狀態檔：一行 JSON，鍵為 `schema`、`loaded_generation`、`loaded_hash`、`attempted_hash`、`result`、`heartbeat`，不含公鑰或 key ID。`result` MUST 是 `ok` 或固定分類之一：parse_error、invalid_key、duplicate、insecure_file、too_large、tombstone_violation、generation_not_increased、io_error、trust_unavailable。狀態改變時立即原子寫入；心跳每 60 秒至多寫一次；兩者只由背景執行緒寫。
+
+#### Scenario: 背景執行緒停止
+- **WHEN** 名冊輪詢執行緒意外結束
+- **THEN** 狀態檔的心跳不再前進，其他欄位不被請求流量改寫
+
+#### Scenario: 載入失敗的分類
+- **WHEN** 載入因較低世代失敗
+- **THEN** `result` 為 `generation_not_increased`，`attempted_hash` 為該檔雜湊，`loaded_*` 不變
+
+### Requirement: 認證設定與狀態路徑
+認證設定 SHALL 以命令列優先、其次環境變數、再來預設值（預設 off）。鎖檔、兩庫、狀態檔、allowed_signers 與簽章暫存目錄 MUST 全由認證狀態目錄推導，服務與管理工具共用同一推導。設定值不合法時結束碼 2。因認證理由拒絕啟動時，結束碼 MUST 為 78，而且 MUST 在綁定 API 埠之前。off MUST NOT 開鎖檔、開庫、讀名冊或碰驗章工具。
+
+#### Scenario: 未知模式
+- **WHEN** 認證模式設為 `strict`
+- **THEN** 服務以結束碼 2 結束，不啟動
+
+#### Scenario: enforce 拒絕啟動
+- **WHEN** enforce 啟動時防重放庫缺檔
+- **THEN** 以結束碼 78 結束，API 埠從未被佔用，庫檔仍不存在
+
+#### Scenario: off 不碰認證檔案
+- **WHEN** off 模式啟動，認證狀態目錄不存在
+- **THEN** 服務照常啟動與處理請求
