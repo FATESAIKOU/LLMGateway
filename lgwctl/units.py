@@ -12,7 +12,7 @@ import os
 import pwd
 
 from . import atomic
-from .layout import ENV_RUNUSER, UNIT_NAMES, SERVICE_NAME
+from .layout import CHECK_UNIT_NAMES, ENV_RUNUSER, SERVICE_NAME, UNIT_NAMES
 from .run import RunError, run
 
 UNITS_REL_DIR = os.path.join("deploy", "units")
@@ -63,6 +63,8 @@ def restore_units(layout, saved: dict) -> bool:
     """把備份寫回（原本沒有的就刪掉剛裝的）；回「是否全部成功」。
 
     升級失敗回復時用：unit 檔要跟 current 一起回到切換前的樣子（中-2）。
+    #289：要刪的 unit 先 ``disable --now`` 再刪，免得留下計時器指向已經刪掉的
+    unit 檔（C-984）。
     """
     ok = True
     for name in UNIT_NAMES:
@@ -70,12 +72,43 @@ def restore_units(layout, saved: dict) -> bool:
         try:
             if saved.get(name) is None:
                 if os.path.lexists(path):
+                    if not disable_now(layout, name):
+                        ok = False
+                        continue
                     os.unlink(path)
             else:
                 atomic.write_bytes(path, saved[name], 0o644)
         except OSError:
             ok = False
     return ok
+
+
+def remove_missing_optional_units(layout, tag_dir: str, report) -> bool:
+    """移除「這一版沒有」的 check unit：先 ``disable --now``、刪檔（C-985）。
+
+    unit 是版本的一部分：回滾到沒有 timer 的版本時，新版的計時器不該留在系統上。
+    只處理 :data:`CHECK_UNIT_NAMES`（timer 先於 service）；**隧道不在這裡**——
+    沒有任何發行版本是「有 service、沒有隧道 unit」，而且誤刪會直接斷線。
+    """
+    removed = []
+    for name in CHECK_UNIT_NAMES:
+        if os.path.isfile(unit_source(tag_dir, name)):
+            continue
+        path = layout.unit_file(name)
+        if not os.path.lexists(path):
+            continue
+        if not disable_now(layout, name):
+            report.fail("units", f"{name} disable --now 失敗（沒有刪檔）")
+            return False
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            report.fail("units", f"刪 {name} 失敗（{type(exc).__name__}）")
+            return False
+        removed.append(name)
+    if removed:
+        report.ok("units", "已移除 " + "、".join(removed))
+    return True
 
 
 # -- systemctl（system 層；不需要任何 --user 或環境變數）-----------------------
@@ -127,6 +160,59 @@ def daemon_reload(layout) -> bool:
 def enable(layout, unit: str) -> bool:
     try:
         return _systemctl(layout, "enable", unit).returncode == 0
+    except RunError:
+        return False
+
+
+#: `systemctl is-enabled` 對「unit 不存在」的幾種寫法（不同版本回 1 或 4）。
+_MISSING_TEXT = (
+    "no such file or directory",
+    "not-found",
+    "not found",
+    "could not be found",
+    "没有那个文件或目录",
+)
+
+
+def _looks_missing(text: str | None) -> bool:
+    value = (text or "").lower()
+    return any(word in value for word in _MISSING_TEXT)
+
+
+def enabled_state(layout, unit: str) -> str:
+    """``enabled``｜``disabled``｜``missing``｜``unknown``（systemctl 不能用）。
+
+    ``systemctl is-enabled`` 的結束碼：0＝enabled、4＝unit 檔不存在（與
+    ``is-active`` 一樣）。**有些版本對不存在的 unit 回 1**，所以回 1 時再看輸出
+    文字（not-found 類字樣）才判 missing，而不是一律 disabled。
+    """
+    try:
+        proc = _systemctl(layout, "is-enabled", unit)
+    except RunError:
+        return "unknown"
+    if proc.returncode == 0:
+        return "enabled"
+    if proc.returncode == 4:
+        return "missing"
+    if _looks_missing(proc.stdout) or _looks_missing(proc.stderr):
+        return "missing"
+    if proc.returncode == 1:
+        return "disabled"
+    return "unknown"
+
+
+def enable_now(layout, unit: str) -> bool:
+    """``systemctl enable --now``（#289：timer 要同時 enable 與啟動）。"""
+    try:
+        return _systemctl(layout, "enable", "--now", unit).returncode == 0
+    except RunError:
+        return False
+
+
+def disable_now(layout, unit: str) -> bool:
+    """``systemctl disable --now``（#289：移除或回復時連計時器一起停）。"""
+    try:
+        return _systemctl(layout, "disable", "--now", unit).returncode == 0
     except RunError:
         return False
 

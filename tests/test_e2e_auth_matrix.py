@@ -66,6 +66,7 @@ def tearDownModule():
 #: 避免 gh／systemctl 碰到真機或網路）。
 CHECK_PATCHES = (
     (check, "_check_units", lambda *a, **k: (False, "missing")),
+    (check, "_check_timer", lambda *a, **k: None),
     (check, "_check_keysync", lambda *a, **k: None),
     (check, "_check_policy", lambda *a, **k: None),
     (check, "_check_gh_repo", lambda *a, **k: None),

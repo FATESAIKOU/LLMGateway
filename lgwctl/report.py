@@ -14,20 +14,29 @@ from __future__ import annotations
 
 LEVELS = ("ok", "todo", "fail")
 
+#: #289：check 在 unit 裡跑時的 syslog 優先級前綴（journal 的等級）。設了
+#: ``LLMGW_CHECK_JOURNAL=1`` 才加；沒設時輸出逐 byte 不變（手動 check 不受影響）。
+JOURNAL_PREFIXES = {"fail": "<3>", "todo": "<4>", "ok": "<6>"}
+
 
 class Report:
-    """收集並即時印出三態行；``out`` 預設 print（測試可傳自己的收集器）。"""
+    """收集並即時印出三態行；``out`` 預設 print（測試可傳自己的收集器）。
 
-    def __init__(self, out=None):
+    ``journal=True`` 時印出的每一行前加 ``<3>``／``<4>``／``<6>``（C-982）；
+    ``self.lines`` 存的仍是沒有前綴的行（三態判斷與測試都用它）。
+    """
+
+    def __init__(self, out=None, journal: bool = False):
         self.lines: list[str] = []
         self._out = print if out is None else out
+        self.journal = journal
 
     def add(self, level: str, name: str, detail: str = "") -> None:
         if level not in LEVELS:
             raise ValueError(f"unknown level: {level}")
         line = f"{level} {name}" + (f"（{detail}）" if detail else "")
         self.lines.append(line)
-        self._out(line)
+        self._out(JOURNAL_PREFIXES[level] + line if self.journal else line)
 
     def ok(self, name: str, detail: str = "") -> None:
         self.add("ok", name, detail)

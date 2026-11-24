@@ -1,0 +1,14 @@
+# LLMGateway 的定期檢查（#289）：開機 5 分鐘後第一次，之後每 15 分鐘一次。
+# 不用 Persistent=（它只對 OnCalendar= 有效）。
+[Unit]
+Description=Run llmgwctl check every 15 minutes
+
+[Timer]
+Unit=llmgateway-check.service
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

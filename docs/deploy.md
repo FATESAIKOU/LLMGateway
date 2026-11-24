@@ -123,7 +123,7 @@ llmgwctl check
    - 確認控制狀態：檢視 `/var/lib/llmgateway-ctl/.cutover.state`，確認目前不處於進行中階段（`cutover-started`、`pending-confirm`）。
    - 暫停同機其他維護排程，並以 `ps -u llmgw` 確認服務帳號行程符合預期。
 3. **窗口內切勿重開機**：自舊版 unit 被 disable 到新版 unit 被 enable 之間（數秒至一分鐘），新舊皆未開機自動啟用，且反向保險為 transient timer；此期間重開機將導致新舊服務均無法自啟。
-4. **切換中斷與狀態防護**：執行 `cutover` 後狀態即進入 `cutover-started`，若切換過程發生未預期中斷或卡住，此階段受到防護，系統會拒絕重新執行 `prepare-migration` 或再次 `cutover`；操作者必須執行 `llmgwctl rollback-to-user` 進行回滾，待回到終態（`reverted`）後方可重新準備與切換。
+4. **切換中斷與狀態防護**：執行 `cutover` 後狀態即進入 `cutover-started`，若切換過程發生未預期中斷或卡住，此階段受到防護，系統會拒絕重新執行 `prepare-migration` 或再次 `cutover`；操作者必須執行 `llmgwctl rollback-to-user` 進行回滾。回到終態（`reverted`）後，**可以直接再跑一次 `cutover`**（它會把舊狀態歸檔、開新一輪，不必重做 prepare），也可以先重跑 `prepare-migration`。回滾對新版的 unit 只做 `disable`、**不刪檔**（與 `llmgateway.service` 的處理一致），所以再切換時會重新 `enable`。
 5. **隧道交接短暫空窗**：因會合點的 4710/4711 埠無法由兩條隧道同時綁定，回滾時在舊服務 list 200 確認正常後，會先停止新隧道讓出該埠（暫不 disable），隨後啟動舊隧道進行連續穩定（≥15～20 秒且 NRestarts 不增）與遠端 `probe.remote` 探針驗證（成功才 disable 新隧道；失敗則立刻重新啟動新隧道保留管理通道）。此交接過程存在數十秒的隧道中斷短暫空窗。
 
 ### 2.3 遷移步驟
@@ -1196,6 +1196,41 @@ handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）�
 | V-0.6 | C-612 在正式主機重跑 | 段二的資源數值取兩邊較大者 |
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
 | P-D4 | Mac 與 worker 映像的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 由本人或 PMO 做 |
+
+### 8.19 定時檢查（timer）（r）
+
+**root：** 要（timer 以 root 跑 `check`）。**lgwd 停止：** 不用。
+
+`deploy/units/` 有兩個 unit：`llmgateway-check.service`（`Type=oneshot`、`User=root`、跑 `/usr/local/bin/llmgwctl check`）與 `llmgateway-check.timer`（開機 5 分鐘後第一次，之後每 15 分鐘一次）。service 沒有 `[Install]` 段，由 timer 啟動；只 enable／disable timer。install 子指令會把兩個檔裝進 `/etc/systemd/system/`，並在 `llmgateway.service` 啟動之後對 timer 做 `enable --now`；重跑 install 是冪等的（timer 已在跑就不動它）。
+
+為什麼要 root：`check` 的 `auth-local`（讀 `root:root` 0600 的管理私鑰簽章）、`auth-water`／`auth-stores`（`llmgw` 0600 的兩個庫）與 `auth-degraded` 的補記（root 寫歷史檔）都需要 root；非 root 跑會全是 `todo`，等於沒有告警。這與本人手動跑 `sudo llmgwctl check` 是同一份程式、同一個信任基礎。unit 另外加固：`NoNewPrivileges=true`、`ProtectSystem=strict`（只開 `/var/lib/llmgateway` 可寫）、`PrivateTmp=true`、`ProtectHome=read-only`；不設 `KillMode`（oneshot 逾時就整組殺掉，不會留下 `gh`／`ssh` 的孤兒）。
+
+**第一次從舊版升級後要再跑一次 install。** 升級是由「目前在跑的那一版」的 `llmgwctl` 執行，舊版的 unit 清單沒有 timer，所以升級本身不會裝它：
+
+```bash
+sudo llmgwctl install --tag <tag>
+```
+
+新版 `check` 的 `check-timer`（這一版的 `deploy/units/` 有 timer 檔時才列）會在 timer 不是「enabled 而且 active」時報 `todo`，訊息分成「未安裝」（附 `install` 指令）、「已安裝但未啟用」（附 `systemctl enable --now llmgateway-check.timer`）與「已安裝但沒在跑」（附 `systemctl start llmgateway-check.timer`）；`systemctl` 不能用時該項也是 `todo`（無法確認）。照上面的指令補跑一次就會變 `ok`。
+
+結束碼與告警：`check` 有 `fail` 時結束碼 1，unit 進入 failed，`systemctl --failed` 與 `systemctl status llmgateway-check.service` 看得到；只有 `todo` 時結束碼 2，unit 的 `SuccessExitStatus=2` 把它視為成功，不會反覆 failed。每 15 分鐘一次，journal 的量不大。
+
+journal：`SyslogIdentifier=llmgwctl-check`，查 `journalctl -t llmgwctl-check`。unit 設了 `LLMGW_CHECK_JOURNAL=1`，`check` 會依等級在每行前面加 syslog 優先級（`fail`→`<3>`、`todo`→`<4>`、`ok`→`<6>`），所以：
+
+```bash
+journalctl -t llmgwctl-check -p warning
+```
+
+只看 `todo` 與 `fail`。手動跑 `check` 沒設這個變數時，輸出與以前逐 byte 相同；舊版的 `check` 不認得這個變數，會忽略它（回滾不需要換 unit）。
+
+維護期間：為了跑寫入指令而停掉 lgwd 時，timer 照樣會跑，`check` 會 fail（心跳逾時、`auth-local` 失敗），unit 進入 failed 是預期的，服務啟動後會自己恢復。要避免這段 failed 狀態，維護前停 timer、結束後再啟動：
+
+```bash
+sudo systemctl stop llmgateway-check.timer
+sudo systemctl start llmgateway-check.timer
+```
+
+回滾：unit 是版本的一部分。`llmgwctl rollback` 回滾到**沒有**這兩個 unit 的版本時，會先對 timer 做 `disable --now`、再刪檔、再 `daemon-reload`（不會留下一個指向已刪 unit 的計時器）；回滾到**有** timer 的版本時照裝並 enable（已在跑就不動）。從 v0.1.x 的 user unit 遷移時，`cutover` 會在新服務健康之後、跑 `check` 之前 `enable --now` timer（不然 `check-timer` 的 todo 會讓遷移被判停損）；`rollback-to-user` 與停損回滾會對這兩個 check unit 做 `disable --now`（timer 先於 service，**不刪 unit 檔**，與 `llmgateway.service` 的回退處理一致），所以從 `reverted` 直接再跑 `cutover` 時會重新 enable；若回到舊版後不再切回新版，這兩個 unit 檔留在 `/etc/systemd/system` 但不會執行。
 
 ### 8.20 從 MLP 清單同步名冊（外圍腳本 `lgw-registry-sync`，#292）
 

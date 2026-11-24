@@ -28,6 +28,9 @@ REAL_POLICY = str(REPO_ROOT / "policy" / "default.json")
 FAKE_TAG = "lgw-v1.2.3"
 NEW_TAG = "lgw-v1.2.4"
 OLD_TAG = "lgw-v1.2.2"
+# #289：定期檢查的 unit 名（沙箱預設把 timer 標成已安裝並在跑）。
+CHECK_SERVICE = "llmgateway-check.service"
+CHECK_TIMER = "llmgateway-check.timer"
 # 假的密碼／key 值：用來證明 llmgwctl 的輸出不含值（只在測試裡用）。
 FAKE_PASSWORD = "FakeKeysPassword_DoNotUse_0001"
 FAKE_KEY_VALUE = "FakeKeyValue_DoNotUse_0002"
@@ -45,6 +48,10 @@ case "$1" in
         [[ -f "${fake}/active/${unit}" ]] && exit 0 || exit 3 ;;
     is-failed)
         [[ -f "${fake}/failed/${unit}" ]] && exit 0 || exit 1 ;;
+    is-enabled)
+        # rc 4＝unit 檔不存在（與 is-active 的 4 一樣是「確定沒裝」）。
+        [[ -f "${fake}/missing/${unit}" ]] && exit 4
+        [[ -f "${fake}/enabled/${unit}" ]] && exit 0 || exit 1 ;;
     show)
         # #288：`show -p ActiveEnterTimestamp --timestamp=unix --value <unit>`；
         # 有設定檔就印 `@<秒>`，否則空輸出（parse 成 None）。
@@ -57,7 +64,15 @@ case "$1" in
         [[ -f "${fake}/reload_fail" ]] && exit 1
         exit 0 ;;
     enable)
-        printf '%s %s\\n' "$1" "$unit" >> "${fake}/actions.log"
+        # #289：enable --now 會同時把 unit 標成 enabled 與 active（timer 用）。
+        printf '%s\\n' "$*" >> "${fake}/actions.log"
+        mkdir -p "${fake}/enabled"
+        : > "${fake}/enabled/${unit}"
+        [[ "${2:-}" == "--now" ]] && : > "${fake}/active/${unit}"
+        exit 0 ;;
+    disable)
+        printf '%s\\n' "$*" >> "${fake}/actions.log"
+        rm -f "${fake}/enabled/${unit}" "${fake}/active/${unit}"
         exit 0 ;;
     start|restart|stop)
         printf '%s %s\\n' "$1" "$unit" >> "${fake}/actions.log"
@@ -279,7 +294,7 @@ def has_line(text: str, name: str, level: str | None = None) -> bool:
 class Sandbox:
     """一個測試用的假機器：prefix 底下的檔案系統＋假指令。"""
 
-    def __init__(self, service_user: str = "lgwfake"):
+    def __init__(self, service_user: str = "lgwfake", *, default_timer: bool = True):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = self._tmp.name
         self.prefix = os.path.join(self.root, "sandbox")
@@ -294,6 +309,12 @@ class Sandbox:
         os.makedirs(os.path.join(self.service_home, ".ssh"), exist_ok=True)
         self._write_tools()
         self._write_template()
+        # #289：install／upgrade 類的既有測試可保留「已經裝好 timer 的機器」
+        # （enabled＋active），check 的 check-timer 才是 ok；遷移沙箱用
+        # default_timer=False，不預設已裝（遷移流程要自己 enable）。
+        if default_timer:
+            self.set_unit_enabled(CHECK_TIMER)
+            self.set_active(CHECK_TIMER)
 
         self.env = dict(os.environ)
         self.env.update({
@@ -354,6 +375,10 @@ class Sandbox:
                    FAKE_KEY_SYNC, 0o755)
         self.write(os.path.join(self.template, "ops-scripts", "llmgateway-tunnel"),
                    FAKE_TUNNEL, 0o755)
+        # #289：版本裡的定期檢查 unit（install／upgrade 會照裝）。
+        for name in (CHECK_SERVICE, CHECK_TIMER):
+            self.write(os.path.join(self.template, "deploy", "units", name),
+                       f"[Unit]\n# {name}\n", 0o644)
 
     # -- 路徑 ---------------------------------------------------------------
 
@@ -418,6 +443,14 @@ class Sandbox:
         elif os.path.exists(path):
             os.unlink(path)
 
+    def set_unit_enabled(self, unit: str, enabled: bool = True) -> None:
+        """#289：假 systemctl 的 is-enabled 狀態（rc 0／1）。"""
+        path = os.path.join(self.fake, "enabled", unit)
+        if enabled:
+            self.write(path, "1\n")
+        elif os.path.exists(path):
+            os.unlink(path)
+
     def set_missing(self, unit: str, missing: bool = True) -> None:
         """讓假 systemctl 對這個 unit 回 rc 4（systemd 的「unit 檔不存在」）。"""
         path = os.path.join(self.fake, "missing", unit)
@@ -476,7 +509,7 @@ class Sandbox:
     # -- 造一版（不經 git）--------------------------------------------------
 
     def make_release(self, tag: str, *, policy: str | None = None,
-                     units: bool = True) -> str:
+                     units: bool = True, check_units: bool = True) -> str:
         dest = self.opt(tag)
         shutil.copytree(self.template, dest, dirs_exist_ok=True)
         if policy is not None:
@@ -486,6 +519,11 @@ class Sandbox:
                        f"[Unit]\n# llmgateway {tag}\n")
             self.write(os.path.join(dest, "deploy", "units", "llmgateway-tunnel.service"),
                        f"[Unit]\n# tunnel {tag}\n")
+        if not check_units:
+            for name in (CHECK_SERVICE, CHECK_TIMER):
+                path = os.path.join(dest, "deploy", "units", name)
+                if os.path.exists(path):
+                    os.unlink(path)
         self.write(os.path.join(dest, ".lgw-tag"), tag + "\n")
         return dest
 

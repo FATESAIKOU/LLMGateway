@@ -82,6 +82,9 @@ import time
 from . import atomic, capability, check, install, probe, release, units, upgrade
 from . import run as runmod
 from .layout import (
+    CHECK_SERVICE_NAME,
+    CHECK_TIMER_NAME,
+    CHECK_UNIT_NAMES,
     DEFAULT_API_PORT,
     KEYSYNC_SHA_NAME,
     OLD_USER_UNIT_REL,
@@ -1709,6 +1712,12 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
     if problems:
         return _stop_loss(layout, old, problems, report)
 
+    # #289（高-1）：新服務健康之後、跑 check **之前**啟用定時檢查。prepare 只放
+    # unit 檔（不 enable），而 check 的 check-timer 在沒 enable 時是 todo（rc 2），
+    # 直接跑 check 會讓遷移被判停損。沿用 install 的步驟：版本裡沒有 timer 就跳過。
+    if not install._step_enable_timer(layout, report):
+        return _stop_loss(layout, old, ["llmgateway-check.timer enable 失敗"], report)
+
     # (e) check；它的 keysync 那項要等第一次拉取有結果才有意義（不然一定 todo）。
     # 中-1：門檻用 (c) 之前的切換開始時間，不是等待開始時間（不然正常情況一定
     # 等滿 grace 秒並印假 todo）。中-8：遠端已在 (d) 重試確認過，check 不再單探。
@@ -2029,6 +2038,8 @@ def _rollback_locked(layout, old: OldLayout, report) -> int:
     if not state:
         # 提示要求：無狀態檔時照常冪等回舊版，但不能印 fail 卻回 0。
         report.ok("rollback-state", "沒有進行中的切換（狀態檔不在）；照常回舊版")
+    # #289：新版的 timer 先停、再停新 service（見 _remove_new_timer）。
+    _remove_new_timer(layout, report)
     if phase == PHASE_REVERTED:
         # 已經回過（人工先回、保險後來才觸發）：再確認一次就好，不動資料——
         # 新的 llm.db 已經複製回去過，再複製一次只會蓋掉舊服務寫的東西。
@@ -2095,6 +2106,37 @@ def _state_revert_unit(state: dict, report=None) -> str:
                         f"{REVERT_TIMER_UNIT}（不拿它去呼叫 systemctl）")
         return REVERT_TIMER_UNIT
     return unit
+
+
+def _remove_new_timer(layout, report) -> None:
+    """#289：回舊版前停用新版的定期檢查 unit（**只 disable --now、不刪檔**）。
+
+    timer 先停、再停 service（agy 低-1）：不然 timer 可能在 service 已經停掉之後
+    才觸發一次 check。與回退時對 ``llmgateway.service`` 的處理一致：只 disable，
+    unit 檔留在 ``/etc/systemd/system``。程式允許從終態 ``reverted`` 直接開新一輪
+    cutover，那時 ``_step_enable_timer`` 會再把 timer enable 回來；若這裡把檔案
+    刪掉，第二輪只會看到 check-timer 的「未安裝」todo 而再次停損（中-1）。
+    失敗只記 fail，不擋後面的回舊版（舊版優先）。
+    """
+    present = any(os.path.lexists(layout.unit_file(name))
+                  for name in CHECK_UNIT_NAMES)
+    engaged = (units.enabled_state(layout, CHECK_TIMER_NAME) == "enabled"
+               or units.is_active(layout, CHECK_TIMER_NAME)
+               or units.is_active(layout, CHECK_SERVICE_NAME))
+    if not present or not engaged:
+        # 沒有任何一個 check unit 還在跑／還 enable（例如保險重複觸發、
+        # 第二次 rollback-to-user）：不用再叫一次 systemctl。
+        return
+    disabled = []
+    for name in CHECK_UNIT_NAMES:          # CHECK_UNIT_NAMES 的順序：timer 先
+        if not os.path.lexists(layout.unit_file(name)):
+            continue
+        if not units.disable_now(layout, name):
+            report.fail("disable-timer", f"{name} disable --now 失敗")
+            return
+        disabled.append(name)
+    if disabled:
+        report.ok("disable-timer", "、".join(disabled) + " 已停用（unit 檔保留）")
 
 
 def _stop_new_service(layout, report) -> None:

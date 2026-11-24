@@ -1,0 +1,30 @@
+# LLMGateway 的定期檢查（#289）：由 llmgateway-check.timer 啟動，不單獨 enable。
+# llmgwctl install 會把當版目錄的這個檔裝到 /etc/systemd/system/。
+[Unit]
+Description=LLMGateway periodic check (llmgwctl check)
+After=llmgateway.service network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot：跑完就結束；結束碼就是 check 的三態（0＝全好、1＝有 fail、2＝只有 todo）。
+Type=oneshot
+# root：auth-local（讀 root 0600 的管理私鑰簽章）、auth-water／auth-stores（llmgw
+# 0600 的庫）、auth-degraded 的補記（root 寫歷史檔）都需要 root。這與本人手動
+# 跑 sudo llmgwctl check 是同一份程式、同一個信任基礎。
+User=root
+WorkingDirectory=/opt/llmgateway/current
+# 用安裝的 wrapper；不加新旗標（回滾到舊版時舊版也接受同一行）。
+ExecStart=/usr/local/bin/llmgwctl check
+# 只有 todo 不算失敗（2 是「要人做某件事／無法確認」）。
+SuccessExitStatus=2
+# 讓 check 的每行帶 syslog 優先級（fail→<3>、todo→<4>、ok→<6>）；舊版忽略這個變數。
+Environment=LLMGW_CHECK_JOURNAL=1
+SyslogIdentifier=llmgwctl-check
+TimeoutStartSec=5min
+# 加固：不能提權、系統唯讀（只開狀態目錄可寫）、私有 /tmp、不能寫家目錄。
+# 不設 KillMode（oneshot 用預設 control-group）：逾時就整組殺掉，不留孤兒。
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/llmgateway
+PrivateTmp=true
+ProtectHome=read-only

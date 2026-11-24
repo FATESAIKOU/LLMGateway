@@ -14,10 +14,10 @@ import time
 import unittest
 
 try:
-    from .lgwctl_fakes import FAKE_CURL
+    from .lgwctl_fakes import CHECK_TIMER, FAKE_CURL
     from .test_lgwctl_migrate import FAKE_TAG, MigrationTestCase, MigrateSandbox
 except ImportError:  # python3 -m unittest discover -s tests
-    from lgwctl_fakes import FAKE_CURL
+    from lgwctl_fakes import CHECK_TIMER, FAKE_CURL
     from test_lgwctl_migrate import FAKE_TAG, MigrationTestCase, MigrateSandbox
 
 VALID = '{"schema": 1, "probe": "healthz"}\n'
@@ -129,6 +129,9 @@ class FinalizeCapabilityTests(MigrateCapabilityCase):
         self.box.set_active("llmgateway-tunnel.service")
         for unit in ("llmgateway.service", "llmgateway-tunnel.service", "key-sync.timer"):
             self.box.set_active(unit, False, layer="user")
+        # #289：confirmed 代表 cutover 已完成；timer 已在跑（finalize 的 check 才不會 todo）。
+        self.box.set_unit_enabled(CHECK_TIMER)
+        self.box.set_active(CHECK_TIMER)
         self.box.write_cutover_state(phase="confirmed", tag=FAKE_TAG,
                                      confirmed_ts=time.time() - 4 * 86400,
                                      revert_unit="lgw-revert.timer",

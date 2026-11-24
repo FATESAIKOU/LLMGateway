@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 
 from . import capability, check, mode_history, probe, release, run as runmod, units
-from .layout import SERVICE_NAME, TAG_PATTERN, TAG_RE
+from .layout import CHECK_TIMER_NAME, SERVICE_NAME, TAG_PATTERN, TAG_RE
 from .report import Report
 
 # policy dry-run 的子行程：cwd 指到新 tag 目錄（``-c`` 會把 cwd 放進
@@ -72,6 +72,24 @@ def _restart_service(layout, report) -> bool:
         report.fail("restart", f"{SERVICE_NAME} restart 失敗")
         return False
     report.ok("restart", SERVICE_NAME)
+    return True
+
+
+def _enable_timer_after_units(layout, tag_dir: str, report) -> bool:
+    """#289 C-984／C-985：目標版本有 timer 就 enable --now（已在跑就不動）。
+
+    版本裡沒有這個 unit 就跳過（舊版目錄）。失敗由呼叫方決定回復。
+    """
+    if not os.path.isfile(units.unit_source(tag_dir, CHECK_TIMER_NAME)):
+        return True
+    if (units.enabled_state(layout, CHECK_TIMER_NAME) == "enabled"
+            and units.is_active(layout, CHECK_TIMER_NAME)):
+        report.ok("enable-timer", f"{CHECK_TIMER_NAME} 已在跑（不動它）")
+        return True
+    if not units.enable_now(layout, CHECK_TIMER_NAME):
+        report.fail("enable-timer", f"{CHECK_TIMER_NAME} enable --now 失敗")
+        return False
+    report.ok("enable-timer", CHECK_TIMER_NAME)
     return True
 
 
@@ -151,6 +169,12 @@ def upgrade(layout, *, tag: str, repo: str | None = None,
                                       restart=True, report=report)
 
     report.ok("list", "200")
+    # #289（架構師低-2）：timer 在 restart 與探針 ok **之後**才 enable --now。開機
+    # 已超過 5 分鐘時，enable --now 會立刻觸發一次 check；太早啟用會剛好撞上
+    # lgwd 重啟，讓那一次 check 失敗、unit 短暫進入 failed。
+    if not _enable_timer_after_units(layout, tag_dir, report):
+        return _rollback_after_switch(layout, saved_units, old_current, old_previous,
+                                      restart=True, report=report)
     # #288：換版重啟成功、探針 ok 之後記模式；任何例外都只警告，不改結束碼。
     try:
         mode_history.record(layout, source="restart")
@@ -214,6 +238,11 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
     if not units.install_unit_files(layout, previous_dir, report):
         return _rollback_after_switch(layout, saved_units, old_current, previous,
                                       restart=False, report=report)
+    # #289 C-985：目標版本沒有的可選 unit（例如新版留下的 check timer）先
+    # disable --now 再刪檔；目標版本有就照上面的 install 裝。
+    if not units.remove_missing_optional_units(layout, previous_dir, report):
+        return _rollback_after_switch(layout, saved_units, old_current, previous,
+                                      restart=False, report=report)
     if not units.daemon_reload(layout):
         report.fail("daemon-reload", f"{layout.systemctl} daemon-reload 失敗")
         return _rollback_after_switch(layout, saved_units, old_current, previous,
@@ -223,6 +252,10 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
         return _rollback_after_switch(layout, saved_units, old_current, previous,
                                       restart=True, report=report)
     if probe.wait_local_ok(layout, layout.list_wait, mode=cap.mode):
+        # #289（架構師低-2）：timer 在 restart 與探針 ok 之後才 enable；理由同 upgrade。
+        if not _enable_timer_after_units(layout, previous_dir, report):
+            return _rollback_after_switch(layout, saved_units, old_current, previous,
+                                          restart=True, report=report)
         # #288：rollback 重啟成功、探針 ok 之後記模式；任何例外都只警告。
         try:
             mode_history.record(layout, source="restart")
