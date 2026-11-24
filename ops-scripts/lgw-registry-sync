@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""lgw-registry-sync：MLP 公鑰清單 → LGW 名冊候選檔（#292；契約 C-970～C-979）。
+
+v1 **只做 plan**：讀清單、產生候選名冊、跑 `llmgwctl auth-registry check
+--against-trust` 驗過，印變更摘要，寫一筆審計。**不自己 install**、不呼叫 `gh`、
+不讀 `/run` 底下的憑證檔；清單由執行的人用自己環境裡的唯讀 `gh` 取得後交給
+`--list`（`-` 表示 stdin）。
+
+用法：
+
+    sudo ops-scripts/lgw-registry-sync plan --list /root/mlp-keys.json \\
+        --out /root/auth-registry.candidate.json
+
+    sudo ops-scripts/lgw-registry-sync plan --list /root/mlp-keys.json \\
+        --out /root/auth-registry.candidate.json --revoke w4 --allow-new 3
+
+設計依據：`REPORT-sync-arch.md`（§9 優先於 §1～§6 的受影響段落）。重點：
+
+- **輸入**是 MLP#1739 的 JSON 陣列：每筆 `version` 必須是 1、`name` 不是 `"?"`
+  且符合 `[A-Za-z0-9][A-Za-z0-9._-]{0,46}`、`status` 是 `ok`／`invalid`／
+  `duplicate`。`duplicate` 或 `"?"` 或同一把公鑰出現在兩個 name → **整份停**；
+  `status=invalid` 的那一台**不新增、不撤銷、不換鑰**，只列 `skip`。
+- **只管 `mlp-` 條目**：principal `mlp-<name>`、key ID `mlp-<name>-<fp12>`
+  （`fp12`＝公鑰 blob 的 SHA-256 前 12 個 hex）。非 `mlp-` 的 principal 與 key
+  原封不動；本機管理 principal 不由這支腳本產生。
+- **換鑰一定換 key ID**：同一個 name 拿到新公鑰時，新 key ID 進名冊、舊的標
+  `revoked`（這一列與 principal 都保留）。清單裡的公鑰已經是名冊裡的 `revoked`
+  列（墓碑）→ 停，並講清楚是哪一台。
+- **消失的 worker 一律不自動撤銷**：只在摘要列 `missing <name>`。要撤銷必須明確
+  下 `--revoke <name>`（可重複），而且被點名的 name 必須真的不在清單裡。
+- **新 name 上限 2**（`--allow-new N` 放行；`N` 只影響摘要與守門，不寫死）。
+- **基準是已載入的名冊**：先讀 `LGWD_AUTH_REGISTRY`（預設
+  `/etc/llmgateway/auth-registry.json`），再用 `llmgwctl auth-registry status`
+  確認它的內容雜湊等於 `loaded_hash`、最近一次載入 `result=ok`。不符就停。
+  有變更時 `generation = 現行 + 1`；沒有變更就不產生候選檔（冪等）。
+- **候選檔一定經過 `llmgwctl auth-registry check --against-trust`**（回 0 才算
+  plan 成功）；先寫同目錄暫存檔，check 過了才 `rename` 成 `--out`（root 0640）。
+- 狀態檔 `<state_dir>/registry-sync.state`（0600）只記上次輸入的 SHA-256 與時刻，
+  **不當守門**；鎖檔 `<state_dir>/registry-sync.lock`；審計一筆用
+  `lgwd.auth_admin.AuditLog`（command `auth-registry sync-plan`——這是
+  `_AUDIT_COMMAND` 已允許的名字，所以不必改 `lgwd/`）。
+
+結束碼：0＝plan 成功（含「無變更」）；1＝清單或名冊不合格、守門擋下、check 失敗
+（不寫候選檔）；2＝無法執行（讀不到檔、鎖被持有、缺 `llmgwctl`、審計寫不進去）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from lgwd.auth_admin import AdminError, AuditLog  # noqa: E402
+from lgwd.auth_paths import (  # noqa: E402
+    AUDIT_LOG_NAME,
+    DEFAULT_REGISTRY_PATH,
+    DEFAULT_STATE_DIR,
+)
+from lgwd.auth_registry import (  # noqa: E402
+    OPS,
+    InvalidPublicKey,
+    Registry,
+    RegistryError,
+    content_hash,
+    fingerprint,
+    parse_registry,
+    read_registry_file,
+    ssh_public_key_blob,
+    validate_ed25519_pubkey,
+)
+from lgwd.clock import SystemClock  # noqa: E402
+from lgwd.policy import AGENTS, ROLES  # noqa: E402
+
+#: worker 名稱的格式（§2.1）：`mlp-` ＋ 47 字 ＋ `-` ＋ 12 hex ＝ 64，剛好是 key ID 上限。
+NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,46}\Z")
+
+#: 清單檔（含 stdin）的大小上限；和名冊一樣 1 MiB，超過就停。
+MAX_LIST_BYTES = 1024 * 1024
+
+#: `source` 的值只接受這個形狀（`node`／`worker` 都在裡面）；其他值當成未知。
+SOURCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
+#: 不合規則的 `source` 在摘要裡的固定占位字串（不印原值）。
+UNKNOWN_SOURCE = "?"
+
+#: 清單來的字串放進輸出前，跳脫後最多留幾個字元（含跳脫序列）。
+DISPLAY_LIMIT = 64
+
+#: 這支腳本只管這個前綴的 principal 與 key（C-971）。
+OURS_PREFIX = "mlp-"
+
+#: 新 name 的預設上限（P1；`--allow-new` 放行）。
+DEFAULT_NEW_LIMIT = 2
+
+#: 狀態／鎖檔名（放在 `LGWD_AUTH_STATE_DIR`）。
+STATE_NAME = "registry-sync.state"
+LOCK_NAME = "registry-sync.lock"
+
+#: 候選檔權限（與 install 寫入名冊相同：root:<服務群組> 0640）。
+CANDIDATE_MODE = 0o640
+
+#: 審計的 command 名。必須符合 `lgwd.auth_admin._AUDIT_COMMAND`；改名要改
+#: `lgwd/`，因此照現有允許的字形取名，不動 lgwd。
+AUDIT_COMMAND = "auth-registry sync-plan"
+
+#: 外部指令的逾時（秒）；check 只是讀 sqlite 與解析 JSON。
+LLMGWCTL_TIMEOUT = 120.0
+
+#: 覆寫 `llmgwctl` 路徑（給沒安裝 wrapper 的 checkout 與測試用）。
+ENV_LLMGWCTL = "LGW_SYNC_LLMGWCTL"
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_CANNOT = 2
+
+
+class PlanStop(Exception):
+    """plan 的固定結束方式。`code` 進審計，`message` 給人看（不含公鑰）。"""
+
+    def __init__(self, exit_code: int, message: str, code: str):
+        super().__init__(code)
+        self.exit_code = int(exit_code)
+        self.message = message
+        self.code = code
+
+
+def _display(value: object, limit: int = DISPLAY_LIMIT) -> str:
+    """把清單來的字串變成可安全印出的形式（中-1）。
+
+    只留可列印 ASCII；控制字元（含 ESC、換行）、反斜線與非 ASCII 一律以
+    `\\xNN`／`\\uNNNN`／`\\UNNNNNNNN`／`\\\\` 表示，並在 `limit` 個字元內截斷。
+    這樣清單端的字串不可能在 root 的終端機上蓋掉或偽造摘要的下一行。
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    parts: list[str] = []
+    size = 0
+    for char in value:
+        code = ord(char)
+        if char == "\\":
+            piece = "\\\\"
+        elif 32 <= code <= 126:
+            piece = char
+        elif code <= 0xFF:
+            piece = "\\x%02x" % code
+        elif code <= 0xFFFF:
+            piece = "\\u%04x" % code
+        else:
+            piece = "\\U%08x" % code
+        if size + len(piece) > limit:
+            break
+        parts.append(piece)
+        size += len(piece)
+    return "".join(parts)
+
+
+# --- 路徑 -------------------------------------------------------------------
+
+
+def _prefix() -> str:
+    return (os.environ.get("LLMGW_PREFIX") or "").rstrip("/")
+
+
+def _default_registry() -> str:
+    return os.environ.get("LGWD_AUTH_REGISTRY") or _prefix() + DEFAULT_REGISTRY_PATH
+
+
+def _default_state_dir() -> str:
+    return os.environ.get("LGWD_AUTH_STATE_DIR") or _prefix() + DEFAULT_STATE_DIR
+
+
+def _owner_uid() -> int:
+    """名冊檔的擁有者檢查值：root 執行時要求 root，測試／非 root 時要求自己。
+
+    正式機由 `sudo` 執行，所以是 0；測試在暫存目錄裡以自己身分建檔，不會為了
+    配合測試而放寬正式機的檢查。
+    """
+    return 0 if os.geteuid() == 0 else os.geteuid()
+
+
+def _atomic_write(path: str, data: bytes, mode: int) -> None:
+    """同目錄暫存檔＋fsync＋rename＋fsync 目錄；失敗不改原本的檔。"""
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=directory)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+class StateLock:
+    """`registry-sync.lock` 上的 `flock(LOCK_EX|LOCK_NB)`；拿不到就是另一個 plan 在跑。"""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fd = None
+
+    def __enter__(self) -> "StateLock":
+        try:
+            fd = os.open(
+                self.path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+        except OSError:
+            raise PlanStop(EXIT_CANNOT, "打不開 registry-sync 鎖檔（檢查狀態目錄權限）",
+                           "lock_unavailable") from None
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise PlanStop(EXIT_CANNOT, "另一個 registry-sync plan 正在進行；稍後再試",
+                           "lock_busy") from None
+        self.fd = fd
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+# --- 清單 -------------------------------------------------------------------
+
+
+def _read_limited(stream, what: str) -> bytes:
+    """讀到 EOF，但最多 1 MiB；超過就以 `list_too_large` 停（低-1）。"""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        try:
+            chunk = stream.read(65536)
+        except OSError:
+            raise PlanStop(EXIT_CANNOT, "讀不到{0}".format(what), "list_unreadable") from None
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > MAX_LIST_BYTES:
+            raise PlanStop(EXIT_FAIL, "{0}超過上限（1 MiB）；停".format(what),
+                           "list_too_large")
+        chunks.append(chunk)
+
+
+def _read_list(path: str) -> bytes:
+    if path == "-":
+        return _read_limited(sys.stdin.buffer, "stdin 的清單")
+    try:
+        with open(path, "rb") as fh:
+            return _read_limited(fh, "清單檔")
+    except OSError:
+        raise PlanStop(EXIT_CANNOT, "讀不到清單檔（{0}）".format(path),
+                       "list_unreadable") from None
+
+
+def _decode_list(raw: bytes):
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise PlanStop(EXIT_FAIL, "清單不是 UTF-8", "list_not_utf8") from None
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        raise PlanStop(EXIT_FAIL, "清單不是合法的 JSON", "list_not_json") from None
+
+
+def _parse_public_key(value: object, name: str) -> bytes:
+    """只接受 `ssh-ed25519 <base64>`；註解一律丟掉（C-970、W-8k）。"""
+    if not isinstance(value, str):
+        raise PlanStop(EXIT_FAIL, "worker {0} 的公鑰不是字串".format(_display(name)), "invalid_key")
+    parts = value.split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise PlanStop(EXIT_FAIL, "worker {0} 的公鑰不是 ssh-ed25519".format(_display(name)),
+                       "invalid_key")
+    encoded = parts[1]
+    try:
+        blob = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise PlanStop(EXIT_FAIL, "worker {0} 的公鑰不是標準 base64".format(_display(name)),
+                       "invalid_key") from None
+    if base64.b64encode(blob).decode("ascii") != encoded:
+        raise PlanStop(EXIT_FAIL, "worker {0} 的公鑰不是標準 base64".format(_display(name)),
+                       "invalid_key")
+    try:
+        return validate_ed25519_pubkey(blob)
+    except InvalidPublicKey:
+        raise PlanStop(EXIT_FAIL, "worker {0} 的公鑰不合 ed25519 規則".format(_display(name)),
+                       "invalid_key") from None
+
+
+def _fp12(public_key32: bytes) -> str:
+    """key ID 用的 12 個 hex：公鑰 blob 的 SHA-256 前 12 個字元。"""
+    return hashlib.sha256(ssh_public_key_blob(public_key32)).hexdigest()[:12]
+
+
+def parse_worker_list(raw: bytes) -> list[dict]:
+    """驗完整份清單（C-970）。任何一項不合就整份停，回傳 status=ok/invalid 的項目。
+
+    回傳的每一筆是 `{name, status, source, raw, fingerprint, fp12}`；`raw` 只在
+    `status=ok` 時有 32 bytes。`status=duplicate` 與 name `"?"` 直接停。
+    """
+    data = _decode_list(raw)
+    if not isinstance(data, list):
+        raise PlanStop(EXIT_FAIL, "清單必須是 JSON 陣列", "list_not_array")
+    if not data:
+        raise PlanStop(EXIT_FAIL, "清單是空的（上游出問題）；不會撤銷任何人", "guard_empty")
+    workers: list[dict] = []
+    seen_names: set[str] = set()
+    seen_bytes: dict[bytes, str] = {}
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise PlanStop(EXIT_FAIL, "清單第 {0} 筆不是物件".format(index + 1),
+                           "list_item_not_object")
+        version = item.get("version")
+        if isinstance(version, bool) or version != 1:
+            raise PlanStop(EXIT_FAIL, "清單第 {0} 筆的 version 不是 1".format(index + 1),
+                           "list_version")
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            raise PlanStop(EXIT_FAIL, "清單第 {0} 筆沒有合法的 name".format(index + 1),
+                           "list_name")
+        if name == "?":
+            raise PlanStop(EXIT_FAIL, "清單有 name 為 ? 的 worker（無法判斷是哪一台），整份停",
+                           "name_question")
+        if not NAME_PATTERN.match(name):
+            # 不合規則的 name 只印第幾筆（中-1）：不把清單端的原字串放到終端機。
+            raise PlanStop(EXIT_FAIL, "清單第 {0} 筆的 name 不合規則；整份停".format(index + 1),
+                           "name_format")
+        if name in seen_names:
+            raise PlanStop(EXIT_FAIL, "同一個 name 出現兩次（{0}）；整份停".format(
+                _display(name)), "name_duplicate")
+        seen_names.add(name)
+        status = item.get("status")
+        if status not in ("ok", "invalid", "duplicate"):
+            raise PlanStop(EXIT_FAIL, "worker {0} 的 status 不是 ok／invalid／duplicate"
+                           .format(_display(name)), "status_unknown")
+        if status == "duplicate":
+            raise PlanStop(EXIT_FAIL, "清單有 status=duplicate 的 worker（{0}）；整份停"
+                           .format(_display(name)), "duplicate")
+        raw_source = item.get("source")
+        if raw_source is None or raw_source == "":
+            source = None
+        elif isinstance(raw_source, str) and SOURCE_PATTERN.match(raw_source):
+            source = raw_source
+        else:
+            # 不在允許值內的一律當成未知，摘要只印固定占位字串（中-1）。
+            source = UNKNOWN_SOURCE
+        entry = {"name": name, "status": status, "source": source,
+                 "raw": None, "fingerprint": None, "fp12": None}
+        if status == "ok":
+            raw_key = _parse_public_key(item.get("public_key"), name)
+            computed = fingerprint(raw_key)
+            claimed = item.get("fingerprint")
+            if not isinstance(claimed, str) or claimed != "SHA256:" + computed:
+                raise PlanStop(EXIT_FAIL,
+                               "worker {0} 的 fingerprint 與公鑰重算不符；整份停".format(
+                                   _display(name)), "fingerprint_mismatch")
+            other = seen_bytes.get(raw_key)
+            if other is not None:
+                raise PlanStop(EXIT_FAIL,
+                               "同一把公鑰出現在兩個 name（{0}、{1}）；整份停"
+                               .format(_display(other), _display(name)), "duplicate_key")
+            seen_bytes[raw_key] = name
+            entry.update(raw=raw_key, fingerprint=computed, fp12=_fp12(raw_key))
+        workers.append(entry)
+    return workers
+
+
+# --- 現行名冊 ---------------------------------------------------------------
+
+
+def _read_current(path: str) -> tuple[bytes, Registry]:
+    try:
+        raw = read_registry_file(path, owner_uid=_owner_uid())
+    except RegistryError as exc:
+        if exc.kind == "io_error":
+            raise PlanStop(EXIT_CANNOT, "讀不到現行名冊（{0}）".format(path),
+                           "registry_unreadable") from None
+        raise PlanStop(EXIT_FAIL, "現行名冊無法讀取（{0}）；先處理".format(exc.kind),
+                       "registry_unreadable") from None
+    try:
+        return raw, parse_registry(raw)
+    except RegistryError as exc:
+        raise PlanStop(EXIT_FAIL, "現行名冊解析失敗（{0}）；先處理".format(exc.kind),
+                       "registry_invalid") from None
+
+
+def _run_llmgwctl(command: str, argv: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            [command] + argv,
+            capture_output=True,
+            text=True,
+            timeout=LLMGWCTL_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise PlanStop(EXIT_CANNOT, "找不到 llmgwctl（{0}）；用 --llmgwctl 指定".format(command),
+                       "llmgwctl_missing") from None
+    except subprocess.TimeoutExpired:
+        raise PlanStop(EXIT_CANNOT, "llmgwctl 逾時（{0}）".format(" ".join(argv[:2])),
+                       "llmgwctl_timeout") from None
+    except OSError:
+        raise PlanStop(EXIT_CANNOT, "無法執行 llmgwctl（{0}）".format(command),
+                       "llmgwctl_unavailable") from None
+
+
+def _confirm_loaded(command: str, raw: bytes, registry: Registry) -> None:
+    """用 `llmgwctl auth-registry status` 確認現行名冊真的已載入（C-974）。"""
+    proc = _run_llmgwctl(command, ["auth-registry", "status"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        hint = ("；" + detail[-1]) if detail else ""
+        raise PlanStop(EXIT_FAIL, "現行名冊未載入，先處理（auth-registry status 回 {0}{1}）"
+                       .format(proc.returncode, hint), "registry_not_loaded")
+    loaded_hash = None
+    loaded_generation = None
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "loaded_hash" and value and value != "（無）":
+            loaded_hash = value.strip()
+        elif key == "loaded_generation" and value and value != "（無）":
+            try:
+                loaded_generation = int(value.strip())
+            except ValueError:
+                loaded_generation = None
+    expected = content_hash(raw)
+    if loaded_hash != expected:
+        raise PlanStop(EXIT_FAIL,
+                       "現行名冊未載入（檔案雜湊 {0} 與 loaded_hash 不同），先處理"
+                       .format(expected), "registry_not_loaded")
+    if loaded_generation != registry.generation:
+        raise PlanStop(EXIT_FAIL,
+                       "現行名冊的世代與 loaded_generation 不同（{0}／{1}），先處理"
+                       .format(registry.generation, loaded_generation),
+                       "registry_not_loaded")
+
+
+# --- 轉換 -------------------------------------------------------------------
+
+
+def _is_ours(entry) -> bool:
+    return entry.principal.startswith(OURS_PREFIX) and entry.key_id.startswith(OURS_PREFIX)
+
+
+def _name_of(principal: str) -> str:
+    return principal[len(OURS_PREFIX):]
+
+
+def _b_principal() -> dict:
+    """新的 `mlp-<name>` principal 用 B（C-973）：值從程式匯入，不寫死。"""
+    return {
+        "ops": list(OPS),
+        "resolve_agents": list(AGENTS),
+        "roles": {role: list(AGENTS) for role in ROLES},
+    }
+
+
+def _principal_json(entry) -> dict:
+    """既有 principal 的值原樣輸出（只做排序正規化，物件層級不變）。"""
+    return {
+        "ops": [op for op in OPS if op in entry.ops],
+        "resolve_agents": list(entry.resolve_agents),
+        "roles": {role: list(entry.roles[role]) for role in ROLES if role in entry.roles},
+    }
+
+
+def _public_key_line(public_key32: bytes) -> str:
+    return "ssh-ed25519 " + base64.b64encode(ssh_public_key_blob(public_key32)).decode("ascii")
+
+
+def _key_json(key, status: str) -> dict:
+    return {
+        "key_id": key.key_id,
+        "principal": key.principal,
+        "public_key": _public_key_line(key.public_key),
+        "status": status,
+    }
+
+
+class ChangePlan:
+    """一次 plan 的變更（尚未套用）；`changes` 決定要不要產生候選檔。"""
+
+    def __init__(self):
+        self.adds: list[dict] = []          # {name, key_id, raw, fingerprint, source, new_principal}
+        self.revokes: list[dict] = []       # {key, reason}
+        self.replaces: list[dict] = []      # {name, old, key_id, fingerprint}
+        self.missing: list[str] = []
+        self.skipped: list[str] = []
+        self.unchanged = 0
+
+    @property
+    def changes(self) -> bool:
+        return bool(self.adds or self.revokes or self.replaces)
+
+
+def build_change_plan(registry: Registry, workers: list[dict],
+                      revoke_names: list[str]) -> ChangePlan:
+    """把清單轉成名冊變更（§2、§9.2）。任何衝突都在這裡停，不動任何檔。"""
+    plan = ChangePlan()
+    by_bytes = {key.public_key: key for key in registry.keys}
+    by_id = {key.key_id: key for key in registry.keys}
+    active_by_name: dict[str, list] = {}
+    for key in registry.keys:
+        if _is_ours(key) and key.active:
+            active_by_name.setdefault(_name_of(key.principal), []).append(key)
+
+    present_names = {worker["name"] for worker in workers}
+    # 撤銷的 name 必須真的不在清單裡（§9.2 ①）。
+    for name in revoke_names:
+        if not NAME_PATTERN.match(name):
+            raise PlanStop(EXIT_CANNOT, "--revoke 的 name 不合規則（{0}）".format(_display(name)),
+                           "revoke_name_format")
+        if name in present_names:
+            raise PlanStop(EXIT_FAIL,
+                           "撤銷點名的 worker 仍在清單裡（{0}）；先讓它從清單消失".format(_display(name)),
+                           "revoke_present_in_list")
+        keys = active_by_name.get(name)
+        if not keys:
+            raise PlanStop(EXIT_FAIL, "沒有可撤銷的 active key（{0}）".format(_display(name)),
+                           "revoke_nothing_to_do")
+        plan.revokes.extend({"key": key, "reason": "{0} not in list".format(_display(name))}
+                            for key in keys)
+
+    for worker in workers:
+        name = worker["name"]
+        if worker["status"] == "invalid":
+            plan.skipped.append(name)
+            continue
+        raw_key = worker["raw"]
+        existing = by_bytes.get(raw_key)
+        if existing is not None:
+            if not _is_ours(existing):
+                raise PlanStop(EXIT_FAIL,
+                               "清單的公鑰已經被非 mlp- 的條目使用（{0}）".format(_display(name)),
+                               "non_mlp_key_in_use")
+            if not existing.active:
+                raise PlanStop(EXIT_FAIL,
+                               "清單出現已撤銷的公鑰（{0}）；重放舊清單或 MLP 狀態錯"
+                               .format(_display(name)), "tombstone")
+            if existing.principal != OURS_PREFIX + name:
+                raise PlanStop(EXIT_FAIL,
+                               "同一把公鑰在名冊裡屬於別的 name（{0}）；整份停".format(_display(name)),
+                               "duplicate_key")
+            plan.unchanged += 1
+            continue
+        key_id = OURS_PREFIX + name + "-" + worker["fp12"]
+        if key_id in by_id:
+            raise PlanStop(EXIT_FAIL,
+                           "key ID 已存在但公鑰不同（{0}）；整份停".format(key_id),
+                           "key_id_collision")
+        older = active_by_name.get(name, [])
+        if older:
+            plan.replaces.append({
+                "name": name,
+                "old": older[0],
+                "key_id": key_id,
+                "fingerprint": worker["fingerprint"],
+            })
+            plan.revokes.extend({"key": key, "reason": "{0} superseded".format(_display(name))}
+                                for key in older[1:])
+        principal_name = OURS_PREFIX + name
+        plan.adds.append({
+            "name": name,
+            "key_id": key_id,
+            "raw": raw_key,
+            "fingerprint": worker["fingerprint"],
+            "source": worker["source"],
+            "new_principal": principal_name not in registry.principals,
+        })
+
+    revoked_names = {_name_of(item["key"].principal) for item in plan.revokes}
+    for name in sorted(active_by_name):
+        if name in present_names or name in revoked_names:
+            continue
+        plan.missing.append(name)
+    return plan
+
+
+def candidate_bytes(registry: Registry, plan: ChangePlan) -> bytes:
+    """固定順序的候選名冊（同一份清單＋同一份現行名冊 → 同一份 bytes）。"""
+    principals: dict[str, dict] = {}
+    for name, entry in registry.principals.items():
+        principals[name] = _principal_json(entry)
+    for add in sorted(plan.adds, key=lambda item: item["name"]):
+        if add["new_principal"]:
+            principals[OURS_PREFIX + add["name"]] = _b_principal()
+
+    revoke_ids = {item["key"].key_id for item in plan.revokes}
+    revoke_ids.update(item["old"].key_id for item in plan.replaces)
+    keys: list[dict] = []
+    for key in registry.keys:
+        status = "revoked" if key.key_id in revoke_ids else key.status
+        keys.append(_key_json(key, status))
+    for add in sorted(plan.adds, key=lambda item: item["name"]):
+        keys.append({
+            "key_id": add["key_id"],
+            "principal": OURS_PREFIX + add["name"],
+            "public_key": _public_key_line(add["raw"]),
+            "status": "active",
+        })
+    document = {
+        "schema": registry.schema,
+        "generation": registry.generation + 1,
+        "principals": principals,
+        "keys": keys,
+    }
+    return (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+# --- 狀態與審計 -------------------------------------------------------------
+
+
+def read_state(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_state(path: str, input_sha: str, when: int) -> None:
+    document = {"schema": 1, "input_sha256": input_sha, "time": int(when)}
+    payload = (json.dumps(document, separators=(",", ":")) + "\n").encode("utf-8")
+    _atomic_write(path, payload, 0o600)
+
+
+def append_audit(path: str, *, args: dict) -> None:
+    audit = AuditLog(path, clock=SystemClock())
+    try:
+        audit.append(AUDIT_COMMAND, **args)
+    except AdminError as exc:
+        raise PlanStop(EXIT_CANNOT, "審計寫不進去（{0}）".format(exc), "audit_failed") from None
+
+
+# --- 摘要 -------------------------------------------------------------------
+
+
+def print_summary(*, base_generation: int, base_hash: str, candidate_generation: int | None,
+                  candidate_hash: str | None, out_path: str | None, plan: ChangePlan,
+                  allow_new: int, input_sha: str, same_as_last: bool, check: str) -> None:
+    """固定格式的變更摘要（C-977）：只印 name、key ID、fingerprint、source。"""
+    suffix = "（與上次相同）" if same_as_last else ""
+    print("base generation {0} ({1}) loaded=yes".format(base_generation, base_hash))
+    if candidate_generation is None:
+        print("candidate generation 無（無變更）")
+    else:
+        print("candidate generation {0} ({1})".format(candidate_generation,
+                                                       candidate_hash))
+    replaced_new = {replace["key_id"] for replace in plan.replaces}
+    for add in sorted(plan.adds, key=lambda item: item["name"]):
+        if add["key_id"] in replaced_new:
+            continue   # 換鑰由下面的 replace 行表示，不再重複列 add
+        origin = " source={0}".format(add["source"]) if add["source"] else ""
+        print("{0:<10}{1}  SHA256:{2}  (new worker {3}{4})".format(
+            "add", add["key_id"], add["fingerprint"], _display(add["name"]), origin))
+    for replace in sorted(plan.replaces, key=lambda item: item["name"]):
+        print("{0:<10}{1} -> {2}  SHA256:{3} -> SHA256:{4}".format(
+            "replace", replace["old"].key_id, replace["key_id"],
+            fingerprint(replace["old"].public_key), replace["fingerprint"]))
+    for item in plan.revokes:
+        print("{0:<10}{1}  ({2})".format("revoke", item["key"].key_id,
+                                          _display(item["reason"])))
+    for name in plan.missing:
+        print("{0:<10}{1}  (not in list; not revoked; use --revoke {1})".format(
+            "missing", _display(name)))
+    for name in plan.skipped:
+        print("{0:<10}{1}  (invalid)".format("skip", _display(name)))
+    print("unchanged {0}".format(plan.unchanged))
+    print("guards    new {0}/{1}  revoke {2}  input {3}{4}".format(
+        sum(1 for add in plan.adds if add["new_principal"]), allow_new,
+        len(plan.revokes), input_sha, suffix))
+    print("check     {0}".format(check))
+    if check == "failed":
+        print("next      修正清單或現行名冊後重跑 plan；沒有寫候選檔")
+    elif out_path is not None:
+        print("out       {0}".format(out_path))
+        print("note      每次用新的 --out 檔名，或先刪舊檔；不要拿上一次留下的候選檔 install")
+        print("next      fingerprint 帶外比對 add／replace 的每一行後："
+              "sudo llmgwctl auth-registry install {0}".format(out_path))
+    else:
+        print("next      無變更；沒有寫候選檔")
+
+
+# --- plan -------------------------------------------------------------------
+
+
+def run_plan(args) -> int:
+    registry_path = os.path.abspath(args.registry or _default_registry())
+    state_dir = os.path.abspath(args.state_dir or _default_state_dir())
+    out_path = os.path.abspath(args.out)
+    llmgwctl = args.llmgwctl or os.environ.get(ENV_LLMGWCTL) or "llmgwctl"
+
+    if not os.path.isdir(state_dir):
+        print("狀態目錄不存在（{0}）".format(state_dir), file=sys.stderr)
+        return EXIT_CANNOT
+    if os.path.realpath(out_path) == os.path.realpath(registry_path):
+        print("--out 不能是現行名冊（{0}）".format(registry_path), file=sys.stderr)
+        return EXIT_CANNOT
+    if not os.path.isdir(os.path.dirname(out_path) or "."):
+        print("--out 的目錄不存在（{0}）".format(os.path.dirname(out_path) or "."),
+              file=sys.stderr)
+        return EXIT_CANNOT
+
+    state_path = os.path.join(state_dir, STATE_NAME)
+    audit_path = os.path.join(state_dir, AUDIT_LOG_NAME)
+    lock_path = os.path.join(state_dir, LOCK_NAME)
+
+    try:
+        with StateLock(lock_path):
+            return _plan_locked(args, registry_path, out_path,
+                                llmgwctl, state_path, audit_path)
+    except PlanStop as exc:
+        print("fail {0}".format(exc.message), file=sys.stderr)
+        try:
+            append_audit(audit_path, args={
+                "args": {"stage": "stop", "reason": exc.code},
+                "old": None,
+                "new": None,
+            })
+        except PlanStop as audit_exc:
+            print("fail {0}".format(audit_exc.message), file=sys.stderr)
+            return EXIT_CANNOT
+        return exc.exit_code
+    except OSError as exc:
+        print("fail 無法執行（{0}）".format(type(exc).__name__), file=sys.stderr)
+        return EXIT_CANNOT
+
+
+def _plan_locked(args, registry_path: str, out_path: str,
+                 llmgwctl: str, state_path: str, audit_path: str) -> int:
+    raw_list = _read_list(args.list)
+    input_sha = content_hash(raw_list)
+    workers = parse_worker_list(raw_list)
+    current_raw, registry = _read_current(registry_path)
+    _confirm_loaded(llmgwctl, current_raw, registry)
+
+    revoke_names = list(dict.fromkeys(args.revoke or ()))
+    plan = build_change_plan(registry, workers, revoke_names)
+    new_names = [add["name"] for add in plan.adds if add["new_principal"]]
+    if len(new_names) > args.allow_new:
+        raise PlanStop(EXIT_FAIL,
+                       "新增的 name 有 {0} 個（{1}），超過上限 {2}；確認來源後用 "
+                       "--allow-new {0} 放行".format(
+                           len(new_names),
+                           "、".join(_display(name) for name in sorted(new_names)[:5])
+                           + ("…" if len(new_names) > 5 else ""),
+                           args.allow_new),
+                       "new_names_over_limit")
+    if registry.generation >= 2 ** 53 - 1:
+        raise PlanStop(EXIT_FAIL, "名冊世代已達上限，不能再加一", "generation_overflow")
+
+    previous = read_state(state_path)
+    same_as_last = bool(previous) and previous.get("input_sha256") == input_sha
+    when = int(time.time())
+
+    base_hash = content_hash(current_raw)
+    if not plan.changes:
+        append_audit(audit_path, args={
+            "args": {"input_sha256": input_sha, "revoke": revoke_names,
+                     "allow_new": args.allow_new, "out": out_path, "result": "unchanged"},
+            "old": {"generation": registry.generation, "snapshot_hash": base_hash},
+            "new": None,
+        })
+        write_state(state_path, input_sha, when)
+        print_summary(base_generation=registry.generation, base_hash=base_hash,
+                      candidate_generation=None, candidate_hash=None, out_path=None,
+                      plan=plan, allow_new=args.allow_new, input_sha=input_sha,
+                      same_as_last=same_as_last, check="not-run")
+        print("result 無變更")
+        return EXIT_OK
+
+    payload = candidate_bytes(registry, plan)
+    candidate_hash = content_hash(payload)
+    check = "failed"
+    directory = os.path.dirname(out_path) or "."
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(out_path) + ".", dir=directory)
+    try:
+        os.fchmod(fd, CANDIDATE_MODE)
+        with os.fdopen(fd, "wb") as out:
+            out.write(payload)
+            out.flush()
+            os.fsync(out.fileno())
+        proc = _run_llmgwctl(llmgwctl, ["auth-registry", "check", "--against-trust", tmp])
+        if proc.returncode == 0:
+            check = "ok"
+        else:
+            detail = (proc.stdout or "") + (proc.stderr or "")
+            for line in detail.splitlines():
+                print(line, file=sys.stderr)
+            print_summary(base_generation=registry.generation, base_hash=base_hash,
+                          candidate_generation=registry.generation + 1,
+                          candidate_hash=candidate_hash, out_path=None,
+                          plan=plan, allow_new=args.allow_new, input_sha=input_sha,
+                          same_as_last=same_as_last, check=check)
+            raise PlanStop(EXIT_FAIL,
+                           "候選名冊沒通過 llmgwctl auth-registry check --against-trust"
+                           "（回 {0}）；沒有寫候選檔".format(proc.returncode),
+                           "check_failed")
+        append_audit(audit_path, args={
+            "args": {"input_sha256": input_sha, "revoke": revoke_names,
+                     "allow_new": args.allow_new, "out": out_path, "result": "candidate"},
+            "old": {"generation": registry.generation, "snapshot_hash": base_hash},
+            "new": {
+                "generation": registry.generation + 1,
+                "snapshot_hash": candidate_hash,
+                "added": [add["key_id"] for add in
+                          sorted(plan.adds, key=lambda item: item["name"])],
+                "revoked": ([item["key"].key_id for item in plan.revokes]
+                            + [item["old"].key_id for item in plan.replaces]),
+                "missing": plan.missing,
+                "skipped": plan.skipped,
+            },
+        })
+        os.replace(tmp, out_path)
+        tmp = None
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    write_state(state_path, input_sha, when)
+    print_summary(base_generation=registry.generation, base_hash=base_hash,
+                  candidate_generation=registry.generation + 1,
+                  candidate_hash=candidate_hash, out_path=out_path,
+                  plan=plan, allow_new=args.allow_new, input_sha=input_sha,
+                  same_as_last=same_as_last, check=check)
+    print("result ok")
+    return EXIT_OK
+
+
+# --- CLI --------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lgw-registry-sync",
+        description="MLP 公鑰清單 → LGW 名冊候選檔（只做 plan；install 由人執行）。",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    plan = sub.add_parser(
+        "plan",
+        help="驗清單、產生候選名冊、跑 auth-registry check --against-trust、印摘要",
+    )
+    plan.add_argument("--list", required=True,
+                      help="MLP#1739 的 JSON 陣列檔（- 表示 stdin；腳本不自己抓）")
+    plan.add_argument("--out", required=True, help="候選名冊檔（root 0640；不得是現行名冊）")
+    plan.add_argument("--revoke", action="append", default=None, metavar="NAME",
+                      help="撤銷這個 worker（可重複；必須真的不在清單裡）")
+    plan.add_argument("--allow-new", type=int, default=DEFAULT_NEW_LIMIT, metavar="N",
+                      help="放行幾個新的 name（預設 {0}）".format(DEFAULT_NEW_LIMIT))
+    plan.add_argument("--registry", default=None,
+                      help="現行名冊（預設 $LGWD_AUTH_REGISTRY 或 /etc/llmgateway/auth-registry.json）")
+    plan.add_argument("--state-dir", default=None,
+                      help="狀態目錄（預設 $LGWD_AUTH_STATE_DIR 或 /var/lib/llmgateway）")
+    plan.add_argument("--llmgwctl", default=None,
+                      help="llmgwctl 的路徑（預設 $LGW_SYNC_LLMGWCTL 或 PATH 上的 llmgwctl）")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else list(argv))
+    if args.allow_new < 0:
+        print("--allow-new 不能是負數", file=sys.stderr)
+        return EXIT_CANNOT
+    if args.command == "plan":
+        return run_plan(args)
+    raise AssertionError("unhandled command: {0}".format(args.command))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
