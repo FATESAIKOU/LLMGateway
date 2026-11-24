@@ -11,8 +11,11 @@
                                               → service.resolve(...)（design 決定 1～3）
   GET  /v1/roles/{role}?agent=[&data=]        → service.role_candidates(role, agent, data)
                                               （#100；spec role-allocation）
-  其他路徑與方法一律 404（含 GET 以外對 /v1/usage 與 /healthz 的方法）。沒有應用層
-  認證（本人選 (a)）；存取控制只靠 SSH。
+  其他路徑與方法一律 404（含 GET 以外對 /v1/usage 與 /healthz 的方法）。應用層認證
+  依模式（#222；設計與 delta 見 ``openspec/changes/lgw-resolve-auth``）：``off``
+  （預設，本人 gateway-v0 決定 5a）不要求憑證，與舊版行為相同；``warn``／``enforce``
+  先驗 SSHSIG 簽章（簽章公鑰須在名冊），再依名冊的 ``ops``／``resolve_agents``／
+  ``roles`` 授權。服務仍只綁 127.0.0.1、經會合點的 SSH 轉發連入。
 - 預驗章 framing（#222 D2 PR-1；C-101～C-108）：``gate`` 的 ``.mode``
   （``off``／``warn``／``enforce``）決定模式，``None`` 等於 off；warn／enforce 的
   gate 必須有可呼叫的 ``.authenticate``（`lgwd.auth.AuthGate`），只有 ``.mode``
@@ -49,7 +52,9 @@
   認證事件（只有 warn／enforce）只記 mode、結果、固定原因與**路由模板**，不含
   標頭值、簽章、nonce、query、body（C-107；聚合與正式格式是 PR-6 的 C-607）。
   ``outcome`` 只用 design 的白名單值（``pass``／``deny``／``rate_limited``／
-  ``unavailable``）；warn 的 would-deny 記成 ``mode=warn outcome=deny``。
+  ``unavailable``／``forbidden``）；warn 的 would-deny 記成 ``mode=warn`` 加
+  ``outcome=deny``，授權不通過記 ``outcome=forbidden``（D3a；reason 是
+  ``forbidden_op``／``forbidden_agent``／``forbidden_role``）。
   ``route`` 只有原文無法路由時的固定哨兵 ``-`` 不是路由模板（唯一的例外，C-607
   的白名單要列入它）。
 - ``gate`` 若有 ``.authenticate``（`lgwd.auth.AuthGate`）就在號誌持有區段內、讀完 body

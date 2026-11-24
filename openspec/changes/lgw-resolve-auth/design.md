@@ -151,7 +151,7 @@ D2 的 off 不得執行或檢查 `ssh-keygen`，缺少它不得影響原本啟�
 
 認證失敗（缺／未知／撤銷／格式／過期／錯簽／重放）統一 401 `{"error":"unauthorized"}`，不回具體原因或公鑰，回應內容一致但不保證時序一致（key ID 非祕密）；已驗證但權限不足 403 `{"error":"forbidden"}`，現有業務 policy 的 403 保留；已驗證但超過每 key 配額 429 `{"error":"rate_limited"}`。enforce 驗章系統不可用（防重放庫不可寫、`ssh-keygen` 逾時或故障、執行中自測失敗）503 `{"error":"auth_unavailable"}`；不回憑證。僅安全事件記固定原因分類、時間、路由模板、結果、已驗證 principal（不記標頭、簽章、nonce、query、body、私鑰或 env）；聚合與速率限制日誌避免灌爆。已實作方法的未知路徑仍 404；HEAD／OPTIONS 等未實作方法目前為 501。這不是網路限流，防 DoS 要另議。
 
-**framing 與日誌的固定值（#247 J-3、G-7、G-10）**：預驗章 framing 不合（見下方「預驗章請求框架」）在 enforce 一律 401 `unauthorized`、與其他認證失敗 bytes 相同，不加 `WWW-Authenticate`；body 超過 1 MiB 照現行回 413，三種模式相同（大小檢查在讀 body 前，與模式無關）。認證事件只記 `mode`、路由模板（例如 `/v1/roles/{role}`，不含實際值）、`outcome`（`pass`／`deny`／`rate_limited`／`unavailable`）、`reason` 與已驗證的 principal；`reason` 白名單：`framing`、`missing`、`malformed`、`unknown_key`、`revoked`、`expired`、`water`、`bad_signature`、`replay`、`rate_limited`、`busy`、`store_unavailable`、`verifier_unavailable`、`registry_unavailable`，白名單外的值不得出現。聚合：同一 `(mode, outcome, reason, 路由模板)` 每 60 秒至多一行並附計數；off 只在啟動時記一行 `auth mode=off`（即原文「記 aggregate off」的意思），之後不記任何認證事件。
+**framing 與日誌的固定值（#247 J-3、G-7、G-10）**：預驗章 framing 不合（見下方「預驗章請求框架」）在 enforce 一律 401 `unauthorized`、與其他認證失敗 bytes 相同，不加 `WWW-Authenticate`；body 超過 1 MiB 照現行回 413，三種模式相同（大小檢查在讀 body 前，與模式無關）。認證事件只記 `mode`、路由模板（例如 `/v1/roles/{role}`，不含實際值）、`outcome`（`pass`／`deny`／`rate_limited`／`unavailable`／`forbidden`；D3a 起授權不通過是 `forbidden`）、`reason` 與已驗證的 principal；`reason` 白名單：`framing`、`missing`、`malformed`、`unknown_key`、`revoked`、`expired`、`water`、`bad_signature`、`replay`、`rate_limited`、`busy`、`store_unavailable`、`verifier_unavailable`、`registry_unavailable`、`forbidden_op`、`forbidden_agent`、`forbidden_role`（後三個是 D3a 的授權原因，只在 `outcome=forbidden` 出現），白名單外的值不得出現。聚合：同一 `(mode, outcome, reason, 路由模板)` 每 60 秒至多一行並附計數；off 只在啟動時記一行 `auth mode=off`（即原文「記 aggregate off」的意思），之後不記任何認證事件。
 
 ## 授權
 
@@ -209,7 +209,7 @@ HTTP: X-LGW-Auth-Version / Key-Id / Timestamp / Nonce / Signature
 
 ## 舊決定與稽核資料遷移
 
-真正的舊決定在 `openspec/specs/key-vault/spec.md:54-61` 的 Requirement「不做應用層認證」（本人選定，gateway-v0 決定 5a；同檔 :5 的 v5 註記亦寫它「不變」）；`subscription-registry/spec.md:224` 的「不做認證，紀錄不分是哪個客戶端」只是它在稽核上的推論，`lgwd/http.py:12-13`、`lgw/client.py:31,93` 是程式註解。本 change 以 key-vault delta 把該 Requirement 改名為「應用層認證依模式」並改寫為「僅 off 不要求應用層憑證；warn／enforce 依 resolve-auth」，以 subscription-registry delta 改稽核；於本人核准並上線後取代舊決定。key-vault :5 的 Purpose 註記不在 delta 機制內，由 D3 的實作 PR 同步改，連同上述註解。成功 resolve／cooldown 稽核新增 nullable `principal` 欄，只有真正驗證成功才寫節點 principal；off／warn 未驗證與舊資料為 null，絕不把客戶端自稱當已驗身分。歷史 `get` 保留不動；舊 DB 原子 migration，維持舊列與 API 相容，並測回退及升級。被拒請求仍只記不含祕密的安全事件，不進成功業務稽核；principal 僅節點歸責，不代表使用者身分。
+真正的舊決定在 `openspec/specs/key-vault/spec.md:54-61` 的 Requirement「不做應用層認證」（本人選定，gateway-v0 決定 5a；同檔 :5 的 v5 註記亦寫它「不變」）；`subscription-registry/spec.md:224` 的「不做認證，紀錄不分是哪個客戶端」只是它在稽核上的推論，`lgwd/http.py:12-13`、`lgw/client.py:31,93` 是程式註解。本 change 以 key-vault delta 把該 Requirement 改名為「應用層認證依模式」並改寫為「僅 off 不要求應用層憑證；warn／enforce 依 resolve-auth」，以 subscription-registry delta 改稽核；於本人核准並上線後取代舊決定。key-vault :5 的 Purpose 註記不在 delta 機制內，由 D3 的實作 PR 同步改，連同上述註解。成功 resolve／cooldown 稽核新增 nullable `principal` 欄，只有真正驗證成功才寫節點 principal；off／warn 未驗證與舊資料為 null，絕不把客戶端自稱當已驗身分。warn 下驗章通過、但授權不通過（`forbidden`）而業務照舊執行成功時，也記那個已驗證的 principal（#279 的 W-3e；enforce 的 forbidden 在業務前就回應，沒有業務稽核列）；驗章或授權拒絕、業務沒有執行的請求一律不寫。歷史 `get` 保留不動；舊 DB 原子 migration，維持舊列與 API 相容，並測回退及升級。被拒請求仍只記不含祕密的安全事件，不進成功業務稽核；principal 僅節點歸責，不代表使用者身分。
 
 **預驗章請求框架（#247 J-1、G-7、G-8、G-9）**：
 
