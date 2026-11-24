@@ -1197,6 +1197,47 @@ handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）�
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
 | P-D4 | Mac 與 worker 映像的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 由本人或 PMO 做 |
 
+### 8.20 從 MLP 清單同步名冊（外圍腳本 `lgw-registry-sync`，#292）
+
+**root：** 要（寫候選檔與審計、跑 `check --against-trust`）。**lgwd 停止：** 不用。
+
+外圍腳本 `ops-scripts/lgw-registry-sync` 把 MLP#1739 的公鑰清單轉成 LGW 名冊候選檔；**v1 只做 plan**，不自己 install。清單由執行的人用自己環境裡的唯讀 `gh` 取得（腳本不碰 token、不讀 `/run` 的憑證檔）：
+
+```bash
+gh api <MLP 取清單的路徑> > /root/mlp-keys.json
+sudo ops-scripts/lgw-registry-sync plan --list /root/mlp-keys.json \
+    --out /root/auth-registry.candidate.json
+```
+
+輸入是 MLP#1739 的 JSON 陣列；`version` 必須是 1、`name` 不是 `?` 且符合 `[A-Za-z0-9][A-Za-z0-9._-]{0,46}`、`status` 是 `ok`／`invalid`／`duplicate`。`status=ok` 的那一筆會重算 fingerprint，不符就整份停。`duplicate`、`?`、同一把公鑰出現在兩個 name、或同一個 name 出現兩次：整份停，不產生候選檔。`status=invalid` 的那一台不新增、不撤銷、不換鑰，摘要列 `skip <name> (invalid)`。
+
+轉換規則（只動 `mlp-` 開頭的 principal 與 key）：
+
+- principal 是 `mlp-<name>`、key ID 是 `mlp-<name>-<fp12>`（`fp12` 是公鑰 blob 的 SHA-256 前 12 個 hex）。非 `mlp-` 的 principal 與 key、以及本機管理 principal，原封不動。
+- 同一個 name 換了新公鑰＝**換 key ID**：新的 active 進名冊，舊的標 `revoked`（那一列與 principal 都保留，墓碑要靠它）。清單出現名冊裡已撤銷的公鑰（例如重放舊清單）→ 停。
+- 名冊裡有、清單裡**不見了**的 `mlp-<name>`：**不自動撤銷**，只列 `missing`。要撤銷必須另外點名（被點名的 name 必須真的不在清單裡）：
+
+```bash
+sudo ops-scripts/lgw-registry-sync plan --list /root/mlp-keys.json \
+    --out /root/auth-registry.candidate.json --revoke w4
+```
+
+- 新的 name 預設上限 2；一次加入更多要人工確認後用 `--allow-new N` 放行。
+- 基準是**目前已載入**的名冊（檔案雜湊要等於 `auth-registry status` 的 `loaded_hash`、`result=ok`）；有變更時世代＋1，沒有變更就不產生候選檔（回 0）。
+- 候選檔一定先過 `check --against-trust`（回 0 才算 plan 成功），先寫暫存檔、驗過才 rename 成 `--out`（root 0640）。腳本寫一筆 `auth-audit.log`，狀態檔只記上次輸入的雜湊與時刻。摘要會印候選檔的內容雜湊（`candidate generation <N> (sha256:…)`）；install 前用 `check` 印出的 `content_hash` 再對一次，避免 plan 與 install 之間被換檔。
+- **正式機不要用 `--llmgwctl` 覆寫**：`check` 的判定必須來自正式安裝的 `llmgwctl`（sudo 預設也會清掉 `LGW_SYNC_LLMGWCTL`）；這個旗標只給沒有 wrapper 的 checkout 與離線測試。
+- **每次用新的 `--out` 檔名，或先刪舊檔**：「無變更」與失敗時不會刪掉舊的候選檔；拿上一次留下的檔案去 install 會被 `check` 的雜湊比對或 `generation_not_increased` 擋下，但不要靠它。
+
+**warn 期先人工，PMO 核可後才 install**：v1 沒有自動 install。看摘要裡的 `add`／`replace`／`revoke`／`missing`，**每一筆 add 與 replace 都要做 fingerprint 帶外比對**（由該 worker 的 PM 或 sidecar 回報 `ssh-keygen -lf` 的輸出，與摘要逐字相同），再請 PMO 核可，然後：
+
+```bash
+sudo llmgwctl auth-registry check --against-trust <候選檔>
+sudo llmgwctl auth-registry install <候選檔>
+```
+
+`install` 回 0 才算完成。若 plan 之後別人先裝了別的名冊，install 會以 `generation_not_increased` 回 1；重跑 plan 再核可，不要手改世代。**不提供「撤回上一次」**：撤銷是不可逆的（墓碑規則），誤撤銷的 worker 只能換一把新鑰重新加入。名冊也不得用備份還原（8.12）。
+
+
 ---
 
 ## 附錄：舊版（v0.1.x，遷移完成後不再使用）
