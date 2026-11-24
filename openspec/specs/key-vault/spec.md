@@ -3,6 +3,7 @@
 ## Purpose
 把五把上游 key（Claude 個人與公司訂閱、OpenRouter、OpenCode Zen、Ollama Cloud）收在 LLMGateway 一個地方保管；正本是 private repo 的加密檔，服務定期自己拉；客戶端經會合點的 SSH 轉發，由 resolve 回覆的 `env` 拿到，其他地方不再放 key。
 > v5（2026-10-12）：`key 只保管在一處`以 v5 全文為準；新增`拉取與輪替`。`值不外洩`、`不做應用層認證`、`服務不對外`不變。第二輪（同日，本人）：拉取改 `gh api`，repo 寫死，`gh` 登入是使用前提。
+> 2026-11-24（#222 D3c）：應用層認證見 change `lgw-resolve-auth`——依模式 off／warn／enforce（off 與舊版相同；warn／enforce 驗 SSHSIG 簽章並依名冊的 ops／resolve_agents／roles 授權）。下面「不做應用層認證」那條 Requirement 還是舊決定，歸檔時由該 change 的 delta 改名為「應用層認證依模式」；本註記不改 Requirement。
 ## Requirements
 ### Requirement: 拉取與輪替
 key-sync SHALL 約每 10 分鐘用 `gh` 從 `FATESAIKOU/LLMGateway-keys` 拉一次 `keys.env.enc`，流程固定為：`gh api repos/FATESAIKOU/LLMGateway-keys/contents/keys.env.enc` 取回 base64 內容與 blob `sha`→比對 `sha`（和上次套用的一樣就不動）→base64 解碼→`openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -a -pass env:…` 解密→驗證格式（同 `keys.env` 五個 `KEY=VALUE`）→原子替換 `keys.env`→`lgwd` 重讀。

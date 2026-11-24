@@ -7,6 +7,8 @@
 
 > v6（2026-11-21，#221）：隧道守護改為可選，並可在斷線恢復時唯讀讀取 `NODE_GATEWAY` 跟隨輪換（見 Purpose 的唯一例外）；新增服務本體啟停（`start`／`stop`／`restart`／`follow-reset`）與無隧道獨立生命週期。
 
+> 2026-11-24（#222 D3c）：上面「探針」那句「不變」是 v5 當時的話；下面「端對端健康探針」那條 Requirement 還寫著 `GET /v1/subscriptions`，是尚未歸檔的舊文。change `lgw-resolve-auth` 的 delta 已改為 `GET /healthz`（#246 起部署的探針就是 `/healthz`：old 模式且 `/healthz` 回 404 才退回 list），歸檔時由 delta 取代該 Requirement；本註記不改 Requirement。
+
 ## Requirements
 
 ### Requirement: 服務端的可選會合點隧道守護
