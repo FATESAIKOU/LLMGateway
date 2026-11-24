@@ -31,6 +31,8 @@ OLD_TAG = "lgw-v1.2.2"
 # #289：定期檢查的 unit 名（沙箱預設把 timer 標成已安裝並在跑）。
 CHECK_SERVICE = "llmgateway-check.service"
 CHECK_TIMER = "llmgateway-check.timer"
+# #296：check 失敗通知的 unit 名（沙箱的版本樣板不含它，需要時測試自己放）。
+CHECK_NOTIFY = "llmgateway-check-notify.service"
 # 假的密碼／key 值：用來證明 llmgwctl 的輸出不含值（只在測試裡用）。
 FAKE_PASSWORD = "FakeKeysPassword_DoNotUse_0001"
 FAKE_KEY_VALUE = "FakeKeyValue_DoNotUse_0002"

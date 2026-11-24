@@ -1191,7 +1191,7 @@ handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）�
 | V-0.1 | `ssh -V` 是 OpenSSH 10.2p1；用臨時金鑰重跑分類表的五種輸出（Good、incorrect、兩種 Could not verify、缺 principal） | 字樣與 design 相同；不同就停下，不擴充分類表 |
 | V-0.2 | lgwd 以 warn 啟動時自測通過 | 日誌沒有 self-test 失敗 |
 | V-0.3 | `prlimit` 存在，且以 llmgw 身分能對子行程設限 | — |
-| V-0.4 | `systemd --version` ≥ 250；`systemd-analyze verify` 乾淨 | `Type=exec` 與 unit 都有效 |
+| V-0.4 | `systemd --version` ≥ 251（失敗通知的 `MONITOR_*` 需要；< 251 時腳本改用 `systemctl show` 的 `InvocationID`，要實測 fallback 有拿到那一次 check 的行）；`systemd-analyze verify` 乾淨 | `Type=exec` 與 unit 都有效 |
 | V-0.5 | 壓測中執行 `systemctl stop` | 503 為 0；停止後 cgroup 沒有殘留行程 |
 | V-0.6 | C-612 在正式主機重跑 | 段二的資源數值取兩邊較大者 |
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
@@ -1201,7 +1201,7 @@ handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）�
 
 **root：** 要（timer 以 root 跑 `check`）。**lgwd 停止：** 不用。
 
-`deploy/units/` 有兩個 unit：`llmgateway-check.service`（`Type=oneshot`、`User=root`、跑 `/usr/local/bin/llmgwctl check`）與 `llmgateway-check.timer`（開機 5 分鐘後第一次，之後每 15 分鐘一次）。service 沒有 `[Install]` 段，由 timer 啟動；只 enable／disable timer。install 子指令會把兩個檔裝進 `/etc/systemd/system/`，並在 `llmgateway.service` 啟動之後對 timer 做 `enable --now`；重跑 install 是冪等的（timer 已在跑就不動它）。
+`deploy/units/` 有三個 unit：`llmgateway-check.service`（`Type=oneshot`、`User=root`、跑 `/usr/local/bin/llmgwctl check`）、`llmgateway-check.timer`（開機 5 分鐘後第一次，之後每 15 分鐘一次）與失敗通知的 `llmgateway-check-notify.service`（#296；見 8.21）。service 沒有 `[Install]` 段，由 timer 啟動；只 enable／disable timer。install 子指令會把這些檔裝進 `/etc/systemd/system/`，並在 `llmgateway.service` 啟動之後對 timer 做 `enable --now`；重跑 install 是冪等的（timer 已在跑就不動它）。
 
 為什麼要 root：`check` 的 `auth-local`（讀 `root:root` 0600 的管理私鑰簽章）、`auth-water`／`auth-stores`（`llmgw` 0600 的兩個庫）與 `auth-degraded` 的補記（root 寫歷史檔）都需要 root；非 root 跑會全是 `todo`，等於沒有告警。這與本人手動跑 `sudo llmgwctl check` 是同一份程式、同一個信任基礎。unit 另外加固：`NoNewPrivileges=true`、`ProtectSystem=strict`（只開 `/var/lib/llmgateway` 可寫）、`PrivateTmp=true`、`ProtectHome=read-only`；不設 `KillMode`（oneshot 逾時就整組殺掉，不會留下 `gh`／`ssh` 的孤兒）。
 
@@ -1230,7 +1230,7 @@ sudo systemctl stop llmgateway-check.timer
 sudo systemctl start llmgateway-check.timer
 ```
 
-回滾：unit 是版本的一部分。`llmgwctl rollback` 回滾到**沒有**這兩個 unit 的版本時，會先對 timer 做 `disable --now`、再刪檔、再 `daemon-reload`（不會留下一個指向已刪 unit 的計時器）；回滾到**有** timer 的版本時照裝並 enable（已在跑就不動）。從 v0.1.x 的 user unit 遷移時，`cutover` 會在新服務健康之後、跑 `check` 之前 `enable --now` timer（不然 `check-timer` 的 todo 會讓遷移被判停損）；`rollback-to-user` 與停損回滾會對這兩個 check unit 做 `disable --now`（timer 先於 service，**不刪 unit 檔**，與 `llmgateway.service` 的回退處理一致），所以從 `reverted` 直接再跑 `cutover` 時會重新 enable；若回到舊版後不再切回新版，這兩個 unit 檔留在 `/etc/systemd/system` 但不會執行。
+回滾：unit 是版本的一部分。`llmgwctl rollback` 回滾到**沒有**這些 check unit 的版本時，會先對 timer 做 `disable --now`、再刪檔、`daemon-reload`（不會留下一個指向已刪 unit 的計時器）；notify unit 同理被移除（它沒有 `[Install]`，`disable --now` 對它是 no-op）。回滾到**有** timer 的版本時照裝並 enable（已在跑就不動）。從 v0.1.x 的 user unit 遷移時，`cutover` 會在新服務健康之後、跑 `check` 之前 `enable --now` timer（不然 `check-timer` 的 todo 會讓遷移被判停損）；`rollback-to-user` 與停損回滾會對這兩個 check unit 做 `disable --now`（timer 先於 service，**不刪 unit 檔**，與 `llmgateway.service` 的回退處理一致），所以從 `reverted` 直接再跑 `cutover` 時會重新 enable；若回到舊版後不再切回新版，這兩個 unit 檔留在 `/etc/systemd/system` 但不會執行。
 
 ### 8.20 從 MLP 清單同步名冊（外圍腳本 `lgw-registry-sync`，#292）
 
@@ -1272,6 +1272,64 @@ sudo llmgwctl auth-registry install <候選檔>
 
 `install` 回 0 才算完成。若 plan 之後別人先裝了別的名冊，install 會以 `generation_not_increased` 回 1；重跑 plan 再核可，不要手改世代。**不提供「撤回上一次」**：撤銷是不可逆的（墓碑規則），誤撤銷的 worker 只能換一把新鑰重新加入。名冊也不得用備份還原（8.12）。
 
+### 8.21 check 失敗時通知 PMO（失敗通知 unit，#296）
+
+**root：** 要（`sudo llmgwctl install --tag <tag>`）；日常通知以 `llmgw` 身分跑。**lgwd 停止：** 不用。
+
+`llmgateway-check.service` 的 `[Unit]` 段有 `OnFailure=llmgateway-check-notify.service`：只有 check **進入 failed** 才觸發（結束碼 1＝有 fail、逾時、被訊號殺掉）；只有 todo 時結束碼 2 由 `SuccessExitStatus=2` 算成功，不會通知。`llmgateway-check-notify.service` 是 `Type=oneshot`、`User=llmgw`、`SupplementaryGroups=systemd-journal`（要讀 check 那一次的 journal）、`TimeoutStartSec=60`；它沒有 `[Install]`（不單獨 enable，也不需要 enable）、沒有再觸發通知或重試的設定——通知失敗不會變成另一種失敗。安裝（`install --tag`）與升級（`upgrade --tag`）都會跟其他 unit 一起裝它，回滾到沒有它的版本時一起移除。
+
+設定不進 repo：放 `/etc/llmgateway/check-notify.env`（root:root 0644）。範本是版本目錄的 `deploy/check-notify.env.example`：
+
+```bash
+sudo install -m 0644 /opt/llmgateway/current/deploy/check-notify.env.example \
+    /etc/llmgateway/check-notify.env
+sudoedit /etc/llmgateway/check-notify.env
+```
+
+| 鍵 | 說明 |
+| --- | --- |
+| `LGW_NOTIFY_CHANNEL` | aicomm 的頻道（`send --channel`） |
+| `LGW_NOTIFY_TO` | 收件人（`send --to`） |
+| `ANGAREION_IDENTITY` | 送件身分（aicomm 讀的環境變數） |
+| `LGW_NOTIFY_LABEL` | 這一台的代號，會填進訊息（1～32 字元；只收英數與 `. _ -`，格式不對就當成沒設：腳本跳過不送、`check-notify` 是 `todo`） |
+
+這些值都不是祕密，也不得放 token、金鑰或身分檔的路徑。`check` 的 `check-notify` 項目（只在這一版有 notify unit 檔時才列）在三個鍵齊全、`LGW_NOTIFY_LABEL` 符合 `[A-Za-z0-9._-]{1,32}`、`PATH` 上找得到 `aicomm` 時是 `ok`，否則 `todo`（缺哪一項就寫哪一項）——它不會 `fail`，也不送訊息。
+
+訊息只有這幾段（一行、白名單字元、最長 300 字元；不含主機名、位址、路徑、帳號、金鑰或 fail 行的說明文字）：
+
+```text
+llmgateway-check failed label=<本機代號> result=<類別> items=<項目名,…|-> at=<UTC 時間>
+```
+
+`items` 只取 `llmgwctl-check` 的 fail 行開頭 `fail <項目名>`（例如 `auth-degraded`、`list-local`），括號裡的說明一律丟掉；最多 10 項，其餘以 `+N` 表示。`result` 只認 `exit-code`、`timeout`、`signal`、`core-dump`、`watchdog`、`oom-kill`、`start-limit-hit`、`resources`，其他一律寫 `other`。摘要取自那一次 check 的 journal：systemd ≥ 251 的 `MONITOR_*` 環境變數，較舊的版本退回 `systemctl show -p InvocationID`（見 V-0.4）。第一版**不送「恢復」通知**：check 回到全好時不發訊息，用 `systemctl is-failed llmgateway-check.service` 或 journal 確認。
+
+三個外部指令各有逾時（`systemctl` 10 秒、`journalctl` 15 秒、`aicomm` 20 秒），整趟另外受 45 秒的總預算限制：三個都卡住時也不會超過 unit 的 `TimeoutStartSec=60`，notify 不會被 systemd 殺掉。
+
+任何不可用的情況都只寫一行 journal、結束碼 0（通知失敗不該再引發一次通知）：
+
+| journal 行 | 意思 |
+| --- | --- |
+| `notify sent` | 已送出（同時寫入去重狀態） |
+| `notify skipped: not configured` | 設定檔不在或鍵不齊 |
+| `notify skipped: invalid label` | `LGW_NOTIFY_LABEL` 不是 `[A-Za-z0-9._-]{1,32}`（當成沒設，不送） |
+| `notify skipped: aicomm not available` | `PATH` 上找不到 `aicomm` |
+| `notify failed: aicomm exit <n>` | `aicomm send` 回非 0（下一次 check 失敗會再試） |
+| `notify suppressed: same failure within 1h` | 同一組失敗一小時內已經送過 |
+| `notify skipped: lock busy`／`notify skipped: state unavailable` | 拿不到鎖／狀態目錄不能寫 |
+
+看通知的 journal：`journalctl -t llmgwctl-check-notify`。
+
+去重：`/var/lib/llmgateway/check-notify.state`（llmgw 0600，一行 JSON）記「同一組失敗上次送出的時間」。key 是 unit 名稱、`result` 與排序後項目名的 SHA-256 前 16 個 hex，所以項目多了或少了就是新的失敗、會立刻通知；一小時內同一組只送一次（每次 check 最多一則）。只有 `aicomm send` 回 0 才寫入；狀態檔不存在、壞掉、schema 不對、讀不到或時鐘倒退都當成沒送過（寧可重送也不漏報），寫入時丟掉超過 7 天的 key。同時只會有一個通知在跑（`check-notify.lock` 的 `flock`）。
+
+`aicomm` 與送件身分要在**這一台主機**上可用（aicomm 是 worker 映像的工具，正式主機不一定有）。沒有的話 `check` 照常運作，失敗通知只會在 journal 留一行 `notify skipped: aicomm not available`。要真的送訊息，得在主機上裝好 aicomm 並把身分設好；`User=` 要換成別的使用者時用 drop-in（`/etc/systemd/system/llmgateway-check-notify.service.d/*.conf`，不進 repo）。unit 是 `ProtectSystem=strict`、只開 `/var/lib/llmgateway` 可寫：aicomm 若需要寫自己的目錄（例如它的狀態或快取），用同一個 drop-in 加 `ReadWritePaths=`；這一點要在 V-0 實測（見 8.18）。
+
+升級與回滾：從 #300 的版本升級上來時，跑升級的是 #300 的 `llmgwctl`，它的 unit 清單沒有 notify unit，**升級本身不會裝它**；但新的 `llmgateway-check.service` 已經帶了 `OnFailure=`，check 失敗時 systemd 只在 journal 記一行「找不到 llmgateway-check-notify.service」，check 本身不受影響。升級後補跑一次 install（`check-timer` 會是 `todo` 提醒）：
+
+```bash
+sudo llmgwctl install --tag <tag>
+```
+
+回滾到沒有 notify unit 的舊版時，`llmgwctl rollback` 會照 check unit 的規則先 `disable --now` 再刪檔（notify unit 沒有 `[Install]`，這一步對它是 no-op）。從 v0.1.x 遷移的回退（`rollback-to-user`）只對這些 unit 做 `disable --now`、**不刪 unit 檔**，與 `llmgateway.service` 的回退處理一致。遷移的 `cutover`／`finalize` 會跑 `check`，但 `check-notify` 的 `todo` 不算新服務壞了（通知的設定是之後才放的），不會因此停損；其他 `todo` 與 `fail` 照舊讓遷移停損。
 
 ---
 

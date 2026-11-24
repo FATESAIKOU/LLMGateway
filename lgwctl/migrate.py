@@ -144,6 +144,11 @@ OPEN_PHASES = (PHASE_PENDING, PHASE_CONFIRMED, PHASE_FINALIZED, PHASE_CUTOVER)
 # 自己的兩個固定值，其他一律不當 systemctl 的參數（高-3）。
 STATE_UNIT_NAMES = (REVERT_TIMER_UNIT, REVERT_UNIT + ".service")
 
+# #296：check 的 todo 裡只是「還沒設定」的那幾項。cutover／finalize 的 check
+# 門檻只看服務本身；通知的設定（/etc/llmgateway/check-notify.env）是本人的動作，
+# prepare 之後一定還沒放，不能讓它被當成新服務壞了而停損。
+BENIGN_CHECK_TODOS = frozenset({"check-notify"})
+
 # 環境變數（測試用的假指令與可調的等待）。
 ENV_SYSTEMD_RUN = "LLMGW_SYSTEMD_RUN"
 ENV_LOGINCTL = "LLMGW_LOGINCTL"
@@ -1727,7 +1732,10 @@ def _cutover_locked(layout, old: OldLayout, *, tag: str, revert_after: str,
         report.todo("keysync", "等不到這次切換後第一次拉取的結果（check 會照實報）")
     # 用 check 自己的 Report：遷移自己的 todo 不能讓 check 的結束碼變成 2
     # （兩者共用一份報告時，任何 todo 都會被當成「check 非 0」→ 假停損）。
-    code = check.run(layout, no_remote=True)
+    # #296：check-notify 的 todo（通知還沒設定）不算新服務壞了。
+    check_report = Report()
+    code = check.run(layout, report=check_report, no_remote=True)
+    code = _acceptable_check_code(check_report, code)
     if code != 0:
         return _stop_loss(layout, old, [f"check 非 0（rc={code}）"], report)
 
@@ -2106,6 +2114,25 @@ def _state_revert_unit(state: dict, report=None) -> str:
                         f"{REVERT_TIMER_UNIT}（不拿它去呼叫 systemctl）")
         return REVERT_TIMER_UNIT
     return unit
+
+
+def _acceptable_check_code(report: Report, code: int) -> int:
+    """cutover／finalize 對 check 結果的門檻（#296）。
+
+    ``check-notify`` 的 todo 只代表「通知還沒設定」（``check-notify.env`` 是本人的
+    動作，prepare 之後一定還沒放），不是新服務壞了；讓它造成停損會把正常的遷移
+    回舊版。其他 todo 與 fail 照舊讓 check 非 0（停損）。
+    """
+    if code != 2 or report.has_fail:
+        return code
+    # 項目名從 Report 的行裡取；不只在全形括號上切（半形括號也吃，審查低-3）。
+    names = set()
+    for line in report.lines:
+        if not line.startswith("todo "):
+            continue
+        name = line[len("todo "):].split("（", 1)[0].split("(", 1)[0].strip()
+        names.add(name)
+    return 0 if names and names <= BENIGN_CHECK_TODOS else code
 
 
 def _remove_new_timer(layout, report) -> None:
@@ -2532,7 +2559,10 @@ def _finalize_locked(layout, *, old_home: str | None, report) -> int:
                                 "（要回舊版就跑 llmgwctl rollback-to-user）")
         return 1
     report.ok("list-local", "200（新版健康，才收舊版）")
-    code = check.run(layout)
+    # #296：check-notify 的 todo（通知還沒設定）不算新服務壞了，不該擋著收舊版。
+    check_report = Report()
+    code = check.run(layout, report=check_report)
+    code = _acceptable_check_code(check_report, code)
     if code != 0:
         report.fail("check", f"check 非 0（rc={code}）；先別收舊版"
                              "（隧道壞了就 rollback-to-user，人在 console 可 "

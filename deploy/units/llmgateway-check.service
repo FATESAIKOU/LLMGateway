@@ -4,6 +4,10 @@
 Description=LLMGateway periodic check (llmgwctl check)
 After=llmgateway.service network-online.target
 Wants=network-online.target
+# #296：check 進入 failed（有 fail、逾時或被訊號殺掉）時跑一次通知；只有 todo 時
+# 結束碼 2 由下面的 SuccessExitStatus=2 算成功，不會通知。通知 unit 本身沒有
+# OnFailure／Restart，所以通知失敗不會再觸發通知。
+OnFailure=llmgateway-check-notify.service
 
 [Service]
 # oneshot：跑完就結束；結束碼就是 check 的三態（0＝全好、1＝有 fail、2＝只有 todo）。

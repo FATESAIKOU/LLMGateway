@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""llmgateway-check-notify：check 失敗時通知 PMO（#296）。
+
+由 ``llmgateway-check-notify.service`` 以 llmgw 身分執行（``llmgateway-check.service``
+的 ``OnFailure=`` 觸發；見 ``docs/deploy.md`` 的 8.21）。只做一件事：把「哪一台、
+哪一類失敗、哪些項目」壓成一行，經 ``aicomm`` 送給設定的收件人；同一組失敗一小時
+內只送一次。
+
+設計（``REPORT-296-arch.md`` 的 §2～§4）：
+
+- **只用環境變數的設定值**（unit 的 ``EnvironmentFile=-/etc/llmgateway/check-notify.env``：
+  ``LGW_NOTIFY_CHANNEL``／``LGW_NOTIFY_TO``／``ANGAREION_IDENTITY``／
+  ``LGW_NOTIFY_LABEL``）。**不讀任何身分檔或憑證**，也不把值以外的東西印出來。
+  ``LGW_NOTIFY_LABEL`` 只收 ``[A-Za-z0-9._-]{1,32}``，不符就當成沒設（寫一行
+  journal 後結束，不送訊息）。
+- **任何一種不可用的情況都只寫一行固定的 journal、exit 0**：通知本身失敗不該再
+  引發一次失敗的通知。journal 就是指 stdout（由 systemd 收進
+  ``SyslogIdentifier=llmgwctl-check-notify``）。
+- **整個流程有總期限**：三個外部指令各有逾時（``SYSTEMCTL_TIMEOUT`` 10、
+  ``JOURNALCTL_TIMEOUT`` 15、``AICOMM_TIMEOUT`` 20 秒），整趟再受
+  ``TOTAL_BUDGET``（45 秒）限制，留在 unit 的 ``TimeoutStartSec=60`` 之內——
+  三個都卡住時 notify 也不會被 systemd 殺掉（#296 架構師低-1）。
+- **訊息只有白名單字元**（``[A-Za-z0-9 ._:,=+-]``，其餘換成 ``?``），長度上限 300；
+  不含主機名、位址、路徑、帳號、key、說明文字：
+
+  ``llmgateway-check failed label=<label> result=<result> items=<a,b|-> at=<UTC RFC3339>``
+
+- **失敗摘要的來源**：systemd ≥ 251 在 OnFailure 觸發的 unit 裡給 ``MONITOR_*``
+  環境變數；沒有時退回 ``systemctl show -p InvocationID --value``（較舊的 systemd）。
+  再從 journal 只取 fail 行的**項目名**（``^fail <name>（``），說明文字一律丟掉。
+- **去重**：``<state_dir>/check-notify.state``（0600，一行 JSON）記「同一組失敗
+  上次送出的整數秒」；一小時內 suppress。只有 ``aicomm send`` 回 0 才記。
+  狀態檔讀不懂、格式不對、讀不到、時鐘倒退 → 一律當成沒送過（寧可重送也不漏報）。
+- **並行**：``<state_dir>/check-notify.lock`` 加 ``flock``；拿不到鎖就寫一行
+  journal 結束。
+
+結束碼一律 0（包含設定缺失、代號格式不對、aicomm 不在、送失敗、被去重、拿不到鎖）。
+
+``LGW_NOTIFY_STATE_DIR`` 可以把狀態與鎖檔換到別的目錄（預設
+``/var/lib/llmgateway``）；正式機器不需要設它。
+"""
+
+from __future__ import annotations
+
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+#: 被監看的 unit（check 的 service）。
+UNIT = "llmgateway-check.service"
+#: check 的 journal ident（unit 的 SyslogIdentifier）。
+JOURNAL_IDENT = "llmgwctl-check"
+#: 送訊息的外部指令。
+AICOMM = "aicomm"
+
+#: 狀態與鎖檔的預設目錄（單元檔的 ReadWritePaths）。
+STATE_DIR = "/var/lib/llmgateway"
+STATE_NAME = "check-notify.state"
+LOCK_NAME = "check-notify.lock"
+STATE_SCHEMA = 1
+
+#: 同一組失敗的去重視窗（秒）。
+DEDUPE_SECONDS = 3600
+#: 狀態檔裡超過這個年齡的 key 直接丟掉（秒；檔案不會一直長大）。
+PRUNE_SECONDS = 7 * 86400
+
+#: 訊息最多幾項（超過以 ``+N`` 表示）。
+MAX_ITEMS = 10
+#: 本機代號最長幾個字元。
+MAX_LABEL = 32
+#: 本機代號的格式（#296 架構師低-2）：只收英數與 ``. _ -``；不符就當成沒設
+#: （寫一行 journal 後結束，不送訊息）。``lgwctl/layout.py`` 的
+#: ``CHECK_NOTIFY_LABEL_PATTERN`` 是同一個字串（測試會比對）。
+LABEL_PATTERN = r"[A-Za-z0-9._-]{1,32}"
+LABEL_RE = re.compile(LABEL_PATTERN)
+#: 整則訊息最長幾個字元。
+MAX_MESSAGE = 300
+
+#: 外部指令各自的逾時（秒）與整趟的總預算（秒）。三個上限合計 45 秒，整趟再受
+#: ``TOTAL_BUDGET`` 限制；unit 的 ``TimeoutStartSec=60``，所以三個都卡住時 notify
+#: 也不會被 systemd 殺掉（#296 架構師低-1；``tests/test_check_notify.py`` 有靜態
+#: 斷言，改這裡的數字要一起顧那個測試）。
+SYSTEMCTL_TIMEOUT = 10
+JOURNALCTL_TIMEOUT = 15
+AICOMM_TIMEOUT = 20
+TOTAL_BUDGET = 45
+
+#: 訊息允許的字元；其餘一律換成 ``?``。
+SAFE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._:,=+-"
+)
+
+#: systemd 的失敗類別白名單；不在裡面的一律寫成 ``other``。
+RESULT_KINDS = (
+    "exit-code", "timeout", "signal", "core-dump", "watchdog", "oom-kill",
+    "start-limit-hit", "resources",
+)
+
+#: check 的 fail 行：只取項目名（第一個括號之前的英數與 ``-``）。
+ITEM_RE = re.compile(r"^fail ([a-z0-9][a-z0-9-]{0,31})(?:（|$)")
+#: systemd 的 invocation ID（32 個 hex）；不認得的形狀不進 journalctl 的參數。
+INVOCATION_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def journal(line: str) -> None:
+    """唯一的輸出：一行 stdout（systemd 收進 journal）。"""
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+# -- 純函式（測試直接呼叫）---------------------------------------------------
+
+
+def sanitize(text: str, limit: int | None = None) -> str:
+    """白名單字元以外的字元換成 ``?``；``limit`` 有值時截斷。"""
+    cleaned = "".join(char if char in SAFE_CHARS else "?" for char in str(text))
+    return cleaned if limit is None else cleaned[:limit]
+
+
+def classify_result(value) -> str:
+    """失敗類別：白名單以外一律 ``other``（連 ``None`` 也不例外）。"""
+    return value if value in RESULT_KINDS else "other"
+
+
+def extract_items(lines) -> list:
+    """fail 行的項目名：丟掉說明文字、忽略不合格的行、去重、排序。
+
+    只看 ``^fail <name>（`` 或 ``^fail <name>``；括號裡的說明（可能含路徑、主機、
+    帳號或錯誤訊息）一律不用。
+    """
+    names = set()
+    for line in lines:
+        match = ITEM_RE.match(line or "")
+        if match is not None:
+            names.add(match.group(1))
+    return sorted(names)
+
+
+def failure_key(unit: str, result: str, items) -> str:
+    """同一組失敗的 key：``sha256(unit + "\\n" + result + "\\n" + 項目名)`` 前 16 個 hex。"""
+    raw = unit + "\n" + classify_result(result) + "\n" + ",".join(sorted(items))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def format_message(label: str, result: str, items, at: str) -> str:
+    """一則通知的內容（一行、白名單字元、最長 300）。
+
+    項目多的時候先放得進 300 字元的前幾項，其餘以 ``+N`` 表示（N 是沒列出的
+    項數）；找不到任何 fail 行時 ``items=-``。
+    """
+    head = "llmgateway-check failed label={0} result={1} items=".format(
+        sanitize(label, MAX_LABEL), classify_result(result))
+    tail = " at=" + sanitize(at)
+    # 保留 ",+N" 的空間，讓 at= 不會被截掉。
+    budget = MAX_MESSAGE - len(head) - len(tail) - len(",+999")
+    shown: list = []
+    used = 0
+    for name in items[:MAX_ITEMS]:
+        cost = len(name) + (1 if shown else 0)
+        if used + cost > budget:
+            break
+        shown.append(name)
+        used += cost
+    if len(items) > len(shown):
+        shown.append("+" + str(len(items) - len(shown)))
+    body = head + (",".join(shown) if shown else "-") + tail
+    return sanitize(body, MAX_MESSAGE)
+
+
+def load_state(path: str) -> dict:
+    """讀狀態檔（``{"schema": 1, "sent": {key: 整數秒}}``）；任何問題都回空字典。
+
+    不存在、讀不到、不是 JSON、schema 不對、``sent`` 不是物件、任何一個 key／值
+    的形狀不對：一律當成「沒送過」（寧可重送也不漏報）。
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(65536)
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    if not isinstance(document, dict) or document.get("schema") != STATE_SCHEMA:
+        return {}
+    sent = document.get("sent")
+    if not isinstance(sent, dict):
+        return {}
+    state = {}
+    for key, value in sent.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{16}", key):
+            return {}
+        if isinstance(value, bool) or not isinstance(value, int):
+            return {}
+        state[key] = value
+    return state
+
+
+def decide(state: dict, key: str, now: int) -> str:
+    """``send`` 或 ``suppress``：同一個 key 一小時內送過就 suppress。
+
+    ``now < sent``（時鐘倒退）不算「一小時內」，照樣送。
+    """
+    sent = state.get(key)
+    if sent is None:
+        return "send"
+    elapsed = now - sent
+    if 0 <= elapsed < DEDUPE_SECONDS:
+        return "suppress"
+    return "send"
+
+
+def prune(state: dict, now: int) -> dict:
+    """丟掉超過 7 天的 key（未來的時刻保留：等它自然變舊再由下一次清）。"""
+    return {key: sent for key, sent in state.items()
+            if now - sent <= PRUNE_SECONDS}
+
+
+# -- 檔案（狀態與鎖）---------------------------------------------------------
+
+
+def save_state(path: str, state: dict) -> None:
+    """原子寫回狀態檔（0600）：同目錄的**唯一**暫存檔再 ``rename``。
+
+    暫存檔名由 ``tempfile.mkstemp`` 產生（不是固定的 ``.tmp``），所以就算有別的
+    呼叫方沒拿鎖也用同一個檔名，也不會互相覆寫或截斷（#296 審查低-1）。
+    """
+    document = {"schema": STATE_SCHEMA,
+                "sent": {key: state[key] for key in sorted(state)}}
+    text = json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    handle_fd, temp = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".",
+        prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(handle_fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+    except OSError:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+# -- 失敗摘要的來源 ----------------------------------------------------------
+
+
+class Budget:
+    """外部指令的總期限（#296 架構師低-1）。
+
+    ``slice(limit)`` 回「這一個指令最多能等幾秒」：不超過它自己的上限，也不超過
+    總預算剩下的時間；預算用完回 0（呼叫方就不跑那個指令）。``clock`` 可以換成
+    假的時鐘，測試不必真的等（預設 ``time.monotonic``）。
+    """
+
+    def __init__(self, total: float = TOTAL_BUDGET, clock=time.monotonic):
+        self.total = total
+        self._clock = clock
+        self._started = clock()
+
+    def used(self) -> float:
+        return max(0.0, self._clock() - self._started)
+
+    def remaining(self) -> float:
+        return max(0.0, self.total - self.used())
+
+    def slice(self, limit: float) -> float:
+        return min(float(limit), self.remaining())
+
+
+def _run(argv, timeout, budget=None):
+    """跑一個外部指令（輸出全收起來）；跑不起來、逾時或預算用完回 None。"""
+    if budget is not None:
+        timeout = budget.slice(timeout)
+        if timeout <= 0:
+            return None
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def invocation_id(budget=None) -> str:
+    """這一次 check 的 invocation ID：先看 ``MONITOR_INVOCATION_ID``，再看 systemctl。
+
+    形狀不是 32 個 hex 就改問 systemctl（不把它放進 journalctl 的參數）。
+    """
+    value = (os.environ.get("MONITOR_INVOCATION_ID") or "").strip()
+    if value and INVOCATION_RE.match(value):
+        return value
+    proc = _run(["systemctl", "show", "-p", "InvocationID", "--value", UNIT],
+                SYSTEMCTL_TIMEOUT, budget)
+    if proc is None or proc.returncode != 0:
+        return ""
+    value = (proc.stdout or "").strip().splitlines()
+    candidate = value[0].strip() if value else ""
+    return candidate if INVOCATION_RE.match(candidate) else ""
+
+
+def check_fail_lines(budget=None) -> list:
+    """那一次 check 的 journal（只取 err 以上、只取內容）；拿不到就回空。"""
+    invocation = invocation_id(budget)
+    if not invocation:
+        return []
+    proc = _run(["journalctl", "_SYSTEMD_INVOCATION_ID=" + invocation,
+                 "-t", JOURNAL_IDENT, "-p", "err", "-o", "cat", "--no-pager"],
+                JOURNALCTL_TIMEOUT, budget)
+    if proc is None or proc.returncode != 0:
+        return []
+    return (proc.stdout or "").splitlines()
+
+
+def utc_now_text() -> str:
+    """UTC 的 RFC 3339（秒級）：``2026-11-24T03:04:05Z``。"""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# -- 主流程 ------------------------------------------------------------------
+
+
+def _config() -> tuple:
+    """設定值（頻道、收件人、本機代號）；缺任何一個就回空字串。"""
+    return (
+        (os.environ.get("LGW_NOTIFY_CHANNEL") or "").strip(),
+        (os.environ.get("LGW_NOTIFY_TO") or "").strip(),
+        (os.environ.get("LGW_NOTIFY_LABEL") or "").strip(),
+    )
+
+
+def _send(aicomm: str, channel: str, to: str, body: str, budget=None):
+    """``aicomm send``：回結束碼；連跑都跑不起來（或預算用完）回 None。"""
+    proc = _run([aicomm, "send", "--channel", channel, "--to", to,
+                 "--body", body], AICOMM_TIMEOUT, budget)
+    return None if proc is None else proc.returncode
+
+
+def main(argv=None) -> int:
+    budget = Budget()
+    channel, to, label = _config()
+    if not channel or not to or not label:
+        journal("notify skipped: not configured")
+        return 0
+    if not LABEL_RE.fullmatch(label):
+        # #296 架構師低-2：代號只收 [A-Za-z0-9._-]{1,32}；不合就當成沒設，
+        # 不送（免得一行訊息難解析），只留一行 journal。
+        journal("notify skipped: invalid label")
+        return 0
+    aicomm = shutil.which(AICOMM)
+    if not aicomm:
+        journal("notify skipped: aicomm not available")
+        return 0
+
+    state_dir = (os.environ.get("LGW_NOTIFY_STATE_DIR") or STATE_DIR)
+    try:
+        lock_fd = os.open(os.path.join(state_dir, LOCK_NAME),
+                          os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        journal("notify skipped: state unavailable")
+        return 0
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            journal("notify skipped: lock busy")
+            return 0
+
+        result = classify_result(os.environ.get("MONITOR_SERVICE_RESULT") or "")
+        items = extract_items(check_fail_lines(budget))
+        now = int(time.time())
+        state_path = os.path.join(state_dir, STATE_NAME)
+        state = load_state(state_path)
+        key = failure_key(UNIT, result, items)
+        if decide(state, key, now) == "suppress":
+            journal("notify suppressed: same failure within 1h")
+            return 0
+
+        body = format_message(label, result, items, utc_now_text())
+        code = _send(aicomm, channel, to, body, budget)
+        if code is None:
+            journal("notify skipped: aicomm not available")
+            return 0
+        if code != 0:
+            # 沒送出去就不記：下一次 check 失敗會再試。
+            journal("notify failed: aicomm exit {0}".format(code))
+            return 0
+
+        # 只有送成功才記（記不進去也只是下一次重送）。
+        state = prune(state, now)
+        state[key] = now
+        try:
+            save_state(state_path, state)
+        except OSError:
+            pass
+        journal("notify sent")
+        return 0
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

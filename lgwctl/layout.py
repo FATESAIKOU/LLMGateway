@@ -45,11 +45,16 @@ TUNNEL_SERVICE_NAME = "llmgateway-tunnel.service"
 # #289：定期檢查（timer 啟動 oneshot 的 check；由 install 安裝並 enable）。
 CHECK_SERVICE_NAME = "llmgateway-check.service"
 CHECK_TIMER_NAME = "llmgateway-check.timer"
-#: #289：與版本一起進出的兩個 check unit（移除時 timer 先停，避免它在 service
-#: 停掉後才觸發；不包含隧道，隧道不因為回滾而移除）。
-CHECK_UNIT_NAMES = (CHECK_TIMER_NAME, CHECK_SERVICE_NAME)
+#: #296：check 失敗時的通知（由 check.service 的 OnFailure= 觸發；沒有 [Install]）。
+CHECK_NOTIFY_NAME = "llmgateway-check-notify.service"
+#: #289：與版本一起進出的 check unit（移除時 timer 先停，避免它在 service 停掉後
+#: 才觸發；不包含隧道，隧道不因為回滾而移除）。#296：check 失敗時的通知 unit 也
+#: 跟著版本進出（它沒有 [Install]，安裝只需要放檔＋daemon-reload；移除時
+#: ``disable --now`` 對它是 no-op）。
+CHECK_UNIT_NAMES = (CHECK_TIMER_NAME, CHECK_SERVICE_NAME, CHECK_NOTIFY_NAME)
 CORE_UNIT_NAMES = (SERVICE_NAME,)
-OPTIONAL_UNIT_NAMES = (TUNNEL_SERVICE_NAME, CHECK_SERVICE_NAME, CHECK_TIMER_NAME)
+OPTIONAL_UNIT_NAMES = (TUNNEL_SERVICE_NAME, CHECK_SERVICE_NAME, CHECK_TIMER_NAME,
+                       CHECK_NOTIFY_NAME)
 UNIT_NAMES = CORE_UNIT_NAMES + OPTIONAL_UNIT_NAMES
 
 ENV_FILE_NAME = "llmgateway.env"
@@ -59,6 +64,18 @@ KEYS_ENV_NAME = "keys.env"
 DB_NAME = "llm.db"
 KEYSYNC_STATUS_NAME = ".keysync.status"
 KEYSYNC_SHA_NAME = ".keysync.sha"
+
+# #296：check 失敗通知的設定檔（不進 repo；機器上放，root:root 0644）與狀態檔。
+# 三個必要的鍵與 ops-scripts/llmgateway-check-notify 讀的是同一組名字。
+CHECK_NOTIFY_ENV_NAME = "check-notify.env"
+CHECK_NOTIFY_ENV_KEYS = ("LGW_NOTIFY_CHANNEL", "LGW_NOTIFY_TO", "LGW_NOTIFY_LABEL")
+#: 本機代號的格式（#296 架構師低-2）：與腳本的 ``LABEL_PATTERN`` 是同一個字串。
+CHECK_NOTIFY_LABEL_PATTERN = r"[A-Za-z0-9._-]{1,32}"
+CHECK_NOTIFY_STATE_NAME = "check-notify.state"
+CHECK_NOTIFY_LOCK_NAME = "check-notify.lock"
+CHECK_NOTIFY_AICOMM = "aicomm"
+#: 通知腳本把狀態與鎖檔換到別的目錄（正式機器不需要設）。
+ENV_CHECK_NOTIFY_STATE_DIR = "LGW_NOTIFY_STATE_DIR"
 
 # 舊（v0.1.4；user 層）unit 檔的位置：**相對服務帳號的 HOME**。
 # install 判斷「機器上還有沒有舊 user 版」（中-10）與遷移搬移舊 unit 都用它，
@@ -391,6 +408,20 @@ class Layout:
     @property
     def keys_pass_file(self) -> str:
         return os.path.join(self.etc_dir, KEYS_PASS_NAME)
+
+    @property
+    def check_notify_env(self) -> str:
+        """check 失敗通知的設定檔（#296；不進 repo，機器上放）。"""
+        return os.path.join(self.etc_dir, CHECK_NOTIFY_ENV_NAME)
+
+    @property
+    def check_notify_state_file(self) -> str:
+        """通知的去重狀態檔（腳本的 ``LGW_NOTIFY_STATE_DIR`` 預設就是 state_dir）。"""
+        return os.path.join(self.state_dir, CHECK_NOTIFY_STATE_NAME)
+
+    @property
+    def check_notify_lock_file(self) -> str:
+        return os.path.join(self.state_dir, CHECK_NOTIFY_LOCK_NAME)
 
     @property
     def state_dir(self) -> str:

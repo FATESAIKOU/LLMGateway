@@ -55,6 +55,7 @@ SECTION_HEADINGS = (
     "### 8.18 上線前清單",
     "### 8.19 定時檢查（timer）（r）",
     "### 8.20 從 MLP 清單同步名冊（外圍腳本 `lgw-registry-sync`，#292）",
+    "### 8.21 check 失敗時通知 PMO（失敗通知 unit，#296）",
 )
 
 #: `--auth-*` 旗標對應 `AuthConfig` 的欄位（C-834 第 2 項）。
