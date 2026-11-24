@@ -45,6 +45,13 @@ case "$1" in
         [[ -f "${fake}/active/${unit}" ]] && exit 0 || exit 3 ;;
     is-failed)
         [[ -f "${fake}/failed/${unit}" ]] && exit 0 || exit 1 ;;
+    show)
+        # #288：`show -p ActiveEnterTimestamp --timestamp=unix --value <unit>`；
+        # 有設定檔就印 `@<秒>`，否則空輸出（parse 成 None）。
+        if [[ -f "${fake}/active_enter_timestamp" ]]; then
+            printf '@%s\\n' "$(cat "${fake}/active_enter_timestamp")"
+        fi
+        exit 0 ;;
     daemon-reload)
         printf '%s %s\\n' "$1" "$unit" >> "${fake}/actions.log"
         [[ -f "${fake}/reload_fail" ]] && exit 1
@@ -431,6 +438,15 @@ class Sandbox:
 
     def set_failed(self, unit: str) -> None:
         self.write(os.path.join(self.fake, "failed", unit), "1\n")
+
+    def set_active_enter_timestamp(self, seconds: int | None) -> None:
+        """假 `systemctl show --timestamp=unix` 的回應（None 表示空輸出）。"""
+        path = os.path.join(self.fake, "active_enter_timestamp")
+        if seconds is None:
+            if os.path.exists(path):
+                os.unlink(path)
+        else:
+            self.write(path, f"{int(seconds)}\n")
 
     def curl_codes(self, codes) -> None:
         self.write(os.path.join(self.fake, "curl_codes"),

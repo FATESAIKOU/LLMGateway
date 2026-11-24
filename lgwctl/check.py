@@ -16,6 +16,8 @@
   端點；root 時以 :mod:`lgwctl.local_auth` 的私鑰簽章（權限不符就是沒有 signer，
   也不改送無簽）：enforce 的 401／403／429／503 與簽章失敗為 fail、warn 一律
   todo（warn 不拒絕，無法確認）、連不上照實 fail／todo。
+- ``auth-degraded``（#288；C-963）：從 enforce 降到 warn／off 滿 3600 秒即 fail；
+  紀錄與判定見 :mod:`lgwctl.mode_history`（root 每次順便補記，非 root 只讀）。
 - ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``，模式以
   環境變數 ``LGW_PROBE_API_MODE`` 傳）；``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
@@ -36,7 +38,7 @@ import os
 import re
 import time
 
-from . import capability, local_auth, probe, units
+from . import capability, local_auth, mode_history, probe, units
 from . import run as runmod
 from .layout import KEYS_REPO, TUNNEL_SERVICE_NAME, SERVICE_NAME
 from .report import Report
@@ -431,6 +433,21 @@ def _admin_detail(exc) -> str:
     return text if not hint else "{0}；{1}".format(text, hint)
 
 
+def _check_auth_degraded(layout, report) -> None:
+    """`auth-degraded`（#288；C-963）：從 enforce 降級滿一小時即 fail。
+
+    判定表與狀態檔在 :mod:`lgwctl.mode_history`；root 每次跑 check 會依
+    systemd 的啟動時刻補記，非 root 只讀。
+    """
+    level, detail = mode_history.check_for_report(layout)
+    if level == "ok":
+        report.ok("auth-degraded", detail)
+    elif level == "todo":
+        report.todo("auth-degraded", detail)
+    else:
+        report.fail("auth-degraded", detail)
+
+
 def run(layout, *, report: Report | None = None, no_remote: bool = False,
         tag: str | None = None) -> int:
     report = report or Report()
@@ -440,6 +457,7 @@ def run(layout, *, report: Report | None = None, no_remote: bool = False,
     _check_list_local(layout, report)
     _check_auth_local(layout, report)
     _check_auth_stores(layout, report)
+    _check_auth_degraded(layout, report)
     if tunnel_present:
         _check_follow(layout, report, tunnel_state == "active")
         _check_list_remote(layout, report)
