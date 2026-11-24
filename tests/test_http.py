@@ -103,7 +103,11 @@ class FakeService:
         return self._finish("list_usage_summary", json.loads(json.dumps(USAGE)))
 
     def resolve(self, agent, provider, model=None, subscription=None, exclude=None,
-                data=None):
+                data=None, *, principal=None):
+        # principal（#222 D3b）是 C-913 的關鍵字參數；這個替身只記呼叫（calls 的形狀
+        # 不變）、不記 principal。principal 是否真的被轉發由
+        # tests/test_http_authz.py 的 RecordingService.principals 驗（低-2：
+        # 兩個替身的分工；PR 說明也要寫這一段）。
         return self._finish("resolve", json.loads(json.dumps(RESOLVE)),
                             agent, provider, model, subscription, exclude, data)
 
@@ -111,7 +115,7 @@ class FakeService:
         return self._finish("role_candidates", json.loads(json.dumps(ROLES)),
                             role, agent, data)
 
-    def register_cooldown(self, sub_id, body):
+    def register_cooldown(self, sub_id, body, *, principal=None):
         return self._finish("register_cooldown", None, sub_id, body)
 
 
