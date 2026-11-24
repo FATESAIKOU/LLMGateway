@@ -24,10 +24,11 @@
   功能）。從不認得 timer 的舊版升級上來的機器會看到「未安裝」，補跑一次
   ``llmgwctl install`` 即可。**#296**：這一版有 notify unit 檔（見下一項）而系統上
   沒有那個檔時，timer 就算在跑也記 todo（安裝指令同上）。
-- ``check-notify``（#296；C-996）：check 失敗時的通知有沒有設定好。只會 ok 或
-  todo（不會 fail）：``/etc/llmgateway/check-notify.env`` 的三個鍵齊全、找得到
-  ``aicomm`` 就是 ok，否則 todo「失敗不會通知 PMO（缺 check-notify.env 或
-  aicomm）」。只有這一版的 ``deploy/units/`` 有 notify unit 檔時才列。不送訊息。
+- ``check-notify``（#296；C-996／C-999）：check 失敗時的通知有沒有設定好。只會 ok
+  或 todo（不會 fail）：``/etc/llmgateway/check-notify.env`` 的三個鍵齊全、
+  ``LGW_NOTIFY_LABEL`` 符合 ``[A-Za-z0-9._-]{1,32}``、找得到 ``aicomm`` 就是 ok，
+  否則 todo「失敗不會通知 PMO（…）」寫明缺哪一項。只有這一版的 ``deploy/units/``
+  有 notify unit 檔時才列。不送訊息。
 - ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``，模式以
   環境變數 ``LGW_PROBE_API_MODE`` 傳）；``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
@@ -51,7 +52,8 @@ import time
 
 from . import capability, local_auth, mode_history, probe, units
 from . import run as runmod
-from .layout import (CHECK_NOTIFY_AICOMM, CHECK_NOTIFY_ENV_KEYS, CHECK_NOTIFY_NAME,
+from .layout import (CHECK_NOTIFY_AICOMM, CHECK_NOTIFY_ENV_KEYS,
+                     CHECK_NOTIFY_LABEL_PATTERN, CHECK_NOTIFY_NAME,
                      CHECK_TIMER_NAME, ENV_CHECK_JOURNAL, KEYS_REPO,
                      SERVICE_NAME, TUNNEL_SERVICE_NAME, parse_env_file)
 from .report import Report
@@ -222,15 +224,16 @@ def _check_timer(layout, report) -> None:
 
 
 def _check_notify(layout, report) -> None:
-    """``check-notify``（#296；C-996）：check 失敗時的通知有沒有設定好。
+    """``check-notify``（#296；C-996／C-999）：check 失敗時的通知有沒有設定好。
 
     只會 ok 或 todo（通知沒設好不是「壞掉」，也絕不在此送訊息）：
 
     - 只有**這一版**的 ``deploy/units/`` 有 notify unit 檔時才列（與 check-timer
       同理：更舊的版本沒有這個功能，列 todo 會讓遷移到舊 tag 被誤判停損）；
     - ``/etc/llmgateway/check-notify.env`` 的三個鍵（頻道、收件人、本機代號）
-      齊全，而且 ``PATH`` 上找得到 ``aicomm`` → ok；
-    - 否則 todo，寫明缺的是設定檔還是 aicomm（不含任何值）。
+      齊全、``LGW_NOTIFY_LABEL`` 符合 ``[A-Za-z0-9._-]{1,32}``，而且 ``PATH`` 上
+      找得到 ``aicomm`` → ok；
+    - 否則 todo，寫明缺的是設定檔、代號格式還是 aicomm（不含任何值）。
     """
     if not os.path.isfile(_version_unit(layout, CHECK_NOTIFY_NAME)):
         return
@@ -241,6 +244,13 @@ def _check_notify(layout, report) -> None:
         report.todo("check-notify",
                     "失敗不會通知 PMO（缺 check-notify.env 或 aicomm）："
                     "check-notify.env 缺 " + "、".join(missing))
+        return
+    label = values.get("LGW_NOTIFY_LABEL").strip()
+    if re.fullmatch(CHECK_NOTIFY_LABEL_PATTERN, label) is None:
+        # 腳本對格式不對的代號是「當成沒設、跳過」；這裡先講清楚（#296 架構師低-2）。
+        report.todo("check-notify",
+                    "失敗不會通知 PMO：LGW_NOTIFY_LABEL 格式不對（要 "
+                    + CHECK_NOTIFY_LABEL_PATTERN + "），腳本會跳過不送")
         return
     if shutil.which(CHECK_NOTIFY_AICOMM, path=layout.env.get("PATH")) is None:
         report.todo("check-notify",

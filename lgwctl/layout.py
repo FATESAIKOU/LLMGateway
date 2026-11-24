@@ -69,6 +69,8 @@ KEYSYNC_SHA_NAME = ".keysync.sha"
 # 三個必要的鍵與 ops-scripts/llmgateway-check-notify 讀的是同一組名字。
 CHECK_NOTIFY_ENV_NAME = "check-notify.env"
 CHECK_NOTIFY_ENV_KEYS = ("LGW_NOTIFY_CHANNEL", "LGW_NOTIFY_TO", "LGW_NOTIFY_LABEL")
+#: 本機代號的格式（#296 架構師低-2）：與腳本的 ``LABEL_PATTERN`` 是同一個字串。
+CHECK_NOTIFY_LABEL_PATTERN = r"[A-Za-z0-9._-]{1,32}"
 CHECK_NOTIFY_STATE_NAME = "check-notify.state"
 CHECK_NOTIFY_LOCK_NAME = "check-notify.lock"
 CHECK_NOTIFY_AICOMM = "aicomm"

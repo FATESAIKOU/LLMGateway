@@ -2125,9 +2125,14 @@ def _acceptable_check_code(report: Report, code: int) -> int:
     """
     if code != 2 or report.has_fail:
         return code
-    todos = {line[len("todo "):].split("（", 1)[0].strip()
-             for line in report.lines if line.startswith("todo ")}
-    return 0 if todos and todos <= BENIGN_CHECK_TODOS else code
+    # 項目名從 Report 的行裡取；不只在全形括號上切（半形括號也吃，審查低-3）。
+    names = set()
+    for line in report.lines:
+        if not line.startswith("todo "):
+            continue
+        name = line[len("todo "):].split("（", 1)[0].split("(", 1)[0].strip()
+        names.add(name)
+    return 0 if names and names <= BENIGN_CHECK_TODOS else code
 
 
 def _remove_new_timer(layout, report) -> None:

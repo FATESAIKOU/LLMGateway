@@ -17,6 +17,8 @@ SupplementaryGroups=systemd-journal
 EnvironmentFile=-/etc/llmgateway/check-notify.env
 ExecStart=/opt/llmgateway/current/ops-scripts/llmgateway-check-notify
 SyslogIdentifier=llmgwctl-check-notify
+# 腳本自己把三個外部指令的逾時壓在 45 秒以內（另有整趟的總預算），所以三個都
+# 卡住時也不會撞到這個上限。改腳本的逾時要一起看這裡（有靜態測試）。
 TimeoutStartSec=60
 NoNewPrivileges=true
 ProtectSystem=strict

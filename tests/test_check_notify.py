@@ -35,8 +35,9 @@
   `test_c993_second_failure_within_an_hour_is_suppressed`、
   `test_c993_sends_again_after_an_hour`、`test_c993_clock_backwards_sends`、
   `test_c993_corrupt_state_still_sends`、`test_c993_lock_busy_exits_zero`。
-- C-994（狀態檔與鎖）：位置與名字、0600、原子寫、7 天清理：
-  `test_c994_save_state_is_0600_and_reloadable`、`test_c993_*`（狀態檔在去重路徑上）。
+- C-994（狀態檔與鎖）：位置與名字、0600、原子寫（暫存檔名唯一，審查低-1）、
+  7 天清理：`test_c994_save_state_is_0600_and_reloadable`、
+  `test_c994_save_state_uses_a_unique_temp_file`、`test_c993_*`（狀態檔在去重路徑上）。
 - C-995（install／upgrade／rollback／migrate）：notify unit 跟著裝、跟著移除、
   回滾到 #300 的版本時被移除、`rollback-to-user` 只 disable 不刪檔：
   `test_c995_install_installs_the_notify_unit`、
@@ -56,6 +57,18 @@
   一致：
   `test_c997_section_documents_the_facts`、
   `test_c997_example_keys_match_program_and_doc`。
+- C-998（修正第 1 輪，架構師低-1）：三個外部指令的逾時合計與整趟總預算都要留在
+  unit 的 `TimeoutStartSec` 之內，而且 `main` 只建一個 `Budget` 傳給每一個指令：
+  `test_c998_timeouts_fit_inside_the_unit_timeout`、
+  `test_c998_budget_caps_each_call_by_the_remaining_time`、
+  `test_c998_exhausted_budget_does_not_run_the_command`、
+  `test_c998_main_passes_one_budget_to_every_command`。
+- C-999（修正第 1 輪，架構師低-2）：`LGW_NOTIFY_LABEL` 只收
+  `[A-Za-z0-9._-]{1,32}`，不合就當成沒設（一行 journal、不送）：
+  `LabelFormatTests.test_c999_label_pattern_accepts_only_the_whitelist`、
+  `test_c999_invalid_label_is_treated_as_unset`、
+  `test_c999_length_boundaries`、`test_c999_check_item_reports_a_bad_label`、
+  `test_c999_pattern_is_shared_with_the_docs_and_the_example`。
 
 全部離線：腳本用假的 `journalctl`／`systemctl`／`aicomm`（暫存目錄，暫存 PATH），
 lgwctl 用 `tests/lgwctl_fakes.Sandbox` 的假 systemctl；不讀憑證、不送真訊息、
@@ -64,18 +77,21 @@ lgwctl 用 `tests/lgwctl_fakes.Sandbox` 的假 systemctl；不讀憑證、不送
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
-import importlib.util
+import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 try:
     from .lgwctl_fakes import CHECK_NOTIFY, FAKE_TAG, NEW_TAG, Sandbox, has_line
@@ -87,7 +103,7 @@ except ImportError:  # python3 -m unittest discover -s tests
 from lgwctl import layout as layoutmod
 from lgwctl import migrate
 from lgwctl.check import _check_notify
-from lgwctl.layout import Layout
+from lgwctl.layout import CHECK_NOTIFY_LABEL_PATTERN, Layout
 from lgwctl.report import Report
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -100,13 +116,18 @@ _SCRIPT_MODULE = None
 
 
 def script_module():
-    """把沒有 `.py` 副檔名的腳本載進來，直接測它的純函式。"""
+    """把沒有 `.py` 副檔名的腳本載進來，直接測它的純函式。
+
+    直接 `compile` 原始碼（不經 `SourceFileLoader`）：這樣不會寫也不會讀
+    `__pycache__`，改壞驗證在副本裡改完再改回來時，不會拿到長度相同、mtime 同一秒
+    的舊 bytecode。
+    """
     global _SCRIPT_MODULE
     if _SCRIPT_MODULE is None:
-        loader = SourceFileLoader("lgw_check_notify_296_under_test", str(SCRIPT))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
+        module = types.ModuleType("lgw_check_notify_296_under_test")
+        module.__file__ = str(SCRIPT)
+        code = compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
+        exec(code, module.__dict__)
         _SCRIPT_MODULE = module
     return _SCRIPT_MODULE
 
@@ -316,6 +337,20 @@ class DedupeTests(unittest.TestCase):
             self.assertEqual(self.module.load_state(path),
                              {"a" * 16: 1, "b" * 16: 2})
             self.assertEqual(sorted(os.listdir(tmp)), ["check-notify.state"])
+
+    def test_c994_save_state_uses_a_unique_temp_file(self):
+        """審查低-1：暫存檔名不是固定的 `.tmp`，不會動到別人留下的同名檔。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "check-notify.state")
+            stale = path + ".tmp"
+            with open(stale, "w", encoding="utf-8") as handle:
+                handle.write("keep me")
+            self.module.save_state(path, {"a" * 16: 1})
+            with open(stale, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "keep me")
+            self.assertEqual(sorted(os.listdir(tmp)),
+                             ["check-notify.state", "check-notify.state.tmp"])
+            self.assertEqual(self.module.load_state(path), {"a" * 16: 1})
 
 
 #: 假的外部指令（用 sys.executable 當 shebang，PATH 再怎麼設都跑得起來）。
@@ -779,6 +814,167 @@ class CutoverCheckCodeTests(unittest.TestCase):
         self.assertEqual(
             source.count("_acceptable_check_code(check_report, code)"), 2,
             "cutover 與 finalize 兩處的 check 門檻都要用它")
+
+
+class TimeoutBudgetTests(unittest.TestCase):
+    """C-998：外部指令的逾時合計與整趟總預算都在 unit 的逾時之內（架構師低-1）。"""
+
+    def setUp(self):
+        self.module = script_module()
+
+    def unit_timeout_seconds(self) -> int:
+        unit = parsed_unit(CHECK_NOTIFY)
+        (value,) = unit.values("Service", "TimeoutStartSec")
+        match = re.fullmatch(r"([0-9]+)(s|sec|min)?", value.strip())
+        self.assertIsNotNone(match, value)
+        number = int(match.group(1))
+        return number * 60 if match.group(2) == "min" else number
+
+    def timeouts(self):
+        return (self.module.SYSTEMCTL_TIMEOUT, self.module.JOURNALCTL_TIMEOUT,
+                self.module.AICOMM_TIMEOUT)
+
+    def test_c998_timeouts_fit_inside_the_unit_timeout(self):
+        unit_timeout = self.unit_timeout_seconds()
+        total = sum(self.timeouts())
+        # 三個都卡住時，加起來也不能超過 unit 的上限（不然 systemd 會先殺掉 notify）。
+        self.assertLess(total, unit_timeout, self.timeouts())
+        # 至少留 10 秒給 systemd 的啟動與收尾。
+        self.assertLessEqual(self.module.TOTAL_BUDGET, unit_timeout - 10)
+        # 整趟總預算不能小於單一指令的上限（不然某一個指令永遠拿不到自己的上限）。
+        for value in self.timeouts():
+            self.assertLess(0, value)
+            self.assertLessEqual(value, self.module.TOTAL_BUDGET)
+        self.assertEqual(self.module.TOTAL_BUDGET, sum(self.timeouts()))
+
+    def test_c998_budget_caps_each_call_by_the_remaining_time(self):
+        now = [100.0]
+
+        def clock():
+            return now[0]
+
+        budget = self.module.Budget(total=50, clock=clock)
+        self.assertEqual(budget.slice(20), 20.0)
+        now[0] += 30.0
+        self.assertEqual(budget.remaining(), 20.0)
+        # 剩 20 秒：一個上限 30 秒的指令只能等 20 秒。
+        self.assertEqual(budget.slice(30), 20.0)
+        now[0] += 25.0
+        self.assertEqual(budget.remaining(), 0.0)
+        self.assertEqual(budget.slice(20), 0.0)
+
+    def test_c998_exhausted_budget_does_not_run_the_command(self):
+        marker = os.path.join(tempfile.mkdtemp(), "ran")
+        self.addCleanup(shutil.rmtree, os.path.dirname(marker), True)
+        budget = self.module.Budget(total=0)
+        proc = self.module._run(
+            [sys.executable, "-c",
+             "open({0!r}, 'w').write('ran')".format(marker)], 20, budget)
+        self.assertIsNone(proc)
+        self.assertFalse(os.path.exists(marker), "預算用完就不該跑那個指令")
+
+class MainBudgetTests(ScriptFixture):
+    """C-998：`main` 只建一個 `Budget`，而且傳給每一個外部指令。"""
+
+    def setUp(self):
+        super().setUp()
+        self.module = script_module()
+
+    def test_c998_main_passes_one_budget_to_every_command(self):
+        seen = []
+        real_run = self.module._run
+
+        def spy(argv, timeout, budget=None):
+            seen.append((os.path.basename(argv[0]), budget, timeout))
+            return real_run(argv, timeout, budget)
+
+        out = io.StringIO()
+        # 不給 MONITOR_INVOCATION_ID：第一支外部指令會是 systemctl（假的那一支）。
+        env = self.env(MONITOR_INVOCATION_ID=None)
+        with mock.patch.object(self.module, "_run", spy), \
+                mock.patch.dict(os.environ, env), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(self.module.main(), 0)
+        self.assertEqual([name for (name, _budget, _timeout) in seen],
+                         ["systemctl", "journalctl", "aicomm"], seen)
+        budgets = [budget for (_name, budget, _timeout) in seen]
+        self.assertEqual(len({id(budget) for budget in budgets}), 1,
+                         "每個外部指令都要拿到同一個 Budget")
+        self.assertIsInstance(budgets[0], self.module.Budget)
+        # 每個指令拿到的是它自己的上限，而且都在總預算之內。
+        for (_name, budget, timeout) in seen:
+            self.assertLessEqual(timeout, budget.total)
+        self.assertEqual(out.getvalue().splitlines(), ["notify sent"])
+
+
+class LabelFormatTests(ScriptFixture):
+    """C-999：`LGW_NOTIFY_LABEL` 只收 `[A-Za-z0-9._-]{1,32}`（架構師低-2）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.module = script_module()
+
+    def test_c999_label_pattern_accepts_only_the_whitelist(self):
+        pattern = self.module.LABEL_RE
+        for good in ("gw-prod", "gw_prod.1", "a", "A" * 32, "node-4.b"):
+            self.assertIsNotNone(pattern.fullmatch(good), good)
+        for bad in ("gw prod", "gw:prod", "gw=prod", "gw,prod", "gw+prod",
+                    "rm -rf /home/worker", "", " ", "a" * 33, "節點"):
+            self.assertIsNone(pattern.fullmatch(bad), bad)
+
+    def test_c999_invalid_label_is_treated_as_unset(self):
+        for bad in ("gw prod", "rm -rf /home/worker", "gw:prod", "gw=prod"):
+            with self.subTest(label=bad):
+                rc, out, err = self.run_script(LGW_NOTIFY_LABEL=bad)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(err, "")
+                self.assertEqual(out.splitlines(),
+                                 ["notify skipped: invalid label"])
+                self.assertEqual(self.aicomm_calls(), [])
+                self.assertFalse(os.path.exists(self.state_path()))
+
+    def test_c999_length_boundaries(self):
+        rc, out, err = self.run_script(LGW_NOTIFY_LABEL="a" * 32)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(out.splitlines(), ["notify sent"])
+        label_field = self.aicomm_calls()[0][6].split("label=", 1)[1]
+        self.assertTrue(label_field.startswith("a" * 32))
+        rc, out, err = self.run_script(LGW_NOTIFY_LABEL="a" * 33)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(out.splitlines(), ["notify skipped: invalid label"])
+
+    def test_c999_check_item_reports_a_bad_label(self):
+        box = Sandbox()
+        self.addCleanup(box.close)
+        box.install_state(FAKE_TAG)
+        box.write(box.etc("llmgateway.env"), 'LGW_API_PORT="8480"\n')
+        box.set_active("llmgateway.service")
+        box.set_active("llmgateway-tunnel.service")
+        box.write(box.state("keys.env"), "X=FakeKeyValue_DoNotUse\n", 0o600)
+        box.write(box.state(".keysync.status"),
+                  json.dumps({"ts": time.time(), "ok": True, "reason": "ok"}), 0o644)
+        box.write(os.path.join(box.opt(FAKE_TAG), "deploy", "units", CHECK_NOTIFY),
+                  f"[Unit]\n# {CHECK_NOTIFY}\n")
+        box.write(box.etc("check-notify.env"),
+                  "LGW_NOTIFY_CHANNEL=c\nLGW_NOTIFY_TO=t\n"
+                  "LGW_NOTIFY_LABEL=gw prod\n")
+        env = dict(box.env)
+        env["PATH"] = "/usr/bin:/bin"
+        rc, out, err = box.run_cli(["check", "--no-remote"], env=env)
+        self.assertEqual(rc, 2, out + err)
+        line = next(line for line in out.splitlines() if " check-notify" in line)
+        self.assertIn("格式不對", line)
+        self.assertIn("[A-Za-z0-9._-]{1,32}", line)
+        self.assertNotIn("gw prod", line)
+
+    def test_c999_pattern_is_shared_with_the_docs_and_the_example(self):
+        self.assertEqual(CHECK_NOTIFY_LABEL_PATTERN, self.module.LABEL_PATTERN)
+        self.assertIn(CHECK_NOTIFY_LABEL_PATTERN,
+                      (REPO_ROOT / "docs" / "deploy.md").read_text(encoding="utf-8"))
+        self.assertIn(CHECK_NOTIFY_LABEL_PATTERN,
+                      EXAMPLE_ENV.read_text(encoding="utf-8"))
+        self.assertIn("notify skipped: invalid label",
+                      (REPO_ROOT / "docs" / "deploy.md").read_text(encoding="utf-8"))
 
 
 class DeployDocNotifyTests(unittest.TestCase):
