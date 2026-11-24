@@ -56,8 +56,10 @@ from lgwctl.report import Report
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNIT_DIR = os.path.join(REPO_ROOT, "deploy", "units")
 
-#: C-987：既有兩個 unit 的內容雜湊（這一張單不得改動它們）。
-LLMGATEWAY_SERVICE_SHA256 = "5f8857529d0b973458eb3aa03aa609f924a3ef283eedaef95d24da9d69abc714"
+#: C-987：既有兩個 unit 的內容雜湊（#289 這一張單不得改動它們）。
+#: #306（D5d 段二）依契約 C-835～C-837 在 llmgateway.service 加了資源上限，
+#: 所以服務 unit 的雜湊跟著更新；tunnel unit 不變，逐 byte 的斷言照舊。
+LLMGATEWAY_SERVICE_SHA256 = "5019d7331ede120771de5977ec188463869c3f14f095a7e47dd2e70813fb0d4f"
 LLMGATEWAY_TUNNEL_SHA256 = "f84b664fb6521c91dfb634a26f32637cf7729cd6554708e74644c17667d068bc"
 
 
@@ -142,7 +144,11 @@ class CheckTimerUnitTests(unittest.TestCase):
 
 
 class ExistingUnitsUnchangedTests(unittest.TestCase):
-    """C-987：`llmgateway.service` 與 `llmgateway-tunnel.service` 逐 byte 不變。"""
+    """C-987：`llmgateway.service` 與 `llmgateway-tunnel.service` 逐 byte 不變。
+
+    #306（D5d 段二）是例外：服務 unit 依契約 C-835～C-837 加了三個資源上限，
+    上面 pin 的雜湊跟著更新；tunnel unit 仍逐 byte 比對。
+    """
 
     def test_existing_units_are_unchanged(self):
         self.assertEqual(

@@ -30,6 +30,29 @@ EnvironmentFile=/etc/llmgateway/llmgateway.env
 # 解密密碼只經 LoadCredential 交給服務（服務裡是 $CREDENTIALS_DIRECTORY/keys.pass；
 # 值不進環境、不進 argv）。
 LoadCredential=keys.pass:/etc/llmgateway/keys.pass
+# 資源上限（#222 D5d 段二）：保護整台主機、擋住失控（fork 洪水、記憶體洩漏、fd
+# 洩漏），不是貼著用量限流。TasksMax 與 MemoryMax 把 lgwd 和所有子行程一起算（同
+# 一個 cgroup）；LimitNOFILE 是每個行程各自的上限。三個值都比實測高峰寬很多，off
+# 與現行負載的用量遠低於它們（#247 J-5）。
+# 算式用 C-612 低負載複測（5860 個樣本）：lgwd 最多 37 個 task、RSS 高峰約 38 MB、
+# fd 高峰 89。TasksMax：37＋驗章 16＋claude CLI 約 15＋key-sync、gh 約 20 ≈ 88，
+# 取兩倍約 176；512 約實測高峰的 5.8 倍，也讓沒有上限的連線執行緒實際停在約 400
+# 條（systemd 預設 DefaultTasksMax 是 pid 上限的 15%，通常幾千，所以 512 真的在擋）。
+# MemoryMax：最壞估算 lgwd 100 MB＋驗章 16×約 10 MB＋claude 約 300 MB＋key-sync、
+# gh 約 80 MB ≈ 640 MB，約 2.4 倍取整到 1.5 GiB；不能只看 lgwd 的 RSS 高峰乘 2
+# （那只有約 77 MB，第一次抓用量就會 OOM）。
+# LimitNOFILE：實測 89；連線數受 TasksMax 512 限制，需要 ≥512＋約 100，取 4096
+# （soft＝hard）。子行程會繼承；ssh-keygen 另有 prlimit 的 nofile 限制。
+# 碰到上限：TasksMax 開不了新執行緒或行程（該連線失敗、驗章 503，lgwd 不掛）；
+# MemoryMax 是 cgroup OOM（通常先殺最大的 claude，Restart=on-failure 會重啟）；
+# LimitNOFILE 是 accept 或開檔失敗（EMFILE）。不用 MemoryHigh：接近上限時整個
+# cgroup 變慢，驗章延遲可能變成 503，比單純上限更難診斷。
+# V-0.6 要以 cgroup 的 pids.peak／memory.peak 驗證（不是量單一行程）：pids.peak
+# ≤ 256、memory.peak ≤ 768M、lgwd 的 fd 高峰 ≤ 2048；超過就開 d 單調高，不放寬到
+# infinity。
+TasksMax=512
+MemoryMax=1536M
+LimitNOFILE=4096
 # 加固（#35 spec）：不能提權、系統唯讀（只開狀態目錄）、私有 /tmp。
 NoNewPrivileges=true
 ProtectSystem=strict

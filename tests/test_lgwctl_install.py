@@ -7,6 +7,7 @@ keys.env 都是假的。
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import unittest
@@ -558,6 +559,19 @@ class _UnitFields:
         return [(sec, value) for (sec, name, value, _) in self.entries if name == key]
 
 
+def _assert_single_service_value(test, unit, key, value):
+    """契約的共用檢查：``[Service]`` 段恰好一行 ``key=value``，其他段與第二次都算紅。"""
+    test.assertEqual(unit.values("Service", key), [value], key)
+    test.assertEqual(unit.every(key), [("Service", value)], key)
+
+
+def _assert_contract_rejects(test, check, cases):
+    """把每個壞掉的 unit 丟給同一個檢查；沒有被擋下來就是紅（負向案例）。"""
+    for name, text in cases.items():
+        with test.subTest(case=name), test.assertRaises(AssertionError):
+            check(_UnitFields(text))
+
+
 class UnitFileTests(unittest.TestCase):
     """deploy/units/llmgateway.service 的靜態檢查（#35 spec 的固定值）。"""
 
@@ -611,6 +625,85 @@ class UnitFileTests(unittest.TestCase):
         """C-832：只對主行程送 SIGTERM（在途驗章不提早被殺）。"""
         self.assertEqual(self.unit.values("Service", "KillMode"), ["mixed"])
         self.assertEqual(self.unit.every("KillMode"), [("Service", "mixed")])
+
+    def test_c835_tasks_max_512(self):
+        """C-835：``[Service]`` 段恰好一行 TasksMax=512（保護整台的任務上限）。"""
+        _assert_single_service_value(self, self.unit, "TasksMax", "512")
+
+    def test_c835_negative_cases(self):
+        """C-835 負向：沒有這一行、infinity、小於 176、放到 [Unit]、寫兩次都會紅。"""
+        _assert_contract_rejects(
+            self,
+            lambda unit: _assert_single_service_value(self, unit, "TasksMax", "512"),
+            {
+                "missing": "[Service]\nMemoryMax=1536M\n",
+                "infinity": "[Service]\nTasksMax=infinity\n",
+                "too-small": "[Service]\nTasksMax=175\n",
+                "in-unit-section": "[Unit]\nTasksMax=512\n[Service]\n",
+                "twice": "[Service]\nTasksMax=512\nTasksMax=512\n",
+            },
+        )
+
+    def test_c836_memory_max_1536m(self):
+        """C-836：``[Service]`` 段恰好一行 MemoryMax=1536M（不是只看 lgwd 的 RSS）。"""
+        _assert_single_service_value(self, self.unit, "MemoryMax", "1536M")
+
+    def test_c836_negative_cases(self):
+        """C-836 負向：沒有這一行、infinity、小於 512M、百分比、放到 [Unit]、寫兩次。"""
+        _assert_contract_rejects(
+            self,
+            lambda unit: _assert_single_service_value(self, unit, "MemoryMax", "1536M"),
+            {
+                "missing": "[Service]\nTasksMax=512\n",
+                "infinity": "[Service]\nMemoryMax=infinity\n",
+                # 只看 lgwd 的 RSS 高峰乘 2 約 77M，第一次抓用量就會 OOM。
+                "too-small": "[Service]\nMemoryMax=80M\n",
+                "percent": "[Service]\nMemoryMax=60%\n",
+                "in-unit-section": "[Unit]\nMemoryMax=1536M\n[Service]\n",
+                "twice": "[Service]\nMemoryMax=1536M\nMemoryMax=1536M\n",
+            },
+        )
+
+    def test_c837_limit_nofile_4096(self):
+        """C-837：``[Service]`` 段恰好一行 LimitNOFILE=4096（單一值，soft＝hard）。"""
+        _assert_single_service_value(self, self.unit, "LimitNOFILE", "4096")
+
+    def test_c837_negative_cases(self):
+        """C-837 負向：沒有這一行、小於 1024、infinity、soft 小於 1024 的 soft:hard、
+        放到 [Unit]、寫兩次。"""
+        _assert_contract_rejects(
+            self,
+            lambda unit: _assert_single_service_value(self, unit, "LimitNOFILE", "4096"),
+            {
+                "missing": "[Service]\nTasksMax=512\n",
+                "too-small": "[Service]\nLimitNOFILE=1023\n",
+                "infinity": "[Service]\nLimitNOFILE=infinity\n",
+                # soft:hard 的 soft 只有 512，等於 TasksMax 的上限，連線一多就 EMFILE。
+                "soft-hard": "[Service]\nLimitNOFILE=512:4096\n",
+                "in-unit-section": "[Unit]\nLimitNOFILE=4096\n[Service]\n",
+                "twice": "[Service]\nLimitNOFILE=4096\nLimitNOFILE=4096\n",
+            },
+        )
+
+    def test_c838_resource_values_match_the_doc(self):
+        """C-838：unit（含註解）與 docs/deploy.md 的三個值逐一相符；文件寫出算式、
+        碰到上限的行為、不用 MemoryHigh，以及 V-0.6 用 cgroup peak 的判準。"""
+        doc_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "docs", "deploy.md")
+        with open(doc_path, encoding="utf-8") as fh:
+            doc = fh.read()
+        for key, value in (("TasksMax", "512"), ("MemoryMax", "1536M"),
+                           ("LimitNOFILE", "4096")):
+            self.assertEqual(self.unit.values("Service", key), [value], key)
+            for where, text in (("unit", self.text), ("docs/deploy.md", doc)):
+                found = re.findall(r"\b" + key + r"=([0-9A-Za-z:.%]+)", text)
+                self.assertTrue(found, "{0} 沒有 {1}=值".format(where, key))
+                self.assertEqual(set(found), {value},
+                                 "{0} 的 {1} 值與 unit 不一致：{2}".format(where, key, found))
+        for needle in ("C-612", "碰到上限", "MemoryHigh", "cgroup"):
+            self.assertIn(needle, doc, needle)
+        for needle in ("memory.peak", "pids.peak", "≤ 256", "≤ 768M", "≤ 2048"):
+            self.assertIn(needle, doc, needle)
 
     def test_not_user_layer(self):
         for needle in ("WantedBy=default.target", "--user", "%h"):
