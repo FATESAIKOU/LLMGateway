@@ -685,17 +685,23 @@ class UnitFileTests(unittest.TestCase):
             },
         )
 
-    def test_c838_resource_values_match_the_doc(self):
-        """C-838：unit（含註解）與 docs/deploy.md 的三個值逐一相符；文件寫出算式、
-        碰到上限的行為、不用 MemoryHigh，以及 V-0.6 用 cgroup peak 的判準。"""
+    def doc_text(self):
         doc_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "docs", "deploy.md")
         with open(doc_path, encoding="utf-8") as fh:
-            doc = fh.read()
+            return fh.read()
+
+    def test_c838_resource_values_match_the_doc(self):
+        """C-838：unit（含註解）與 docs/deploy.md 的值逐一相符；文件寫出算式、
+        碰到上限的行為、不用 MemoryHigh，以及 V-0.6 用 cgroup peak 的判準。"""
+        doc = self.doc_text()
         for key, value in (("TasksMax", "512"), ("MemoryMax", "1536M"),
-                           ("LimitNOFILE", "4096")):
+                           ("LimitNOFILE", "4096"), ("OOMPolicy", "continue")):
             self.assertEqual(self.unit.values("Service", key), [value], key)
             for where, text in (("unit", self.text), ("docs/deploy.md", doc)):
+                # 審查低提醒：文件若用 key=值 的形式寫「負向範例」，這裡會把它當成
+                # 設定值而轉紅；要舉反例時不要用這個形式，才能保住「文件裡每一處
+                # 設定值都等於 unit」的強度。
                 found = re.findall(r"\b" + key + r"=([0-9A-Za-z:.%]+)", text)
                 self.assertTrue(found, "{0} 沒有 {1}=值".format(where, key))
                 self.assertEqual(set(found), {value},
@@ -704,6 +710,28 @@ class UnitFileTests(unittest.TestCase):
             self.assertIn(needle, doc, needle)
         for needle in ("memory.peak", "pids.peak", "≤ 256", "≤ 768M", "≤ 2048"):
             self.assertIn(needle, doc, needle)
+
+    def test_c839_oom_policy_continue(self):
+        """C-839：cgroup OOM 不讓整個 unit 陪葬——`[Service]` 段恰好一行
+        OOMPolicy=continue，文件說明 DefaultOOMPolicy 預設為 stop 為何不適合。"""
+        _assert_single_service_value(self, self.unit, "OOMPolicy", "continue")
+        doc = self.doc_text()
+        for needle in ("OOMPolicy=continue", "DefaultOOMPolicy", "243", "oom-kill"):
+            self.assertIn(needle, doc, needle)
+
+    def test_c839_negative_cases(self):
+        """C-839 負向：沒有這一行、stop、kill、放到 [Unit]、寫兩次都會紅。"""
+        _assert_contract_rejects(
+            self,
+            lambda unit: _assert_single_service_value(self, unit, "OOMPolicy", "continue"),
+            {
+                "missing": "[Service]\nMemoryMax=1536M\n",
+                "stop": "[Service]\nOOMPolicy=stop\n",
+                "kill": "[Service]\nOOMPolicy=kill\n",
+                "in-unit-section": "[Unit]\nOOMPolicy=continue\n[Service]\n",
+                "twice": "[Service]\nOOMPolicy=continue\nOOMPolicy=continue\n",
+            },
+        )
 
     def test_not_user_layer(self):
         for needle in ("WantedBy=default.target", "--user", "%h"):

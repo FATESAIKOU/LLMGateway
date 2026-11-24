@@ -44,15 +44,22 @@ LoadCredential=keys.pass:/etc/llmgateway/keys.pass
 # LimitNOFILE：實測 89；連線數受 TasksMax 512 限制，需要 ≥512＋約 100，取 4096
 # （soft＝hard）。子行程會繼承；ssh-keygen 另有 prlimit 的 nofile 限制。
 # 碰到上限：TasksMax 開不了新執行緒或行程（該連線失敗、驗章 503，lgwd 不掛）；
-# MemoryMax 是 cgroup OOM（通常先殺最大的 claude，Restart=on-failure 會重啟）；
-# LimitNOFILE 是 accept 或開檔失敗（EMFILE）。不用 MemoryHigh：接近上限時整個
-# cgroup 變慢，驗章延遲可能變成 503，比單純上限更難診斷。
+# MemoryMax 是 cgroup OOM；LimitNOFILE 是 accept 或開檔失敗（EMFILE）。不用
+# MemoryHigh：接近上限時整個 cgroup 變慢，驗章延遲可能變成 503，比單純上限更難
+# 診斷。
+# OOMPolicy：systemd 243 起沒設時用 DefaultOOMPolicy，預設是 stop——cgroup 裡任何
+# 一個行程被核心 OOM 殺掉，systemd 就把整個 unit 停掉（結果是 oom-kill）再由
+# Restart=on-failure 重啟，正在處理的請求（含在途驗章）都會被斷。改成 continue：
+# 子行程（claude CLI、gh、ssh-keygen）被殺時只有那一次工作失敗（用量抓取跳過、
+# 驗章 503），lgwd 照常服務；被殺的是 lgwd 主行程時，行程結束後仍由
+# Restart=on-failure 重啟。
 # V-0.6 要以 cgroup 的 pids.peak／memory.peak 驗證（不是量單一行程）：pids.peak
 # ≤ 256、memory.peak ≤ 768M、lgwd 的 fd 高峰 ≤ 2048；超過就開 d 單調高，不放寬到
 # infinity。
 TasksMax=512
 MemoryMax=1536M
 LimitNOFILE=4096
+OOMPolicy=continue
 # 加固（#35 spec）：不能提權、系統唯讀（只開狀態目錄）、私有 /tmp。
 NoNewPrivileges=true
 ProtectSystem=strict

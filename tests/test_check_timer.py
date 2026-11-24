@@ -59,7 +59,7 @@ UNIT_DIR = os.path.join(REPO_ROOT, "deploy", "units")
 #: C-987：既有兩個 unit 的內容雜湊（#289 這一張單不得改動它們）。
 #: #306（D5d 段二）依契約 C-835～C-837 在 llmgateway.service 加了資源上限，
 #: 所以服務 unit 的雜湊跟著更新；tunnel unit 不變，逐 byte 的斷言照舊。
-LLMGATEWAY_SERVICE_SHA256 = "5019d7331ede120771de5977ec188463869c3f14f095a7e47dd2e70813fb0d4f"
+LLMGATEWAY_SERVICE_SHA256 = "2d98b945a308c6d5ce71dc38419f3ac041b150a59ddf9966fb3d71181ba0b899"
 LLMGATEWAY_TUNNEL_SHA256 = "f84b664fb6521c91dfb634a26f32637cf7729cd6554708e74644c17667d068bc"
 
 
