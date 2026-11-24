@@ -15,7 +15,7 @@ import argparse
 import os
 import sys
 
-from . import capability, check, install, status, sync, upgrade, usage, units, probe
+from . import capability, check, install, mode_history, status, sync, upgrade, usage, units, probe
 from .layout import DEFAULT_REPO, Layout, SERVICE_NAME
 from .report import Report
 
@@ -194,7 +194,15 @@ def main(argv=None, env=None) -> int:
         if args.command == "start" and state == "active" and probe.local_ok(layout, mode=mode):
             return 0
         action = units.start if args.command == "start" else units.restart
-        return 0 if action(layout, SERVICE_NAME) and probe.wait_local_ok(layout, layout.list_wait, mode=mode) else 1
+        if not (action(layout, SERVICE_NAME)
+                and probe.wait_local_ok(layout, layout.list_wait, mode=mode)):
+            return 1
+        # #288：服務起來且探針 ok 之後才記模式；任何例外都只警告，不改結束碼。
+        try:
+            mode_history.record(layout, source="restart")
+        except Exception as exc:  # 記錄不能讓重啟失敗（C-962 的縱深防禦）
+            mode_history.warn_record_failure(exc)
+        return 0
     if args.command == "tunnel-apply":
         # 沿用 migrate.py 的鎖與時間格式；晚點才匯入（沒有 migrate.py 時其他子指令不受影響）。
         from . import tunnel_apply

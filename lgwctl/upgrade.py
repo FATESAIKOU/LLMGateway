@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 
-from . import capability, check, probe, release, run as runmod, units
+from . import capability, check, mode_history, probe, release, run as runmod, units
 from .layout import SERVICE_NAME, TAG_PATTERN, TAG_RE
 from .report import Report
 
@@ -151,6 +151,11 @@ def upgrade(layout, *, tag: str, repo: str | None = None,
                                       restart=True, report=report)
 
     report.ok("list", "200")
+    # #288：換版重啟成功、探針 ok 之後記模式；任何例外都只警告，不改結束碼。
+    try:
+        mode_history.record(layout, source="restart")
+    except Exception as exc:  # 記錄不能讓重啟失敗（C-962 的縱深防禦）
+        mode_history.warn_record_failure(exc)
     removed = release.cleanup_old_versions(layout)
     report.ok("cleanup", "、".join(removed) + " 已移除" if removed else "沒有多餘版本")
     return report.exit_code(todo_ok=True)
@@ -217,5 +222,10 @@ def rollback(layout, *, report: Report | None = None, no_remote: bool = False) -
     if not _restart_service(layout, report):
         return _rollback_after_switch(layout, saved_units, old_current, previous,
                                       restart=True, report=report)
-    probe.wait_local_ok(layout, layout.list_wait, mode=cap.mode)
+    if probe.wait_local_ok(layout, layout.list_wait, mode=cap.mode):
+        # #288：rollback 重啟成功、探針 ok 之後記模式；任何例外都只警告。
+        try:
+            mode_history.record(layout, source="restart")
+        except Exception as exc:  # 記錄不能讓重啟失敗（C-962 的縱深防禦）
+            mode_history.warn_record_failure(exc)
     return check.run(layout, report=report, no_remote=no_remote)

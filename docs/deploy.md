@@ -1069,6 +1069,9 @@ resolve 的請求不帶角色，名冊只能限制 agent（`resolve_agents`）�
 sudo llmgwctl restart
 ```
 - 回退順序是 enforce → warn → off，每一步都 `restart`。**回退等於恢復免認證，不是安全措施**；若懷疑盜鑰，先撤銷並換鑰，不為便利降級。
+- 降級會被告警：`check` 的 `auth-degraded` 看降級多久，從 `enforce` 降到 `warn` 或 `off` 滿 **3600 秒**（1 小時）就 fail，未滿是 todo（結束碼 2）。判定用 `/var/lib/llmgateway/auth-mode-history.json`（`root:root` 0644，一行 JSON，沒有祕密），root 每次跑 `check` 會依 systemd 的啟動時刻補記。
+- **切模式要用 `llmgwctl restart` 才會被記錄**：模式只在重啟時改變，`start`／`restart`／`upgrade`／`rollback` 在服務起來且本機探針 ok 之後寫入；只改 env 檔而沒有重啟時，`check` 判「設定已改成 warn 但服務尚未重啟，目前仍是 enforce」。繞過 `llmgwctl`、直接 `systemctl restart` 的情況由 `check` 讀 `systemctl show -p ActiveEnterTimestamp --timestamp=unix` 補上（需要 systemd ≥ 247）。
+- 刪除或替換歷史檔要有 root 或 `llmgw`（狀態目錄的擁有者）；`root:root` 只防得了直接改寫內容，`auth-audit.log` 也一樣。在降級中刪掉它，`check` 會判「未曾 enforce」而失去告警。每次模式轉換另外附加一筆到 `auth-audit.log`，歷史檔被刪了，轉換紀錄仍留在那裡。
 - 結束碼 2 仍會照常重啟（見 8.1）：OSError 等暫時性錯誤重啟可能自己好。
 
 ### 8.9 回滾版本的副作用（i）
@@ -1148,7 +1151,7 @@ sudo llmgwctl start
 
 **root：** 不用（`check` 可非 root 跑，但 `auth-*` 需 root 才是確定結果）。**lgwd 停止：** 這是預期結果。
 
-為了跑寫入指令而停掉 lgwd 時，`check` 的 `auth-heartbeat` 會 fail（心跳超過 180 秒），`auth-local` 也會失敗；這是預期的，啟動後恢復。`check` 的認證項目是 `auth-local`、`auth-heartbeat`、`auth-water`、`auth-stores`；非 root 時 `auth-local`、`auth-water`、`auth-stores` 記 `todo`（結束碼 2），不報 fail。
+為了跑寫入指令而停掉 lgwd 時，`check` 的 `auth-heartbeat` 會 fail（心跳超過 180 秒），`auth-local` 也會失敗；這是預期的，啟動後恢復。`check` 的認證項目是 `auth-local`、`auth-heartbeat`、`auth-water`、`auth-stores`、`auth-degraded`；非 root 時 `auth-local`、`auth-water`、`auth-stores` 記 `todo`（結束碼 2），不報 fail。`auth-degraded` 的門檻是 **3600 秒**：從 enforce 降到 warn／off 滿 1 小時即 fail；切模式要用 `llmgwctl restart` 才會被記錄，刪除或替換歷史檔要有 root 或 `llmgw`（狀態目錄的擁有者），判定細節見 8.8。
 
 ### 8.15 policy 新增 agent 或角色時（o）
 
