@@ -1,5 +1,7 @@
 #!/bin/bash
 # 把 Mac 本機的暫時 Gateway 從舊版換成新版（回滾也用同一支）。版本與目錄不寫死。
+# Mac 退路只跑 off 模式的本機 lgwd（start 不帶 --auth-mode，預設 off，不驗應用層簽章）：本檔的 list／get／resolve
+#   驗收都是對這個本機 lgwd，不是主機；經隧道打到主機的 4710 一律用 /healthz（見 docs/mac-fallback.md 第 1 節）。
 # 用法：switch <舊程式目錄> <舊 tag> <新程式目錄> <新 tag>
 #       或不給參數：讀設定檔的 SWITCH_OLD_CODE／SWITCH_OLD_TAG／SWITCH_NEW_CODE／SWITCH_NEW_TAG。
 # 順序：① 前置：兩個 checkout 的 HEAD 都是指定的 tag；② 唯讀稽核 llm.db 的 action='get'，不是 0 就不換（rc=3）；

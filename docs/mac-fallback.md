@@ -3,16 +3,20 @@
 對應工單 #154。正式 Gateway 留在原本的服務主機；主機不可用時，退路是直接在 Mac 本機起 lgwd，只聽 `127.0.0.1:4710`。
 腳本在 `ops-scripts/mac-fallback/`：`start`、`stop`、`switch`（換版本）、`lib.sh`（共用函式）、`check-scripts`（檢查）、`mac-fallback.conf.example`（設定範例）。
 
+**Mac 退路只跑 `off` 模式的本機 lgwd。** `start`／`switch` 起的 lgwd 不帶 `--auth-mode`，用的是預設 `off`（不驗應用層簽章，見 `docs/deploy.md` 8.1）。所以本文件裡對 **Mac 本機** `127.0.0.1:4710` 的 list 探針（第 4、6 節的 `start`／`switch` 驗收）是對本機這個 `off` 的 lgwd，不需要簽章；反過來，**經隧道打到主機的 4710 不能用無簽的 `/v1/` 路由當健康判斷**，一律用 `/healthz`（第 1、7 節）。
+
 本文件只寫程序與原則。**實際值（程式目錄、密碼檔路徑、狀態目錄、名稱對應）全在設定檔裡，設定檔放 repo 外**，預設是 `~/.config/llmgateway/mac-fallback.conf`，可用環境變數 `LGW_MAC_FALLBACK_CONF` 指定。
 
 ## 1. 什麼時候切過去
 
 同時符合兩件事才切：
 
-- 本機 `127.0.0.1:4710` 不通（`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4710/v1/subscriptions` 不是 200）；
+- 本機 `127.0.0.1:4710` 不通（`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4710/healthz` 不是 200）；
 - 主機顯示 down（由本人或 PMO 確認，AI 不 ssh 去查）。
 
 主機只是慢或只是隧道斷，不切；先確認隧道。
+
+**判斷一律打 `/healthz`，不要打 `/v1/subscriptions`。** 平常的 4710 是 Mac 上轉發到正式主機的隧道，不是本機 lgwd；`/healthz` 不需認證、任何模式（含 `off`／`warn`／`enforce`）都回 200，能分辨的只有「隧道通不通、服務在不在」。無簽的 list 在主機開 `warn` 會被記 would-deny、開 `enforce` 會回 401——那時 4710 其實是通的，用 list 判斷就會把 401 讀成「不通」而誤觸發切換條件的第一項。`/healthz` 在名冊不可用或 warn 降級時仍回 200，是設計上的健康端點（`docs/deploy.md` 第 8 節）。
 
 ## 2. 前置（會動到本人的密碼與隧道，先由本人處理）
 
@@ -37,7 +41,7 @@ ops-scripts/mac-fallback/start
 
 ## 4. 驗收
 
-`start` 印出 `RESULT: OK` 才算過（rc=0）。它做的驗收是：
+`start` 印出 `RESULT: OK` 才算過（rc=0）。它做的驗收是（都對 Mac 本機剛起的 `off` lgwd，不需簽章）：
 
 - `/v1/subscriptions` 回 200，且有列；
 - 沒有冷卻的列都是 `available=True`。
@@ -68,7 +72,7 @@ ops-scripts/mac-fallback/switch <舊程式目錄> <舊 tag> <新程式目錄> <�
 1. 前置：兩個 checkout 的 HEAD 都是指定的 tag（舊版也要在，回滾用）；**密碼檔可用**（路線 1 的 `PASS_SOURCE` 或路線 2 的 `KEY_MAP` 全部名稱都在檔裡；只比對名稱）。不過就 rc=1，**舊版沒動**，多半是密碼檔加密或不見了，先請本人解密。
 2. **稽核（唯讀）**：Mac 這台的 `llm.db` 裡，`action='get'` 且 `ts >= AUDIT_SINCE` 的筆數。**不是 0 就不換，rc=3。**
 3. stop → start 新版（stop 回 rc=1，例如 pid 檔指到別的行程，就不換版本、rc=1）。
-4. 驗收：list 200 且有列；可選的檢查項（`VERIFY_PIPES`、`VERIFY_OLD_GET_ID`、`VERIFY_RESOLVE`＋`VERIFY_RESOLVE_MODEL`，留空就不查）。
+4. 驗收：list 200 且有列（Mac 本機 `off` 的 lgwd，不需簽章）；可選的檢查項（`VERIFY_PIPES`、`VERIFY_OLD_GET_ID`、`VERIFY_RESOLVE`＋`VERIFY_RESOLVE_MODEL`，留空就不查）。
 5. 任一步失敗 → 停損：stop、用舊版 start、驗 list。成功 rc=5（`ROLLED-BACK`），也失敗 rc=6（`ROLLBACK-FAILED`，4710 可能沒有服務，要回報）。
 
 換完之後，設定檔的 `CODE`／`TAG` 要改成新版，下次 `start` 才會起新版。
@@ -80,7 +84,7 @@ Mac 上的 lgwd 與隧道搶的是同一個本機埠 `127.0.0.1:4710`，同一�
 1. **先確認主機的 lgwd 起來了**（由本人或照原授權處理，AI 不 ssh）。
 2. 在 Mac 跑 `ops-scripts/mac-fallback/stop`：停掉 Mac 的 lgwd，刪掉 key 檔。
 3. 本人重開 Mac 的 4710 隧道。
-4. 驗 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4710/v1/subscriptions` 回 200（這時回答的是主機）。
+4. 驗 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4710/healthz` 回 200（這時回答的是主機）。**用 `/healthz` 不用 list**：主機開 `enforce` 時，無簽 list 會回 401，會被讀成「主機沒起來」；開 `warn` 只記 would-deny、照舊回 200；`/healthz` 在任何模式都回 200。
 
 Mac 期間登錄的冷卻不會帶回主機（只是提示，遺失只會讓剛撞牆的那把再被試一次）。主機的 key 檔沒有動過，不用輪替。
 
