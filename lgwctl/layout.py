@@ -42,8 +42,14 @@ BIN_DIR = "/usr/local/bin"
 
 SERVICE_NAME = "llmgateway.service"
 TUNNEL_SERVICE_NAME = "llmgateway-tunnel.service"
+# #289：定期檢查（timer 啟動 oneshot 的 check；由 install 安裝並 enable）。
+CHECK_SERVICE_NAME = "llmgateway-check.service"
+CHECK_TIMER_NAME = "llmgateway-check.timer"
+#: #289：與版本一起進出的兩個 check unit（移除時 timer 先停，避免它在 service
+#: 停掉後才觸發；不包含隧道，隧道不因為回滾而移除）。
+CHECK_UNIT_NAMES = (CHECK_TIMER_NAME, CHECK_SERVICE_NAME)
 CORE_UNIT_NAMES = (SERVICE_NAME,)
-OPTIONAL_UNIT_NAMES = (TUNNEL_SERVICE_NAME,)
+OPTIONAL_UNIT_NAMES = (TUNNEL_SERVICE_NAME, CHECK_SERVICE_NAME, CHECK_TIMER_NAME)
 UNIT_NAMES = CORE_UNIT_NAMES + OPTIONAL_UNIT_NAMES
 
 ENV_FILE_NAME = "llmgateway.env"
@@ -87,6 +93,9 @@ ENV_GIT = "LLMGW_GIT"
 ENV_CURL = "LLMGW_CURL"
 ENV_GH = "LLMGW_GH"
 ENV_SUDO = "LLMGW_SUDO"
+# #289：check 在 unit 裡跑時，每行加上 syslog 優先級前綴（fail→<3>、todo→<4>、
+# ok→<6>）。舊版不認得這個變數就忽略，所以回滾不需要換 unit。
+ENV_CHECK_JOURNAL = "LLMGW_CHECK_JOURNAL"
 ENV_SH = "LLMGW_SH"
 ENV_USERADD = "LLMGW_USERADD"
 # 以服務帳號身分下 user manager 的指令（install 確認舊版、遷移停／啟舊 unit 共用）。

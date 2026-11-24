@@ -16,7 +16,7 @@ import os
 import sys
 
 from . import capability, check, install, mode_history, status, sync, upgrade, usage, units, probe
-from .layout import DEFAULT_REPO, Layout, SERVICE_NAME
+from .layout import DEFAULT_REPO, ENV_CHECK_JOURNAL, Layout, SERVICE_NAME
 from .report import Report
 
 MIGRATE_COMMANDS = ("prepare-migration", "cutover", "confirm", "rollback-to-user",
@@ -159,7 +159,8 @@ def main(argv=None, env=None) -> int:
         return _migrate(args_in, env)
     args = build_parser().parse_args(args_in)
     layout = Layout.from_env(env)
-    report = Report()
+    # #289 C-982：unit 裡跑 check 時，每行帶 syslog 優先級（舊版忽略這個變數）。
+    report = Report(journal=(layout.env.get(ENV_CHECK_JOURNAL) == "1"))
     if args.command == "follow-reset":
         if os.geteuid() != 0:
             print("follow-reset 需要 root 權限", file=sys.stderr)

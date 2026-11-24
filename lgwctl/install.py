@@ -22,6 +22,7 @@ import stat
 from . import atomic, capability, probe, release, units
 from . import run as runmod
 from .layout import (
+    CHECK_TIMER_NAME,
     DEFAULT_API_PORT,
     ENV_FILE_NAME,
     KEYS_ENV_NAME,
@@ -310,6 +311,27 @@ def _step_daemon_reload(layout, report) -> bool:
     return True
 
 
+def _step_enable_timer(layout, report) -> bool:
+    """#289 C-983：版本裡有 timer 就 ``enable --now``（在服務啟動**之後**）。
+
+    冪等：已經 enabled 而且 active 就不動它。版本裡沒有這個 unit（例如舊版
+    回滾回來的目錄）就跳過。
+    """
+    if not os.path.isfile(layout.unit_file(CHECK_TIMER_NAME)):
+        return True
+    if (units.enabled_state(layout, CHECK_TIMER_NAME) == "enabled"
+            and units.is_active(layout, CHECK_TIMER_NAME)):
+        report.ok("enable-timer", f"{CHECK_TIMER_NAME} 已在跑（不動它）")
+        return True
+    if not units.enable_now(layout, CHECK_TIMER_NAME):
+        report.fail("enable-timer",
+                    f"{CHECK_TIMER_NAME} enable --now 失敗"
+                    f"（{layout.journalctl} -u {CHECK_TIMER_NAME}）")
+        return False
+    report.ok("enable-timer", CHECK_TIMER_NAME)
+    return True
+
+
 def _step_enable(layout, report) -> bool:
     names = [SERVICE_NAME]
     if layout.tunnel_configured() and os.path.isfile(layout.unit_file(TUNNEL_SERVICE_NAME)):
@@ -491,6 +513,8 @@ def run(layout, *, tag: str, repo: str | None = None, report: Report | None = No
     if not _step_enable(layout, report):
         return report.exit_code(todo_ok=True)
     if not _step_service(layout, report, cap.mode):
+        return report.exit_code(todo_ok=True)
+    if not _step_enable_timer(layout, report):
         return report.exit_code(todo_ok=True)
     if layout.tunnel_configured():
         ready, missing = layout.tunnel_config_state()

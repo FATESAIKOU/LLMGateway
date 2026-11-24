@@ -53,6 +53,7 @@ SECTION_HEADINGS = (
     "### 8.16 warn 的恢復（p）",
     "### 8.17 停止與日誌（q）",
     "### 8.18 上線前清單",
+    "### 8.19 定時檢查（timer）（r）",
     "### 8.20 從 MLP 清單同步名冊（外圍腳本 `lgw-registry-sync`，#292）",
 )
 
@@ -229,10 +230,25 @@ class DeployDocConsistencyTests(unittest.TestCase):
     def test_c834_3_check_items_exist_in_report_calls(self):
         source = (REPO_ROOT / "lgwctl" / "check.py").read_text(encoding="utf-8")
         for name in ("auth-local", "auth-heartbeat", "auth-water", "auth-stores",
-                     "auth-degraded"):
+                     "auth-degraded", "check-timer"):
             self.assertIn(name, self.chapter, name)
             self.assertRegex(source, r'report\.(?:ok|todo|fail)\(\s*"' + re.escape(name) + r'"',
                              name)
+
+    # -- C-834／C-988：定時檢查的 unit 名與環境變數（#289） -------------------
+
+    def test_c834_7_timer_units_and_journal_env_are_documented(self):
+        """#289 C-988：文件要提到兩個 unit、timer 的環境變數與安裝指令。"""
+        from lgwctl.layout import CHECK_SERVICE_NAME, CHECK_TIMER_NAME, ENV_CHECK_JOURNAL
+
+        self.assertIn(CHECK_SERVICE_NAME, self.chapter)
+        self.assertIn(CHECK_TIMER_NAME, self.chapter)
+        self.assertIn(ENV_CHECK_JOURNAL, self.chapter)
+        # 從舊版升級後要再跑一次 install（契約 C-988）。
+        self.assertIn("install --tag", self.chapter)
+        # 維護期間的停／啟指令（PM 的裁定）。
+        self.assertIn("systemctl stop " + CHECK_TIMER_NAME, self.chapter)
+        self.assertIn("systemctl start " + CHECK_TIMER_NAME, self.chapter)
 
     # -- C-834 第 4 項 -------------------------------------------------------
 

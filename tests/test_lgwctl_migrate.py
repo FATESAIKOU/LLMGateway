@@ -34,6 +34,8 @@ from unittest import mock
 
 try:
     from .lgwctl_fakes import (
+        CHECK_SERVICE,
+        CHECK_TIMER,
         FAKE_KEY_VALUE,
         FAKE_PASSWORD,
         FAKE_TAG,
@@ -43,6 +45,8 @@ try:
     )
 except ImportError:  # python3 -m unittest discover -s tests
     from lgwctl_fakes import (
+        CHECK_SERVICE,
+        CHECK_TIMER,
         FAKE_KEY_VALUE,
         FAKE_PASSWORD,
         FAKE_TAG,
@@ -77,25 +81,42 @@ if [[ -f "${fake}/busfail/${layer}" ]]; then
     exit 1
 fi
 verb="${args[0]:-}"
-unit="${args[1]:-}"
+# 最後一個參數才是 unit：enable --now／disable --now 會多一個 --now。
+unit="${!#}"
 active="${fake}/active/${layer}/${unit}"
+enabled="${fake}/enabled/${layer}/${unit}"
 case "$verb" in
     is-active)
         [[ -f "$active" ]] && exit 0 || exit 3 ;;
+    is-enabled)
+        [[ -f "${fake}/missing/${layer}/${unit}" ]] && exit 4
+        [[ -f "$enabled" ]] && exit 0 || exit 1 ;;
     is-failed)
         [[ -f "${fake}/failed/${layer}/${unit}" ]] && exit 0 || exit 1 ;;
     *)
-        if [[ -n "$unit" ]]; then
+        if [[ -n "$unit" && "$verb" != "daemon-reload" ]]; then
             printf '%s %s %s\\n' "$layer" "$verb" "$unit" >> "${fake}/actions.log"
         else
             printf '%s %s\\n' "$layer" "$verb" >> "${fake}/actions.log"
         fi ;;
 esac
 case "$verb" in
-    enable|daemon-reload)
+    enable)
+        mkdir -p "${fake}/enabled/${layer}"
+        : > "$enabled"
+        if [[ " $* " == *" --now "* ]]; then
+            mkdir -p "${fake}/active/${layer}"
+            : > "$active"
+        fi
         exit 0 ;;
     disable)
         [[ -f "${fake}/fail/disable/${layer}/${unit}" ]] && exit 1
+        rm -f "$enabled"
+        if [[ " $* " == *" --now "* ]]; then
+            rm -f "$active"
+        fi
+        exit 0 ;;
+    daemon-reload)
         exit 0 ;;
     start|restart)
         [[ -f "${fake}/fail/start/${layer}/${unit}" ]] && exit 1
@@ -239,7 +260,9 @@ class MigrateSandbox(Sandbox):
     """Sandbox ＋ 遷移用的假指令（共用一份 order.log）＋舊佈局的造景。"""
 
     def __init__(self):
-        super().__init__()
+        # #289 高-1：遷移沙箱不預設 timer 已裝／已啟用——cutover 必須自己 enable，
+        # 否則（真機）check 的 check-timer 會是 todo（rc 2）而誤判停損。
+        super().__init__(default_timer=False)
         self._write_migrate_tools()
         self.env.update({
             "LLMGW_SYSTEMD_RUN": os.path.join(self.fakebin, "systemd-run"),
@@ -291,6 +314,18 @@ class MigrateSandbox(Sandbox):
 
     def active(self, unit: str, *, layer: str = "system") -> bool:
         return os.path.exists(os.path.join(self.fake, "active", layer, unit))
+
+    def set_unit_enabled(self, unit: str, enabled: bool = True, *,
+                         layer: str = "system") -> None:
+        """#289：假 systemctl 的 is-enabled 狀態（遷移沙箱分層）。"""
+        path = os.path.join(self.fake, "enabled", layer, unit)
+        if enabled:
+            self.write(path, "1\n")
+        elif os.path.exists(path):
+            os.unlink(path)
+
+    def unit_enabled(self, unit: str, *, layer: str = "system") -> bool:
+        return os.path.exists(os.path.join(self.fake, "enabled", layer, unit))
 
     def fail_action(self, verb: str, unit: str, *, layer: str = "system") -> None:
         self.write(os.path.join(self.fake, "fail", verb, layer, unit), "1\n")
@@ -394,7 +429,8 @@ class MigrateSandbox(Sandbox):
                    f"CLAUDE_PERSONAL_OAUTH_TOKEN={FAKE_KEY_VALUE}\n", 0o600)
         self.write(self.state(".keysync.status"),
                    json.dumps({"ts": time.time(), "ok": True, "reason": "ok"}) + "\n")
-        for name in ("llmgateway.service", "llmgateway-tunnel.service"):
+        for name in ("llmgateway.service", "llmgateway-tunnel.service",
+                     CHECK_SERVICE, CHECK_TIMER):
             self.write(self.unit(name), f"[Unit]\n# 新版 {name}\n")
         return dest
 
@@ -1107,6 +1143,70 @@ class CutoverTests(MigrationTestCase):
 
     # -- 停損 ---------------------------------------------------------------
 
+    def test_cutover_enables_the_timer_before_check(self):
+        """#289 高-1：遷移沙箱沒有預先 enable timer；cutover 要在 check 之前自己
+        enable（否則 check-timer 是 todo、rc 2，會被判停損）。"""
+        # 前置：沙箱確實不是「timer 已在跑」的假設。
+        self.assertFalse(self.box.unit_enabled(CHECK_TIMER))
+        self.assertFalse(self.box.active(CHECK_TIMER))
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(lines_with_level(out, "fail"), [], out)
+        self.assertTrue(has_line(out, "enable-timer", "ok"), out)
+        self.assertTrue(has_line(out, "check-timer", "ok"), out)
+        self.assertTrue(self.box.unit_enabled(CHECK_TIMER))
+        self.assertTrue(self.box.active(CHECK_TIMER))
+        order = self.box.order()
+        self.assertLess(index_of(order, "systemctl start llmgateway.service"),
+                        index_of(order, "systemctl enable --now " + CHECK_TIMER))
+
+    def test_cutover_to_a_version_without_the_timer_unit_does_not_stop_loss(self):
+        """#289：遷移到沒有 timer 的舊 tag 時，check 不列 check-timer，不能因而停損。"""
+        for name in (CHECK_SERVICE, CHECK_TIMER):
+            os.unlink(os.path.join(self.box.opt(FAKE_TAG), "deploy", "units", name))
+            path = self.box.unit(name)
+            if os.path.exists(path):
+                os.unlink(path)
+        rc, out, err = self.inner()
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(has_line(out, "check-timer"), out)
+        self.assertNotIn("enable --now " + CHECK_TIMER, self.box.order())
+
+    def test_stop_loss_disables_the_timer_but_keeps_the_unit_files(self):
+        """#289 中-1：停損要 disable --now，但 unit 檔留著（再 cutover 才能 enable）。"""
+        rc, out, err = self.inner(FAKE_GH_API_RC="1")
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        actions = self.box.actions()
+        timer_disable = "system disable " + CHECK_TIMER
+        service_disable = "system disable " + CHECK_SERVICE
+        self.assertIn(timer_disable, actions)
+        self.assertIn(service_disable, actions)
+        # agy 低-1：timer 先停，再停 service。
+        self.assertLess(actions.index(timer_disable), actions.index(service_disable))
+        self.assertFalse(self.box.active(CHECK_TIMER))
+        self.assertFalse(self.box.unit_enabled(CHECK_TIMER))
+        # 中-1：檔案不刪（與 llmgateway.service 的回退處理一致）。
+        self.assertTrue(os.path.exists(self.box.unit(CHECK_TIMER)))
+        self.assertTrue(os.path.exists(self.box.unit(CHECK_SERVICE)))
+
+    def test_cutover_can_rerun_directly_after_a_stop_loss(self):
+        """#289 中-1：停損一次後，從 reverted 直接再跑 cutover（不重做 prepare）
+        要成功，而且 timer 在第二輪被 enable（不是卡在「未安裝」todo）。"""
+        rc, out, err = self.inner(FAKE_GH_API_RC="1")
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(self.box.cutover_state()["phase"], "reverted")
+        self.assertFalse(self.box.unit_enabled(CHECK_TIMER))
+
+        rc, out, err = self.inner()          # 第二輪：健康的 gh（預設 rc 0）
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "enable-timer", "ok"), out)
+        self.assertTrue(has_line(out, "check-timer", "ok"), out)
+        self.assertFalse(has_line(out, "check-timer", "todo"), out)
+        self.assertTrue(self.box.unit_enabled(CHECK_TIMER))
+        self.assertTrue(self.box.active(CHECK_TIMER))
+        self.assertEqual(self.box.cutover_state()["phase"], "pending-confirm")
+
     def test_local_list_not_200_rolls_back_immediately(self):
         self.box.curl_codes(["500"])
         rc, out, err = self.inner()
@@ -1348,6 +1448,9 @@ class RollbackToUserTests(MigrationTestCase):
         self.box.set_active("llmgateway-tunnel.service")
         for unit in ("llmgateway.service", "llmgateway-tunnel.service", "key-sync.timer"):
             self.box.set_active(unit, False, layer="user")
+        # #289：cutover 之後 timer 已經 enable --now（回舊版時要移除）。
+        self.box.set_unit_enabled(CHECK_TIMER)
+        self.box.set_active(CHECK_TIMER)
         self.box.write_cutover_state(phase="pending-confirm", tag=FAKE_TAG,
                                      revert_unit="lgw-revert.timer",
                                      new_service_ts=time.time() - 3600)
@@ -1409,6 +1512,23 @@ class RollbackToUserTests(MigrationTestCase):
         self.assertFalse(self.box.active("llmgateway.service"))
         self.assertTrue(self.box.active("llmgateway.service", layer="user"))
         self.assert_no_values(out, err)
+
+    def test_rollback_disables_the_new_timer_before_stopping_the_service(self):
+        """#289 中-1：回舊版要 disable --now，但**不刪** check unit 檔；timer 先於 service。"""
+        rc, out, err = self.rollback()
+        self.assertEqual(rc, 0, out + err)
+        actions = self.box.actions()
+        timer_disable = "system disable " + CHECK_TIMER
+        service_disable = "system disable " + CHECK_SERVICE
+        self.assertIn(timer_disable, actions)
+        self.assertIn(service_disable, actions)
+        self.assertLess(actions.index(timer_disable), actions.index(service_disable))
+        self.assertLess(actions.index(timer_disable),
+                        actions.index("system stop llmgateway.service"))
+        self.assertFalse(self.box.active(CHECK_TIMER))
+        self.assertFalse(self.box.unit_enabled(CHECK_TIMER))
+        self.assertTrue(os.path.exists(self.box.unit(CHECK_TIMER)))
+        self.assertTrue(os.path.exists(self.box.unit(CHECK_SERVICE)))
 
     def test_rollback_is_idempotent_when_insurance_fires_twice(self):
         self.assertEqual(self.rollback()[0], 0)
@@ -1913,6 +2033,9 @@ class FinalizeMigrationTests(MigrationTestCase):
         self.box.set_active("llmgateway-tunnel.service")
         for unit in ("llmgateway.service", "llmgateway-tunnel.service", "key-sync.timer"):
             self.box.set_active(unit, False, layer="user")
+        # #289：cutover 已經把 timer enable --now（confirmed 狀態代表切換完成）。
+        self.box.set_unit_enabled(CHECK_TIMER)
+        self.box.set_active(CHECK_TIMER)
         # 三天前就 confirm 了
         self.box.write_cutover_state(phase="confirmed", tag=FAKE_TAG,
                                      confirmed_ts=time.time() - 4 * 86400,
@@ -1992,6 +2115,27 @@ class FinalizeMigrationTests(MigrationTestCase):
         self.assertTrue(has_line(out, "check", "fail"), out)
         self.assertTrue(os.path.isdir(self.box.old_conf()))
         self.assertEqual(self.box.cutover_state()["phase"], "confirmed")
+
+    def test_finalize_after_a_real_cutover_does_not_fail_on_check_timer(self):
+        """#289 高-1：真的走 cutover → confirm → finalize，timer 由 cutover 啟用，
+        finalize 的完整 check 不該因為 check-timer todo 而拒絕收舊版。"""
+        box = MigrateSandbox()
+        self.addCleanup(box.close)
+        box.make_old_layout()
+        box.install_new_state(FAKE_TAG)
+        rc, out, err = box.run_migrate(
+            ["cutover", "--tag", FAKE_TAG, "--revert-after", "10m", "--inner"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(box.unit_enabled(CHECK_TIMER))
+        rc, out, err = box.run_migrate(["confirm"])
+        self.assertEqual(rc, 0, out + err)
+        state = box.cutover_state()
+        box.write_cutover_state(**{**state, "confirmed_ts": time.time() - 4 * 86400})
+        rc, out, err = box.run_migrate(["finalize-migration", "--yes"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "check-timer", "ok"), out)
+        self.assertTrue(os.path.isdir(os.path.join(box.state("old-user-layout"),
+                                                   ".config", "llmgateway")))
         self.assertFalse(any(line.startswith("system stop")
                              for line in self.box.actions()), self.box.actions())
 
