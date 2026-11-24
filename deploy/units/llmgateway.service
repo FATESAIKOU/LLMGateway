@@ -18,6 +18,14 @@ WorkingDirectory=/opt/llmgateway/current
 # 那個檔或那一行不在，unit 就起不來（fail-closed）。
 ExecStart=/usr/bin/python3 -m lgwd --policy /opt/llmgateway/current/policy/default.json --keys /var/lib/llmgateway/keys.env --db /var/lib/llmgateway/llm.db --api-port=${LGW_API_PORT}
 Restart=on-failure
+# 認證啟動被拒＝78（EX_CONFIG）：重啟也不會好，反而會反覆重啟到頻率限制。
+# 設定錯誤的 2 刻意不列：OSError（例如 bind 失敗）可能是暫時性的，照舊重啟。
+RestartPreventExitStatus=78
+# 停止時先只對主行程送 SIGTERM，讓它在 20 秒內等完在途請求；主行程結束後或
+# 期限到時，才對 cgroup 裡剩下的行程送 SIGKILL。預設的 control-group 會同時
+# 殺掉在途的驗章子行程。
+TimeoutStopSec=30
+KillMode=mixed
 EnvironmentFile=/etc/llmgateway/llmgateway.env
 # 解密密碼只經 LoadCredential 交給服務（服務裡是 $CREDENTIALS_DIRECTORY/keys.pass；
 # 值不進環境、不進 argv）。

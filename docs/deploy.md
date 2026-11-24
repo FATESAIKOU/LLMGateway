@@ -14,7 +14,7 @@
 
 ## 0. 全貌與架構
 
-服務只做這幾件事：list、resolve、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`POST /v1/subscriptions/{id}/cooldown`）。單筆取回 key 的 `GET /v1/subscriptions/{id}?agent=` 已於 #48 移除，現在一律 404；要拿 key 改用 resolve 回的 `env`。冷卻只是提示，resolve 不因冷卻拒絕（冷卻資訊在 `meta`／`list` 的 `cooldown`、`model_cooldowns`；要不要等、換哪個模型由呼叫方決定）。**不做應用層認證**，存取控制只靠 SSH 與本機綁定：
+服務只做這幾件事：list、resolve、登錄冷卻（`GET /v1/subscriptions`、`GET /v1/resolve?agent=&provider=…`、`POST /v1/subscriptions/{id}/cooldown`）。單筆取回 key 的 `GET /v1/subscriptions/{id}?agent=` 已於 #48 移除，現在一律 404；要拿 key 改用 resolve 回的 `env`。冷卻只是提示，resolve 不因冷卻拒絕（冷卻資訊在 `meta`／`list` 的 `cooldown`、`model_cooldowns`；要不要等、換哪個模型由呼叫方決定）。**預設不做應用層認證**（`LGWD_AUTH_MODE=off`），存取控制只靠 SSH 與本機綁定；`warn`／`enforce` 見第 8 節：
 
 - `lgwd` 只綁放服務那台的 `127.0.0.1:<API 埠>`（預設 8480），不綁任何對外或容器網路的介面。
 - 隧道守護 `llmgateway-tunnel.service`（**可選**：沒有它 `lgwd` 照常運作，`llmgwctl start`／`stop`／`restart`／`check`／`upgrade` 都不依賴它）用自己的金鑰 `ssh -R` 到會合點，把兩個埠公開在**會合點的 127.0.0.1**：
@@ -438,7 +438,7 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 
   只認 `enabled`（布林）與 `ttl_seconds`（正整數），其他鍵一律拒收。**程式**在政策沒有設定時預設關閉（`enabled: false`）；**出廠政策檔**（`policy/default.json`）自 #60 階段 C 起開啟 Claude（經本人授權）；部署前需完成 10.1／10.2 與 C1（階段 C 的前置，即以服務帳號裝原版 Claude Code、trust 固定目錄、服務的 PATH 與 `LGW_USAGE_CLAUDE_CWD` 或 `--usage-claude-cwd`，見 `openspec/changes/archive/2026-10-26-usage-in-responses/tasks.md` 第 10 節），未完成時 `usage` 會是 `unknown`／`upstream_error`。
 - **`available_again_at`**：`cooldown.until`（未來）與「用完（`remaining_percent` ≤ 0）的窗口之 `resets_at`」中最晚者；`available` 不因用量為 0 而變 false，選把規則也不變。
-- **`GET /v1/usage`（用量一覽）**：唯讀，只接受 GET（`POST`、`PUT`、`DELETE`、`PATCH` 回 404；其他未實作的方法如 `HEAD`、`OPTIONS` 由 Python 標準函式庫回 501）；回 `{"schema": 1, "subscriptions": [...]}`，順序與 list 相同（依 `priority`）。每筆恰十二鍵：`id`、`kind`，加上 list 的 `usage` 八個共用欄位（`status`、`source`、`fetched_at`、`stale`、`reason`、`note`、`session`、`weekly`，同一快取狀態下與 list 逐值相等），再加 `weekly_used_usd`、`weekly_used_usd_fetched_at`。沒有 `pipes`。存取控制與 list 相同：沒有應用層認證，只靠 SSH 與本機綁定。用途是週報或 AI 取一覽，不必抓整份 list。
+- **`GET /v1/usage`（用量一覽）**：唯讀，只接受 GET（`POST`、`PUT`、`DELETE`、`PATCH` 回 404；其他未實作的方法如 `HEAD`、`OPTIONS` 由 Python 標準函式庫回 501）；回 `{"schema": 1, "subscriptions": [...]}`，順序與 list 相同（依 `priority`）。每筆恰十二鍵：`id`、`kind`，加上 list 的 `usage` 八個共用欄位（`status`、`source`、`fetched_at`、`stale`、`reason`、`note`、`session`、`weekly`，同一快取狀態下與 list 逐值相等），再加 `weekly_used_usd`、`weekly_used_usd_fetched_at`。沒有 `pipes`。存取控制與 list 相同：`off` 時沒有應用層認證，只靠 SSH 與本機綁定；`warn`／`enforce` 見第 8 節。用途是週報或 AI 取一覽，不必抓整份 list。
 - **`weekly_used_usd`／`weekly_used_usd_fetched_at`**：只有 OpenRouter 可以是非 null。`weekly_used_usd` 是上游 `usage_weekly` 的原值，單位 USD，不換算、不取整，不是餘額或配額。`weekly_used_usd_fetched_at` 是該金額的取得時刻（RFC 3339 UTC），與窗口的 `fetched_at` 各自獨立；金額可能在窗口失敗時仍有值，應以金額自己的時間判讀。`0` 是真的 0，表示上游回報本週用量為 0；`null` 是拿不到，**不是金額**，不得當 0 用。拿不到的原因包括：欄位缺、值無效、上游失敗、未取過、停用或未部署、超過 6 小時、跨 UTC 週一 00:00 之後（金額屬上一週）、取用量內部例外。兩鍵同時為 null。其他訂閱、list、resolve、pipes、note 仍不含金額。
 - **讀法（消費者）**：查詢不等背景請求，第一次可能是 null。先呼叫一次 `GET /v1/usage` 觸發取值；間隔 ≥ 6 秒（上游逾時為 5 秒）再讀；仍為 null 再間隔 ≥ 6 秒讀第二次；第二次也是 null 就記「金額未取得」（附窗口的 `status` 與 `reason`），不以 0 代替，也不再等待。
 - **相容**：兩鍵是新增欄位，舊消費端忽略即可。但嚴格檢查舊的十鍵一覽的外部讀者會壞；週報讀取端尚未實作，部署前須確認它容忍未知鍵。
@@ -495,7 +495,7 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 
 > [!IMPORTANT]
 > **限度（advisory，不是存取控制）：這把只在 Mac 能用，但 Gateway 擋不住誤用。**
-> 出廠政策是所有實例共用的一份（同一份 `policy/default.json`），所以 worker 實例的 `GET /v1/subscriptions` 也會對 `antigravity` 顯示 `available: true`、`usage.status` 為 `not_applicable`——那是「沒有憑證但恆算已部署」，不是「這台可以用」。worker 誤用時會拿到 200 與空的 `env`，直到 agy 在該台找不到而失敗（503）才會發現。Gateway 沒有呼叫方／主機概念，也不做應用層認證（只有 loopback＋SSH 轉發），因此「只給 Mac」只能靠部署與自律（worker 的 sidecar 不要求 agy），不能寫成擋得住。
+> 出廠政策是所有實例共用的一份（同一份 `policy/default.json`），所以 worker 實例的 `GET /v1/subscriptions` 也會對 `antigravity` 顯示 `available: true`、`usage.status` 為 `not_applicable`——那是「沒有憑證但恆算已部署」，不是「這台可以用」。worker 誤用時會拿到 200 與空的 `env`，直到 agy 在該台找不到而失敗（503）才會發現。Gateway 的 `off` 模式沒有呼叫方／主機概念，也不驗應用層認證（只有 loopback＋SSH 轉發；`warn`／`enforce` 見第 8 節），因此「只給 Mac」只能靠部署與自律（worker 的 sidecar 不要求 agy），不能寫成擋得住。
 
 
 ### 5.10 啟動、停止與重啟服務（`start`／`stop`／`restart`）
@@ -916,6 +916,286 @@ repo 側的舊靜態鍵文件與腳本殘留，另開 d 單清理；清理前不
 
 ---
 
+## 8. 應用層認證
+
+本章涵蓋 `LGWD_AUTH_MODE` 的設定、首次啟用、名冊（principal／key）的維護、輪替與撤銷、回退與故障修復。預設 `off`，行為與以前相同。每一節開頭寫明「要 root 嗎」「lgwd 要停嗎」；管理指令一律由 root 在當版目錄（`/opt/llmgateway/current`）以 `sudo llmgwctl` 執行。
+
+### 8.1 認證設定（a）
+
+**root：** 要（寫 `/etc/llmgateway/llmgateway.env`）。**lgwd 停止：** 不用，改完 `sudo llmgwctl restart`。
+
+`lgwd` 沒有設定檔，認證設定與既有設定同一套慣例：命令列優先，其次環境變數，最後預設值（正式部署用 unit 的 `EnvironmentFile`）。路徑須為絕對路徑。
+
+| 旗標 | 環境變數 | 預設值 |
+| --- | --- | --- |
+| `--auth-mode` | `LGWD_AUTH_MODE` | `off`（另有 `warn`、`enforce`） |
+| `--auth-registry` | `LGWD_AUTH_REGISTRY` | `/etc/llmgateway/auth-registry.json` |
+| `--auth-state-dir` | `LGWD_AUTH_STATE_DIR` | `/var/lib/llmgateway` |
+| `--auth-sshkeygen-path` | `LGWD_AUTH_SSHKEYGEN_PATH` | `/usr/bin/ssh-keygen` |
+| `--auth-per-key-max` | `LGWD_AUTH_PER_KEY_MAX` | `600`（正整數） |
+| `--auth-verify-concurrency` | `LGWD_AUTH_VERIFY_CONCURRENCY` | `16`（1 至 32） |
+| `--auth-verify-timeout` | `LGWD_AUTH_VERIFY_TIMEOUT` | `2`（正有限數，秒） |
+
+- `off`：不驗證；啟動只記一行 `auth mode=off`。存取控制只靠 loopback 與 SSH 轉發。
+- `warn`：有名冊就驗章與授權，並把 would-deny 記進日誌，但**所有結果照舊處理業務**（仍會洩漏憑證）。名冊、`ssh-keygen` 或兩個庫不可用時不阻止啟動，記 `auth_unavailable` 並標示驗證不可判定，不誤報成功。
+- `enforce`：五條業務路由先驗章與授權才進業務。啟動須有有效名冊（或信任庫的已驗證快照）、可用且自測通過的 `ssh-keygen`、已存在且庫識別一致的兩個庫，否則拒絕啟動。
+
+其他路徑一律由 `auth-state-dir` 推導，沒有另外的旗標：`auth-replay.sqlite`（可丟棄的防重放庫）、`auth-trust.sqlite`（世代水位、墓碑、已驗證快照）、`auth-store.lock`、`.auth-registry.status`、`allowed_signers.<世代>`、`sshsig/`、`auth-audit.log`。
+
+結束碼：設定值不合法（含未知模式）以結束碼 2 結束；因認證理由拒絕啟動以結束碼 78 結束。2 仍照舊讓 systemd 重啟（OSError 等可能是暫時性的，例如 bind 失敗）；78 由 unit 的 `RestartPreventExitStatus=78` 擋下，不反覆重啟（見 8.17）。
+
+### 8.2 首次啟用（離線可重現）（b）
+
+**root：** 要。**lgwd 停止：** 要（`auth-store init` 是離線寫入）。
+
+1. 停服務：
+```bash
+sudo llmgwctl stop
+```
+2. 建兩個庫（任一庫已存在就拒絕；兩庫都遺失時要先確認這真的是首次啟用）：
+```bash
+sudo llmgwctl auth-store init --confirm
+```
+3. 備妥名冊，`root:llmgw` 0640（內容見 8.4）。候選檔放在**別的位置**（例如 root 的家目錄 `/root/auth-registry.json`）；第 7 步的 `install` 會把它原子寫進正式路徑 `/etc/llmgateway/auth-registry.json`，不要直接拿正式路徑當候選檔。若尚未建立本機管理私鑰，先照 8.3 產生 `/etc/llmgateway/local-admin-signing-key`，並把它的公鑰填進名冊的 `llmgwctl-local-admin`。
+4. 離線驗名冊（lgwd 啟動後、安裝前後都可以再跑一次；`--against-trust` 需 root，會比對信任庫的世代水位、墓碑與內容雜湊）：
+```bash
+sudo llmgwctl auth-registry check <檔>
+```
+5. 把 `LGWD_AUTH_MODE=warn` 寫進 `/etc/llmgateway/llmgateway.env`。
+6. 啟動：
+```bash
+sudo llmgwctl start
+```
+7. 安裝名冊並等 lgwd 載入確認（回 0 才算完成）：
+```bash
+sudo llmgwctl auth-registry install <檔>
+```
+8. 檢查：
+```bash
+sudo llmgwctl check
+```
+`warn` 下 `auth-local` 會報 `todo`、`check` 結束碼為 2，屬正常；切到 `enforce` 之後才會全綠。
+
+`auth-store init` 建庫時把鎖檔與兩個庫設成 `llmgw` 擁有、0600；lgwd 在 warn／enforce 啟動時以 `llmgw` 身分開鎖檔（`O_RDWR|O_CREAT`，0600）並取獨佔 `flock`，所以 init 之後 lgwd 拿得到鎖。lgwd **在任何模式都不建庫**：任一庫缺檔或識別不一致，enforce 拒絕啟動、warn 告警並以驗證不可判定照舊處理。
+
+### 8.3 本機管理 principal（c）
+
+**root：** 要（建私鑰與安裝名冊）。**lgwd 停止：** 不用。
+
+`llmgwctl usage` 與 `check` 的 `auth-local` 以本機管理 principal 簽章：
+
+- 私鑰：`/etc/llmgateway/local-admin-signing-key`，`root:root`，權限**恰為 0600**。0400 也會被拒，因為檢查是「恰等於」，不是「沒有群組／其他人權限」。
+- 型別：`ssh-ed25519`、**沒有密語**、不載入 ssh-agent。
+- key ID：`llmgwctl-local-admin`（可用 `LLMGW_LOCAL_ADMIN_KEY_ID` 覆寫；覆寫時必須與名冊登記的 `key_id` 一致）。
+- 名冊登記的權限：`ops` 為 `["list","usage","roles"]`、`resolve_agents` 為 `[]`、`roles` 列出全部角色與 agent（讓 `usage --role` 可用）。
+
+建私鑰（不覆蓋既有的）：
+```bash
+sudo ssh-keygen -q -t ed25519 -N '' -C '' -f /etc/llmgateway/local-admin-signing-key
+sudo chown root:root /etc/llmgateway/local-admin-signing-key
+sudo chmod 0600 /etc/llmgateway/local-admin-signing-key
+```
+非 root 讀不到私鑰時，`usage` 照 design 只送一次無簽請求（enforce 下回 401、結束碼 1 並提示用 `sudo`），`check` 的 `auth-local` 記 `todo`；**不得**先簽、失敗後再改送無簽，也不重試。
+
+### 8.4 名冊預設（B）與範例（d）
+
+**root：** 要。**lgwd 停止：** 不用（`install` 不必停）。
+
+本人裁定 B：節點 principal 預設五種操作全開，`resolve_agents` 與 `roles` 填滿。名冊是 UTF-8 JSON（無 BOM、≤1 MiB、物件內重複鍵即拒絕），schema 1，頂層鍵恰為 `schema`、`generation`、`principals`、`keys`。`generation` 是 1～2^53−1 的整數，每次變更（新增、輪替、撤銷）都要加一。
+
+範例有兩個 principal（節點與本機管理）與一筆 `revoked` 鍵（墓碑示範；撤銷的 key 不得從名冊刪除）：
+
+```json
+{
+  "schema": 1,
+  "generation": 12,
+  "principals": {
+    "w1-worker": {
+      "ops": ["list", "usage", "roles", "resolve", "cooldown"],
+      "resolve_agents": ["claude-code", "opencode", "agy", "codex"],
+      "roles": {
+        "PMO": ["claude-code", "opencode", "agy", "codex"],
+        "PM": ["claude-code", "opencode", "agy", "codex"],
+        "impl": ["claude-code", "opencode", "agy", "codex"],
+        "rev": ["claude-code", "opencode", "agy", "codex"],
+        "qa": ["claude-code", "opencode", "agy", "codex"]
+      }
+    },
+    "local-admin": {
+      "ops": ["list", "usage", "roles"],
+      "resolve_agents": [],
+      "roles": {
+        "PMO": ["claude-code", "opencode", "agy", "codex"],
+        "PM": ["claude-code", "opencode", "agy", "codex"],
+        "impl": ["claude-code", "opencode", "agy", "codex"],
+        "rev": ["claude-code", "opencode", "agy", "codex"],
+        "qa": ["claude-code", "opencode", "agy", "codex"]
+      }
+    }
+  },
+  "keys": [
+    {"key_id": "w1-tunnel-a", "principal": "w1-worker", "public_key": "<NODE_PUBKEY>", "status": "active"},
+    {"key_id": "w1-tunnel-old", "principal": "w1-worker", "public_key": "<REVOKED_PUBKEY>", "status": "revoked"},
+    {"key_id": "llmgwctl-local-admin", "principal": "local-admin", "public_key": "<LOCAL_PUBKEY>", "status": "active"}
+  ]
+}
+```
+
+### 8.5 resolve_agents 與 roles 的用法（e）
+
+**root：** 不用（純讀名冊格式）。**lgwd 停止：** 不用。
+
+`ops` 不含 `resolve` 時 `resolve_agents` 必須是空陣列；不含 `roles` 時 `roles` 必須是空物件，否則整份名冊被拒。`roles` 的格式是 `{角色: [agent ...]}`，角色取自 `lgwd/policy.py` 的 `ROLES`，agent 取自 `AGENTS`；未列在該 principal 的 `resolve_agents`／`roles` 的呼叫一律拒絕。
+
+### 8.6 resolve 不能依角色限制（f）
+
+**root：** 不用。**lgwd 停止：** 不用。
+
+resolve 的請求不帶角色，名冊只能限制 agent（`resolve_agents`）。要依角色限制 resolve，需要 schema 2，不在本期範圍；不要把 role 字串當成可信來源。
+
+### 8.7 cooldown 粒度粗（g）
+
+**root：** 不用。**lgwd 停止：** 不用。
+
+`cooldown` 是全有或全無，不能限定到某個訂閱。要每個訂閱各自的權限，需要 schema 2。
+
+### 8.8 warn 到 enforce 與回退（h）
+
+**root：** 要（改 env 檔）。**lgwd 停止：** 不用，每步都是 `restart`。
+
+- 觀察期要涵蓋**所有已知呼叫方至少各一次 `outcome=pass`**（日誌可以看到已驗章的 principal），而且之後至少一個完整工作日沒有 `deny` 或 `forbidden`，才切 `enforce`。觀察期多長由維運依呼叫方清單決定，不能只看一個 60 秒窗口。
+- 切換方法：把 `/etc/llmgateway/llmgateway.env` 的 `LGWD_AUTH_MODE` 改成 `warn` 或 `enforce`，再：
+```bash
+sudo llmgwctl restart
+```
+- 回退順序是 enforce → warn → off，每一步都 `restart`。**回退等於恢復免認證，不是安全措施**；若懷疑盜鑰，先撤銷並換鑰，不為便利降級。
+- 結束碼 2 仍會照常重啟（見 8.1）：OSError 等暫時性錯誤重啟可能自己好。
+
+### 8.9 回滾版本的副作用（i）
+
+**root：** 要（`rollback`）。**lgwd 停止：** 不用（指令自己處理）。
+
+`llmgwctl rollback` 或升級失敗自動切回時，會一併換回**該版本的 unit**（unit 是版本的一部分）。這些內部里程碑沒有對應的發行 tag（用 `git tag --contains <該版 commit>` 查是空的），所以看**版本目錄的靜態條件**辨認，不要打請求、也不要用請求確認（那會實際取得憑證）：
+
+```bash
+# D5d 之前：沒有這一行，78 會再度被反覆重啟
+grep -q '^RestartPreventExitStatus=78' <版本目錄>/deploy/units/llmgateway.service
+# D3a 之前（含 D2）：沒有授權判斷；只驗章、不授權，
+# 任何已登記的 principal 都能做五種操作，包括本機管理 principal 拿到 resolve
+test -f <版本目錄>/lgwd/auth_authz.py
+# D2 之前：沒有認證模組，lgwd 不認得 LGWD_AUTH_*，等於 off 而且不會告警
+test -f <版本目錄>/lgwd/auth.py
+```
+
+上面三個指令回非 0 就代表是那一種版本。`<版本目錄>` 是 `/opt/llmgateway/<tag>` 的版本目錄。
+
+enforce 期間若要回滾到這些版本，先照 8.8 降到 `off`，並記錄風險。
+
+### 8.10 新增鍵與輪替（j）
+
+**root：** 要（install）。**lgwd 停止：** 不用。
+
+雙鍵輪替：
+
+1. `generation` ＋1，加新鍵（同一個 principal，`status` 為 `active`），install 回 0。
+2. 客戶端換用新鍵。
+2.5 在**客戶端**確認新鍵已經在用：每個使用這個 principal 的客戶端，設定裡的 key ID 都已換成新的，而且各用新鍵成功打過一次（`enforce` 下回 200；`warn` 下看 lgwd 日誌，這個 principal 有 `outcome=pass`、沒有 deny）。lgwd 日誌不記 key ID，伺服端無法分辨新舊鍵的流量。
+3. `generation` ＋1，把舊鍵改成 `revoked`（**不得刪掉這一列**，墓碑要靠它），install 回 0。
+
+```bash
+sudo llmgwctl auth-registry check <檔>
+sudo llmgwctl auth-registry install <檔>
+```
+
+### 8.11 撤銷與撤銷延遲（k）
+
+**root：** 要（install）。**lgwd 停止：** 不用。
+
+撤銷＝`generation` ＋1 並把該鍵改成 `revoked`，`install` 回 0 才算完成。用 `--no-wait` 或 `install` 逾時都**不得**宣告撤銷完成（它會印「名冊已寫入但服務尚未載入／載入失敗」）。
+
+延遲：lgwd 每 2 秒查一次名冊檔，`install` 等載入確認最多 30 秒（預設 `--timeout 30`）。載入前已經通過驗章的請求照常完成。`warn` 下撤銷不會擋請求，只記 deny；`off` 下名冊不生效。
+
+```bash
+sudo llmgwctl auth-registry install --timeout 30 <檔>
+sudo llmgwctl auth-registry status
+```
+
+### 8.12 不得用備份還原（l）
+
+**root：** 要（修復指令）。**lgwd 停止：** 要。
+
+任何一個庫都**不得**用備份檔還原：還原舊的防重放庫，等於讓已被截存的簽章可以再送一次；還原舊的信任庫，會讓墓碑與世代水位倒退。一律走 `recover-store` 或 `rebuild-trust`；這兩個指令印出「回退防護已失效」時，要人工核驗名冊與可信來源一致。
+
+### 8.13 故障修復（m）
+
+**root：** 要。**lgwd 停止：** 要；每個指令都要 `--confirm`，做完再手動 `start`。
+
+| 症狀 | 指令 |
+| --- | --- |
+| 防重放庫壞了（`auth-stores`／啟動說 replay 庫不可用） | `sudo llmgwctl auth-replay recover-store --confirm` |
+| 信任庫壞了（墓碑與水位要重建） | `sudo llmgwctl auth-registry rebuild-trust --confirm <已核驗名冊>` |
+| 誤裝高世代（例如誤裝 generation 100，可信的是 12） | `sudo llmgwctl auth-registry reset-generation --confirm <已核驗名冊>` |
+| 時鐘跳到未來（`auth-water` 報某把 key 的 H 在未來） | `sudo llmgwctl auth-replay reset-key-water --confirm --key <key ID>`（或 `--all-future`） |
+
+修復完成後：
+```bash
+sudo llmgwctl start
+```
+
+`recover-store` 會把每把 key 的 H 設成 now＋60；`reset-key-water` 會印伺服器時間與新舊 H，供確認時鐘已校正。lgwd 啟動時拿不到鎖（另一個 lgwd 或寫入工具持有）會以 78 結束，而且**不會自動重試**（unit 的 `RestartPreventExitStatus=78`）。
+
+### 8.14 維護期間的 check（n）
+
+**root：** 不用（`check` 可非 root 跑，但 `auth-*` 需 root 才是確定結果）。**lgwd 停止：** 這是預期結果。
+
+為了跑寫入指令而停掉 lgwd 時，`check` 的 `auth-heartbeat` 會 fail（心跳超過 180 秒），`auth-local` 也會失敗；這是預期的，啟動後恢復。`check` 的認證項目是 `auth-local`、`auth-heartbeat`、`auth-water`、`auth-stores`；非 root 時 `auth-local`、`auth-water`、`auth-stores` 記 `todo`（結束碼 2），不報 fail。
+
+### 8.15 policy 新增 agent 或角色時（o）
+
+**root：** 要（install）。**lgwd 停止：** 不用。
+
+`AGENTS` 與 `ROLES` 寫在程式裡（`lgwd/policy.py`）。新版本加了 agent 或角色時，名冊要先把它列進 `resolve_agents` 或 `roles` 並 install；否則 enforce 下用新 agent 的呼叫會 403。反過來，名冊列了舊版不認得的 agent，舊版 parser 會整份拒絕，所以回滾前也要先檢查名冊。
+
+### 8.16 warn 的恢復（p）
+
+**root：** 不用。**lgwd 停止：** 名冊與 `ssh-keygen` 不用；鎖與兩個庫要。
+
+名冊（背景每 2 秒輪詢）與 `ssh-keygen`（stat 改變重跑自測）在執行中會自動恢復。鎖與兩個庫如果在**啟動時**就不可用，整個執行期維持「不可判定」，要 `restart` 才會再試。
+
+### 8.17 停止與日誌（q）
+
+**root：** 要（`stop`／`restart`）。**lgwd 停止：** 這一節就是停止行為。
+
+停止（SIGTERM／SIGINT）時先不再接受新連線，最多等 20 秒讓已進來的請求做完，再關閉兩個認證庫並釋放鎖。閒置連線與只送了一半標頭的連線不會讓停止卡住，第二次 SIGTERM／SIGINT 也不會加速或打斷收尾：兩個訊號共用同一個 handler，而且從註冊後一路安裝到停止流程跑完、行程要退出之前，都不還原預設處置；重複的訊號只是再設一次停止事件。unit 的 `TimeoutStopSec=30` 不得小於 30 秒。
+
+unit 另外設 `KillMode=mixed`：停止時只對主行程送 SIGTERM，等它收尾（最多 20 秒），**主行程結束後或期限到時**，才對 cgroup 裡剩下的行程送 SIGKILL。預設的 `control-group` 會同時殺掉在途的驗章子行程（`ssh-keygen`、`prlimit`），把停止那一刻正在驗章的請求變成 503，也讓 #263 的「最多等 20 秒」白做；`mixed` 不會留下孤兒。
+
+handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）收到 SIGTERM 會照預設行為立刻結束，鎖由作業系統釋放，SQLite 的 WAL 不受影響。
+
+日誌：
+
+- `auth-audit.log`（`/var/lib/llmgateway/auth-audit.log`）是 `root:root` 0600 的附加式歸責紀錄，一行一筆 JSON；root 改得了，所以不是不可竄改的證據。
+- 寫入型 CLI 同時送 journal，ident 是 `llmgwctl-auth`、facility 是 `authpriv`；用 `journalctl -t llmgwctl-auth` 查。
+
+### 8.18 上線前清單
+
+**root：** 要（真機操作）。**lgwd 停止：** 視項目。
+
+正式主機啟用 warn／enforce 之前，逐項完成（單次真機授權由本人給；V-0 的每一項都由 PMO 申請、PM 執行，P-D4 由本人或 PMO 做）：
+
+| # | 項目 | 判準 |
+| --- | --- | --- |
+| V-0.1 | `ssh -V` 是 OpenSSH 10.2p1；用臨時金鑰重跑分類表的五種輸出（Good、incorrect、兩種 Could not verify、缺 principal） | 字樣與 design 相同；不同就停下，不擴充分類表 |
+| V-0.2 | lgwd 以 warn 啟動時自測通過 | 日誌沒有 self-test 失敗 |
+| V-0.3 | `prlimit` 存在，且以 llmgw 身分能對子行程設限 | — |
+| V-0.4 | `systemd --version` ≥ 250；`systemd-analyze verify` 乾淨 | `Type=exec` 與 unit 都有效 |
+| V-0.5 | 壓測中執行 `systemctl stop` | 503 為 0；停止後 cgroup 沒有殘留行程 |
+| V-0.6 | C-612 在正式主機重跑 | 段二的資源數值取兩邊較大者 |
+| V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
+| P-D4 | Mac 與 worker 映像的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 由本人或 PMO 做 |
+
+---
+
 ## 附錄：舊版（v0.1.x，遷移完成後不再使用）
 
 > [!WARNING]
@@ -937,29 +1217,3 @@ repo 側的舊靜態鍵文件與腳本殘留，另開 d 單清理；清理前不
    ```
 3. 舊版升級依賴 `deploy/install.sh --tag <tag>`，無自動 policy dry-run 與 rollback 機制。
 4. 解密密碼存放於 `~/.config/llmgateway/keysync.env`（0600，llmgw 自有）。
-
-### 應用層認證設定
-
-`lgwd` 的認證設定以命令列優先，其次是環境變數，最後是預設值；路徑須為絕對路徑。
-
-| 旗標 | 環境變數 | 預設值 |
-| --- | --- | --- |
-| `--auth-mode` | `LGWD_AUTH_MODE` | `off`（另有 `warn`、`enforce`） |
-| `--auth-registry` | `LGWD_AUTH_REGISTRY` | `/etc/llmgateway/auth-registry.json` |
-| `--auth-state-dir` | `LGWD_AUTH_STATE_DIR` | `/var/lib/llmgateway` |
-| `--auth-sshkeygen-path` | `LGWD_AUTH_SSHKEYGEN_PATH` | `/usr/bin/ssh-keygen` |
-| `--auth-per-key-max` | `LGWD_AUTH_PER_KEY_MAX` | `600`（正整數） |
-| `--auth-verify-concurrency` | `LGWD_AUTH_VERIFY_CONCURRENCY` | `16`（1 至 32） |
-| `--auth-verify-timeout` | `LGWD_AUTH_VERIFY_TIMEOUT` | `2` 秒（正有限數） |
-
-`off` 不啟用認證；`warn` 記錄認證結果並維持原業務行為；`enforce` 要求認證。
-設定錯誤以 2 結束，認證啟動被拒絕以 78 結束。兩庫與鎖檔路徑由狀態目錄推導，
-服務不自行建立認證庫。庫或鎖在 warn 啟動時不可用，修復後須重啟服務。
-
-停止（SIGTERM／SIGINT）時先不再接受新連線，最多等 20 秒讓已進來的請求做完，再關閉
-兩個認證庫並釋放鎖。閒置連線與只送了一半標頭的連線不會讓停止卡住，第二次
-SIGTERM／SIGINT 也不會加速或打斷收尾：兩個訊號共用同一個 handler，而且從註冊後
-一路安裝到停止流程跑完、行程要退出之前，都不還原預設處置；重複的訊號只是再設一次
-停止事件。unit 的 `TimeoutStopSec`（沒設定時 systemd 預設 90 秒）不得小於 30 秒。
-handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）收到 SIGTERM 會照預設
-行為立刻結束，鎖由作業系統釋放，SQLite 的 WAL 不受影響。
