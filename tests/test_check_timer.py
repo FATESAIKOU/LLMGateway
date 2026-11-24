@@ -24,6 +24,7 @@ from unittest import mock
 
 try:
     from .lgwctl_fakes import (
+        CHECK_NOTIFY,
         CHECK_SERVICE,
         CHECK_TIMER,
         FAKE_KEY_VALUE,
@@ -36,6 +37,7 @@ try:
     from .test_lgwctl_install import _UnitFields
 except ImportError:  # python3 -m unittest discover -s tests
     from lgwctl_fakes import (
+        CHECK_NOTIFY,
         CHECK_SERVICE,
         CHECK_TIMER,
         FAKE_KEY_VALUE,
@@ -314,6 +316,38 @@ class CheckTimerItemTests(TimerFixture):
         rc, out, err = self.check("--no-remote")
         self.assertEqual(rc, 0, out + err)
         self.assertFalse(has_line(out, "check-timer"), out)
+
+    # -- #296（C-996）：這一版有 notify unit 檔、系統上卻沒有 -----------------
+
+    def test_c296_timer_ok_but_notify_unit_missing_is_todo(self):
+        """從 #300 的版本升級上來：跑升級的是舊版 lgwctl，不會裝 notify unit。
+
+        timer 在跑也要提醒補跑 install（systemd 會在 check 失敗時記找不到 unit）。
+        """
+        self.box.write(os.path.join(self.box.opt(FAKE_TAG), "deploy", "units",
+                                    CHECK_NOTIFY), f"[Unit]\n# {CHECK_NOTIFY}\n")
+        self.assertFalse(os.path.exists(self.box.unit(CHECK_NOTIFY)))
+        rc, out, err = self.check("--no-remote")
+        self.assertEqual(rc, 2, out + err)
+        line = next(line for line in out.splitlines() if " check-timer" in line)
+        self.assertIn(CHECK_NOTIFY, line)
+        self.assertIn("未安裝", line)
+        self.assertIn("llmgwctl install", line)
+
+    def test_c296_timer_ok_and_notify_unit_installed_is_ok(self):
+        self.box.write(os.path.join(self.box.opt(FAKE_TAG), "deploy", "units",
+                                    CHECK_NOTIFY), f"[Unit]\n# {CHECK_NOTIFY}\n")
+        self.box.write(self.box.unit(CHECK_NOTIFY), f"[Unit]\n# {CHECK_NOTIFY}\n")
+        rc, out, err = self.check("--no-remote")
+        # check-notify 另有自己的 todo（沙箱沒放 check-notify.env），這一項是 ok。
+        self.assertTrue(has_line(out, "check-timer", "ok"), out)
+        self.assertIn(rc, (0, 2), out + err)
+
+    def test_c296_version_without_notify_unit_does_not_check_it(self):
+        """這一版沒有 notify unit（#300 及更舊）：只看 timer，不因它變 todo。"""
+        rc, out, err = self.check("--no-remote")
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "check-timer", "ok"), out)
 
 
 class InstallTimerTests(unittest.TestCase):

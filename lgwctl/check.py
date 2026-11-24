@@ -22,7 +22,12 @@
   否則 todo（未安裝／未啟用／沒在跑分開寫，附下一步指令）；systemctl 不能用時
   todo。只有在這一版的 ``deploy/units/`` 有 timer 檔時才列（更舊的版本沒有這個
   功能）。從不認得 timer 的舊版升級上來的機器會看到「未安裝」，補跑一次
-  ``llmgwctl install`` 即可。
+  ``llmgwctl install`` 即可。**#296**：這一版有 notify unit 檔（見下一項）而系統上
+  沒有那個檔時，timer 就算在跑也記 todo（安裝指令同上）。
+- ``check-notify``（#296；C-996）：check 失敗時的通知有沒有設定好。只會 ok 或
+  todo（不會 fail）：``/etc/llmgateway/check-notify.env`` 的三個鍵齊全、找得到
+  ``aicomm`` 就是 ok，否則 todo「失敗不會通知 PMO（缺 check-notify.env 或
+  aicomm）」。只有這一版的 ``deploy/units/`` 有 notify unit 檔時才列。不送訊息。
 - ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``，模式以
   環境變數 ``LGW_PROBE_API_MODE`` 傳）；``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
@@ -41,12 +46,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 
 from . import capability, local_auth, mode_history, probe, units
 from . import run as runmod
-from .layout import (CHECK_TIMER_NAME, ENV_CHECK_JOURNAL, KEYS_REPO,
-                     TUNNEL_SERVICE_NAME, SERVICE_NAME)
+from .layout import (CHECK_NOTIFY_AICOMM, CHECK_NOTIFY_ENV_KEYS, CHECK_NOTIFY_NAME,
+                     CHECK_TIMER_NAME, ENV_CHECK_JOURNAL, KEYS_REPO,
+                     SERVICE_NAME, TUNNEL_SERVICE_NAME, parse_env_file)
 from .report import Report
 
 # .keysync.status 的 reason 白名單（低-8）：writer（lgwd/keysync.py、sync.py）
@@ -165,10 +172,16 @@ def _check_follow(layout, report, active):
             report.todo("tunnel-credential", "檢查金鑰檔路徑、權限或 drop-in LoadCredential")
 
 
+def _version_unit(layout, name: str) -> str:
+    """當版目錄裡的 unit 檔路徑（判斷「這一版有沒有這個 unit」）。"""
+    return os.path.join(layout.current_link, "deploy", "units", name)
+
+
 def _check_timer(layout, report) -> None:
     """``check-timer``（#289；C-986）：定時檢查的 timer 裝了而且正在跑嗎。
 
-    - enabled 而且 active → ok；
+    - enabled 而且 active → ok（#296：這一版有 notify unit 檔、系統上卻沒有時仍
+      記 todo「未安裝」＋安裝指令）；
     - systemctl 不能用（跑不起來／結束碼不是 0、1、4）→ todo（無法確認）；
     - 確定沒裝（is-enabled 說 missing，或 unit 檔不在）→ todo「未安裝」＋安裝指令；
     - 已安裝但沒 enable → todo「已安裝但未啟用」＋enable 指令；
@@ -178,8 +191,7 @@ def _check_timer(layout, report) -> None:
     根本沒有定時檢查，列 todo 會讓「遷移到沒有 timer 的舊 tag」被誤判停損；
     升級上來的新版目錄一定有這個檔，所以該看到的「未安裝」不會被跳過。
     """
-    if not os.path.isfile(os.path.join(layout.current_link, "deploy", "units",
-                                       CHECK_TIMER_NAME)):
+    if not os.path.isfile(_version_unit(layout, CHECK_TIMER_NAME)):
         return
     enabled = units.enabled_state(layout, CHECK_TIMER_NAME)
     active = units.unit_state(layout, CHECK_TIMER_NAME)
@@ -187,6 +199,14 @@ def _check_timer(layout, report) -> None:
         report.todo("check-timer", "systemctl 不能用，無法確認")
         return
     if enabled == "enabled" and active == "active":
+        # #296：這一版有失敗通知的 unit 檔，但系統上沒有（從 #300 的版本升級上來，
+        # 跑升級的是舊版 lgwctl，它的 unit 清單沒有 notify unit）→ 補跑 install。
+        if (os.path.isfile(_version_unit(layout, CHECK_NOTIFY_NAME))
+                and not os.path.isfile(layout.unit_file(CHECK_NOTIFY_NAME))):
+            report.todo("check-timer",
+                        f"失敗通知的 {CHECK_NOTIFY_NAME} 未安裝"
+                        "（sudo llmgwctl install --tag <tag>）")
+            return
         report.ok("check-timer", CHECK_TIMER_NAME)
         return
     if enabled == "missing" or not os.path.isfile(layout.unit_file(CHECK_TIMER_NAME)):
@@ -199,6 +219,35 @@ def _check_timer(layout, report) -> None:
         return
     report.todo("check-timer",
                 f"定時檢查已安裝但沒在跑（sudo systemctl start {CHECK_TIMER_NAME}）")
+
+
+def _check_notify(layout, report) -> None:
+    """``check-notify``（#296；C-996）：check 失敗時的通知有沒有設定好。
+
+    只會 ok 或 todo（通知沒設好不是「壞掉」，也絕不在此送訊息）：
+
+    - 只有**這一版**的 ``deploy/units/`` 有 notify unit 檔時才列（與 check-timer
+      同理：更舊的版本沒有這個功能，列 todo 會讓遷移到舊 tag 被誤判停損）；
+    - ``/etc/llmgateway/check-notify.env`` 的三個鍵（頻道、收件人、本機代號）
+      齊全，而且 ``PATH`` 上找得到 ``aicomm`` → ok；
+    - 否則 todo，寫明缺的是設定檔還是 aicomm（不含任何值）。
+    """
+    if not os.path.isfile(_version_unit(layout, CHECK_NOTIFY_NAME)):
+        return
+    values = parse_env_file(layout.check_notify_env)
+    missing = [key for key in CHECK_NOTIFY_ENV_KEYS
+               if not (values.get(key) or "").strip()]
+    if missing:
+        report.todo("check-notify",
+                    "失敗不會通知 PMO（缺 check-notify.env 或 aicomm）："
+                    "check-notify.env 缺 " + "、".join(missing))
+        return
+    if shutil.which(CHECK_NOTIFY_AICOMM, path=layout.env.get("PATH")) is None:
+        report.todo("check-notify",
+                    "失敗不會通知 PMO（缺 check-notify.env 或 aicomm）："
+                    f"找不到 {CHECK_NOTIFY_AICOMM}")
+        return
+    report.ok("check-notify", "設定齊全")
 
 
 def _check_tag(layout, report, tag: str) -> None:
@@ -495,6 +544,7 @@ def run(layout, *, report: Report | None = None, no_remote: bool = False,
     report = report or Report(journal=(layout.env.get(ENV_CHECK_JOURNAL) == "1"))
     tunnel_present, tunnel_state = _check_units(layout, report, no_remote=no_remote)
     _check_timer(layout, report)
+    _check_notify(layout, report)
     if tag:
         _check_tag(layout, report, tag)
     _check_list_local(layout, report)

@@ -1,0 +1,24 @@
+# LLMGateway 的 check 失敗通知（#296）：由 llmgateway-check.service 的失敗觸發，
+# 不單獨 enable（沒有 [Install]）。llmgwctl install／upgrade 會把這一個檔一起裝到
+# /etc/systemd/system/；回滾到沒有這個 unit 的舊版時會被移除。
+# 這一個 unit 刻意沒有再觸發通知或重試的設定：通知失敗不該變成另一種失敗。
+[Unit]
+Description=Notify PMO when llmgwctl check fails
+
+[Service]
+# oneshot：跑一次就結束；結束碼一律 0（通知失敗不該變成另一種失敗）。
+Type=oneshot
+# llmgw 不是 root：通知只需要讀 journal、寫一個狀態檔、跑一個外部指令。
+# SupplementaryGroups=systemd-journal 讓它讀得到 check 那一次的 journal 內容。
+User=llmgw
+SupplementaryGroups=systemd-journal
+# 頻道、收件人、送件身分與本機代號都由機器上放（不進 repo）；檔案不在就是
+# 「通知沒設定」，腳本只寫一行 journal 就結束（`-` 讓缺檔不算啟動失敗）。
+EnvironmentFile=-/etc/llmgateway/check-notify.env
+ExecStart=/opt/llmgateway/current/ops-scripts/llmgateway-check-notify
+SyslogIdentifier=llmgwctl-check-notify
+TimeoutStartSec=60
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/llmgateway
+PrivateTmp=true
