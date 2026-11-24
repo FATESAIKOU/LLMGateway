@@ -527,6 +527,37 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(mode, 0o755)
 
 
+class _UnitFields:
+    """把 unit 檔逐行解析成 ``(section, key, value, lineno)``。
+
+    不是完整的 systemd 語法（不做續行、不做 list 拆解），只夠本檔的靜態斷言：
+    每個鍵屬於哪一段、出現幾次、值是什麼。依段落解析才能抓到「把
+    RestartPreventExitStatus 搬到 [Unit]」這種只比對字串會漏掉的錯誤（C-830）。
+    """
+
+    def __init__(self, text):
+        self.entries = []
+        section = None
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            self.entries.append((section, key.strip(), value.strip(), lineno))
+
+    def values(self, section, key):
+        return [value for (sec, name, value, _) in self.entries
+                if sec == section and name == key]
+
+    def every(self, key):
+        return [(sec, value) for (sec, name, value, _) in self.entries if name == key]
+
+
 class UnitFileTests(unittest.TestCase):
     """deploy/units/llmgateway.service 的靜態檢查（#35 spec 的固定值）。"""
 
@@ -535,6 +566,7 @@ class UnitFileTests(unittest.TestCase):
                             "deploy", "units", "llmgateway.service")
         with open(path, encoding="utf-8") as fh:
             self.text = fh.read()
+        self.unit = _UnitFields(self.text)
 
     def test_required_settings(self):
         for needle in (
@@ -560,6 +592,25 @@ class UnitFileTests(unittest.TestCase):
             "--api-port=${LGW_API_PORT}",
         ):
             self.assertIn(needle, self.text, needle)
+
+    def test_c830_restart_prevent_exit_status_78(self):
+        """C-830：78 不重啟；[Service] 段恰好一行，Restart 仍是 on-failure。
+
+        負向：搬到 [Unit]、寫成 `2 78`、寫兩次，或 Restart 改成 always 都會紅。
+        """
+        self.assertEqual(self.unit.values("Service", "RestartPreventExitStatus"), ["78"])
+        self.assertEqual(self.unit.every("RestartPreventExitStatus"), [("Service", "78")])
+        self.assertEqual(self.unit.values("Service", "Restart"), ["on-failure"])
+
+    def test_c831_timeout_stop_sec_30(self):
+        """C-831：停止期限恰好 30 秒（lgwd 收尾最多等 20 秒）。"""
+        self.assertEqual(self.unit.values("Service", "TimeoutStopSec"), ["30"])
+        self.assertEqual(self.unit.every("TimeoutStopSec"), [("Service", "30")])
+
+    def test_c832_kill_mode_mixed(self):
+        """C-832：只對主行程送 SIGTERM（在途驗章不提早被殺）。"""
+        self.assertEqual(self.unit.values("Service", "KillMode"), ["mixed"])
+        self.assertEqual(self.unit.every("KillMode"), [("Service", "mixed")])
 
     def test_not_user_layer(self):
         for needle in ("WantedBy=default.target", "--user", "%h"):
