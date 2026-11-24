@@ -453,18 +453,22 @@ def main(argv: list[str] | None = None) -> int:
         if runtime is not None:
             runtime.stop()
         raise
-    stop = threading.Event()
+    signalled: list[int] = []
 
     def on_signal(signum, frame):
         # #263 修正第 2 輪：SIGTERM 與 SIGINT 共用同一個 handler，且一路安裝到
         # gateway.stop() 跑完、行程退出為止，**不還原預設行為**。收尾期間重複收到的
-        # 訊號只會再 set 一次事件（事件已設就什麼都不做），不會加速也不會打斷收尾
+        # 訊號只會再 append 一次（主迴圈已離開，沒有影響），不會加速也不會打斷收尾
         # ——尤其不會讓行程在鎖還沒放、兩庫還沒關時以預設處置被殺掉。
-        # 只有第一次訊號寫 log：signal handler 裡動 logging 有鎖的風險，收尾期間
-        # 越少做事越好。
-        if not stop.is_set():
-            _LOG.info("received %s, shutting down", signal.Signals(signum).name)
-        stop.set()
+        # #297：handler 只把號碼記下來（list.append 不取鎖、不寫 I/O），其他什麼都
+        # 不做。原本先寫一行 log 再 stop.set()：SIGTERM 恰好落在主執行緒自己寫
+        # stderr 的中間時，logging 撞上 BufferedWriter 的重入保護丟 RuntimeError，
+        # 例外從 handler 冒出去，stop.set() 沒被執行——這次 SIGTERM 就被吞掉
+        # （systemd 只送一次），行程要等到 TimeoutStopSec 才被 SIGKILL。而
+        # stop.set() 本身也會取 threading.Event 的（不可重入）鎖：訊號落在主執行緒
+        # 持有那把鎖的幾微秒內，handler 在同一執行緒再取鎖就永久死結（#297 中-1）。
+        # 所以 handler 連 set 都不做，log 也由主執行緒在主迴圈醒來之後才寫。
+        signalled.append(signum)
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
@@ -472,10 +476,16 @@ def main(argv: list[str] | None = None) -> int:
     host, port = gateway.addr[:2]
     _LOG.info("serving api=%s:%s", host, port)
     try:
-        while not stop.wait(0.5):
-            pass
+        # 只檢查 list（不需要鎖）。time.sleep 被訊號打斷時會先跑 handler，再睡完剩下
+        # 的時間，所以最多晚 0.5 秒醒來；不需要 Event 的 set／wait，也就沒有 handler
+        # 與主執行緒互搶同一把鎖的問題。
+        while not signalled:
+            time.sleep(0.5)
     finally:
         # 這裡到 return 之前都不碰 signal.signal：handler 保持安裝，第二次 SIGTERM
-        # 落在收尾中時只會再 set 一次事件（見上）。
+        # 落在收尾中時只會再 append 一次（見上）。log 在訊號已到之後、由主執行緒寫
+        # （#297），不在 handler 裡寫。
+        if signalled:
+            _LOG.info("received %s, shutting down", signal.Signals(signalled[0]).name)
         gateway.stop()
     return 0
