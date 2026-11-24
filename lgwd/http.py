@@ -68,6 +68,14 @@
   enforce 回 403 ``forbidden``（所有授權 reason 的 body 逐 byte 相同、不加標頭）、
   warn 記 ``outcome=forbidden`` 後照舊處理、off 完全不呼叫；``/healthz`` 與 404 不經
   授權。query 形狀錯（重複的已知參數）不判授權，維持業務的 400（C-902）。
+- 業務稽核的 principal（#222 D3b；C-910～C-913）：``_respond`` 把**驗章驗過**的
+  ``Verdict.principal`` 以關鍵字傳給 service（``resolve``、``register_cooldown``），由
+  service 在**同一個業務交易**內寫入。條件是 PASS，或 warn 下的 FORBIDDEN（授權不通過
+  但業務照舊執行成功；PM 於 #279 裁定照 W-3e 記已驗證的 principal）。off、warn 下的
+  無簽或壞簽、deny／rate_limited／unavailable，一律傳 None；**絕不**用標頭自稱的
+  ``X-LGW-Key-Id`` 或其他自稱身分。被驗章或授權拒絕的請求不進業務（也就不寫業務
+  稽核）；enforce 的 forbidden 在 apply 就回應並返回，同樣沒有稽核列，只留下
+  ``AuthLog`` 的安全事件（C-912）。
 """
 
 from __future__ import annotations
@@ -454,7 +462,19 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                     return
             else:
                 body = _UNREAD
-            self._respond(method, path, route, query, body, params=params)
+            # C-911（PM 於 #279 fix1 裁定照 W-3e）：驗章 PASS 且授權通過 → 記已驗證的
+            # principal；warn 下驗章 PASS 但授權為 forbidden、業務照舊執行且成功時，
+            # 也記同一個已驗證的 principal（身分仍是驗章驗過的，不是自稱）。enforce 的
+            # forbidden 已在上面 apply 回應並 return，不會走到業務、也不會記。
+            # deny／rate_limited／unavailable 以及沒驗章（verdict=None）一律 None；
+            # 絕不拿標頭自稱的 key ID 或其他自稱身分充當 principal。
+            principal = (verdict.principal
+                         if verdict is not None
+                         and verdict.outcome in (auth_mod.OUTCOME_PASS,
+                                                 auth_mod.OUTCOME_FORBIDDEN)
+                         else None)
+            self._respond(method, path, route, query, body, params=params,
+                          principal=principal)
 
         def _read_gated_body(self, length: int, template: str,
                              method: str, path: str):
@@ -471,11 +491,14 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                 return None
 
         def _respond(self, method: str, path: str, route, query: str, body=_UNREAD,
-                     params=None):
+                     params=None, principal=None):
             """路由 → service → 回應（含錯誤對應與 log）。off 與 gated 共用。
 
             ``params`` 是 gated 路徑已經解析好的 query dict（C-909：與授權用同一份）；
-            ``None`` 時照 off 的舊路徑自己解析。
+            ``None`` 時照 off 的舊路徑自己解析。``principal`` 是已驗證的節點身分
+            （C-911／W-3e）：驗章 PASS 且授權通過、或 warn 下 FORBIDDEN 而業務照舊
+            執行時才有值，其餘一律 ``None``；以關鍵字轉給 service，寫進同一筆業務
+            稽核（C-912）。
             """
             try:
                 if route[0] == "healthz":
@@ -493,6 +516,7 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                         subscription=q.get("subscription"),
                         exclude=q.get("exclude"),
                         data=q.get("data"),
+                        principal=principal,
                     )
                     status = 200
                 elif route[0] == "roles":
@@ -503,7 +527,7 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                 else:
                     if body is _UNREAD:
                         body = _read_json(self)
-                    service.register_cooldown(route[1], body)
+                    service.register_cooldown(route[1], body, principal=principal)
                     status, payload = 204, {}
             except ApiError as exc:
                 _LOG.info("%s %s -> %s", method, path, exc.status)

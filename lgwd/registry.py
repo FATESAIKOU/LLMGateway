@@ -20,7 +20,8 @@
   agent → privacy 不低於 data → allow 涵蓋／能推導模型 → exclude），resolve 再接
   已部署 → priority→id；**冷卻不參與選把**（不排除、也不是排序鍵），隱私也不參與
   排序；錯誤 precedence＝輸入形狀 400 → 查無 404 → 政策 403／no_model → 候選狀態 409。
-  每次成功 resolve 記一筆只追加的稽核（provider／model 是中介資料；不記 data）。
+  每次成功 resolve 記一筆只追加的稽核（provider／model 是中介資料；不記 data；
+  principal 是已驗證的節點身分，未驗證為 null——#222 D3b）。
 - register_cooldown(id, body)：登錄冷卻，body {"until": RFC 3339 UTC[, "model": 模型 id]}
   （過去或超過上限拒絕；同一筆重複登錄取較晚的 until；到時自動解除）。有 model 時只
   冷卻那個模型，沒有（或 null）時冷卻整把；整把與模型兩層各自獨立、互不刪除。
@@ -237,12 +238,18 @@ class RegistryService:
         subscription: str | None = None,
         exclude: str | None = None,
         data: str | None = None,
+        *,
+        principal: str | None = None,
     ) -> dict:
         """GET /v1/resolve：選把後回 {schema, env_schema, meta, env}。
 
         subscription 是釘住（有給時只看該把，不代換另一把）；exclude 是逗號分隔的
         id 清單（不在政策檔的 id 忽略），只在沒有釘住時套用。錯誤照 design 決定 3
         的步驟與 precedence 斷在最前面的一層。成功才記一筆 resolve 稽核。
+
+        ``principal`` 只能以關鍵字傳入（C-913）：只放**已驗證**的節點身分（C-911），
+        HTTP 層只在驗章 PASS 且授權通過時傳；其他呼叫方（測試、未經 HTTP 的用法）
+        不傳就是 None，稽核該欄為 null。它不影響選把、也不進回覆。
 
         data 是選填的資料等級宣告（#102）：不在三個等級之內是形狀錯 400；有給時
         候選限於 privacy 不低於它，一個都不剩回 403 privacy_not_allowed（步驟 3.5，
@@ -284,6 +291,7 @@ class RegistryService:
             self._store.audit_add(
                 cur, to_rfc3339(now), selected.name, "resolve",
                 agent=agent, provider=provider_info.provider, model=model_value,
+                principal=principal,
             )
 
         meta = {
@@ -310,12 +318,16 @@ class RegistryService:
             "env": env,
         }
 
-    def register_cooldown(self, subscription: str, body: dict) -> None:
+    def register_cooldown(self, subscription: str, body: dict, *,
+                          principal: str | None = None) -> None:
         """POST /v1/subscriptions/{id}/cooldown {until[, model]}：成功為 None（HTTP 204）。
 
         未知欄位忽略；同一筆重複登錄取較晚的 until。有 model（且不是 null）時只冷卻
         那個模型；沒有或 null 時冷卻整把；兩層各自獨立、互不刪除。驗證順序照舊：
         未知 id 404 → 缺 until 400 → until 格式／範圍 400 → model 400。
+
+        ``principal`` 只能以關鍵字傳入（C-913）；語意與 ``resolve`` 相同（C-911）：
+        只在驗章 PASS 且授權通過時由 HTTP 層傳入，否則為 None（稽核該欄 null）。
         """
         if subscription not in self._policy.subscriptions:
             raise not_found()
@@ -342,7 +354,7 @@ class RegistryService:
                     cur, subscription, model, to_rfc3339(effective))
             self._store.audit_add(
                 cur, stamp, subscription, "cooldown",
-                until=to_rfc3339(effective), model=model,
+                until=to_rfc3339(effective), model=model, principal=principal,
             )
 
     def _cooldown_model(self, sub: SubscriptionPolicy, model) -> str | None:

@@ -58,6 +58,8 @@ class RecordingService:
     def __init__(self, real):
         self.real = real
         self.calls = []
+        # (方法, principal) 的呼叫紀錄（#222 D3b 的 C-913／W-3i 用；calls 的形狀不動）。
+        self.principals = []
 
     def audit_rows(self):
         return self.real._store.audit_all()
@@ -71,18 +73,20 @@ class RecordingService:
         return self.real.list_usage_summary()
 
     def resolve(self, agent, provider, model=None, subscription=None, exclude=None,
-                data=None):
+                data=None, *, principal=None):
         self.calls.append(("resolve", agent, provider))
+        self.principals.append(("resolve", principal))
         return self.real.resolve(agent, provider, model=model, subscription=subscription,
-                                 exclude=exclude, data=data)
+                                 exclude=exclude, data=data, principal=principal)
 
     def role_candidates(self, role, agent, data=None):
         self.calls.append(("role_candidates", role, agent))
         return self.real.role_candidates(role, agent, data)
 
-    def register_cooldown(self, sub_id, body):
+    def register_cooldown(self, sub_id, body, *, principal=None):
         self.calls.append(("register_cooldown", sub_id))
-        return self.real.register_cooldown(sub_id, body)
+        self.principals.append(("register_cooldown", principal))
+        return self.real.register_cooldown(sub_id, body, principal=principal)
 
 
 class HttpAuthzCase(unittest.TestCase):

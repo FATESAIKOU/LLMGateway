@@ -6,8 +6,9 @@
   重複登錄取較晚的；本版沒有解除，過期列讀時視為無效）；
 - audit：只追加。（action='get' 是 #48 移除前的歷史列，留著不動；現行只寫）resolve 記（時刻、
   subscription id、agent、provider、model—— provider／model 是中介資料）；登錄冷卻記
-  （時刻、subscription id、until、model——model 是選填的模型 id）。
-絕不存 key 的值，也不記客戶端（沒有應用層認證）。
+  （時刻、subscription id、until、model——model 是選填的模型 id）。principal 是**已驗證**
+  的節點身分（#222 D3b）：只有驗章與授權都通過才寫，off／未驗證／歷史列為 null。
+絕不存 key 的值；不記客戶端自稱的 key ID 或其他自稱身分。
 
 單一連線＋RLock；會改變狀態的動作一律經 txn()（BEGIN IMMEDIATE）。
 """
@@ -38,13 +39,15 @@ CREATE TABLE IF NOT EXISTS audit (
     agent TEXT,
     until TEXT,
     provider TEXT,
-    model TEXT
+    model TEXT,
+    principal TEXT
 );
 """
 
 # v5 schema（gateway-v0）的 audit 沒有的欄位；啟動時以 PRAGMA table_info 檢查、
 # ALTER TABLE ADD COLUMN 補上（只增不改；舊資料的新欄位為 null）。
-_AUDIT_MIGRATE_COLUMNS = ("provider", "model")
+# principal 是 D3b 加的（沒有應用層認證的舊 DB 沒有這一欄）。
+_AUDIT_MIGRATE_COLUMNS = ("provider", "model", "principal")
 
 
 class Store:
@@ -57,16 +60,32 @@ class Store:
         self._lock = threading.RLock()
 
     def _migrate_audit(self) -> None:
-        """additive 遷移：v5 的 audit 少 provider／model 欄就補上。
+        """additive 遷移：v5 的 audit 少 provider／model 欄、D3b 前的 DB 少 principal 欄就補上。
 
-        CREATE TABLE IF NOT EXISTS 不會補欄位，所以要一次 PRAGMA 檢查＋ALTER TABLE。
-        舊 lgwd 的 SELECT 指定欄位，讀到多出的欄位不受影響（支援退版）。
+        CREATE TABLE IF NOT EXISTS 不會補欄位，所以要一次 PRAGMA 檢查＋ALTER TABLE；
+        可以重跑（欄位已存在就不動，不重建表、不改既有欄位型別）。舊 lgwd 的 SELECT
+        指定欄位，讀到多出的欄位不受影響（支援退版）。
         """
         existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(audit)")}
         for column in _AUDIT_MIGRATE_COLUMNS:
             if column not in existing:
-                self._conn.execute("ALTER TABLE audit ADD COLUMN {0} TEXT".format(column))
+                self._add_audit_column(column)
         self._conn.commit()
+
+    def _add_audit_column(self, column: str) -> None:
+        """補一欄（additive）；兩個行程同時第一次開同一個舊庫時的 duplicate column 不算錯。
+
+        低-1（REPORT-279-archreview）：兩邊都在 PRAGMA 看到欄位不在，後到者的 ALTER
+        會丟 `duplicate column name`。lgwd 是單一服務，實際走不到，但吃到這一種
+        `OperationalError` 是安全的（欄位已經在了，正是想要的結果）。其他
+        `OperationalError` 照樣往外丟，不吞掉真正的失敗。
+        """
+        try:
+            self._conn.execute(
+                "ALTER TABLE audit ADD COLUMN {0} TEXT".format(column))
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -143,17 +162,20 @@ class Store:
         until: str | None = None,
         provider: str | None = None,
         model: str | None = None,
+        principal: str | None = None,
     ) -> None:
+        """追加一列；``principal`` 只放已驗證的節點身分（None＝未驗證或舊資料）。"""
         cur.execute(
-            "INSERT INTO audit (ts, subscription, action, agent, until, provider, model)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ts, subscription, action, agent, until, provider, model),
+            "INSERT INTO audit"
+            " (ts, subscription, action, agent, until, provider, model, principal)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, subscription, action, agent, until, provider, model, principal),
         )
 
     def audit_all(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT seq, ts, subscription, action, agent, until, provider, model"
-                " FROM audit ORDER BY seq"
+                "SELECT seq, ts, subscription, action, agent, until, provider, model,"
+                " principal FROM audit ORDER BY seq"
             ).fetchall()
             return [dict(r) for r in rows]
