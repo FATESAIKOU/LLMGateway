@@ -248,7 +248,7 @@ ssh -N -i ~/.ssh/<能登入 sshproxy 的金鑰> -o StrictHostKeyChecking=yes \
 測試連線（#246 起服務有 `/healthz`：只證明行程活著、能回應，不讀 DB）：
 ```bash
 curl -s http://127.0.0.1:4710/healthz          # {"status": "ok"}
-curl -s http://127.0.0.1:4710/v1/subscriptions  # 業務資料（不是探針）
+curl -s http://127.0.0.1:4710/v1/subscriptions  # 業務資料（不是探針）；無簽只在 off／warn 可用，enforce 之後要改用 §4.2 的 lgw（帶 signer）
 ```
 
 > [!NOTE]
