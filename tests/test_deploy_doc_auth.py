@@ -481,5 +481,65 @@ class IoPrerequisiteTests(unittest.TestCase):
                 db.close()
 
 
+class V06MeasurementTests(unittest.TestCase):
+    """V-0.6 改用 scope 量測（#319）：量 C-612 的 scope 組與服務 cgroup 基線，分開標示、判準不放寬。
+
+    推論的依據是 `tests/test_main_auth_rate_263.py` 的 `subprocess.Popen`（子行程繼承 pytest 的 cgroup）；
+    這裡只鎖文件的字樣與判準數字，不驗 systemd 的行為（沙箱沒有 systemd）。
+    """
+
+    def setUp(self):
+        self.doc = read_doc()
+        self.table_section = between(self.doc, "### 8.18 上線前清單", "### 8.19 ")
+        self.procedure = between(self.doc, "#### V-0.6 量測步驟", "### 8.19 ")
+        self.rollout = (REPO_ROOT / "docs" / "auth-rollout.md").read_text(encoding="utf-8")
+
+    def row(self, prefix):
+        rows = [line for line in self.table_section.splitlines() if line.startswith(prefix)]
+        self.assertEqual(len(rows), 1, prefix)
+        return rows[0]
+
+    def test_v06_names_scope_method_and_service_baseline(self):
+        row = self.row("| V-0.6 |")
+        for needle in ("systemd-run --scope", "systemctl show -p ControlGroup --value", "pids.peak",
+                       "memory.peak", "兩組、分開標示", "A＝scope 組", "B＝服務 cgroup 基線",
+                       "含客戶端的上界", "subprocess.Popen", "scope 方法不依賴這個推論"):
+            self.assertIn(needle, row, needle)
+
+    def test_v06_criteria_not_loosened(self):
+        # 判準：A＋B 的和比 256／768M／2048（保守上界）；字樣不得放寬。
+        row = self.row("| V-0.6 |")
+        for needle in ("用 A＋B 的和比較", "`pids.peak` ≤ 256", "`memory.peak` ≤ 768M",
+                       "fd 高峰 ≤ 2048", "不放寬", "不放寬到 `infinity`"):
+            self.assertIn(needle, row, needle)
+
+    def test_v06_procedure_pins_commands_and_limits(self):
+        for needle in ("sudo systemd-run --scope", "systemctl show -p ControlGroup --value",
+                       "LGW_SLOW_TESTS=1", "TMPDIR=<TMPDIR>", "findmnt -T /var/lib/llmgateway",
+                       "/proc/$p/fd", "只 kill 這個 pid", "未在真機驗證", "未知",
+                       "不設** `MemoryMax`／`TasksMax`", "scope 不套服務層的",
+                       "`User=`、`ProtectSystem=`、`PrivateTmp=`",
+                       "runuser -u llmgw"):
+            self.assertIn(needle, self.procedure, needle)
+
+    def test_v06b_no_longer_leaves_inference_open(self):
+        row = self.row("| V-0.6b |")
+        self.assertIn("scope 方法不依賴該推論", row)
+        self.assertIn("可以共用同一次 C-612 執行", row)
+        self.assertIn("同一個 scope", row)
+        self.assertIn(".auth-busy.status", row)
+        self.assertIn("結束前讀它", row)
+        self.assertNotIn("要確認", row)
+        self.assertNotIn("推論：", row)
+
+    def test_rollout_v06_row_matches_scope_method(self):
+        line = next(l for l in self.rollout.splitlines() if l.startswith("| V-0.6 |"))
+        self.assertIn("systemd-run --scope", line)
+        self.assertIn("服務 cgroup 基線", line)
+        self.assertIn("A＋B", line)
+        self.assertIn("不放寬", line)
+        self.assertNotIn("整個 cgroup 的", line)
+
+
 if __name__ == "__main__":
     unittest.main()

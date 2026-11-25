@@ -85,7 +85,7 @@ V-0 是「可不可以在正式主機上做上線前的實機檢查」，不是�
 | V-0.3 | `prlimit` 存在，且以 llmgw 身分能對子行程設限 | 未 | 未；要本人單次授權後才能做 |
 | V-0.4 | `systemd --version` ≥ 251（失敗通知的 `MONITOR_*` 需要），`systemd-analyze verify` 乾淨 | 未 | 未；要本人單次授權後才能做 |
 | V-0.5 | 壓測中執行 `systemctl stop`，503 為 0，停止後 cgroup 沒有殘留行程 | 未 | 未；要本人單次授權後才能做 |
-| V-0.6 | C-612 在正式主機重跑，量整個 cgroup 的 `pids.peak`／`memory.peak` 與 lgwd 的 fd 高峰 | 未 | 未；要本人單次授權後才能做 |
+| V-0.6 | C-612 在正式主機重跑：用 `systemd-run --scope` 量 C-612 的 scope 組（A，含客戶端的上界），另量 llmgateway.service 的 cgroup 基線（B，服務 cgroup 基線），判準用 A＋B 的和、不放寬（步驟見 `docs/deploy.md` 8.18） | 未 | 未；要本人單次授權後才能做 |
 | V-0.6b | 認證庫 IO 前提（#313）：C-612 的 10 分鐘版，TMPDIR 與認證庫同一檔案系統，記錄磁碟種類與 `/proc/pressure/io`，503 數為上界 | 未 | 未；要本人單次授權後才能做；細項見 `docs/deploy.md` 8.17.2 與 8.18 |
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取：讀得到名冊、寫得了 `/var/lib/llmgateway/` | 未 | 未；要本人單次授權後才能做 |
 | P-D4 | Mac 與 worker 的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 未 | 未；MLP 11-24 回覆說 ssh-agent 與帶密語還沒測 |

@@ -1249,10 +1249,51 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
 | V-0.3 | `prlimit` 存在，且以 llmgw 身分能對子行程設限 | — |
 | V-0.4 | `systemd --version` ≥ 251（失敗通知的 `MONITOR_*` 需要；< 251 時腳本改用 `systemctl show` 的 `InvocationID`，要實測 fallback 有拿到那一次 check 的行）；確認 systemd 版本支援 `OOMPolicy`（243 以上）；`systemd-analyze verify` 乾淨 | `Type=exec` 與 unit 都有效 |
 | V-0.5 | 壓測中執行 `systemctl stop` | 503 為 0；停止後 cgroup 沒有殘留行程 |
-| V-0.6 | C-612 在正式主機重跑，期間同時手動觸發一次 keysync 與一次用量抓取（`claude` CLI）；量的是整個 cgroup，不是單一行程：讀 cgroup v2 的 `memory.peak`／`pids.peak`（`/sys/fs/cgroup/system.slice/llmgateway.service/`；`memory.peak` 需要 kernel ≥ 5.19，沒有時以每秒取樣 `memory.current`、`pids.current` 代替） | `pids.peak` ≤ 256、`memory.peak` ≤ 768M、lgwd 的 fd 高峰 ≤ 2048；超過任何一項就開 d 單調高，不放寬到 `infinity` |
-| V-0.6b | 認證庫 IO 前提（見 8.17.2；與 V-0.6 的 cgroup 量測並列，不取代）。在正式主機以 `LGW_SLOW_TESTS=1` 跑 C-612 的 10 分鐘版（`tests/test_main_auth_rate_263.py`，`stop.wait(600)`；repo 內的 C-611 只有 30 秒版，不算 10 分鐘版）。**跑之前**先把 `TMPDIR` 指到與認證庫（`/var/lib/llmgateway`）同一個檔案系統的目錄：C-612 把自己的庫建在 `tempfile.TemporaryDirectory()`，也就是 `$TMPDIR`（預設 `/tmp`），不是正式庫的目錄；`/tmp` 與認證庫可能不同檔案系統，也可能是 tmpfs（不 fsync 到磁碟，測出來漂亮但無意義）；出貨 unit 另有 `PrivateTmp=true`（第 7.2 節「出貨 unit 的加固」），服務行程看到的 /tmp 不是主機共用的那個，所以不能拿它的 /tmp 當代表。用 `findmnt -T /var/lib/llmgateway -no SOURCE,TARGET` 與 `findmnt -T <TMPDIR> -no SOURCE,TARGET` 比對，對不上就換目錄重跑；兩邊的結果都記入部署紀錄。期間記錄：認證庫所在檔案系統的 FSTYPE 與 OPTIONS（同一支 findmnt 加 `-no FSTYPE,OPTIONS`）；磁碟是否旋轉用 `lsblk -s -no NAME,ROTA <SOURCE>` 追到底層實體裝置（SOURCE 是 overlay 時不是區塊裝置，改用 upperdir 所在的掛載點重做 findmnt；LVM／dm 用 `lsblk -s` 追到底）。貼 OPTIONS 之前自己看一眼：overlay 的 OPTIONS 會帶 lowerdir／upperdir 的長路徑，不要原樣貼進紀錄。每秒取樣一次 `/proc/pressure/io` 的 `some`／`full` 的 `avg10`，記最大值；取樣行程要記下 pid，結束時只 kill 那個 pid（不用 pkill）。C-612 印出的 `statuses`（503 數）、`wait_count`、等鎖 `p50`／`p99`、`rate`，原樣記入部署紀錄。503 數是 StoreBusy＋號誌 `REASON_BUSY`＋驗章不可用的**總和，是上界**，不是 StoreBusy 數（目前沒有獨立計數）。V-0.6 與 V-0.6b 可以共用同一次 C-612 執行、同時取兩組量測，授權以單次計；但兩組量的東西不同（V-0.6 量的是 llmgateway.service 的 cgroup，推論：C-612 自己起的 lgwd 子行程不在那個 cgroup 裡，正式主機上要確認），部署紀錄要分開標示 | 判準不變：接受率 ≥ 50 筆/秒、零假 503（零非 200）、等鎖 p99 < 1 秒（與 C-612 的三條斷言相同）；未達就先不開 enforce，或先調號誌／期限並把量測寫進部署紀錄；**不得只調大 `busy_timeout` 來過判準**；上界的 503 數不得當成 StoreBusy 數寫進紀錄 |
+| V-0.6 | C-612 在正式主機重跑，量**兩組、分開標示**，判準用兩組的和。**A＝scope 組（主法，含客戶端的上界）**：用 `sudo systemd-run --scope` 包住整個 C-612（含 pytest 客戶端；所以是上界，不是 lgwd 本身），量該 scope 的 `pids.peak`／`memory.peak`；scope 在結束前取樣（cgroup 行程全部結束後就被移除，所以取樣與最後那次讀取都在 scope 之內）；scope 的 cgroup 路徑用 `systemctl show -p ControlGroup --value <scope>` 取得；lgwd 的 fd 高峰每秒取樣 lgwd 行程的 `/proc/<pid>/fd`。kernel < 5.19 沒有 `memory.peak` 時，每秒取樣該 scope 的 `memory.current`、`pids.current` 代替（記取樣行程的 pid，結束時只 kill 那個 pid）。**B＝服務 cgroup 基線**：讀 `/sys/fs/cgroup/system.slice/llmgateway.service/` 的 `pids.peak`／`memory.peak`（含它平常起的 `claude` CLI、keysync 子行程）；期間實際觸發一次 keysync 與一次用量抓取（本人確認過才觸發）後讀取。這兩個 peak 是自服務啟動以來的累計最大值，紀錄要寫服務的啟動時間。為什麼 A 不是服務 cgroup：`tests/test_main_auth_rate_263.py:44` 的 `subprocess.Popen` 讓 C-612 的 lgwd 繼承 pytest 行程的 cgroup，**推論**是它不在服務 cgroup 裡（成立條件是 pytest 行程本身不在服務 cgroup 裡）；scope 方法不依賴這個推論。步驟與指令範本見下方「V-0.6 量測步驟」 | 判準不變，用 A＋B 的和比較（保守上界，不放寬）：`pids.peak` ≤ 256、`memory.peak` ≤ 768M、lgwd 的 fd 高峰 ≤ 2048；超過任何一項就開 d 單調高，不放寬到 `infinity` |
+| V-0.6b | 認證庫 IO 前提（見 8.17.2；與 V-0.6 的 cgroup 量測並列，不取代）。在正式主機以 `LGW_SLOW_TESTS=1` 跑 C-612 的 10 分鐘版（`tests/test_main_auth_rate_263.py`，`stop.wait(600)`；repo 內的 C-611 只有 30 秒版，不算 10 分鐘版）。**跑之前**先把 `TMPDIR` 指到與認證庫（`/var/lib/llmgateway`）同一個檔案系統的目錄：C-612 把自己的庫建在 `tempfile.TemporaryDirectory()`，也就是 `$TMPDIR`（預設 `/tmp`），不是正式庫的目錄；`/tmp` 與認證庫可能不同檔案系統，也可能是 tmpfs（不 fsync 到磁碟，測出來漂亮但無意義）；出貨 unit 另有 `PrivateTmp=true`（第 7.2 節「出貨 unit 的加固」），服務行程看到的 /tmp 不是主機共用的那個，所以不能拿它的 /tmp 當代表。用 `findmnt -T /var/lib/llmgateway -no SOURCE,TARGET` 與 `findmnt -T <TMPDIR> -no SOURCE,TARGET` 比對，對不上就換目錄重跑；兩邊的結果都記入部署紀錄。期間記錄：認證庫所在檔案系統的 FSTYPE 與 OPTIONS（同一支 findmnt 加 `-no FSTYPE,OPTIONS`）；磁碟是否旋轉用 `lsblk -s -no NAME,ROTA <SOURCE>` 追到底層實體裝置（SOURCE 是 overlay 時不是區塊裝置，改用 upperdir 所在的掛載點重做 findmnt；LVM／dm 用 `lsblk -s` 追到底）。貼 OPTIONS 之前自己看一眼：overlay 的 OPTIONS 會帶 lowerdir／upperdir 的長路徑，不要原樣貼進紀錄。每秒取樣一次 `/proc/pressure/io` 的 `some`／`full` 的 `avg10`，記最大值；取樣行程要記下 pid，結束時只 kill 那個 pid（不用 pkill）。C-612 印出的 `statuses`（503 數）、`wait_count`、等鎖 `p50`／`p99`、`rate`，原樣記入部署紀錄。503 數是 StoreBusy＋號誌 `REASON_BUSY`＋驗章不可用的**總和，是上界**，不是 StoreBusy 數（目前沒有獨立計數；#312 已合：C-612 的 lgwd 每 60 秒寫一次 `.auth-busy.status` 到暫存 state dir，**結束前讀它**，完整修正歸 #321）。V-0.6 與 V-0.6b 可以共用同一次 C-612 執行、同一個 scope 同時取兩組量測（V-0.6b 的 IO 量測照常），授權以單次計；但兩組量的東西不同（V-0.6 量 C-612 的 scope，V-0.6b 量認證庫的 IO），部署紀錄要分開標示；scope 方法不依賴該推論（見 V-0.6） | 判準不變：接受率 ≥ 50 筆/秒、零假 503（零非 200）、等鎖 p99 < 1 秒（與 C-612 的三條斷言相同）；未達就先不開 enforce，或先調號誌／期限並把量測寫進部署紀錄；**不得只調大 `busy_timeout` 來過判準**；上界的 503 數不得當成 StoreBusy 數寫進紀錄 |
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
 | P-D4 | Mac 與 worker 映像的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 由本人或 PMO 做 |
+
+#### V-0.6 量測步驟（scope 方法）
+
+**root：** 要（`systemd-run --scope` 與讀 cgroup）。**lgwd 停止：** 不用（C-612 自己起 lgwd；服務基線那一組在服務照跑時量）。
+
+這一段的 `<repo>` 是 repo 的絕對路徑（llmgw 要讀得到）、`<TMPDIR>` 是同一個目錄要換的那個 TMPDIR（與 V-0.6b 一致）。**未在真機驗證**：沙箱沒有 systemd，transient scope 的行為與 `systemctl show -p ControlGroup --value` 的輸出格式，第一次執行時逐步確認；不通就停下回報，不改用別的量法硬過。
+
+1. **TMPDIR**：照 V-0.6b 的檢查，`findmnt -T /var/lib/llmgateway -no SOURCE,TARGET` 與 `findmnt -T <TMPDIR> -no SOURCE,TARGET` 對得上才用；建好並讓 llmgw 可寫：`sudo install -d -o llmgw -g llmgw <TMPDIR>`。
+
+2. **先起 sampler**（在 scope 之前）：它等 scope 出現後，每秒記 `memory.current`、`pids.current`，以及 lgwd 行程的 fd 數；scope 不見了就自己結束。它要 root 才讀得到 llmgw 行程的 `/proc/<pid>/fd`。
+
+```bash
+UNIT=lgw-v06-c612-$(date +%s)
+sudo sh -c '
+  while :; do CG=$(systemctl show -p ControlGroup --value "$1"); [ -n "$CG" ] && [ -d /sys/fs/cgroup$CG ] && break; sleep 1; done
+  while [ -d /sys/fs/cgroup$CG ]; do
+    L=$(for p in $(cat /sys/fs/cgroup$CG/cgroup.procs); do grep -q lgwd /proc/$p/cmdline 2>/dev/null && echo "lgwd_pid=$p fd=$(ls /proc/$p/fd | wc -l)"; done)
+    echo "$(date +%T) mem=$(cat /sys/fs/cgroup$CG/memory.current) pids=$(cat /sys/fs/cgroup$CG/pids.current) $L"
+    sleep 1
+  done' sampler "$UNIT" >> <TMPDIR>/v06-samples.txt 2>&1 &
+SAMPLER=$!
+```
+
+3. **C-612 跑在 scope 裡**。外層 `sh` 也在 scope 裡，所以測試結束後它還能讀到 scope 的 `pids.peak`／`memory.peak`，然後才退出（scope 一結束 cgroup 就沒了）。`-p` 只開 accounting，**不設** `MemoryMax`／`TasksMax`，否則會把量到的高峰壓成上限。scope 不套服務層的 `User=`、`ProtectSystem=`、`PrivateTmp=`（推論，未實測），所以身分用 `runuser -u llmgw` 換、TMPDIR 用 `env` 指定；這些屬性的實際行為歸 V-0.7 與 transient service（#320）。`LGW_SLOW_TESTS=1` 沒設就是 skip，`-rs` 會印出 SKIPPED；那次作廢。
+
+```bash
+sudo systemd-run --scope --unit="$UNIT" \
+  -p MemoryAccounting=yes -p TasksAccounting=yes -p IOAccounting=yes \
+  sh -c 'cd <repo> && runuser -u llmgw -- env TMPDIR=<TMPDIR> LGW_SLOW_TESTS=1 python3 -m pytest -q -rs tests/test_main_auth_rate_263.py; rc=$?
+  echo "ControlGroup=$(systemctl show -p ControlGroup --value "$1")"
+  CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "scope=$CG"
+  cat $CG/pids.peak $CG/memory.peak
+  exit $rc' sh "$UNIT"
+echo "systemd-run exit=$?"
+```
+
+kernel < 5.19 沒有 `memory.peak`，最後一個 `cat` 會報錯；這時 scope 組的記憶體高峰取 sampler 檔（`<TMPDIR>/v06-samples.txt`）的 `mem=` 最大值。`pids.peak` 在 5.3 以上有。
+
+4. **服務 cgroup 基線**（與 step 3 同一段時間，服務照跑）：手動各觸發一次 keysync 與一次用量抓取。**觸發的指令本文件目前沒有定義，未知**，要 PMO 或本人指定後再做，不自己猜。前後各讀一次：`cat /sys/fs/cgroup/system.slice/llmgateway.service/pids.peak /sys/fs/cgroup/system.slice/llmgateway.service/memory.peak`。讀到的是自服務啟動以來的最大值；要乾淨數字需要本人決定是否重啟服務，PM 不自行決定。
+
+5. **收尾**：`systemctl is-active "$UNIT"` 應該是 inactive；sampler 應已自行結束。若還在跑，`sudo kill $SAMPLER`（只 kill 這個 pid）。scope 組結果寫進部署紀錄時，把 step 3 的 `ControlGroup=` 行與 `pids.peak`、`memory.peak` 原樣記下；服務基線與 scope 組分表列。
 
 ### 8.19 定時檢查（timer）（r）
 
