@@ -513,14 +513,73 @@ class V06MeasurementTests(unittest.TestCase):
                        "fd 高峰 ≤ 2048", "不放寬", "不放寬到 `infinity`"):
             self.assertIn(needle, row, needle)
 
-    def test_v06_procedure_pins_commands_and_limits(self):
-        for needle in ("sudo systemd-run --scope", "systemctl show -p ControlGroup --value",
-                       "LGW_SLOW_TESTS=1", "TMPDIR=<TMPDIR>", "findmnt -T /var/lib/llmgateway",
-                       "/proc/$p/fd", "只 kill 這個 pid", "未在真機驗證", "未知",
-                       "不設** `MemoryMax`／`TasksMax`", "scope 不套服務層的",
-                       "`User=`、`ProtectSystem=`、`PrivateTmp=`",
-                       "runuser -u llmgw"):
-            self.assertIn(needle, self.procedure, needle)
+    def code(self):
+        # 只比對 fenced 程式碼區塊（指令範本）；說明文字裡提到 MemoryMax 等不算。
+        return "\n".join(line for block in code_blocks(self.procedure) for line in block)
+
+    def test_v06_procedure_code_pins_commands(self):
+        code = self.code()
+        for needle in (
+            "sudo systemd-run --scope", "--unit=\"$SCOPE\"", "-p MemoryAccounting=yes",
+            "-p TasksAccounting=yes", "-p IOAccounting=yes", "runuser -u llmgw",
+            "env TMPDIR=<TMPDIR>", "LGW_SLOW_TESTS=1", "PYTHONDONTWRITEBYTECODE=1",
+            "python3 -m unittest -v tests.test_main_auth_rate_263",
+            "/proc/self/cgroup", "cat $CG/pids.peak", "$CG/memory.peak",
+            "ControlGroup=", "git -C <repo> rev-parse HEAD",
+            "-lt 60", "/proc/$p/fd", "sudo sh -c", "sampler", "trap ",
+            "fdmax", "pids.current", "memory.current",
+        ):
+            self.assertIn(needle, code, needle)
+        # 不設上限（見說明文）；pytest 不再是指令的一部分。
+        for banned in ("MemoryMax", "TasksMax", "pytest"):
+            self.assertNotIn(banned, code, banned)
+        # TMPDIR 的 findmnt 檢查是步驟文字（與 V-0.6b 一致），不在指令範本裡。
+        self.assertIn("findmnt -T /var/lib/llmgateway", self.procedure)
+
+    def test_v06_every_systemctl_targets_the_scope(self):
+        # 高-1：ControlGroup 與 is-active 一律對到 scope 單元，不能是無後綴的名字（會被補成 .service）。
+        code = self.code()
+        # 範本裡的 sh -c 會收 "$1"，呼叫端必須把 "$SCOPE"（已含 .scope）傳進去。
+        lines = [l for l in self.procedure.splitlines()
+                 if "systemctl" in l and ("ControlGroup" in l or "is-active" in l)]
+        self.assertGreaterEqual(len(lines), 3)  # 取樣 CG、內層 CG、收尾 is-active
+        for line in lines:
+            self.assertTrue(any(s in line for s in ("$SCOPE", ".scope", '"$1"')), line)
+        self.assertIn('sh "$SCOPE"', code)
+        self.assertIn('sampler "$SCOPE"', code)
+        self.assertNotIn('"$UNIT"', self.procedure)
+        self.assertIn('SCOPE=lgw-v06-c612-$(date +%s).scope', code)
+
+    def test_v06_sampler_output_is_written_under_sudo(self):
+        # 中-1：取樣輸出在 sudo 內寫（`>> "$2"` 在 sh -c 的字串裡），不是呼叫者的 >>。
+        code = self.code()
+        # 每個 sudo sh -c 取樣腳本裡的每一個 >> 都要寫到 "$2"（外層傳進來的輸出檔）。
+        scripts = re.findall(r"sudo sh -c '(.*?)' sampler", code, re.S)
+        self.assertEqual(len(scripts), 2, "A 與 B 兩個取樣腳本")
+        for script in scripts:
+            script = script.replace('\\"', '"').replace("\\$", "$")
+            targets = re.findall(r">>\s*([^\s;]+)", script)
+            self.assertTrue(targets, script)
+            for target in targets:
+                self.assertEqual(target, '"$2"', script)
+        self.assertNotIn('sampler "$SCOPE" >>', code)
+        self.assertNotIn('sampler-b "$SVC" >>', code)
+
+    def test_v06_b_group_has_fallback_and_kill_by_pid(self):
+        # 中-3：B 組也有 *.current 取樣退路；收尾只 kill 記下的 pid。
+        procedure = self.procedure
+        self.assertIn("sampler-b", procedure)
+        self.assertIn("memory.current", procedure)
+        self.assertIn("kill <B 的 pid>", procedure)
+        self.assertNotIn("5.3 以上", procedure)
+        self.assertIn("兩者不存在就都用取樣", self.row("| V-0.6 |"))
+
+    def test_v06_sampler_has_timeout_and_fd_max(self):
+        # 低-1：scope 起不來要逾時結束並記錄；低-2：fd 取最大值並記錄。
+        code = self.code()
+        self.assertIn("not started within 60s", code)
+        self.assertIn("max fd=", code)
+        self.assertIn("max fd", self.procedure)
 
     def test_v06b_no_longer_leaves_inference_open(self):
         row = self.row("| V-0.6b |")
