@@ -139,9 +139,16 @@ class LoadClientTest(unittest.TestCase):
             self.assertEqual(result["errors"], {}, result)
 
     def _with_fake_server(self, mode: str, duration: str = "1", concurrency: str = "4"):
-        """假服務：`503`＝回 503；`garbage`＝回非 HTTP 的字；`reset`＝讀完就 RST 切斷。"""
+        """假服務。模式：`503`＝回 503；`garbage`＝回非 HTTP 的字；`reset`＝讀完就 RST 切斷；
+        `reset_then_garbage`＝前半段 RST、過了一半時間後改回 garbage；`silent`＝收了請求卻不回，
+        客戶端會在 socket 逾時時記錯誤（用來鎖「第三種錯誤也有 window」）。
+
+        回傳 (客戶端 JSON, 伺服器紀錄)；紀錄是 (種類, time.time())，種類 `reset`／`garbage`／`503`，
+        時間是伺服器在送出該回應或 RST 之前記下的。
+        """
         import struct
         import threading
+        log: list = []
         with tempfile.TemporaryDirectory() as d:
             v0_prepare.prepare(d, "warn", _free_port())
             server = socket.socket()
@@ -150,6 +157,9 @@ class LoadClientTest(unittest.TestCase):
             server.settimeout(0.2)
             port = server.getsockname()[1]
             halt = threading.Event()
+            held: list = []
+            began = time.time()
+            switch_at = began + float(duration) / 2
 
             def serve() -> None:
                 while not halt.is_set():
@@ -157,13 +167,20 @@ class LoadClientTest(unittest.TestCase):
                         conn, _ = server.accept()
                     except socket.timeout:
                         continue
+                    if mode == "silent":
+                        held.append(conn)
+                        continue
                     with conn:
                         conn.recv(65536)
+                        now = time.time()
                         if mode == "503":
+                            log.append(("503", now))
                             conn.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
-                        elif mode == "garbage":
+                        elif mode == "garbage" or (mode == "reset_then_garbage" and now >= switch_at):
+                            log.append(("garbage", now))
                             conn.sendall(b"HELLO\r\n\r\n")
-                        elif mode == "reset":
+                        elif mode in ("reset", "reset_then_garbage"):
+                            log.append(("reset", now))
                             conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
 
             thread = threading.Thread(target=serve, daemon=True)
@@ -174,31 +191,76 @@ class LoadClientTest(unittest.TestCase):
                 halt.set()
                 thread.join(timeout=5)
                 server.close()
+                for conn in held:
+                    conn.close()
             self.assertEqual(done.returncode, 0, done.stderr)
-            return json.loads(done.stdout)
+            return json.loads(done.stdout), list(log)
 
     def test_503_is_reported_as_status_and_never_as_200(self):
-        result = self._with_fake_server("503")
+        result, _ = self._with_fake_server("503")
         self.assertGreater(result["statuses"].get("503", 0), 0, result)
         self.assertEqual(set(result["statuses"]), {"503"}, result)
         self.assertEqual(result["rate"], 0.0, result)
         self.assertEqual(result["connection_refused"], 0, result)
 
     def test_rst_is_counted_as_connection_reset_with_time_window(self):
-        result = self._with_fake_server("reset")
+        result, log = self._with_fake_server("reset")
         self.assertGreater(result["connection_reset"], 0, result)
         self.assertEqual(result["connection_reset"], result["errors"].get("ConnectionResetError"), result)
-        window = result["error_window"]["ConnectionResetError"]
-        self.assertLessEqual(window["first"], window["last"], result)
         self.assertEqual(result["bad_status_line"], 0, result)
         self.assertEqual(result["statuses"], {}, result)
+        window = result["error_window"]["ConnectionResetError"]
+        self.assertLessEqual(window["first"], window["last"], result)
+
+    def test_error_window_first_is_the_first_occurrence_not_the_latest(self):
+        # 低-4／M10：連續製造多次、不同時間的 reset。first 必須是第一次那一下，last 是最後一次。
+        # 伺服器在 RST 之前記下時間；客戶端在收到錯誤之後才記，所以 first 只會晚，不會早。
+        result, log = self._with_fake_server("reset")
+        resets = [t for kind, t in log if kind == "reset"]
+        self.assertGreater(len(resets), 5, "需要連續多次 reset 才測得出 first 與 last 的差")
+        self.assertGreater(resets[-1] - resets[0], 0.5, "測試前提：reset 要橫跨一段時間")
+        window = result["error_window"]["ConnectionResetError"]
+        self.assertGreaterEqual(window["first"], resets[0] - 0.01, result)
+        self.assertLess(window["first"] - resets[0], 0.5, f"first 不是第一次出現：{window} {resets[0]}")
+        self.assertLess(window["first"], window["last"], result)
+        self.assertGreaterEqual(window["last"], resets[-1] - 0.5, result)
+        self.assertGreater(window["last"] - window["first"], 0.5, result)
+
+    def test_reset_window_ends_before_garbage_window_begins(self):
+        # 中-2 的機制：前段 RST、後段 garbage；兩個 window 必須能分開。
+        result, log = self._with_fake_server("reset_then_garbage")
+        self.assertGreater(result["connection_reset"], 0, result)
+        self.assertGreater(result["bad_status_line"], 0, result)
+        reset_window = result["error_window"]["ConnectionResetError"]
+        garbage_window = result["error_window"]["bad_status_line"]
+        self.assertLess(reset_window["last"], garbage_window["first"], result)
+        self.assertEqual(log[0][0], "reset", log)
+        self.assertEqual(log[-1][0], "garbage", log)
 
     def test_garbage_reply_is_counted_as_bad_status_line(self):
-        result = self._with_fake_server("garbage")
+        result, _ = self._with_fake_server("garbage")
         self.assertGreater(result["bad_status_line"], 0, result)
         self.assertEqual(result["bad_status_line"], result["errors"].get("bad_status_line"), result)
         self.assertEqual(result["connection_reset"], 0, result)
         self.assertIn("bad_status_line", result["error_window"], result)
+
+    def test_silent_peer_timeout_is_a_third_kind_with_a_window(self):
+        result, _ = self._with_fake_server("silent")
+        self.assertGreater(sum(result["errors"].values()), 0, result)
+        self.assertTrue(any("imeout" in kind for kind in result["errors"]), result)
+        self.assertEqual(set(result["errors"]), set(result["error_window"]), result)
+        self.assertEqual(result["connection_reset"], 0, result)
+        self.assertEqual(result["bad_status_line"], 0, result)
+
+    def test_every_error_kind_gets_a_window_and_no_kind_is_missing(self):
+        # 低-5 的測試面：errors 出現過的每一種，error_window 都有同名的一格（first≤last）。
+        # 不鎖「哪些型別算切斷」——那是文件判準，不在這裡。
+        for mode in ("503", "garbage", "reset", "reset_then_garbage", "silent"):
+            with self.subTest(mode=mode):
+                result, _ = self._with_fake_server(mode)
+                self.assertEqual(set(result["error_window"]), set(result["errors"]), result)
+                for kind, window in result["error_window"].items():
+                    self.assertLessEqual(window["first"], window["last"], (kind, result))
 
     def test_sigterm_ends_client_cleanly_and_still_prints_result(self):
         with tempfile.TemporaryDirectory() as d:

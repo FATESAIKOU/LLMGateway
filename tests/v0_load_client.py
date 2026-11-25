@@ -75,6 +75,9 @@ def run(directory: str, port: int, duration: float, concurrency: int, target: st
                 if stop.is_set():
                     return
                 continue
+            # 停止後不再送佇列裡剩下的請求（否則每筆都要等 10 秒逾時，SIGTERM 之後會拖很久）。
+            if stop.is_set():
+                return
             try:
                 with socket.create_connection((host, port), timeout=10) as sock:
                     sock.sendall(raw)
