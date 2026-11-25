@@ -30,6 +30,10 @@
   否則 todo「失敗不會通知 PMO（…）」寫明缺哪一項。**#304**：值還是範本的
   ``place-holder-*``（去頭尾空白、不分大小寫）時視為未設定，todo 只寫鍵名。
   只有這一版的 ``deploy/units/`` 有 notify unit 檔時才列。不送訊息。
+- ``auth-busy``（#312；C-1009）：防重放庫忙碌（StoreBusy）的計數檔
+  ``.auth-busy.status``。enforce 下近 30 分鐘 ≥ 5 次 fail；enforce 近 60 分鐘 ≥ 1 次、
+  或 warn 近 60 分鐘 ≥ 1 次 todo（warn 永遠不 fail）；檔案缺失、壞檔、過期都是 todo。
+  只讀計數檔，不開庫。
 - ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``，模式以
   環境變數 ``LGW_PROBE_API_MODE`` 傳）；``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
@@ -538,6 +542,70 @@ def _check_auth_stores(layout, report) -> None:
         report.fail("auth-stores", _admin_detail(exc))
 
 
+#: enforce 下近 30 分鐘 StoreBusy 次數到達這個數就 fail（C-1009；#312 §7 待決 2）。
+BUSY_FAIL_30M = 5
+
+
+def _check_auth_busy(layout, report) -> None:
+    """``auth-busy``（#312；C-1009）：防重放庫忙碌（StoreBusy）的計數檔。
+
+    只讀 ``.auth-busy.status``，不開庫。判定依表由上往下，先符合的一條決定結果；檔案缺失、
+    壞檔、過期都不算 fail（lgwd 沒在跑時 ``auth-heartbeat`` 已經會 fail）。最外層接住任何
+    未預期的例外轉成 todo，絕不讓 ``check`` 崩潰。
+    """
+    try:
+        _check_auth_busy_inner(layout, report)
+    except Exception as exc:  # 觀測項不能讓 check 崩潰
+        report.todo("auth-busy", "auth-busy 無法判定（{0}）".format(type(exc).__name__))
+
+
+def _check_auth_busy_inner(layout, report) -> None:
+    from lgwd import auth_busy
+    from .auth_cli import HEARTBEAT_STALE_SECONDS, paths_for
+
+    mode = layout.auth_mode()
+    if mode == "off":
+        report.ok("auth-busy", "未啟用認證")
+        return
+    if mode == "unreadable":
+        report.todo("auth-busy", "認證模式讀不到（llmgateway.env 需 root 或 llmgw 才讀得）")
+        return
+    if mode not in ("warn", "enforce"):
+        report.todo("auth-busy", "認證模式讀不懂（llmgateway.env 的 LGWD_AUTH_MODE）")
+        return
+    try:
+        paths = paths_for(layout)
+    except ValueError:
+        report.fail("auth-busy", "認證路徑設定錯誤")
+        return
+    try:
+        document = auth_busy.read_status(paths.busy_status)
+    except auth_busy.BusyStatusMissing:
+        report.todo("auth-busy", "沒有計數檔：lgwd 版本較舊或剛啟動")
+        return
+    except auth_busy.BusyStatusBad as exc:
+        report.todo("auth-busy", "計數檔讀不到或讀不懂（{0}）".format(exc.reason))
+        return
+    now = int(time.time())
+    updated = document["updated"]
+    if abs(now - updated) > HEARTBEAT_STALE_SECONDS:
+        report.todo("auth-busy", "計數檔過期；見 auth-heartbeat")
+        return
+    since_text = _age_text(now - document["since"])
+    last_30m = document["store_busy_30m"]
+    last_60m = document["store_busy_60m"]
+    detail = "近 30 分鐘 {0} 次、近 60 分鐘 {1} 次（啟動 {2}前）".format(
+        last_30m, last_60m, since_text)
+    if document["mode"] == "enforce" and last_30m >= BUSY_FAIL_30M:
+        report.fail("auth-busy", detail)
+    elif document["mode"] == "enforce" and last_60m >= 1:
+        report.todo("auth-busy", detail)
+    elif document["mode"] == "warn" and last_60m >= 1:
+        report.todo("auth-busy", detail)
+    else:
+        report.ok("auth-busy", detail)
+
+
 def _admin_detail(exc) -> str:
     """`AdminError` 的一行說明（訊息＋固定的下一步；不含任何值）。"""
     text = str(exc)
@@ -571,6 +639,7 @@ def run(layout, *, report: Report | None = None, no_remote: bool = False,
     _check_list_local(layout, report)
     _check_auth_local(layout, report)
     _check_auth_stores(layout, report)
+    _check_auth_busy(layout, report)
     _check_auth_degraded(layout, report)
     if tunnel_present:
         _check_follow(layout, report, tunnel_state == "active")

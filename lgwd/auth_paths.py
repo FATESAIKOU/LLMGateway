@@ -24,6 +24,7 @@ REPLAY_DB_NAME = "auth-replay.sqlite"
 TRUST_DB_NAME = "auth-trust.sqlite"
 STORE_LOCK_NAME = "auth-store.lock"
 STATUS_NAME = ".auth-registry.status"
+BUSY_STATUS_NAME = ".auth-busy.status"
 AUDIT_LOG_NAME = "auth-audit.log"
 SSHSIG_DIR_NAME = "sshsig"
 
@@ -65,6 +66,10 @@ class AuthPaths:
     @property
     def status(self) -> str:
         return os.path.join(self.state_dir, STATUS_NAME)
+
+    @property
+    def busy_status(self) -> str:
+        return os.path.join(self.state_dir, BUSY_STATUS_NAME)
 
     @property
     def audit_log(self) -> str:

@@ -57,12 +57,19 @@ from lgwd import sshsig
 from lgwd.auth_db import (
     LockBusy,
     LockUnavailable,
+    StoreBusy,
     StoreError,
     StoreMissing,
     acquire_store_lock,
     check_store_identity,
 )
 from lgwd.auth_authz import FORBIDDEN_AGENT, FORBIDDEN_OP, FORBIDDEN_REASONS, FORBIDDEN_ROLE
+from lgwd.auth_busy import (
+    BUSY_STATUS_SCHEMA,
+    BusyCounter,
+    BusyWindow,
+    write_status,
+)
 from lgwd.auth_paths import AuthPaths, auth_paths, now_seconds
 from lgwd.auth_registry import ID_PATTERN, PrincipalEntry, Registry
 from lgwd.auth_reload import RegistryWatcher
@@ -108,6 +115,8 @@ REASON_BAD_SIGNATURE = "bad_signature"
 REASON_REPLAY = "replay"
 REASON_RATE_LIMITED = "rate_limited"
 REASON_BUSY = "busy"
+#: 防重放庫忙碌到期限（C-1000）：回應與 `store_unavailable` 逐 byte 相同，只在日誌與計數檔分開。
+REASON_STORE_BUSY = "store_busy"
 REASON_STORE_UNAVAILABLE = "store_unavailable"
 REASON_VERIFIER_UNAVAILABLE = "verifier_unavailable"
 REASON_REGISTRY_UNAVAILABLE = "registry_unavailable"
@@ -130,6 +139,7 @@ REASONS = frozenset({
     REASON_REPLAY,
     REASON_RATE_LIMITED,
     REASON_BUSY,
+    REASON_STORE_BUSY,
     REASON_STORE_UNAVAILABLE,
     REASON_VERIFIER_UNAVAILABLE,
     REASON_REGISTRY_UNAVAILABLE,
@@ -170,6 +180,9 @@ _NONCE_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 #: `on_snapshot` 失敗後重試 allowed_signers 的退避（REPORT-260-archreview §3 第 3 點）。
 SIGNERS_BACKOFF_INITIAL = 5.0
 SIGNERS_BACKOFF_MAX = 300.0
+
+#: `.auth-busy.status` 的寫入間隔（monotonic 秒；C-1007）。寫失敗時下一輪 tick 直接補寫。
+BUSY_STATUS_INTERVAL = 60.0
 
 #: 觀測用：`_monotonic` 是可替換的單調時鐘（只給重試退避與測試；不影響請求判定）。
 _monotonic: Callable[[], float] = time.monotonic
@@ -527,7 +540,7 @@ class AuthGate:
     """
 
     def __init__(self, *, mode: str, clock: Clock, verifier, replay,
-                 stores_ok: bool = True):
+                 stores_ok: bool = True, busy_counter: BusyCounter | None = None):
         if mode not in (MODE_WARN, MODE_ENFORCE):
             raise ValueError("the gate is only used in warn/enforce")
         self.mode = mode
@@ -535,6 +548,8 @@ class AuthGate:
         self.verifier = verifier
         self.replay = replay
         self.stores_ok = bool(stores_ok)
+        # StoreBusy 的計數（C-1001）；None 時判定結果相同，只是不計數。
+        self.busy_counter = busy_counter
         self._lock = threading.Lock()
         self._state = AuthState()
         # 觀測用（測試與報告；不影響判定）。
@@ -693,6 +708,11 @@ class AuthGate:
             return unavailable(REASON_STORE_UNAVAILABLE)
         try:
             accepted = self.replay.accept(key_id, nonce, timestamp)
+        except StoreBusy:
+            # C-1000／C-1001：只有忙碌到期限才計數；其他錯誤維持 store_unavailable。
+            if self.busy_counter is not None:
+                self.busy_counter.hit()
+            return unavailable(REASON_STORE_BUSY)
         except (StoreError, OSError):
             return unavailable(REASON_STORE_UNAVAILABLE)
         except Exception:  # 任何未預期錯誤也絕不當成 PASS
@@ -794,6 +814,12 @@ class AuthRuntime:
         self.verifier = None
         self.purge: PurgeTimer | None = None
         self.gate: AuthGate | None = None
+        # StoreBusy 計數與計數檔（#312；warn／enforce 才建，`_open` 裡建立）。
+        self.busy_counter: BusyCounter | None = None
+        self.busy_window: BusyWindow | None = None
+        self._busy_since = 0
+        self._busy_last_write: float | None = None
+        self._busy_pending = False
         self._degraded: set[str] = set()
         self._stopped = False
         self._signers_backoff = 0.0
@@ -844,6 +870,11 @@ class AuthRuntime:
         # 3. verifier（先自測，再 load_initial；REPORT-D2c-arch §2.2／§5 決定 2）。
         self._open_verifier()
 
+        # StoreBusy 計數與取樣（#312；C-1001／C-1006）。gate 之前建好，要注入它。
+        self.busy_counter = BusyCounter()
+        self.busy_window = BusyWindow(self.busy_counter, monotonic=lambda: _monotonic())
+        self._busy_since = now_seconds(self.clock)
+
         # gate 必須在 load_initial 之前存在：on_snapshot 會發布到它。
         self.gate = AuthGate(
             mode=cfg.mode,
@@ -851,6 +882,7 @@ class AuthRuntime:
             verifier=self.verifier,
             replay=self.replay,
             stores_ok="stores" not in self._degraded,
+            busy_counter=self.busy_counter,
         )
 
         # 4. 名冊與信任庫快照。
@@ -955,7 +987,7 @@ class AuthRuntime:
             self.trust,
             self.clock,
             on_snapshot=self._on_snapshot,
-            extra_ticks=(self._extra_tick,),
+            extra_ticks=(self._extra_tick, self._busy_tick),
             poll_interval=self.cfg.poll_interval,
             owner_uid=self.registry_owner_uid,
         )
@@ -1010,6 +1042,39 @@ class AuthRuntime:
             except Exception as exc:  # 背景執行緒不能因一次失敗就死掉
                 _LOG.warning("auth verifier recheck failed: %s", type(exc).__name__)
         self._retry_signers()
+
+    def _busy_tick(self) -> None:
+        """`.auth-busy.status`（C-1007）：啟動後第一次就寫，之後每 60 秒寫一次；寫失敗的下一輪直接補寫。
+
+        只在 watcher 的背景執行緒上跑。寫入失敗不往上丟，只在每段連續失敗的第一次記一行
+        （不帶路徑、不帶 errno）。
+        """
+        window = self.busy_window
+        if window is None or self.watcher is None:
+            return
+        now = _monotonic()
+        last = self._busy_last_write
+        if not self._busy_pending and last is not None and now - last < BUSY_STATUS_INTERVAL:
+            return
+        total, last_30m, last_60m = window.sample()
+        document = {
+            "schema": BUSY_STATUS_SCHEMA,
+            "mode": self.mode,
+            "since": self._busy_since,
+            "updated": now_seconds(self.clock),
+            "store_busy_total": total,
+            "store_busy_30m": last_30m,
+            "store_busy_60m": last_60m,
+        }
+        try:
+            write_status(self.paths.busy_status, document)
+        except OSError as exc:
+            if not self._busy_pending:
+                self._event("busy_status_write_failed", kind=type(exc).__name__)
+            self._busy_pending = True
+            return
+        self._busy_pending = False
+        self._busy_last_write = now
 
     def _retry_signers(self) -> None:
         gate = self.gate

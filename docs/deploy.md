@@ -56,6 +56,7 @@
 | `/var/lib/llmgateway/llm.db` | `llmgw:llmgw` 0600 | SQLite 資料庫（冷卻紀錄與稽核） |
 | `/var/lib/llmgateway/.keysync.sha` | `llmgw:llmgw` 0600 | 上次套用的金鑰 blob sha 記錄 |
 | `/var/lib/llmgateway/.keysync.status`| `llmgw:llmgw` 0644 | 金鑰同步狀態檔（時間戳與成敗原因，不含值） |
+| `/var/lib/llmgateway/.auth-busy.status` | `llmgw:llmgw` 0644 | 認證防重放庫忙碌（store busy）的計數檔（只有次數與時間，不含請求資料；見 8.22） |
 | `/var/lib/llmgateway/gateway.json`、`.tunnel_known_hosts`、`.tunnel_generation`、`.tunnel_fetch_state`、`.tunnel_fetch_backoff`、`.tunnel_token_meta` | `llmgw:llmgw` 0600 | 隧道跟隨狀態（位址檔、私用 known_hosts、已驗證水位、最近抓取分類與退避、token 到期標頭；不含 token，見 7.1） |
 | `/var/lib/llmgateway-ctl/` | `root:root` 0700 | 遷移與控制狀態目錄（`.cutover.state`、`.cutover.lock`）；`tunnel-apply` 的 `.tunnel-apply.lock`、`.tunnel-apply.state` 與備份目錄 `tunnel-apply.bak/` |
 | `/etc/systemd/system/` | `root:root` 0644 | 系統層 unit：`llmgateway.service`、`llmgateway-tunnel.service` |
@@ -940,7 +941,7 @@ repo 側的舊靜態鍵文件與腳本殘留，另開 d 單清理；清理前不
 - `warn`：有名冊就驗章與授權，並把 would-deny 記進日誌，但**所有結果照舊處理業務**（仍會洩漏憑證）。名冊、`ssh-keygen` 或兩個庫不可用時不阻止啟動，記 `auth_unavailable` 並標示驗證不可判定，不誤報成功。
 - `enforce`：五條業務路由先驗章與授權才進業務。啟動須有有效名冊（或信任庫的已驗證快照）、可用且自測通過的 `ssh-keygen`、已存在且庫識別一致的兩個庫，否則拒絕啟動。
 
-其他路徑一律由 `auth-state-dir` 推導，沒有另外的旗標：`auth-replay.sqlite`（可丟棄的防重放庫）、`auth-trust.sqlite`（世代水位、墓碑、已驗證快照）、`auth-store.lock`、`.auth-registry.status`、`allowed_signers.<世代>`、`sshsig/`、`auth-audit.log`。
+其他路徑一律由 `auth-state-dir` 推導，沒有另外的旗標：`auth-replay.sqlite`（可丟棄的防重放庫）、`auth-trust.sqlite`（世代水位、墓碑、已驗證快照）、`auth-store.lock`、`.auth-registry.status`、`.auth-busy.status`、`allowed_signers.<世代>`、`sshsig/`、`auth-audit.log`。
 
 結束碼：設定值不合法（含未知模式）以結束碼 2 結束；因認證理由拒絕啟動以結束碼 78 結束。2 仍照舊讓 systemd 重啟（OSError 等可能是暫時性的，例如 bind 失敗）；78 由 unit 的 `RestartPreventExitStatus=78` 擋下，不反覆重啟（見 8.17）。
 
@@ -1151,7 +1152,9 @@ sudo llmgwctl start
 
 **root：** 不用（`check` 可非 root 跑，但 `auth-*` 需 root 才是確定結果）。**lgwd 停止：** 這是預期結果。
 
-為了跑寫入指令而停掉 lgwd 時，`check` 的 `auth-heartbeat` 會 fail（心跳超過 180 秒），`auth-local` 也會失敗；這是預期的，啟動後恢復。`check` 的認證項目是 `auth-local`、`auth-heartbeat`、`auth-water`、`auth-stores`、`auth-degraded`；非 root 時 `auth-local`、`auth-water`、`auth-stores` 記 `todo`（結束碼 2），不報 fail。`auth-degraded` 的門檻是 **3600 秒**：從 enforce 降到 warn／off 滿 1 小時即 fail；切模式要用 `llmgwctl restart` 才會被記錄，刪除或替換歷史檔要有 root 或 `llmgw`（狀態目錄的擁有者），判定細節見 8.8。
+為了跑寫入指令而停掉 lgwd 時，`check` 的 `auth-heartbeat` 會 fail（心跳超過 180 秒），`auth-local` 也會失敗；這是預期的，啟動後恢復。`check` 的認證項目是 `auth-local`、`auth-heartbeat`、`auth-water`、`auth-stores`、`auth-busy`、`auth-degraded`；非 root 時 `auth-local`、`auth-water`、`auth-stores` 記 `todo`（結束碼 2），不報 fail。`auth-degraded` 的門檻是 **3600 秒**：從 enforce 降到 warn／off 滿 1 小時即 fail；切模式要用 `llmgwctl restart` 才會被記錄，刪除或替換歷史檔要有 root 或 `llmgw`（狀態目錄的擁有者），判定細節見 8.8。
+
+`auth-busy` 讀 `.auth-busy.status` 的計數：enforce 下近 30 分鐘 StoreBusy 達 **5 次**記 fail；enforce 近 60 分鐘有 **1 次**以上、或 warn 近 60 分鐘有 1 次以上，記 todo（warn 只會 todo，不會 fail）。檔案缺失、壞檔或過期都記 todo，不記 fail。**todo 不會通知，只有 fail 會通知**（見 8.21）。判定與原因見 8.22。
 
 ### 8.15 policy 新增 agent 或角色時（o）
 
@@ -1352,6 +1355,17 @@ sudo llmgwctl install --tag <tag>
 ```
 
 回滾到沒有 notify unit 的舊版時，`llmgwctl rollback` 會照 check unit 的規則先 `disable --now` 再刪檔（notify unit 沒有 `[Install]`，這一步對它是 no-op）。從 v0.1.x 遷移的回退（`rollback-to-user`）只對這些 unit 做 `disable --now`、**不刪 unit 檔**，與 `llmgateway.service` 的回退處理一致。遷移的 `cutover`／`finalize` 會跑 `check`，但 `check-notify` 的 `todo` 不算新服務壞了（通知的設定是之後才放的），不會因此停損；其他 `todo` 與 `fail` 照舊讓遷移停損。
+
+### 8.22 store busy 計數與 `auth-busy`（#312）
+
+**root：** 不用（計數檔 0644，非 root 讀得到，但 `auth-busy` 要讀 `llmgateway.env` 的模式，非 root 跑出來是 todo）。**lgwd 停止：** 不用；計數檔只在 lgwd 運作時寫。
+
+防重放庫忙碌到期限（StoreBusy，行程內鎖或 SQLite 忙碌）時，請求會得到 503 `auth_unavailable`，回應與其他不可用的 503 逐 byte 相同；lgwd 在日誌裡記 `reason=store_busy`，並把次數寫進 `.auth-busy.status`（每 60 秒一次，只有次數、窗口與時間）。`auth-busy` 只看這個檔，不開庫。
+
+- 偶爾一次 StoreBusy：`auth-busy` 記 todo（或 warn 模式下記 todo）；這是可以重試的尾端，不需要動作。
+- enforce 下近 30 分鐘 ≥ 5 次：`auth-busy` 記 fail 並通知。這代表呼叫方反覆吃到 503。先看 #313 的磁碟前提（磁碟或檔案系統是否忙、寫入是否變慢），**不要調 `busy_timeout`**：調大只會讓請求等更久，不會減少忙碌。
+- 重啟 lgwd 會把窗口歸零；`auth-busy` 的 detail 會寫「啟動多久以前」，重啟前的事件留在 journal。
+- 計數檔過期（超過 180 秒沒更新，或時間晚於現在超過 180 秒）時記 todo「計數檔過期」，這時看 `auth-heartbeat`；lgwd 沒在跑時 `auth-heartbeat` 已經會 fail，這裡不重複通知。
 
 ---
 

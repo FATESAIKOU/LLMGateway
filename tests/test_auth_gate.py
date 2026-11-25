@@ -305,12 +305,15 @@ class C602GateFlowTests(GateCase):
         self.assertEqual(verdict.retry_after, 42)
 
     def test_C602_accept_store_error_is_unavailable_never_pass(self):
-        for error in (StoreBusy("busy"), OSError("closed"), RuntimeError("bug")):
+        # StoreBusy 是 #312 的 `store_busy`（C-1000）；其他錯誤仍是 `store_unavailable`。
+        cases = ((StoreBusy("busy"), auth.REASON_STORE_BUSY),
+                 (OSError("closed"), auth.REASON_STORE_UNAVAILABLE),
+                 (RuntimeError("bug"), auth.REASON_STORE_UNAVAILABLE))
+        for error, reason in cases:
             with self.subTest(error=type(error).__name__):
                 self.replay.error = error
                 self.assertVerdict(self.authenticate(self.headers()),
-                                   auth.OUTCOME_UNAVAILABLE,
-                                   auth.REASON_STORE_UNAVAILABLE)
+                                   auth.OUTCOME_UNAVAILABLE, reason)
 
     def test_C602_accept_receives_the_header_key_and_nonce(self):
         headers = self.headers(nonce=nonce(8))
@@ -509,7 +512,7 @@ class C604UnauthorizedBodyTests(unittest.TestCase):
             {
                 "framing", "missing", "malformed", "unknown_key", "revoked",
                 "expired", "water", "bad_signature", "replay", "rate_limited",
-                "busy", "store_unavailable", "verifier_unavailable",
+                "busy", "store_busy", "store_unavailable", "verifier_unavailable",
                 "registry_unavailable",
                 # D3a／C-906：三個授權原因加進白名單（只屬於 `forbidden` 結果）。
                 "forbidden_op", "forbidden_agent", "forbidden_role",
