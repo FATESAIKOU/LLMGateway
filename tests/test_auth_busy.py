@@ -11,12 +11,18 @@ import inspect
 import json
 import logging
 import os
+import socket
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
 from unittest import mock
 
 from lgwd import auth, auth_busy, framing, sshsig
@@ -34,6 +40,7 @@ from lgwd.auth_db import (
     StoreBusy,
     StoreMissing,
     StoreUnavailable,
+    StoreUnclean,
     create_stores,
 )
 from lgwd.auth_paths import auth_paths, now_seconds
@@ -42,7 +49,8 @@ from lgwd.auth_replay import ACCEPTED, DENIED, Accept, ReplayStore
 from lgwd.clock import FakeClock
 from lgwctl import check
 from lgwctl.report import Report
-from tests.auth_fakes import REPO_ROOT
+from tests.auth_fakes import REPO_ROOT, write_registry_file
+from tests.test_main import FAKE_KEYS, key_text, write_policy
 from tests.auth_signer import Signer, key_entry, registry_bytes
 
 UTC = _dt.timezone.utc
@@ -161,6 +169,9 @@ class GateClassificationTests(GateBusyBase):
             (StoreUnavailable("full"), auth.REASON_STORE_UNAVAILABLE),
             (StoreMissing("missing"), auth.REASON_STORE_UNAVAILABLE),
             (StoreUnavailable("corrupt"), auth.REASON_STORE_UNAVAILABLE),
+            (StoreUnavailable("readonly"), auth.REASON_STORE_UNAVAILABLE),
+            (StoreUnavailable("unknown"), auth.REASON_STORE_UNAVAILABLE),
+            (StoreUnclean(), auth.REASON_STORE_UNAVAILABLE),
             (OSError("closed"), auth.REASON_STORE_UNAVAILABLE),
             (RuntimeError("bug"), auth.REASON_STORE_UNAVAILABLE),
         )
@@ -259,12 +270,23 @@ class RealStoreBusyTests(RealStoreBase):
         self.assertEqual(self.counter.total(), 1)
 
     def test_C1000b_in_process_lock_timeout_is_store_busy(self):
-        acquired = self.store._db._lock.acquire(timeout=1)
-        self.assertTrue(acquired)
+        # 另一條執行緒持有 AuthDb._lock 直到測試結束；accept 在 busy_timeout 內拿不到鎖。
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with self.store._db._lock:
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(held.wait(5))
         try:
             verdict = self.authenticate()
         finally:
-            self.store._db._lock.release()
+            release.set()
+            thread.join(5)
         self.assertEqual(verdict.reason, auth.REASON_STORE_BUSY)
         self.assertEqual(self.counter.total(), 1)
 
@@ -318,23 +340,19 @@ class RealStoreBusyTests(RealStoreBase):
             thread.start()
         for thread in threads:
             thread.join()
-        # 推進假時鐘超過一個視窗，最後一筆才會把前一個視窗的累計寫出來。
+        n1 = gate_busy[0]          # 第一個視窗內 gate 回 store_busy 的筆數
+        self.assertGreaterEqual(n1, 2)
+        # 假時鐘推過 60 秒，再打一次，讓 AuthLog 滾動寫出第一個視窗的累計。
         log_clock.t += 61.0
         verdict = self.authenticate()
         auth.apply("enforce", verdict, route="/v1/subscriptions", log=log)
-        with gate_lock:
-            gate_busy[0] += 1
         self.assertEqual(verdict.reason, auth.REASON_STORE_BUSY)
-        emitted = 0
-        for line in lines:
-            if " reason=store_busy " in line:
-                emitted += int(line.rsplit("count=", 1)[1])
-        self.assertEqual(self.counter.total(), gate_busy[0])
-        # AuthLog 的既有行為（lgwd/auth.py `AuthLog.record`）：視窗的第一筆先寫 count=1，
-        # 視窗滾動時再把含第一筆在內的累計寫一次，所以 count 總和比實際次數多 1（本次
-        # 只有一個多筆視窗）。C-1004 要求三數相等，這一點與 AuthLog 的既有語意衝突，
-        # 見報告「需 PM 裁定」；這裡照實際語意斷言，不偷換成相等。
-        self.assertEqual(emitted, gate_busy[0] + 1)
+        self.assertEqual(self.counter.total(), n1 + 1)
+        # 日誌行序列（修訂 3）：第一視窗開頭即時通知 1、滾動寫出的第一視窗累計 N1、
+        # 新視窗開頭即時通知 1。不把 count 加總（AuthLog 的 count 不可相加）。
+        counts = [int(line.rsplit("count=", 1)[1]) for line in lines
+                  if " reason=store_busy " in line]
+        self.assertEqual(counts, [1, n1, 1])
 
     def test_C1004_counter_is_exact_across_threads(self):
         counter = BusyCounter()
@@ -487,6 +505,11 @@ class StatusFileTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.path = os.path.join(self._tmp.name, ".auth-busy.status")
 
+    def test_status_write_never_fsyncs(self):
+        with mock.patch("lgwd.auth_busy.os.fsync") as fsync:
+            write_status(self.path, _document())
+        fsync.assert_not_called()
+
     def test_round_trip_and_mode_0644(self):
         write_status(self.path, _document())
         self.assertEqual(read_status(self.path), _document())
@@ -628,13 +651,15 @@ class RuntimeWriterTests(unittest.TestCase):
         writer.assert_called_once()
 
     def test_iv_log_line_has_no_state_dir_path(self):
-        with mock.patch("lgwd.auth.write_status", side_effect=OSError("x")), \
+        error = PermissionError(13, "Permission denied", self.paths.busy_status)
+        with mock.patch("lgwd.auth.write_status", side_effect=error), \
                 self.assertLogs("lgwd.auth", level="WARNING") as logs:
             self.runtime._busy_tick()
         message = logs.output[0]
         self.assertIn("busy_status_write_failed", message)
-        self.assertIn("kind=OSError", message)
+        self.assertIn("kind=PermissionError", message)
         self.assertNotIn(self.state_dir, message)
+        self.assertNotIn("Permission denied", message)
 
     def test_written_document_has_the_contract_fields(self):
         self.runtime.busy_counter.hit()
@@ -645,6 +670,152 @@ class RuntimeWriterTests(unittest.TestCase):
         self.assertEqual(document["store_busy_total"], 1)
         self.assertEqual(document["since"], now_seconds(self.clock))
         self.assertEqual(document["updated"], now_seconds(self.clock))
+
+
+# ---------------------------------------------------------------------------
+# 真實 open_runtime 的接線（修訂 mid-1）與端到端
+# ---------------------------------------------------------------------------
+
+class RuntimeWiringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._keys = tempfile.TemporaryDirectory()
+        cls.signer = Signer(cls._keys.name, "k-a")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._keys.cleanup()
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+        self.state_dir = os.path.join(self.dir, "state")
+        os.makedirs(self.state_dir, mode=0o700)
+        self.paths = auth_paths(self.state_dir,
+                                registry=os.path.join(self.dir, "auth-registry.json"))
+        create_stores(self.paths.trust_db, self.paths.replay_db)
+        write_registry_file(self.paths.registry,
+                            registry_bytes(1, [key_entry("k-a", self.signer)]))
+        self.clock = FakeClock(NOW)
+        self.mono = Mono(1000.0)
+        patcher = mock.patch.object(auth, "_monotonic", lambda: self.mono.t)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def open(self, mode):
+        cfg = auth.AuthConfig(mode=mode, registry_path=self.paths.registry,
+                              state_dir=self.state_dir, per_key_max=600,
+                              poll_interval=0.0, busy_timeout=0.1)
+        runtime = auth.open_runtime(cfg, self.clock, owner_uid=0,
+                                    registry_owner_uid=os.getuid())
+        self.addCleanup(runtime.stop)
+        return runtime
+
+    def authenticate(self, runtime):
+        headers = Headers(self.signer.headers(
+            key_id="k-a", method="GET", target=TARGET, body=b"",
+            timestamp=now_seconds(self.clock)))
+        return runtime.gate.authenticate(method="GET", framing=_framing(),
+                                         headers=headers, body=b"")
+
+    def hold_write_lock(self):
+        holder = sqlite3.connect(self.paths.replay_db, isolation_level=None, timeout=0)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+        self.addCleanup(lambda: holder.execute("ROLLBACK") if holder.in_transaction else None)
+
+    def scenario(self, mode):
+        runtime = self.open(mode)
+        # 接線：計數器注入 gate；watcher 的 extra tick 含寫檔；第一次 tick 就寫。
+        self.assertIs(runtime.gate.busy_counter, runtime.busy_counter)
+        self.assertIn(runtime._busy_tick, runtime.watcher.extra_ticks)
+        runtime.watcher.tick()
+        first = read_status(self.paths.busy_status)
+        self.assertEqual((first["mode"], first["store_busy_total"]), (mode, 0))
+        self.assertEqual(first["since"], now_seconds(self.clock))
+        self.assertEqual(first["updated"], first["since"])
+        self.assertEqual(stat.S_IMODE(os.stat(self.paths.busy_status).st_mode), 0o644)
+
+        self.hold_write_lock()
+        for _ in range(2):
+            verdict = self.authenticate(runtime)
+            self.assertEqual(verdict.reason, auth.REASON_STORE_BUSY)
+        self.mono.t = 3000.0
+        runtime.watcher.tick()
+        second = read_status(self.paths.busy_status)
+        self.assertEqual((second["store_busy_total"], second["store_busy_30m"],
+                          second["store_busy_60m"]), (2, 2, 2))
+
+        self.assertEqual(self.authenticate(runtime).reason, auth.REASON_STORE_BUSY)
+        # 時鐘前進 2000 秒（updated 與 since 不同）；單調時鐘在 3000 之後 1900 秒。
+        self.clock.advance(seconds=2000)
+        self.mono.t = 4900.0
+        runtime.watcher.tick()
+        third = read_status(self.paths.busy_status)
+        self.assertEqual(third["mode"], mode)
+        self.assertEqual(third["store_busy_total"], 3)
+        self.assertEqual(third["store_busy_30m"], 1)   # 基準是 3000 秒那一筆（total 2）
+        self.assertEqual(third["store_busy_60m"], 3)   # 基準是啟動樣本（total 0）
+        self.assertEqual(third["since"], first["since"])
+        self.assertEqual(third["updated"] - third["since"], 2000)
+
+    def test_enforce_wiring_and_end_to_end(self):
+        self.scenario("enforce")
+
+    def test_warn_wiring_and_end_to_end(self):
+        self.scenario("warn")
+
+
+# ---------------------------------------------------------------------------
+# C-1008：off 前後的 state dir 目錄清單（修訂 mid-2）
+# ---------------------------------------------------------------------------
+
+class OffStateDirTests(unittest.TestCase):
+    def test_off_leaves_an_existing_state_dir_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            write_policy(root)
+            (root / "keys.env").write_text(key_text(FAKE_KEYS))
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            (state / "sentinel").write_text("keep")
+            before = sorted(os.listdir(state))
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            cmd = [sys.executable, "-m", "lgwd", "--auth-mode", "off",
+                   "--auth-state-dir", str(state),
+                   "--auth-registry", str(root / "registry"),
+                   "--auth-sshkeygen-path", str(root / "ssh-keygen"),
+                   "--db", str(root / "app.sqlite"), "--keys", str(root / "keys.env"),
+                   "--policy", str(root / "policy.json"), "--keysync-interval", "0",
+                   "--api-port", str(port)]
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 10
+                while True:
+                    try:
+                        with urllib.request.urlopen(
+                                f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
+                            self.assertEqual(response.status, 200)
+                            break
+                    except OSError:
+                        self.assertIsNone(proc.poll())
+                        if time.monotonic() > deadline:
+                            self.fail("server did not start")
+                        time.sleep(0.05)
+                # 業務路由：off 下不驗章，任何 HTTP 回應都算走完一次請求。
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/subscriptions", timeout=2)
+                except urllib.error.HTTPError:
+                    pass
+            finally:
+                proc.terminate()
+                proc.wait(timeout=10)
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(sorted(os.listdir(state)), before)
+            self.assertFalse((state / ".auth-busy.status").exists())
 
 
 # ---------------------------------------------------------------------------
