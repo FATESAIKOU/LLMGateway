@@ -38,12 +38,17 @@ def run(directory: str, port: int, duration: float, concurrency: int, target: st
     lock = threading.Lock()
     statuses: collections.Counter = collections.Counter()
     errors: collections.Counter = collections.Counter()
+    # 每種錯誤第一次與最後一次出現的時刻（epoch 秒，time.time()）；呼叫端拿它跟停止時刻比。
+    windows: dict = {}
     refused = 0
     q: queue.Queue = queue.Queue(maxsize=256)
 
     def fail(kind: str) -> None:
+        now = time.time()
         with lock:
             errors[kind] += 1
+            first, _ = windows.get(kind, (now, now))
+            windows[kind] = (first, now)
 
     def producer() -> None:
         while not stop.is_set():
@@ -119,6 +124,11 @@ def run(directory: str, port: int, duration: float, concurrency: int, target: st
         "requests": sum(statuses.values()) + refused + sum(errors.values()),
         "statuses": {str(code): n for code, n in sorted(statuses.items())},
         "errors": dict(sorted(errors.items())),
+        # 連線被切斷類（伺服器 RST）與回應格式錯誤各自單列；它們同時也在 errors 裡，不重複計入別處。
+        "connection_reset": errors.get("ConnectionResetError", 0),
+        "bad_status_line": errors.get("bad_status_line", 0),
+        "error_window": {kind: {"first": round(a, 3), "last": round(b, 3)}
+                         for kind, (a, b) in sorted(windows.items())},
         "connection_refused": refused,
         "rate": round(total_ok / elapsed, 2) if elapsed > 0 else 0.0,
     }

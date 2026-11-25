@@ -138,8 +138,9 @@ class LoadClientTest(unittest.TestCase):
             self.assertEqual(result["statuses"], {}, result)
             self.assertEqual(result["errors"], {}, result)
 
-    def test_503_is_reported_as_status_and_never_as_200(self):
-        # 假服務：每個連線都回 503；客戶端必須把它記成 503，rate（只算 200）為 0。
+    def _with_fake_server(self, mode: str, duration: str = "1", concurrency: str = "4"):
+        """假服務：`503`＝回 503；`garbage`＝回非 HTTP 的字；`reset`＝讀完就 RST 切斷。"""
+        import struct
         import threading
         with tempfile.TemporaryDirectory() as d:
             v0_prepare.prepare(d, "warn", _free_port())
@@ -158,22 +159,46 @@ class LoadClientTest(unittest.TestCase):
                         continue
                     with conn:
                         conn.recv(65536)
-                        conn.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                        if mode == "503":
+                            conn.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                        elif mode == "garbage":
+                            conn.sendall(b"HELLO\r\n\r\n")
+                        elif mode == "reset":
+                            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
 
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
             try:
-                done = _client(d, port, duration="1", concurrency="4")
+                done = _client(d, port, duration=duration, concurrency=concurrency)
             finally:
                 halt.set()
                 thread.join(timeout=5)
                 server.close()
             self.assertEqual(done.returncode, 0, done.stderr)
-            result = json.loads(done.stdout)
-            self.assertGreater(result["statuses"].get("503", 0), 0, result)
-            self.assertEqual(set(result["statuses"]), {"503"}, result)
-            self.assertEqual(result["rate"], 0.0, result)
-            self.assertEqual(result["connection_refused"], 0, result)
+            return json.loads(done.stdout)
+
+    def test_503_is_reported_as_status_and_never_as_200(self):
+        result = self._with_fake_server("503")
+        self.assertGreater(result["statuses"].get("503", 0), 0, result)
+        self.assertEqual(set(result["statuses"]), {"503"}, result)
+        self.assertEqual(result["rate"], 0.0, result)
+        self.assertEqual(result["connection_refused"], 0, result)
+
+    def test_rst_is_counted_as_connection_reset_with_time_window(self):
+        result = self._with_fake_server("reset")
+        self.assertGreater(result["connection_reset"], 0, result)
+        self.assertEqual(result["connection_reset"], result["errors"].get("ConnectionResetError"), result)
+        window = result["error_window"]["ConnectionResetError"]
+        self.assertLessEqual(window["first"], window["last"], result)
+        self.assertEqual(result["bad_status_line"], 0, result)
+        self.assertEqual(result["statuses"], {}, result)
+
+    def test_garbage_reply_is_counted_as_bad_status_line(self):
+        result = self._with_fake_server("garbage")
+        self.assertGreater(result["bad_status_line"], 0, result)
+        self.assertEqual(result["bad_status_line"], result["errors"].get("bad_status_line"), result)
+        self.assertEqual(result["connection_reset"], 0, result)
+        self.assertIn("bad_status_line", result["error_window"], result)
 
     def test_sigterm_ends_client_cleanly_and_still_prints_result(self):
         with tempfile.TemporaryDirectory() as d:

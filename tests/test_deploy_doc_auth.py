@@ -538,6 +538,52 @@ class V05TransientServiceTests(unittest.TestCase):
                        "沒有驗到的", "不碰 `/opt/llmgateway/current`"):
             self.assertIn(needle, self.section, needle)
 
+    def _step(self, prefix):
+        lines = [line for line in self.section.splitlines() if line.startswith(prefix)]
+        self.assertEqual(len(lines), 1, prefix)
+        return lines[0]
+
+    def test_prepare_step_says_three_lines_with_key_id(self):
+        step = self._step("2. 準備：")
+        self.assertIn("它印出三行", step)
+        for name in ("lgwd-args:", "client-env:", "client-key-id:"):
+            self.assertIn(name, step)
+
+    def test_load_start_has_no_subshell_and_checks_pid_with_ps(self):
+        # 中-1：cd 與背景指令分行；$! 取到的是 python 本身；用 ps 確認。
+        self.assertIn("LOAD_PID=$!", self.section)
+        self.assertIn('ps -p "$LOAD_PID" -o cmd=', self.section)
+        self.assertIn("python3 -m tests.v0_load_client", self.section)
+        load_lines = [l for l in self.section.splitlines() if "tests.v0_load_client --duration" in l]
+        self.assertEqual(len(load_lines), 1)
+        self.assertNotIn("&&", load_lines[0])
+        self.assertTrue(load_lines[0].rstrip().endswith("&"), load_lines[0])
+        self.assertIn("不用 pkill", self.section)
+
+    def test_assertion1_separates_cut_errors_by_stop_time(self):
+        # 中-2：切斷類錯誤只能出現在停止之後；errors 原樣進紀錄。
+        line = self._step("1. **期間無 503")
+        for needle in ("`errors`", "`connection_reset`", "`bad_status_line`", "`error_window`",
+                       "`STOP_EPOCH`", "不得早於", "停止之前出現任一項即未達"):
+            self.assertIn(needle, line, needle)
+        self.assertIn("STOP_EPOCH=$(date +%s.%N)", self.section)
+
+    def test_assertion2_is_the_20_second_sentence_with_monotonic_method(self):
+        # 低-2：「20 秒內結束」鎖在斷言 2 那一句，判準是單調時間差。
+        line = self._step("2. **主行程 20 秒內結束**")
+        for needle in ("ExecMainExitTimestampMonotonic", "/proc/uptime", "T0",
+                       "≤ 20", "值為 `0`", "未在真機驗"):
+            self.assertIn(needle, line, needle)
+        self.assertIn("T0=$(cut -d' ' -f1 /proc/uptime)", self.section)
+        self.assertNotIn("InactiveEnterTimestamp ", self._step("2. **主行程 20 秒內結束"))
+
+    def test_assertion3_locks_full_cgroup_path_and_absent_counts_as_empty(self):
+        # 低-1：完整字串；檔案不存在也算空。
+        line = self._step("3. **cgroup 沒有殘留**")
+        self.assertIn("/sys/fs/cgroup/system.slice/lgw-v0.service/cgroup.procs", line)
+        self.assertIn("檔案不存在", line)
+        self.assertIn("也算空", line)
+
     def test_v06_rows_untouched_by_v05_section(self):
         table = between(self.doc, "### 8.18 上線前清單", "### 8.18.1 ")
         self.assertEqual(len([l for l in table.splitlines() if l.startswith("| V-0.6b |")]), 1)

@@ -1291,17 +1291,26 @@ systemd-run --unit=lgw-v0 --service-type=exec --working-directory=/var/lib/llmga
 **步驟：**
 
 1. 建空目錄 `/var/lib/llmgateway-v0/run`（用 `mkdir` 新建，不重用舊的）。
-2. 準備：在 `/var/lib/llmgateway-v0/src` 下執行 `PYTHONDONTWRITEBYTECODE=1 python3 -m tests.v0_prepare --dir /var/lib/llmgateway-v0/run --mode enforce --port <埠>`。它印出兩行：`lgwd-args:`（貼進上面的 `systemd-run`）與 `client-env:`（客戶端要的環境變數名，只有名字沒有值）。埠要是 127.0.0.1 上沒有別人在用的埠。輸出不含金鑰內容；`keys.env` 與私鑰是 0600。`v0_prepare` 會多給 `--auth-per-key-max 1000000`（與 C-612 同值）：出廠 600 是 65 秒視窗（約 9 筆／秒），負載會被 429 擋掉，量到的就不是 V-0.5 要的東西。
+2. 準備：在 `/var/lib/llmgateway-v0/src` 下執行 `PYTHONDONTWRITEBYTECODE=1 python3 -m tests.v0_prepare --dir /var/lib/llmgateway-v0/run --mode enforce --port <埠>`。它印出三行：`lgwd-args:`（貼進上面的 `systemd-run`）、`client-env:`（客戶端要的環境變數名，只有名字沒有值）與 `client-key-id:`（簽章金鑰的 ID，記進部署紀錄；客戶端不靠它給參數，它寫死在 `tests/v0_prepare.py`）。埠要是 127.0.0.1 上沒有別人在用的埠。輸出不含金鑰內容；`keys.env` 與私鑰是 0600。`v0_prepare` 會多給 `--auth-per-key-max 1000000`（與 C-612 同值）：出廠 600 是 65 秒視窗（約 9 筆／秒），負載會被 429 擋掉，量到的就不是 V-0.5 要的東西。
 3. 啟動：貼上面的 `systemd-run`；等 `127.0.0.1:<埠>` 的 `/healthz` 回 200 之後才開負載（這一步只確認服務起來，不拿它當驗收）。
-4. 負載：`cd /var/lib/llmgateway-v0/src && LGW_V0_DIR=/var/lib/llmgateway-v0/run LGW_V0_PORT=<埠> PYTHONDONTWRITEBYTECODE=1 python3 -m tests.v0_load_client --duration 120 --concurrency 32 > /var/lib/llmgateway-v0/load.json 2> /var/lib/llmgateway-v0/load.err &`，記下 pid（停的時候只 kill 這個 pid，不用 pkill）。
-5. 負載跑約 60 秒後，記下時刻（`date +%s.%N`），執行 `systemctl stop lgw-v0`，再記下停止完成的時刻。
+4. 負載（分三行。不寫成 `cd … && … &`：那樣 `$!` 會是子 shell，不是客戶端）：
+
+   ```bash
+   cd /var/lib/llmgateway-v0/src
+   LGW_V0_DIR=/var/lib/llmgateway-v0/run LGW_V0_PORT=<埠> PYTHONDONTWRITEBYTECODE=1 python3 -m tests.v0_load_client --duration 120 --concurrency 32 > /var/lib/llmgateway-v0/load.json 2> /var/lib/llmgateway-v0/load.err &
+   LOAD_PID=$!
+   ps -p "$LOAD_PID" -o cmd=
+   ```
+
+   `ps` 的輸出必須是 `python3 -m tests.v0_load_client …`；如果是 `bash`／`sh` 或別的東西，就停下、不 kill 任何東西，回報。停的時候只 kill 這個 `LOAD_PID`（不用 pkill）。（推論：單一簡單指令前面加環境變數時，`$!` 是 python 本身；未在真機驗，所以用 `ps` 確認。）
+5. 負載跑約 60 秒後，先記下停止開始的時刻 `STOP_EPOCH=$(date +%s.%N)` 與 `T0=$(cut -d' ' -f1 /proc/uptime)`，再執行 `systemctl stop lgw-v0`。
 6. 等客戶端自己結束（它在 120 秒時結束，或收到 SIGTERM 時乾淨結束並印出 JSON）。讀 `load.json`。
 
 **三項斷言（全部成立才算 V-0.5 通過）：**
 
-1. **期間無 503**：`load.json` 的 `statuses` 沒有 `"503"` 鍵；`connection_refused` 單獨計，停止後的新連線被拒**不算** 503。
-2. **主行程 20 秒內結束**：`systemctl stop` 的時刻到 `systemctl show lgw-v0 -p InactiveEnterTimestamp` 之間 ≤ 20 秒（`TimeoutStopSec=30` 是上限；超過就是停損）。
-3. **cgroup 沒有殘留**：`cat /sys/fs/cgroup/system.slice/lgw-v0.service/cgroup.procs` 為空，或 `systemctl is-active lgw-v0` 是 `inactive`。
+1. **期間無 503，切斷類錯誤只能出現在停止之後**：`load.json` 的 `statuses` 沒有 `"503"` 鍵；`connection_refused` 單獨計，停止後的新連線被拒**不算** 503。`load.json` 的 `errors` 原樣寫進部署紀錄（整個物件，不只挑幾項）。另看 `connection_reset`（`ConnectionResetError`）與 `bad_status_line`：它們在 `error_window` 裡的 `first`（epoch 秒）**不得早於** `STOP_EPOCH`；之後出現的才算停止過程中的正常現象。停止之前出現任一項即未達。
+2. **主行程 20 秒內結束**：用單調時間差算。`(systemctl show lgw-v0 -p ExecMainExitTimestampMonotonic --value 的值 ÷ 1000000) − T0 ≤ 20` 才算過（微秒值，自開機起算；`T0` 是步驟 5 停止前讀的 `/proc/uptime` 第一欄，也是自開機起算的秒數）。值為 `0` 表示主行程沒有結束過，視為未達。`TimeoutStopSec=30` 是上限，超過就是停損。（推論：`/proc/uptime` 與 systemd 的單調時間同一個起點；未在真機驗。若真機差距明顯，改用 `InactiveEnterTimestampMonotonic` 同樣取法，並把差異記入紀錄。）
+3. **cgroup 沒有殘留**：`cat /sys/fs/cgroup/system.slice/lgw-v0.service/cgroup.procs` 為空；**檔案不存在**（unit 已 inactive、cgroup 已移除）也算空；或 `systemctl is-active lgw-v0` 是 `inactive`。檔案存在且有 pid 即未達。
 
 **停損：** 任一項未達，就**不要**改正式服務，照下面的清理做，把原樣輸出與未達的那一項寫進部署紀錄。不得為了過斷言而放寬 `TimeoutStopSec`、改 `KillMode`，或把連線被拒算成 200。
 
