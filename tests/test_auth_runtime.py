@@ -3,8 +3,8 @@
 - C-605（程式庫層）：`open_runtime` 的順序、每種拒絕分類、warn 的降級與「不重開庫」。
 - C-610：REPORT-D2c-arch §2.3 的 W-1～W-20（各案例在測試名或 docstring 標編號；
   已在其他檔驗過的案例在對應測試的 docstring 註明）。
-- C-611：30 秒短版持續率（功能支一律執行；時間支只在機器未被共載時斷言；預設 5 秒商店
-  期限與 2 秒驗章期限，不放寬）。
+- C-611：30 秒短版持續率（功能支一律執行；時間支只在機器未被**外部**共載時斷言：開始前
+  就過載，或跑完後過載且開始前機器就不是閒置的；預設 5 秒商店期限與 2 秒驗章期限，不放寬）。
 
 全部用暫存目錄、真的暫存金鑰與真的 `ssh-keygen`；不碰 `/var/lib`、`/etc`、不讀憑證、
 不連真機。
@@ -717,20 +717,119 @@ class WaterEventTests(RuntimeCase):
 # C-611：30 秒短版持續率
 # ---------------------------------------------------------------------------
 
-def _oversubscribed() -> tuple[float, int, bool]:
-    """機器是否被別的 session 共載到量不出持續率與等鎖 p99 的程度（load1 > 2 × 核數）。
-
-    慣例同 PR-3 `tests/test_auth_replay.py` 的 `_oversubscribed`：時間判準是設計值，要在
-    不被別的 heavy job 搶 CPU／磁碟的機器上量。回 (load1, 核數, 是否過載)；讀不到 load
-    就當沒過載（照常量）。取樣在負載**開始之前**，這樣不會把這一支自己的 32 條執行緒算
-    進來（load1 是 1 分鐘平均，跑完再取會把自己算成共載）。
-    """
-    cores = os.cpu_count() or 1
+def _load1() -> float | None:
+    """目前 1 分鐘平均 load（load1）；讀不到（非 POSIX）回 None。"""
     try:
-        load = float(os.getloadavg()[0])
+        return float(os.getloadavg()[0])
     except OSError:  # pragma: no cover - 非 POSIX
-        return 0.0, cores, False
-    return load, cores, load > 2 * cores
+        return None
+
+
+def _should_skip_time_branch(load_before: float | None, load_after: float | None,
+                             cores: int | None) -> tuple[bool, str]:
+    """時間支該不該 skip（純函式，不碰機器也不讀 load）：回 (skip, 說明)。
+
+    skip 只有兩種情況，都是「機器在跑的期間被**外部**共載到量不出設計值」：
+
+    1. 負載**開始之前**就過載：load_before > 2×核數。
+    2. 跑完後過載，而且開始前機器就不是閒置的：load_after > 2×核數 且 load_before > 核數。
+       開始前就超過核數代表機器本來就有別人在跑，跑完後再被推過 2×核數就視為外部共載。
+
+    閒置的機器（load_before ≤ 核數）不得因為跑完後 load_after 被這一支自己的 36 條執行緒
+    推高而 skip：例如 2 核、開始前 0.1、跑完 14.0 仍要照常量斷言，否則小核 CI 的時間判準
+    會被無聲略過（#305）。
+
+    為什麼不扣「自身貢獻」（load_after − own_threads×(1−e^(−duration/60))）：那個估計假設
+    執行緒一直在跑、而且只算這一支，實際上 32 條 consumer 大半在等鎖／等 I/O，估計不準；
+    在長期共載的機器上（例如本機 16 核、load1 約 30）扣完會讓 #263 那種邊緣失敗
+    （p99=1.07s）重新照常量斷言，把 flaky 引回來（PM 2026-11-25 裁定不採該公式）。
+
+    已知限制：開始前 load 介於核數與 2×核數之間的機器，自己的負載把 load_after 推過
+    2×核數 時仍會 skip。這只會多 skip、不會多失敗，可接受。
+
+    口徑與 PR-3 `tests/test_auth_replay.py` 的 `_oversubscribed` 同源（開始前的
+    load1 > 2×核數），差別是這裡多看跑完後的 load。核數或 load 讀不到（None）時不 skip，
+    照常量斷言；判準數值（rate≥50/s、p99<1s、30 秒、32 並發）不在這裡。
+    """
+    if cores is None or cores < 1 or load_before is None or load_after is None:
+        return False, "核數或 load1 讀不到，照常量斷言（不 skip）"
+    limit = 2.0 * cores
+    detail = ("開始前 load1={0:.2f}、跑完 {1:.2f}；核數={2}、門檻 2×核數={3:.0f}".format(
+        load_before, load_after, cores, limit))
+    if load_before > limit:
+        return True, "開始前就共載：" + detail
+    if load_after > limit and load_before > cores:
+        return True, "跑的期間有外部共載（跑完後過載且開始前非閒置）：" + detail
+    return False, detail
+
+
+class TimeBranchSkipRuleTests(unittest.TestCase):
+    """C-611 時間支 skip 口徑的表格測試（純函式；不跑 30 秒負載、不讀機器）。"""
+
+    def decide(self, load_before, load_after, cores):
+        return _should_skip_time_branch(load_before, load_after, cores)
+
+    def test_idle_small_machine_does_not_skip_itself(self):
+        """閒置 2 核（門檻 4）、開始前 0.1、跑完 14.0 幾乎全是自己的執行緒：不得自我 skip。"""
+        skip, detail = self.decide(0.1, 14.0, 2)
+        self.assertFalse(skip, detail)
+
+    def test_small_machine_not_idle_before_skips_when_pushed_over(self):
+        """同型 2 核但開始前 3.0（> 核數、非閒置）、跑完 14.0（> 4）：視為外部共載而 skip。"""
+        skip, detail = self.decide(3.0, 14.0, 2)
+        self.assertTrue(skip, detail)
+        self.assertIn("外部共載", detail)
+
+    def test_idle_large_machine_does_not_skip(self):
+        """閒置 16 核：開始前 0.1、跑完 14.0 低於門檻 32，不 skip。"""
+        skip, detail = self.decide(0.1, 14.0, 16)
+        self.assertFalse(skip, detail)
+
+    def test_oversubscribed_before_skips(self):
+        """開始前就過載（16 核、門檻 32、開始前 33）：跑完的 load 不影響這個判斷（這裡故意
+        給低於門檻的 30），仍然 skip。"""
+        skip, detail = self.decide(33.0, 30.0, 16)
+        self.assertTrue(skip, detail)
+        self.assertIn("開始前", detail)
+
+    def test_263_case_skips(self):
+        """#263 實跑（16 核、開始前 29.7、跑完 36.7）：before > 16 且 after > 32 → skip。"""
+        skip, detail = self.decide(29.7, 36.7, 16)
+        self.assertTrue(skip, detail)
+        self.assertIn("外部共載", detail)
+
+    def test_busy_before_but_not_over_after_does_not_skip(self):
+        """16 核、開始前 20（> 核數）、跑完 20（≤ 32）：沒有過載，不 skip。"""
+        skip, detail = self.decide(20.0, 20.0, 16)
+        self.assertFalse(skip, detail)
+
+    def test_pushed_over_after_with_busy_before_skips(self):
+        """16 核、開始前 17（> 核數）、跑完 33（> 32）→ skip。"""
+        skip, detail = self.decide(17.0, 33.0, 16)
+        self.assertTrue(skip, detail)
+
+    def test_threshold_boundaries_are_strict(self):
+        """門檻是嚴格大於：剛好等於核數／2×核數都不算超過。"""
+        cores = 4
+        limit = 2.0 * cores
+        # 開始前剛好等於 2×核數：不算過載；多一點才 skip。
+        self.assertFalse(self.decide(limit, limit, cores)[0])
+        self.assertTrue(self.decide(limit + 0.01, limit, cores)[0])
+        # 開始前剛好等於核數：不算「非閒置」，跑完再高也不 skip；多一點才 skip。
+        self.assertFalse(self.decide(float(cores), 100.0, cores)[0])
+        self.assertTrue(self.decide(cores + 0.01, limit + 0.01, cores)[0])
+        # 跑完剛好等於 2×核數：不算過載；多一點才 skip。
+        self.assertFalse(self.decide(cores + 0.01, limit, cores)[0])
+        self.assertTrue(self.decide(cores + 0.01, limit + 0.01, cores)[0])
+
+    def test_unreadable_load_or_cores_does_not_skip(self):
+        """核數或 load 讀不到：不 skip，照常量斷言。"""
+        for load_before, load_after, cores in (
+                (None, 99.0, 16), (0.1, None, 16), (0.1, 99.0, None),
+                (0.1, 99.0, 0)):
+            skip, detail = self.decide(load_before, load_after, cores)
+            self.assertFalse(skip, "{0!r}/{1!r}/{2!r}: {3}".format(
+                load_before, load_after, cores, detail))
 
 
 class RateTests(unittest.TestCase):
@@ -740,10 +839,11 @@ class RateTests(unittest.TestCase):
 
     - 功能支（**永遠執行**，不受機器負載影響）：零例外、零假 503／非 200、每一筆都
       ACCEPTED（`200`）且都寫進 replay 庫（列數＝接受數）。
-    - 時間支（共載時 skip）：接受率 ≥ 50 req/s、等鎖 p99 < 1 秒；只在
-      `_oversubscribed()` 為假（load1 ≤ 2×核數）時斷言，被別的 session 共載時
-      `skipTest`，訊息帶量到的 rate／p99／load1／核數。功能判準在另一支，不會跟著
-      skip。
+    - 時間支（外部共載時 skip）：接受率 ≥ 50 req/s、等鎖 p99 < 1 秒；只在機器沒有被
+      **外部**共載時斷言——開始前 load1 就 > 2×核數，或跑完後 load1 > 2×核數而且開始前
+      就 > 核數（口徑與表格見 `_should_skip_time_branch` 與 `TimeBranchSkipRuleTests`）。
+      閒置的機器不會因為跑完後被這一支自己推高而 skip。共載時 `skipTest`，訊息帶量到的
+      rate／p99／load1／核數。功能判準在另一支，不會跟著 skip。
 
     量到的數字一律印出來供報告引用。驗章期限用預設 2 秒、商店 `busy_timeout` 用預設
     5 秒（不放寬，也不拿放寬當時間判準的依據）。簽章由 4 條 producer 執行緒在視窗內
@@ -867,8 +967,10 @@ class RateTests(unittest.TestCase):
 
         producers = [threading.Thread(target=producer, daemon=True)
                      for _ in range(self.PRODUCERS)]
-        # 共載判準取樣在啟動負載之前：load1 是 1 分鐘平均，跑完再取會把自己算成共載。
-        load, cores, oversubscribed = _oversubscribed()
+        # 共載判準取樣在啟動負載之前（開始前就過載＝共載）；跑完再取一次，跑完後過載而且
+        # 開始前機器就不是閒置的，才視為跑的期間有外部共載（口徑見 _should_skip_time_branch）。
+        load = _load1()
+        cores = os.cpu_count()
         for worker in producers:
             worker.start()
         consumers = [threading.Thread(target=consumer, daemon=True)
@@ -891,18 +993,18 @@ class RateTests(unittest.TestCase):
         with lock:
             snapshot = list(results)
             failures = list(errors)
-        try:
-            load_after = float(os.getloadavg()[0])
-        except OSError:  # pragma: no cover - 非 POSIX
-            load_after = 0.0
+        load_after = _load1()
         rate = len(snapshot) / elapsed
         ordered = sorted(waits)
         p99 = ordered[int(len(ordered) * 0.99) - 1] if ordered else 0.0
+        skip, skip_detail = _should_skip_time_branch(load, load_after, cores)
         print("C-611 elapsed={0:.1f}s accepted={1} rows={2} rate={3:.1f}/s "
-              "p99_lock={4:.4f}s loadavg={5} (after {6:.2f}) cores={7} "
-              "oversubscribed={8}".format(
-                  elapsed, len(snapshot), rows, rate, p99, load, load_after, cores,
-                  oversubscribed))
+              "p99_lock={4:.4f}s loadavg={5} (after {6}) cores={7} "
+              "time_branch={8} ({9})".format(
+                  elapsed, len(snapshot), rows, rate, p99,
+                  "n/a" if load is None else "{0:.2f}".format(load),
+                  "n/a" if load_after is None else "{0:.2f}".format(load_after),
+                  cores, "skip" if skip else "run", skip_detail))
         return {
             "elapsed": elapsed,
             "statuses": snapshot,
@@ -915,7 +1017,8 @@ class RateTests(unittest.TestCase):
             "load": load,
             "load_after": load_after,
             "cores": cores,
-            "oversubscribed": oversubscribed,
+            "skip": skip,
+            "skip_detail": skip_detail,
         }
 
     def test_C611_throughput_functional_always_accepted(self):
@@ -933,22 +1036,22 @@ class RateTests(unittest.TestCase):
     def test_C611_throughput_hit_rate_and_lock_p99(self):
         """C-611 時間：接受率 ≥ 50 req/s、等鎖 p99 < 1 秒（判準不放寬）。
 
-        只在機器沒有被別的 session 共載（開始前與跑完後的 load1 都 ≤ 2×核數）
-        時斷言；共載時 `skipTest`，訊息帶量到的 rate／p99／load1／核數。功能判準在另一
-        支，不會因為這一支 skip 而消失。
+        只在機器沒有被**外部**共載時斷言：開始前 load1 就 > 2×核數，或跑完後 load1 > 2×核數
+        而且開始前就 > 核數（開始前機器本來就有別人在跑）；口徑與表格見
+        `_should_skip_time_branch` 與 `TimeBranchSkipRuleTests`。閒置的機器不會因為跑完後
+        被這一支自己推高而 skip。共載時 `skipTest`，訊息帶量到的 rate／p99／load1／核數；
+        功能判準在另一支，不會因為這一支 skip 而消失。
         """
         sample = self._run_sample()
-        detail = "rate={0:.1f}/s p99={1:.4f}s load1={2:.2f} (after {3:.2f}) cores={4}".format(
-            sample["rate"], sample["p99"], sample["load"], sample["load_after"],
-            sample["cores"])
-        # PM 調整（#263 全套實跑）：開始前 load1 剛好在門檻下（29.7<32），跑完後升到 36.7，
-        # 結果 p99=1.07s 邊緣失敗；共載是否影響量測要看**跑的期間**，所以開始前或結束後任一
-        # 超過 2×核數都視為共載而 skip（判準數值不變）。
-        if sample["oversubscribed"] or sample["load_after"] > 2 * sample["cores"]:
+        detail = ("rate={0:.1f}/s p99={1:.4f}s 開始前 load1={2}（跑完 {3}）"
+                  " cores={4}").format(
+                      sample["rate"], sample["p99"], sample["load"],
+                      sample["load_after"], sample["cores"])
+        if sample["skip"]:
             self.skipTest(
-                "機器共載：load1={0:.2f}（跑完 {4:.2f}）> 2×{1} 核，持續率與等鎖 p99 量到的是共用資源"
-                "競爭不是設計值；判準（rate≥50/s、p99<1s）不變：{2}".format(
-                    sample["load"], sample["cores"], detail, 0, sample["load_after"]))
+                "機器共載：{0}；持續率與等鎖 p99 量到的是共用資源競爭不是設計值；"
+                "判準（rate≥50/s、p99<1s）不變：{1}".format(
+                    sample["skip_detail"], detail))
         self.assertTrue(sample["waits"], "沒有收到等鎖樣本")
         self.assertGreaterEqual(sample["rate"], 50.0,
                                 msg="接受率低於 50 req/s：" + detail)
