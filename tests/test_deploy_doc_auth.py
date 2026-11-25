@@ -360,16 +360,125 @@ class IoPrerequisiteTests(unittest.TestCase):
         self.assertIn("503 `auth_unavailable`", self.section)
         self.assertIn("fail-closed", self.section)
 
+    def v06b_row(self):
+        rows = [line for line in self.table_section.splitlines() if line.startswith("| V-0.6b |")]
+        self.assertEqual(len(rows), 1, "8.18 要有且只有一列 V-0.6b")
+        return rows[0]
+
     def test_v06b_points_at_the_ten_minute_test(self):
         source = (REPO_ROOT / "tests" / "test_main_auth_rate_263.py").read_text(encoding="utf-8")
         self.assertIn("LGW_SLOW_TESTS", source)
         self.assertEqual(re.findall(r"stop\.wait\((\d+)\)", source), ["600"])
-        rows = [line for line in self.table_section.splitlines() if line.startswith("| V-0.6b |")]
-        self.assertEqual(len(rows), 1, "8.18 要有且只有一列 V-0.6b")
-        row = rows[0]
-        for needle in ("C-612", "LGW_SLOW_TESTS=1", "/proc/pressure/io", "findmnt",
-                       "≥ 50 筆/秒", "p99 < 1 秒", "不得只調大 `busy_timeout`"):
+        # 文件說 repo 內的 C-611 只有 30 秒版：這一句要守住。
+        auth_runtime = (REPO_ROOT / "tests" / "test_auth_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("DURATION = 30.0", auth_runtime)
+        row = self.v06b_row()
+        self.assertIn("tests/test_main_auth_rate_263.py", row)
+        for needle in ("C-612", "LGW_SLOW_TESTS=1", "stop.wait(600)", "C-611", "30 秒",
+                       "/proc/pressure/io", "findmnt", "≥ 50 筆/秒", "p99 < 1 秒",
+                       "不得只調大 `busy_timeout`"):
             self.assertIn(needle, row, needle)
+
+    def test_v06b_pins_tmpdir_and_device_steps(self):
+        # 高-1：C-612 的庫建在 $TMPDIR，量測前要對齊到認證庫的檔案系統。
+        row = self.v06b_row()
+        for needle in ("跑之前", "TMPDIR", "tempfile.TemporaryDirectory()", "/var/lib/llmgateway",
+                       "findmnt -T /var/lib/llmgateway", "tmpfs", "PrivateTmp=true"):
+            self.assertIn(needle, row, needle)
+        # 低-1：lsblk 要指定裝置並追到底層；OPTIONS 貼之前要看。
+        for needle in ("lsblk -s", "overlay", "upperdir", "LVM", "OPTIONS"):
+            self.assertIn(needle, row, needle)
+
+    def test_v06b_503_count_is_upper_bound_and_pid_kill_only(self):
+        row = self.v06b_row()
+        # 量測欄的說明（上界是 503 的總和，不是 StoreBusy 數）；判準欄還有一個「上界」，所以要比整句。
+        self.assertIn("**總和，是上界**", row)
+        self.assertIn("只 kill 那個 pid", row)
+        self.assertIn("不得", row)
+        self.assertIn("當成 StoreBusy 數", row)
+
+    def test_measurements_match_source_table(self):
+        # 數字來源：#310 報告（不在 repo；這張表是測試自己的來源副本）。
+        # 改掉文件的數字而不改這張表，測試會紅；要改數字兩邊都要改，並回到來源確認。
+        measurements = (
+            "268.1 筆/秒",       # REPORT-310-impl §5.1，load1 3.20
+            "0.553 秒",
+            "102.4 筆/秒",       # PM-RUN-305.txt:39，load1 36.95（skip 訊息）
+            "0.988 秒",
+            "load1 3.20",
+            "load1 36.95",
+            "1.2%",              # 0.988 離 1 秒只差 1.2%（REPORT-310 §0.2.3）
+            "0～8 次",           # io2 三次：busy 8／0／6
+            "1.73～2.56 秒",     # io2 三次：p99 2.564／1.730／1.945
+            "一份測試加 2 個 writer",
+            "高負載下已貼近判準",
+        )
+        for item in measurements:
+            self.assertIn(item, self.section, item)
+        self.assertNotIn("唯一的真實路徑實測", self.section)
+
+    def test_cited_code_lines_name_the_expected_code(self):
+        # 文件引的每個 lgwd 行號都要在這張表裡，而且該行真的含預期字樣：
+        # 行號漂移或寫錯檔案，這裡會紅。
+        expected = {
+            ("lgwd/auth_db.py", 32): "DEFAULT_BUSY_TIMEOUT = 5.0",
+            ("lgwd/auth_db.py", 169): "threading.Lock()",
+            ("lgwd/auth_db.py", 183): "PRAGMA journal_mode=WAL",
+            ("lgwd/auth_db.py", 186): "PRAGMA synchronous=FULL",
+            ("lgwd/auth_db.py", 188): "int(row[0]) != 2",
+            ("lgwd/auth_db.py", 220): "deadline = time.monotonic() + self.busy_timeout",
+            ("lgwd/auth_db.py", 255): "BEGIN IMMEDIATE",
+            ("lgwd/auth.py", 696): "except (StoreError, OSError):",
+            ("lgwd/auth.py", 697): "return unavailable(REASON_STORE_UNAVAILABLE)",
+            ("lgwd/http.py", 106): "_FRAMING_PERMITS = 32",
+            ("lgwd/http.py", 107): "_PERMIT_WAIT_SECONDS = 1.0",
+            ("lgwd/http.py", 416): "self._framing_sem.acquire(timeout=_PERMIT_WAIT_SECONDS)",
+            ("lgwd/http.py", 420): "REASON_BUSY",
+            ("lgwd/sshsig.py", 84): "DEFAULT_CONCURRENCY = 16",
+        }
+        for (path, line), keyword in expected.items():
+            lines = (REPO_ROOT / path).read_text(encoding="utf-8").splitlines()
+            self.assertGreaterEqual(len(lines), line, path)
+            self.assertIn(keyword, lines[line - 1], f"{path}:{line} 應含 {keyword!r}")
+        cited = set()
+        for text in (self.section, self.v06b_row()):
+            for path, line in re.findall(r"(lgwd/[\w/]+\.py):(\d+)", text):
+                cited.add((path, int(line)))
+        self.assertTrue(cited, "8.17.2 與 V-0.6b 應該有 lgwd 行號引用")
+        self.assertEqual(cited - set(expected), set(), "文件引了表外的行號")
+
+    def test_v06b_503_and_busy_wording_matches_section(self):
+        # 中-2：兩條 503 路徑都要寫進 8.17.2，「不要只調大 busy_timeout」要涵蓋兩條。
+        for needle in ("REASON_BUSY", "1 秒", "號誌", "StoreBusy", "不要只調大 `busy_timeout`",
+                       "不與重 fsync 的負載共用"):
+            self.assertIn(needle, self.section, needle)
+
+    def test_rollout_v0_list_matches_818(self):
+        # 中-3：auth-rollout.md 的 V-0 清單與 8.18 的 ID 一致，白話版的項數也一致。
+        rollout = (REPO_ROOT / "docs" / "auth-rollout.md").read_text(encoding="utf-8")
+        id_pattern = re.compile(r"^\| (V-0\.\w+|P-D4) \|", re.MULTILINE)
+        deploy_ids = set(id_pattern.findall(self.table_section))
+        rollout_ids = set(id_pattern.findall(rollout))
+        self.assertEqual(rollout_ids, deploy_ids)
+        self.assertIn("V-0.6b", rollout_ids)
+        v0_count = len([i for i in deploy_ids if i.startswith("V-0.")])
+        self.assertEqual(v0_count, 8)
+        self.assertIn(f"V-0 會在正式主機做 {v0_count} 項檢查", rollout)
+
+    def test_behavior_open_rw_sets_wal_and_full_sync(self):
+        # 行為支：不靠字串。改掉 PRAGMA 會讓 configure() 的讀回驗證失敗，open_rw 就丟例外。
+        with tempfile.TemporaryDirectory() as d:
+            trust = str(Path(d) / "trust.db")
+            replay = str(Path(d) / "replay.db")
+            auth_db.create_stores(trust, replay)
+            db = auth_db.open_rw(replay)
+            try:
+                self.assertEqual(db.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+                self.assertEqual(
+                    str(db.conn.execute("PRAGMA journal_mode").fetchone()[0]).lower(), "wal")
+                self.assertEqual(db.busy_timeout, 5.0)
+            finally:
+                db.close()
 
 
 if __name__ == "__main__":

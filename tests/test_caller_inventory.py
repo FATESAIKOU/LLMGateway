@@ -535,9 +535,9 @@ class AuthRolloutDocTests(unittest.TestCase):
             self.assertIn(token, self.doc, token)
 
     def test_c962_v0_prerequisites_present(self):
-        # REPORT-D6-arch §3.2：V-0 的七項與 P-D4（真機，要本人單次授權）。
+        # REPORT-D6-arch §3.2：V-0 的七項與 P-D4（真機，要本人單次授權）；#313 加入 V-0.6b，共八項。
         for item in ("V-0.1", "V-0.2", "V-0.3", "V-0.4", "V-0.5", "V-0.6",
-                     "V-0.7", "P-D4"):
+                     "V-0.6b", "V-0.7", "P-D4"):
             self.assertIn(item, self.doc, item)
         self.assertIn("本人單次授權", self.doc)
         self.assertIn("不會打開強制認證", self.doc)
