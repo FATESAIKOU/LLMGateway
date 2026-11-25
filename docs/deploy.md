@@ -1180,6 +1180,28 @@ handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）�
 - `auth-audit.log`（`/var/lib/llmgateway/auth-audit.log`）是 `root:root` 0600 的附加式歸責紀錄，一行一筆 JSON；root 改得了，所以不是不可竄改的證據。
 - 寫入型 CLI 同時送 journal，ident 是 `llmgwctl-auth`、facility 是 `authpriv`；用 `journalctl -t llmgwctl-auth` 查。
 
+### 8.17.1 資源上限
+
+**root：** 要（unit 檔與 install）。**lgwd 停止：** 要（改完重啟才生效）。
+
+unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**的上限，不是貼著用量限流：目的是擋住失控（fork 洪水、記憶體洩漏、fd 洩漏），所以三個值都比實測高峰寬很多，off 模式與現行負載的用量都遠低於它們（#247 J-5）。`TasksMax` 與 `MemoryMax` 是 cgroup 層級，把 lgwd 和它所有的子行程一起算；`LimitNOFILE` 是每個行程各自的上限。
+
+算式用 C-612 的低負載複測（`PM-C612-samples.csv`，5860 個樣本，`pytest_rc 0`）：lgwd 最多 37 個 task（pids 1、threads 高峰 37）、RSS 高峰約 38 MB、fd 高峰 89。
+
+- `TasksMax=512`：下限估算 37（lgwd）＋16（驗章）＋約 15（用量抓取的 claude CLI）＋約 20（key-sync、gh）≈ 88，取兩倍約 176；512 約是實測高峰的 5.8 倍，同時讓沒有上限的連線執行緒實際停在約 400 條。systemd 預設的 `DefaultTasksMax` 是 pid 上限的 15%（通常是幾千），所以 512 是真的在擋，不是沒有作用。
+- `MemoryMax=1536M`：最壞估算 lgwd 100 MB（連線多時）＋驗章 16×約 10 MB＋claude 約 300 MB＋key-sync、gh 約 80 MB ≈ 640 MB，約 2.4 倍取整到 1.5 GiB。**不能**只看 lgwd 的 RSS 高峰乘 2：C-612 實測 38 MB，乘 2 只有約 77 MB，第一次抓用量（`claude` CLI，off 模式也會跑）就會 OOM。
+- `LimitNOFILE=4096`（單一值，soft＝hard）：實測 fd 高峰 89；連線數受 `TasksMax=512` 限制，需要 ≥512＋約 100，取 4096。systemd 服務預設的 soft 是 1024、hard 是 524288；設 4096 會把 soft 提高、hard 降低。子行程會繼承這個值（node 會把 soft 拉到 hard，也就是 4096，夠用）；`ssh-keygen` 由 `prlimit --nofile=32` 另外限制，不受影響。
+
+碰到上限時會怎樣：`TasksMax` 用完時開不了新執行緒或新行程，該連線失敗，或驗章回 503，lgwd 本身不會掛；`MemoryMax` 用完時是 cgroup 內 OOM（page cache 也算在內，但會先回收）；`LimitNOFILE` 用完時 `accept()` 或開檔失敗（EMFILE）。
+
+`MemoryMax` 這一段另外設了 `OOMPolicy=continue`。systemd 243 起沒設 `OOMPolicy` 時用 `DefaultOOMPolicy`，預設是 `stop`：cgroup 裡**任何一個**行程被核心 OOM 殺掉，systemd 就把**整個 unit** 停掉（結果是 `oom-kill`），再由 `Restart=on-failure` 重啟，正在處理的請求（連在途驗章）都會被斷。這對本服務不適合：`claude` 或 gh 只是週期性工作，不值得讓整個 Gateway 陪它重啟。改成 `continue` 之後，子行程（`claude` CLI、gh、`ssh-keygen`）被殺掉時只有那一次工作失敗（用量抓取跳過、驗章回 503），lgwd 照常服務；如果被殺的是 lgwd 主行程，行程結束後仍由 `Restart=on-failure` 重啟。實際行為在 V-0 確認（worker 上沒有 systemd 可實測）。
+
+為什麼用 cgroup 保護整台而不是貼著用量：最大來源不是驗章，而是 off 模式也會跑的 `claude` CLI 與 keysync 的 gh，貼著 lgwd 的用量設會讓正常尖峰就撞上限。cgroup 的上限涵蓋所有子行程，某一個子行程失控也擋得住。
+
+不用 `MemoryHigh`：它會在接近上限時讓整個 cgroup 變慢，驗章延遲可能讓請求逾時變成 503，比單純的上限更難診斷。等 V-0.6 有正式主機的高峰再考慮。
+
+這三個值先合，V-0.6 再以 cgroup 的 peak 驗證（見 8.18）；高峰超過上限的一半就開 d 單調高，不要放寬到 `infinity`。
+
 ### 8.18 上線前清單
 
 **root：** 要（真機操作）。**lgwd 停止：** 視項目。
@@ -1191,9 +1213,9 @@ handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）�
 | V-0.1 | `ssh -V` 是 OpenSSH 10.2p1；用臨時金鑰重跑分類表的五種輸出（Good、incorrect、兩種 Could not verify、缺 principal） | 字樣與 design 相同；不同就停下，不擴充分類表 |
 | V-0.2 | lgwd 以 warn 啟動時自測通過 | 日誌沒有 self-test 失敗 |
 | V-0.3 | `prlimit` 存在，且以 llmgw 身分能對子行程設限 | — |
-| V-0.4 | `systemd --version` ≥ 251（失敗通知的 `MONITOR_*` 需要；< 251 時腳本改用 `systemctl show` 的 `InvocationID`，要實測 fallback 有拿到那一次 check 的行）；`systemd-analyze verify` 乾淨 | `Type=exec` 與 unit 都有效 |
+| V-0.4 | `systemd --version` ≥ 251（失敗通知的 `MONITOR_*` 需要；< 251 時腳本改用 `systemctl show` 的 `InvocationID`，要實測 fallback 有拿到那一次 check 的行）；確認 systemd 版本支援 `OOMPolicy`（243 以上）；`systemd-analyze verify` 乾淨 | `Type=exec` 與 unit 都有效 |
 | V-0.5 | 壓測中執行 `systemctl stop` | 503 為 0；停止後 cgroup 沒有殘留行程 |
-| V-0.6 | C-612 在正式主機重跑 | 段二的資源數值取兩邊較大者 |
+| V-0.6 | C-612 在正式主機重跑，期間同時手動觸發一次 keysync 與一次用量抓取（`claude` CLI）；量的是整個 cgroup，不是單一行程：讀 cgroup v2 的 `memory.peak`／`pids.peak`（`/sys/fs/cgroup/system.slice/llmgateway.service/`；`memory.peak` 需要 kernel ≥ 5.19，沒有時以每秒取樣 `memory.current`、`pids.current` 代替） | `pids.peak` ≤ 256、`memory.peak` ≤ 768M、lgwd 的 fd 高峰 ≤ 2048；超過任何一項就開 d 單調高，不放寬到 `infinity` |
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
 | P-D4 | Mac 與 worker 映像的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 由本人或 PMO 做 |
 
