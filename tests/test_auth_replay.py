@@ -48,25 +48,36 @@ CONCURRENT_BUSY_TIMEOUT = 30.0
 CONCURRENT_THREADS = 32
 CONCURRENT_PER_THREAD = 500
 
-# 時間支（#311）的量法與判準。新判準是「在設計操作點下鎖不會成為瓶頸」：以固定到達率
-# 持續 15 秒，只量等鎖 p99 與 StoreBusy 並印出（不 gating；#311 fix1 裁定 (c)）。到達率 30/s
-# 是 (d) 的操作點（設計持續率 50/s 的 60%）；(d) 在受控共載下假失敗超過一次，所以降為觀察。
-# 100 筆/秒與背靠背 32×500 同為不 gating 的觀察（LGW_SLOW_TESTS=1）。
+# 時間支（#311）的量法：固定到達率、持續 15 秒，只量等鎖 p99 與 StoreBusy 並印出，**不 gating**
+# （#311 fix1 裁定 (c)）。到達率 30/s 是設計持續率 50/s 的 60%，是 PM 允許的 20～30 範圍上緣；
+# 理由與限制見 _observe_paced 與 test_c305_paced_30_observation_not_gating 的 docstring。
 TIME_RATE_PER_SECOND = 30
 TIME_DURATION_SECONDS = 15.0
-LOCK_WAIT_P99_LIMIT = 1.0           # 判準：等鎖 p99 < 1 秒，且零失敗（StoreBusy）
+# 警示門檻，不是判準：超過只發出 LockObservationWarning，不會讓測試失敗。
+LOCK_WAIT_P99_LIMIT = 1.0
 LOAD_SKIP_FACTOR = 2                # 開始前 load1 > 2×核數：最外層的舊規則，仍 skip
 IO_SOME_AVG10_LIMIT = 40.0          # 跑期間 /proc/pressure/io some avg10（%）超過就 skip
 IO_FULL_AVG10_LIMIT = 30.0          # full avg10（%）超過就 skip
 HOLD_P99_FALLBACK_LIMIT = 0.200     # 無 /proc/pressure 時的退路：持鎖 p99（秒）超過就 skip
 
 
+class LockObservationWarning(UserWarning):
+    """等鎖觀察的警示（只印、不斷言）。
+
+    注意：若以 `-W error` 執行，這個警示會變成例外，觀察測試就變成 gating（而且會因共載假失敗）。
+    所以 CI 與日常執行都不要加 `-W error`。
+    """
+
+
 def _oversubscribed() -> tuple[float, int, bool]:
     """機器是否被別的 session 共載到量不出等鎖 p99 的程度（load > 2 × 核數）。
 
-    等鎖 p99 的判準是設計值，要在不被別的 heavy job 搶磁碟／CPU 的機器上量；共載時單次
+    等鎖 p99 的量測要在不被別的 heavy job 搶磁碟／CPU 的機器上做；共載時單次
     fsync 可從 ~2 ms 升到數十毫秒，尾端等鎖由環境決定而不是由設計決定。回
     (load1, 核數, 是否過載)；讀不到 load 就當沒過載（照常量）。
+
+    第三個回傳值目前兩個呼叫點都不用（觀察測試只記錄、不 skip）；保留簽章，作為日後恢復
+    gating 時的工具。
     """
     cores = os.cpu_count() or 1
     try:
@@ -114,22 +125,25 @@ def _time_branch_skip(load_before: float | None, cores: int | None,
                       io_before: tuple[float, float] | None,
                       io_after: tuple[float, float] | None,
                       hold_p99: float | None) -> tuple[bool, str]:
-    """時間支該不該 skip（純函式，不碰機器）：回 (skip, 說明)。
+    """環境壓力的判定（純函式，不碰機器）：回 (是否環境壓力, 說明)。
+
+    目前只影響觀察行的說明文字，不 skip 任何測試；保留作日後恢復 gating 時的工具。
+    說明一律以「規則＝…」開頭，標示是哪一條規則觸發：外層 load1／io 壓力／持鎖退路。
 
     依序判斷，第一個成立的決定結果：
-    1. 開始前 load1 > 2×核數：外層的舊規則，仍 skip（說明帶 load1 與核數）。
-    2. 有 /proc/pressure/io：取開始前與跑完後較大的 some／full avg10；任一超過門檻就 skip。
-       門檻 some > 40、full > 30 的依據（REPORT-310-impl §2、§7）：乾淨樣本的 some 最大
-       約 38（中位 26）；失敗樣本 some 落在 30～63，失敗時 full 最高 31.2。
-       這兩個數只表示「環境已經壞到量不出設計值」，不是判定失敗的依據。
-    3. 沒有 /proc/pressure：退路是實測持鎖 p99（本次 accept 交易的 body＋commit）超過
-       0.2 秒，代表磁碟慢到連單筆都量不準，skip。
-    4. 兩者皆無：照常斷言。
+    1. 開始前 load1 > 2×核數：外層的舊規則（規則＝外層 load1）。
+    2. 有 /proc/pressure/io：取開始前與跑完後較大的 some／full avg10；some > 40 或
+       full > 30 就判為環境壓力（規則＝io 壓力）。門檻依據：#310 調查的觀察數據（乾淨樣本
+       some 最大約 38；失敗樣本 some 落在 30～63，失敗時 full 最高 31.2）；這兩個數只表示
+       「環境已經壞到量不出設計值」，不是判定失敗的依據。
+    3. 沒有 /proc/pressure：退路是實測持鎖 p99（交易本體＋commit）超過 0.2 秒，代表磁碟慢到
+       連單筆都量不準（規則＝持鎖退路）。
+    4. 兩者皆無：照常（規則＝無）。
 
-    skip 的說明一律帶量到的數值，供報告引用。
+    說明帶量到的數值，供觀察輸出引用。
     """
     if load_before is not None and cores and load_before > LOAD_SKIP_FACTOR * cores:
-        return True, "開始前 load1={0:.2f} > {1}×{2} 核（外層舊規則）".format(
+        return True, "規則＝外層 load1；開始前 load1={0:.2f} > {1}×{2} 核".format(
             load_before, LOAD_SKIP_FACTOR, cores)
     pressures = [item for item in (io_before, io_after) if item is not None]
     if pressures:
@@ -138,16 +152,17 @@ def _time_branch_skip(load_before: float | None, cores: int | None,
         detail = "io 壓力（開始前與跑完後較大者）some avg10={0:.2f} full avg10={1:.2f}".format(
             some, full)
         if some > IO_SOME_AVG10_LIMIT or full > IO_FULL_AVG10_LIMIT:
-            return True, "{0}，超過門檻 some>{1:g} 或 full>{2:g}".format(
+            return True, "規則＝io 壓力；{0}，超過門檻 some>{1:g} 或 full>{2:g}".format(
                 detail, IO_SOME_AVG10_LIMIT, IO_FULL_AVG10_LIMIT)
-        return False, "{0}，未超門檻".format(detail)
+        return False, "規則＝io 壓力；{0}，未超門檻".format(detail)
     if hold_p99 is not None:
         if hold_p99 > HOLD_P99_FALLBACK_LIMIT:
-            return True, "無 /proc/pressure；實測持鎖 p99={0:.3f}s > {1:g}s（磁碟太慢）".format(
+            return True, "規則＝持鎖退路；無 /proc/pressure，實測持鎖 p99={0:.3f}s > {1:g}s（磁碟太慢）".format(
                 hold_p99, HOLD_P99_FALLBACK_LIMIT)
-        return False, "無 /proc/pressure；實測持鎖 p99={0:.3f}s，未超 {1:g}s".format(
+        return False, "規則＝持鎖退路；無 /proc/pressure，實測持鎖 p99={0:.3f}s，未超 {1:g}s".format(
             hold_p99, HOLD_P99_FALLBACK_LIMIT)
-    return False, "無 /proc/pressure 且讀不到持鎖；照常斷言"
+    return False, "規則＝無；讀不到壓力與持鎖"
+
 
 
 def _p99(values: list[float]) -> float:
@@ -695,9 +710,10 @@ class ConcurrencyTests(ReplayTestBase):
         return failures, per_thread * CONCURRENT_THREADS
 
     def _observe_paced(self, rate: float, label: str) -> None:
-        """固定到達率的等鎖觀察：只印統計與警示，**不斷言**（#311 fix1，(c)）。
+        """固定到達率的等鎖觀察：只印統計與警示（LockObservationWarning），**不斷言**。
 
-        `_time_branch_skip` 的結果只寫進說明（環境是否已壓到量不出設計值），不決定通過與否。
+        `_time_branch_skip` 的結果只寫進說明行（規則＝外層 load1／io 壓力／持鎖退路／無），
+        不決定通過與否。警示只在 failures 非空或等鎖 p99 ≥ LOCK_WAIT_P99_LIMIT 時發出。
         """
         load, cores, _ = _oversubscribed()
         io_before = _read_io_pressure()
@@ -724,25 +740,37 @@ class ConcurrencyTests(ReplayTestBase):
             _read_cpu_some(), "環境壓力" if skip else "未達環境壓力", why)
         sys.stderr.write(line + "\n")
         if failures or p99 >= LOCK_WAIT_P99_LIMIT:
-            warnings.warn(line, stacklevel=1)
+            warnings.warn(line, LockObservationWarning, stacklevel=1)
 
     def test_c305_paced_30_observation_not_gating(self) -> None:
-        """C-305 時間支（#311 fix1 裁定 (c)）：固定到達率 30 筆/秒、15 秒，**不 gating**。
+        """C-305 時間支（#311）：固定到達率 30 筆/秒、15 秒，**不 gating**，只印統計與警示。
 
-        沿革：#311 原判準是等鎖 p99 < 1 秒（50/s，再改 25/s、30/s）。受控共載下 (d) 的假失敗超過一次
-        （REPORT-311-fix1 §2），依 BRIEF-311-fix1 降為觀察：只印統計與警示，不斷言 p99，也不斷言零
-        StoreBusy。要設 LGW_SLOW_TESTS=1 才跑。**代價**：CI 沒有鎖退化的自動 gating；鎖退化的自動訊號
-        只剩功能支 `test_c305_concurrent_distinct_nonces_zero_unavailable`（30 秒期限，零 unavailable）。
+        沿革：#311 最初以等鎖 p99 < 1 秒 gating（50/s；之後 25/s、30/s）。受控共載下 30/s 的假失敗
+        超過一次，所以降為觀察（#311 fix1 裁定 (c)）。
+
+        為什麼是 30/s：它是 PM 允許的 20～30 範圍上緣，也是 busy_timeout 縮成 0.2 秒的變異（M2）
+        在這個操作點下轉紅最穩定的一點（5/5 轉紅；25/s 為 5/6）。**限制**：25/s 只在輕負載
+        （load1 約 3～6）跑過 10 次，沒有重負載的數據；30/s 在重負載下假失敗 5/18。
+
+        由誰、何時跑：V-0.6 部署機量測時、以及手動調查等鎖時跑。repo 沒有 CI 設這個旗標，所以
+        CI 預設不跑、也不會看到輸出。命令：`LGW_SLOW_TESTS=1 python3 -m pytest -q -rs -s -k observation tests/test_auth_replay.py`
+        （`-s` 才會看到 stderr 的統計行）。
+
+        **代價與現況**：CI 沒有等鎖的自動 gating。鎖退化的自動訊號：busy_timeout 縮短由
+        `tests/test_auth_db.py::ErrorClassificationTests::test_c304_write_lock_held_four_seconds_still_succeeds`
+        抓到；持鎖變慢（服務時間）只有功能支 `test_c305_concurrent_distinct_nonces_zero_unavailable` 抓到，
+        且要約 12 分鐘（M1 實測）。
         """
         if os.environ.get("LGW_SLOW_TESTS") != "1":
             self.skipTest("等鎖觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
         self._observe_paced(TIME_RATE_PER_SECOND, "paced30")
 
     def test_c305_paced_100_observation_not_gating(self) -> None:
-        """C-305 固定到達率 100 筆/秒觀察（#311 fix1；**不 gating**）：設計操作點的 4 倍。
+        """C-305 固定到達率 100 筆/秒觀察（#311；**不 gating**）：設計操作點的 4 倍。
 
         同一套 `_paced_accepts`、15 秒、正式預設 5 秒期限；只印統計與警示，**不斷言**。
-        要設 LGW_SLOW_TESTS=1 才跑。用來看單寫者在這台機器上的容量邊界。
+        由誰、何時跑：同 `test_c305_paced_30_observation_not_gating`（V-0.6 部署機量測、手動調查時，
+        LGW_SLOW_TESTS=1）。用來看單寫者在這台機器上的容量邊界。
         """
         if os.environ.get("LGW_SLOW_TESTS") != "1":
             self.skipTest("100 筆/秒觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
@@ -752,7 +780,8 @@ class ConcurrencyTests(ReplayTestBase):
         """C-305 背靠背壓力觀察（#311；**不 gating**）：32 條執行緒背靠背各 500 次 accept。
 
         這是悲觀上界（遠超設計持續率，見 `test_c305_paced_30_observation_not_gating`），
-        只印統計與警示，**不斷言 p99**。要設 LGW_SLOW_TESTS=1 才跑。
+        只印統計與警示（LockObservationWarning），**不斷言 p99**。由誰、何時跑：同上面的觀察測試，
+        LGW_SLOW_TESTS=1 才跑。
         """
         if os.environ.get("LGW_SLOW_TESTS") != "1":
             self.skipTest("壓力觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
@@ -766,7 +795,7 @@ class ConcurrencyTests(ReplayTestBase):
             len(waits), len(failures), _p99(waits), waits[-1], load, cores)
         sys.stderr.write(line + "\n")
         if failures or _p99(waits) >= LOCK_WAIT_P99_LIMIT:
-            warnings.warn(line, stacklevel=1)
+            warnings.warn(line, LockObservationWarning, stacklevel=1)
 
     def test_c305_purge_and_replay_interleave_at_most_once(self) -> None:
         """到期前一刻重放與清除交錯 1000 輪，每輪至多接受一次。"""
@@ -809,7 +838,7 @@ class ConcurrencyTests(ReplayTestBase):
         self.assertEqual(accepted, 1000)
 
 
-class TimeBranchSkipRuleTests(unittest.TestCase):
+class ReplayTimeBranchSkipTableTests(unittest.TestCase):
     """#311：時間支 skip 決定（純函式表格測試，不碰機器）。"""
 
     def decide(self, load, cores, io_before, io_after, hold):
@@ -840,7 +869,7 @@ class TimeBranchSkipRuleTests(unittest.TestCase):
         self.assertIn("some avg10=2.00", detail)
 
     def test_clean_baseline_max_38_does_not_skip(self):
-        # REPORT-310-impl 乾淨基線 some 最大約 38（中位 26）：不得因此 skip。
+        # #310 調查的乾淨基線 some 最大約 38（中位 26）：不得因此 skip。
         skip, detail = self.decide(9.5, 16, (26.0, 10.0), (37.8, 12.0), 0.03)
         self.assertFalse(skip, detail)
 
@@ -853,6 +882,16 @@ class TimeBranchSkipRuleTests(unittest.TestCase):
         skip, detail = self.decide(9.0, 16, (1.0, 1.0), (10.0, 31.2), 0.03)
         self.assertTrue(skip)
         self.assertIn("full avg10=31.20", detail)
+
+    def test_io_some_exactly_40_does_not_skip(self):
+        # 門檻是「超過才 skip」：剛好 40.0 不 skip（把 > 改成 >= 會轉紅）。
+        skip, detail = self.decide(9.0, 16, (40.0, 0.0), (0.0, 0.0), 0.03)
+        self.assertFalse(skip, detail)
+
+    def test_io_full_exactly_30_does_not_skip(self):
+        # 同上，full 剛好 30.0 不 skip。
+        skip, detail = self.decide(9.0, 16, (0.0, 30.0), (0.0, 0.0), 0.03)
+        self.assertFalse(skip, detail)
 
     def test_some_over_limit_skips(self):
         skip, detail = self.decide(9.0, 16, (41.0, 0.0), (0.0, 0.0), 0.03)
@@ -871,7 +910,7 @@ class TimeBranchSkipRuleTests(unittest.TestCase):
     def test_no_pressure_and_no_hold_asserts(self):
         skip, detail = self.decide(9.0, 16, None, None, None)
         self.assertFalse(skip, detail)
-        self.assertIn("照常斷言", detail)
+        self.assertIn("規則＝無", detail)
 
     def test_pressure_available_takes_precedence_over_hold(self):
         # 有 /proc/pressure 時不看持鎖退路：壓力正常、持鎖慢也不因退路 skip。
