@@ -23,7 +23,10 @@ from unittest import mock
 
 from lgwctl import local_auth
 from lgwctl.cli import build_parser
+from lgwd import auth_db
+from lgwd import http as lgwd_http
 from lgwd import main as lgwd_main
+from lgwd import sshsig
 from lgwd.auth_registry import OPS, parse_registry
 from lgwd.policy import AGENTS, ROLES
 
@@ -53,6 +56,7 @@ SECTION_HEADINGS = (
     "### 8.16 warn 的恢復（p）",
     "### 8.17 停止與日誌（q）",
     "### 8.17.1 資源上限",
+    "### 8.17.2 enforce 的磁碟與 IO 前提（#313）",
     "### 8.18 上線前清單",
     "### 8.19 定時檢查（timer）（r）",
     "### 8.20 從 MLP 清單同步名冊（外圍腳本 `lgw-registry-sync`，#292）",
@@ -313,6 +317,59 @@ class DeployDocConsistencyTests(unittest.TestCase):
         self.assertIn("結束碼 2", self.chapter)
         self.assertIn("結束碼 78", self.chapter)
         self.assertIn("RestartPreventExitStatus=78", self.chapter)
+
+
+def between(doc: str, start_heading: str, end_heading: str) -> str:
+    """回兩個標題之間的文字（不含結束標題）；找不到就失敗。"""
+    start = doc.find(start_heading)
+    end = doc.find(end_heading, start + 1)
+    if start < 0 or end < 0:
+        raise AssertionError("找不到 " + start_heading + " 到 " + end_heading + " 的區段")
+    return doc[start:end]
+
+
+class IoPrerequisiteTests(unittest.TestCase):
+    """#313：8.17.2 的數字與事實對得上程式；8.18 的 V-0.6b 指到真的 10 分鐘測試。
+
+    數字來源：5 秒＝`auth_db.DEFAULT_BUSY_TIMEOUT`；32＝`http._FRAMING_PERMITS`；
+    16＝`sshsig.DEFAULT_CONCURRENCY`。268.1 筆/秒、p99 0.553 秒、StoreBusy 8 次、
+    p99 2.564 秒是 #310 的量測紀錄（報告在團隊目錄，不在 repo），測試無法重現，
+    只保證文件寫的是那個來源，不驗數字本身。
+    """
+
+    def setUp(self):
+        self.doc = read_doc()
+        self.section = between(self.doc, "### 8.17.2 ", "### 8.18 上線前清單")
+        self.table_section = between(self.doc, "### 8.18 上線前清單", "### 8.19 ")
+
+    def test_numbers_match_code(self):
+        self.assertEqual(auth_db.DEFAULT_BUSY_TIMEOUT, 5.0)
+        self.assertIn("5.0 秒", self.section)
+        self.assertEqual(lgwd_http._FRAMING_PERMITS, 32)
+        self.assertIn("**32**", self.section)
+        self.assertEqual(sshsig.DEFAULT_CONCURRENCY, 16)
+        self.assertIn("**16**", self.section)
+        self.assertLessEqual(sshsig.DEFAULT_CONCURRENCY, lgwd_http._FRAMING_PERMITS)
+
+    def test_auth_db_facts_match_code(self):
+        source = (REPO_ROOT / "lgwd" / "auth_db.py").read_text(encoding="utf-8")
+        for token in ("journal_mode=WAL", "synchronous=FULL", "BEGIN IMMEDIATE", "threading.Lock"):
+            self.assertIn(token, source, token)
+            self.assertIn(token, self.section, token)
+        self.assertIn("busy_timeout", self.section)
+        self.assertIn("503 `auth_unavailable`", self.section)
+        self.assertIn("fail-closed", self.section)
+
+    def test_v06b_points_at_the_ten_minute_test(self):
+        source = (REPO_ROOT / "tests" / "test_main_auth_rate_263.py").read_text(encoding="utf-8")
+        self.assertIn("LGW_SLOW_TESTS", source)
+        self.assertEqual(re.findall(r"stop\.wait\((\d+)\)", source), ["600"])
+        rows = [line for line in self.table_section.splitlines() if line.startswith("| V-0.6b |")]
+        self.assertEqual(len(rows), 1, "8.18 要有且只有一列 V-0.6b")
+        row = rows[0]
+        for needle in ("C-612", "LGW_SLOW_TESTS=1", "/proc/pressure/io", "findmnt",
+                       "≥ 50 筆/秒", "p99 < 1 秒", "不得只調大 `busy_timeout`"):
+            self.assertIn(needle, row, needle)
 
 
 if __name__ == "__main__":

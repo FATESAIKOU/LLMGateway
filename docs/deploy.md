@@ -1202,6 +1202,31 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
 
 這三個值先合，V-0.6 再以 cgroup 的 peak 驗證（見 8.18）；高峰超過上限的一半就開 d 單調高，不要放寬到 `infinity`。
 
+### 8.17.2 enforce 的磁碟與 IO 前提（#313）
+
+**root：** 不用（這一節是部署前提與量測，不改設定）。**lgwd 停止：** 不用。
+
+認證庫（信任庫與防重放庫）是**單寫者**：每次開啟都設 `journal_mode=WAL`、`synchronous=FULL` 並讀回驗證，交易一律明確 `BEGIN IMMEDIATE`，一庫一條連線、一把行程內 `threading.Lock`（`lgwd/auth_db.py:10`、`:169`、`:183`–`:187`、`:255`）。`threading.Lock` 不保證先到先得，排在後面的請求可能一直拿不到鎖。
+
+等待期限：`busy_timeout` 預設 **5.0 秒**（`lgwd/auth_db.py:32`）。它是**共用的總期限**：行程內鎖的等待與 SQLite 的 busy 重試排在同一個期限裡（`lgwd/auth_db.py:213`–`:261`）。
+
+並發上限：預驗章 framing 的號誌是 **32**（`lgwd/http.py:106`，讀 body 到驗章的階段都持有）；驗章子行程的號誌是 **16**（`lgwd/sshsig.py:84`）。32 條請求同時排在單寫者的鎖上，若再加上磁碟 fsync 壓力（同一顆磁碟上有重 fsync 的負載），尾端等待就可能超過 5 秒。
+
+超時的結果：StoreBusy 在驗證路徑上轉成 **503 `auth_unavailable`**（`lgwd/auth.py:695`–`:696` 把 `StoreError` 轉成 `unavailable`；enforce 回 503）。這是 **fail-closed**：不放行、不重放，客戶端可以重試。warn 模式只記錄、照舊處理。
+
+目前的證據（#310 調查，報告不在 repo 內）：
+
+- 完整 HTTP＋`ssh-keygen`＋SQLite 路徑、32 路並發、30 秒（C-611 的短版，開始前 load1 3.20）：**268.1 筆/秒、等鎖 p99 0.553 秒**、零非 200。這是**低負載**的樣本，也是目前唯一的真實路徑實測。
+- 單元路徑（32 條執行緒直接呼叫 accept）只加兩個 Python 寫檔＋fsync 行程時：**StoreBusy 8 次、p99 2.564 秒**（三次中都失敗）。這說明磁碟壓力本身就能觸發，不需要 CI 的高 load。
+- **部署機的磁碟種類與 fsync 延遲還沒有量過**。上面的數字不能直接當成部署機的前提，要在部署機照 8.18 的 V-0.6b 量。
+
+上線前提（照這幾點做，不要只調數字）：
+
+1. 認證庫所在的磁碟**不與重 fsync 的負載共用**（例如大量寫檔、資料庫、日誌）。做不到，就要先以 V-0.6b 量過，結果達標才開 enforce。
+2. **不要只調大 `busy_timeout`**：那只把 503 換成更長的等待，同時更久佔住 32 路的號誌，尾端會更慢，也讓量測更難分辨設計好壞。
+3. 量測未達判準：**先不開 enforce**（維持 warn），或先調號誌或期限，並把量測寫進部署紀錄。調整要開 d 單，不在正式主機上直接改。
+4. 把 FIFO（公平）鎖換掉、或改成多連線／分片，會動到單寫者與 WAL 的契約（C-302、C-304），屬於 b／c 的設計變更，不在這一節的範圍。
+
 ### 8.18 上線前清單
 
 **root：** 要（真機操作）。**lgwd 停止：** 視項目。
@@ -1216,6 +1241,7 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
 | V-0.4 | `systemd --version` ≥ 251（失敗通知的 `MONITOR_*` 需要；< 251 時腳本改用 `systemctl show` 的 `InvocationID`，要實測 fallback 有拿到那一次 check 的行）；確認 systemd 版本支援 `OOMPolicy`（243 以上）；`systemd-analyze verify` 乾淨 | `Type=exec` 與 unit 都有效 |
 | V-0.5 | 壓測中執行 `systemctl stop` | 503 為 0；停止後 cgroup 沒有殘留行程 |
 | V-0.6 | C-612 在正式主機重跑，期間同時手動觸發一次 keysync 與一次用量抓取（`claude` CLI）；量的是整個 cgroup，不是單一行程：讀 cgroup v2 的 `memory.peak`／`pids.peak`（`/sys/fs/cgroup/system.slice/llmgateway.service/`；`memory.peak` 需要 kernel ≥ 5.19，沒有時以每秒取樣 `memory.current`、`pids.current` 代替） | `pids.peak` ≤ 256、`memory.peak` ≤ 768M、lgwd 的 fd 高峰 ≤ 2048；超過任何一項就開 d 單調高，不放寬到 `infinity` |
+| V-0.6b | 認證庫 IO 前提（見 8.17.2；與 V-0.6 的 cgroup 量測並列，不取代）：在正式主機以 `LGW_SLOW_TESTS=1` 跑 C-612 的 10 分鐘版（`tests/test_main_auth_rate_263.py`，`stop.wait(600)`；C-611 在 repo 內只有 30 秒版，不算 10 分鐘版）。期間記錄：認證庫所在檔案系統的種類與掛載選項（`findmnt -T <認證庫目錄> -no FSTYPE,OPTIONS`，不貼位址）、磁碟是否旋轉（`lsblk -no ROTA`）；每秒取樣一次 `/proc/pressure/io` 的 `some`／`full` 的 `avg10`，記最大值（取樣行程記下 pid，結束時只 kill 那個 pid）；C-612 印出的 `statuses`（503 數）、`wait_count`、等鎖 `p50`／`p99`、`rate`，原樣記入部署紀錄。StoreBusy 目前沒有獨立計數，以 `statuses` 的 503 數代替 | 判準不變：接受率 ≥ 50 筆/秒、零假 503（零非 200）、等鎖 p99 < 1 秒（與 C-612 的三條斷言相同）；未達就先不開 enforce，或先調號誌／期限並把量測寫進部署紀錄；**不得只調大 `busy_timeout` 來過判準** |
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
 | P-D4 | Mac 與 worker 映像的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 由本人或 PMO 做 |
 
