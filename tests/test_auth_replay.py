@@ -49,8 +49,8 @@ CONCURRENT_THREADS = 32
 CONCURRENT_PER_THREAD = 500
 
 # 時間支（#311）的量法：固定到達率、持續 15 秒，只量等鎖 p99 與 StoreBusy 並印出，**不 gating**
-# （#311 fix1 裁定 (c)）。到達率 30/s 是設計持續率 50/s 的 60%，是 PM 允許的 20～30 範圍上緣；
-# 理由與限制見 _observe_paced 與 test_c305_paced_30_observation_not_gating 的 docstring。
+# （#311 裁定 (c)）。到達率 30/s 是設計持續率 50/s 的 60%，是 20～30 範圍的上緣；
+# 理由與限制見 test_c305_paced_30_observation_not_gating 的 docstring。
 TIME_RATE_PER_SECOND = 30
 TIME_DURATION_SECONDS = 15.0
 # 警示門檻，不是判準：超過只發出 LockObservationWarning，不會讓測試失敗。
@@ -162,7 +162,6 @@ def _time_branch_skip(load_before: float | None, cores: int | None,
         return False, "規則＝持鎖退路；無 /proc/pressure，實測持鎖 p99={0:.3f}s，未超 {1:g}s".format(
             hold_p99, HOLD_P99_FALLBACK_LIMIT)
     return False, "規則＝無；讀不到壓力與持鎖"
-
 
 
 def _p99(values: list[float]) -> float:
@@ -746,20 +745,21 @@ class ConcurrencyTests(ReplayTestBase):
         """C-305 時間支（#311）：固定到達率 30 筆/秒、15 秒，**不 gating**，只印統計與警示。
 
         沿革：#311 最初以等鎖 p99 < 1 秒 gating（50/s；之後 25/s、30/s）。受控共載下 30/s 的假失敗
-        超過一次，所以降為觀察（#311 fix1 裁定 (c)）。
+        超過一次，所以降為觀察（#311 裁定 (c)）。
 
-        為什麼是 30/s：它是 PM 允許的 20～30 範圍上緣，也是 busy_timeout 縮成 0.2 秒的變異（M2）
-        在這個操作點下轉紅最穩定的一點（5/5 轉紅；25/s 為 5/6）。**限制**：25/s 只在輕負載
-        （load1 約 3～6）跑過 10 次，沒有重負載的數據；30/s 在重負載下假失敗 5/18。
+        為什麼是 30/s：它是 20～30 範圍的上緣；在這個操作點下，busy_timeout 縮成 0.2 秒的退化
+        轉紅最穩定（已移除的 gating 版本的數據：5/5 轉紅；25/s 為 5/6）。**限制**：25/s 只在輕負載
+        （load1 約 3～6）跑過 10 次，沒有重負載的數據；30/s 在重負載下（已移除的 gating 版本的數據）
+        假失敗 5/18。
 
-        由誰、何時跑：V-0.6 部署機量測時、以及手動調查等鎖時跑。repo 沒有 CI 設這個旗標，所以
-        CI 預設不跑、也不會看到輸出。命令：`LGW_SLOW_TESTS=1 python3 -m pytest -q -rs -s -k observation tests/test_auth_replay.py`
+        由誰、何時跑：目前沒有排程或人被指派；需要時手動跑（命令如下）。repo 沒有 CI 設這個旗標，
+        所以 CI 預設不跑、也不會看到輸出。命令：`LGW_SLOW_TESTS=1 python3 -m pytest -q -rs -s -k observation tests/test_auth_replay.py`
         （`-s` 才會看到 stderr 的統計行）。
 
         **代價與現況**：CI 沒有等鎖的自動 gating。鎖退化的自動訊號：busy_timeout 縮短由
         `tests/test_auth_db.py::ErrorClassificationTests::test_c304_write_lock_held_four_seconds_still_succeeds`
         抓到；持鎖變慢（服務時間）只有功能支 `test_c305_concurrent_distinct_nonces_zero_unavailable` 抓到，
-        且要約 12 分鐘（M1 實測）。
+        且要約 12 分鐘（txn 內 sleep 50 ms 的退化實測）。
         """
         if os.environ.get("LGW_SLOW_TESTS") != "1":
             self.skipTest("等鎖觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
@@ -769,8 +769,8 @@ class ConcurrencyTests(ReplayTestBase):
         """C-305 固定到達率 100 筆/秒觀察（#311；**不 gating**）：設計操作點的 4 倍。
 
         同一套 `_paced_accepts`、15 秒、正式預設 5 秒期限；只印統計與警示，**不斷言**。
-        由誰、何時跑：同 `test_c305_paced_30_observation_not_gating`（V-0.6 部署機量測、手動調查時，
-        LGW_SLOW_TESTS=1）。用來看單寫者在這台機器上的容量邊界。
+        由誰、何時跑：同 `test_c305_paced_30_observation_not_gating`（目前沒有排程或人被指派；需要時
+        手動以 LGW_SLOW_TESTS=1 跑）。用來看單寫者在這台機器上的容量邊界。
         """
         if os.environ.get("LGW_SLOW_TESTS") != "1":
             self.skipTest("100 筆/秒觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
@@ -839,7 +839,7 @@ class ConcurrencyTests(ReplayTestBase):
 
 
 class ReplayTimeBranchSkipTableTests(unittest.TestCase):
-    """#311：時間支 skip 決定（純函式表格測試，不碰機器）。"""
+    """#311：環境壓力判定的純函式表格測試（不碰機器；判定只影響觀察行說明，不 skip 任何測試）。"""
 
     def decide(self, load, cores, io_before, io_after, hold):
         return _time_branch_skip(load, cores, io_before, io_after, hold)
@@ -856,6 +856,7 @@ class ReplayTimeBranchSkipTableTests(unittest.TestCase):
     def test_outer_load_rule_still_skips_first(self):
         skip, detail = self.decide(33.0, 16, (0.0, 0.0), (0.0, 0.0), 0.01)
         self.assertTrue(skip)
+        self.assertIn("規則＝外層 load1", detail)
         self.assertIn("load1=33.00", detail)
         self.assertIn("16", detail)
 
@@ -876,6 +877,7 @@ class ReplayTimeBranchSkipTableTests(unittest.TestCase):
     def test_pressure_before_run_alone_skips(self):
         skip, detail = self.decide(9.0, 16, (45.3, 10.0), None, 0.03)
         self.assertTrue(skip)
+        self.assertIn("規則＝io 壓力", detail)
         self.assertIn("some avg10=45.30", detail)
 
     def test_pressure_after_run_alone_skips(self):
@@ -900,6 +902,7 @@ class ReplayTimeBranchSkipTableTests(unittest.TestCase):
     def test_no_pressure_uses_hold_fallback_slow_disk_skips(self):
         skip, detail = self.decide(9.0, 16, None, None, 0.35)
         self.assertTrue(skip)
+        self.assertIn("規則＝持鎖退路", detail)
         self.assertIn("磁碟太慢", detail)
         self.assertIn("0.350s", detail)
 
