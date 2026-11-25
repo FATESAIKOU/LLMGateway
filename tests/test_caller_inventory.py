@@ -599,6 +599,26 @@ class AuthRolloutDocTests(unittest.TestCase):
                 )
         self.assertGreater(checked, 0, "文件裡沒有任何「已完成」列可以檢查（C-962 的斷言會空轉）")
 
+    def test_c321_status_rows_cite_merged_evidence(self):
+        # #321：狀態列要附 PR／commit 依據；已合的 D6a／b／c 與 D5d 段二要看得到編號。
+        rows = {}
+        for _, block in self.tables:
+            for row in block:
+                if row and row[0].strip().isdigit():
+                    rows[int(row[0].strip())] = row
+        self.assertIn(1, rows, "§4 表缺第 1 列")
+        for token in ("#293", "#301", "#299", "c73ed97", "b9c7c46", "fe5f60f"):
+            self.assertIn(token, " ".join(rows[1]), token)
+        self.assertIn("#307", " ".join(rows[3]))
+        self.assertIn("26fd98f", " ".join(rows[3]))
+        self.assertIn("#290", " ".join(rows[2]))
+        self.assertIn("#291", " ".join(rows[2]))
+        self.assertIn("V-0 計畫 v2", " ".join(rows[6]))
+        self.assertIn("lgw-v0", " ".join(rows[6]))
+        # 第 4、5 列維持未成立。
+        self.assertTrue(rows[4][2].strip().startswith("未"), rows[4])
+        self.assertTrue(rows[5][2].strip().startswith("未"), rows[5])
+
     def test_c962_unsigned_rows_are_not_claimed_done(self):
         # 誰簽回還是「未」的列，不得寫成已完成。
         for headers, rows in self.tables:

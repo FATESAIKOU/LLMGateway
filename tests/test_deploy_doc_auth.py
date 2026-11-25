@@ -397,6 +397,18 @@ class IoPrerequisiteTests(unittest.TestCase):
         self.assertIn("不得", row)
         self.assertIn("當成 StoreBusy 數", row)
 
+    def test_v06b_reads_auth_busy_status_file(self):
+        # #312 之後 lgwd 每 60 秒寫 .auth-busy.status；V-0.6b 要寫怎麼讀它，舊的「沒有獨立計數」不得留著。
+        row = self.v06b_row()
+        self.assertNotIn("目前沒有獨立計數", row)
+        self.assertIn(".auth-busy.status", row)
+        self.assertIn("每 60 秒", self.doc)
+        for needle in ("每分鐘讀暫存 state dir", "結束前讀", "暫存目錄結束即刪"):
+            self.assertIn(needle, row, needle)
+        # 寫在 C-612 的暫存 state dir 裡（測試的 state 目錄），而不是正式庫目錄。
+        source = (REPO_ROOT / "lgwd" / "auth_paths.py").read_text(encoding="utf-8")
+        self.assertIn('BUSY_STATUS_NAME = ".auth-busy.status"', source)
+
     def test_measurements_match_source_table(self):
         # 數字來源：#310 報告（不在 repo；這張表是測試自己的來源副本）。
         # 改掉文件的數字而不改這張表，測試會紅；要改數字兩邊都要改，並回到來源確認。
@@ -428,8 +440,8 @@ class IoPrerequisiteTests(unittest.TestCase):
             ("lgwd/auth_db.py", 188): "int(row[0]) != 2",
             ("lgwd/auth_db.py", 220): "deadline = time.monotonic() + self.busy_timeout",
             ("lgwd/auth_db.py", 255): "BEGIN IMMEDIATE",
-            ("lgwd/auth.py", 696): "except (StoreError, OSError):",
-            ("lgwd/auth.py", 697): "return unavailable(REASON_STORE_UNAVAILABLE)",
+            ("lgwd/auth.py", 716): "except (StoreError, OSError):",
+            ("lgwd/auth.py", 717): "return unavailable(REASON_STORE_UNAVAILABLE)",
             ("lgwd/http.py", 106): "_FRAMING_PERMITS = 32",
             ("lgwd/http.py", 107): "_PERMIT_WAIT_SECONDS = 1.0",
             ("lgwd/http.py", 416): "self._framing_sem.acquire(timeout=_PERMIT_WAIT_SECONDS)",

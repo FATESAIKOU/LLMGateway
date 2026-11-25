@@ -65,12 +65,12 @@ MLP 11-24 回覆的重點：**MLP 只有兩個呼叫方**——sidecar（X1，�
 
 | # | 條件 | 狀態 | 依據 |
 | --- | --- | --- | --- |
-| 1 | D6a、D6b、D6c 都已合，驗收報告每一格都有測試名稱，全套綠，skip 的原因只是共載或 Mac 專用 | 未 | D6a 已完成（PR #293）；D6b（#294）測試已寫好並審查通過，等合併（生命週期的驗證證據在合併後才算數）；D6c 在本 PR。三張沒同時成立 |
-| 2 | d 單-1 已合；d 單-2 已合，或本人書面接受不做 | 已完成 | d 單-1：PR #290（`7e90320`，`docs/mac-fallback.md` 的判斷指令改打 `/healthz`）；d 單-2：PR #291（`d966aae`，#288 的降級滿 1 小時告警 `auth-degraded`） |
-| 3 | D5d 段二已合：C-612 在低負載下重跑，報告附原始取樣；資源三鍵已定值 | 未 | D5d 只有段一（#285）已合；段二還沒做 |
+| 1 | D6a、D6b、D6c 都已合，驗收報告每一格都有測試名稱，全套綠，skip 的原因只是共載或 Mac 專用 | 已合（D6a／b／c 三張） | D6a：PR #293（`c73ed97`，11-24 merged）；D6b：PR #301（`b9c7c46`，11-24 merged）；D6c：PR #299（`fe5f60f`，11-24 merged）。以上是 `gh pr view` 與 `git log` 查到的合併事實；驗收報告每一格與全套綠未在本單重新查證 |
+| 2 | d 單-1 已合；d 單-2 已合，或本人書面接受不做 | 已完成 | d 單-1：PR #290（`7e90320`，`docs/mac-fallback.md` 的判斷指令改打 `/healthz`）；d 單-2：PR #291（`d966aae`，#288 的降級滿 1 小時告警 `auth-degraded`）。兩個 commit 都在 git log 上，本單重新查證 |
+| 3 | D5d 段二已合：C-612 在低負載下重跑，報告附原始取樣；資源三鍵已定值 | 已合（段二）；C-612 低負載複測已完成 | 段二：PR #307（`26fd98f`，11-25 merged），資源三鍵 `TasksMax=512`、`MemoryMax=1536M`、`LimitNOFILE=4096` 已定值（`deploy/units/llmgateway.service`）。C-612 低負載複測：依工單說法 11-24 完成，`docs/deploy.md` 8.17.1 引用 `PM-C612-samples.csv`（5860 個樣本）；本單在本機找不到該檔，完成日期與取樣內容未驗 |
 | 4 | P-D4 結果已記錄：Mac 與 worker 的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 未 | MLP 11-24 回覆：Mac 的 ssh-agent 與帶密語不卡住都還沒測 |
-| 5 | 跨 repo：MLP 的 sidecar signer 與 capability 探針已合到 MLP，聯合向量已通過，問題 4 的清單已簽回 | 未 | MyLinuxPool#1740／#1741 都還沒完成（§2）；問題 4 的清單只回到「兩個呼叫方」 |
-| 6 | `docs/deploy.md` 8.18 的 V-0 清單（V-0.1～V-0.7，含 V-0.6b）作為 V-0 的執行計畫 | 未 | #313 在 8.18 新增 V-0.6b，清單已經變動；要 PM 重新確認這份執行計畫（原與 `REPORT-D6-arch.md` §3.2 一致的說法已不成立） |
+| 5 | 跨 repo：MLP 的 sidecar signer 與 capability 探針已合到 MLP，聯合向量已通過，問題 4 的清單已簽回 | 未 | MyLinuxPool#1740（X1 sidecar 簽章）仍 OPEN；#1741（X2 capability 探針）已 MERGED，但 X1 未合，條件仍不成立（§2）；問題 4 的清單只回到「兩個呼叫方」 |
+| 6 | `docs/deploy.md` 8.18 的 V-0 清單（V-0.1～V-0.7，含 V-0.6b）作為 V-0 的執行計畫 | 未 | 依 V-0 計畫 v2（工單 BRIEF-321 轉述；repo 內找不到 v2 計畫文件可對照）：8.18 為執行計畫；V-0 不停正式服務，用 lgw-v0。#313 在 8.18 新增 V-0.6b，清單已經變動；要 PM 重新確認這份執行計畫（原與 `REPORT-D6-arch.md` §3.2 一致的說法已不成立） |
 
 ## 5. V-0 前置（真機檢查，要本人單次授權）
 
