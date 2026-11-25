@@ -12,7 +12,9 @@
   ``LGW_NOTIFY_CHANNEL``／``LGW_NOTIFY_TO``／``ANGAREION_IDENTITY``／
   ``LGW_NOTIFY_LABEL``）。**不讀任何身分檔或憑證**，也不把值以外的東西印出來。
   ``LGW_NOTIFY_LABEL`` 只收 ``[A-Za-z0-9._-]{1,32}``，不符就當成沒設（寫一行
-  journal 後結束，不送訊息）。
+  journal 後結束，不送訊息）。**#304**：值還是範本的 ``place-holder-*``
+  （去頭尾空白、不分大小寫）也當成沒設，走與「設定不存在」相同的
+  ``notify skipped: not configured``（不送訊息）。
 - **任何一種不可用的情況都只寫一行固定的 journal、exit 0**：通知本身失敗不該再
   引發一次失敗的通知。journal 就是指 stdout（由 systemd 收進
   ``SyslogIdentifier=llmgwctl-check-notify``）。
@@ -81,6 +83,11 @@ MAX_LABEL = 32
 #: ``CHECK_NOTIFY_LABEL_PATTERN`` 是同一個字串（測試會比對）。
 LABEL_PATTERN = r"[A-Za-z0-9._-]{1,32}"
 LABEL_RE = re.compile(LABEL_PATTERN)
+#: 範本（``deploy/check-notify.env.example``）的佔位值開頭（#304）。比對前去頭尾
+#: 空白、大小寫不分；值還是範本的佔位值就**當成沒設**（走「notify skipped: not
+#: configured」，不送訊息）。``lgwctl/layout.py`` 的
+#: ``CHECK_NOTIFY_PLACEHOLDER_PREFIX`` 是同一個字串（測試會比對兩處一致）。
+PLACEHOLDER_PREFIX = "place-holder-"
 #: 整則訊息最長幾個字元。
 MAX_MESSAGE = 300
 
@@ -173,6 +180,18 @@ def format_message(label: str, result: str, items, at: str) -> str:
         shown.append("+" + str(len(items) - len(shown)))
     body = head + (",".join(shown) if shown else "-") + tail
     return sanitize(body, MAX_MESSAGE)
+
+
+def unset_value(value) -> str:
+    """設定值的正規化（#304）：去頭尾空白；範本的佔位值算成空字串。
+
+    去頭尾空白後（不分大小寫）以 ``PLACEHOLDER_PREFIX`` 開頭就是範本留下來的
+    佔位值，回空字串——呼叫方走「沒設定」那條路，不拿它送訊息。
+    """
+    text = (value or "").strip()
+    if text.lower().startswith(PLACEHOLDER_PREFIX):
+        return ""
+    return text
 
 
 def load_state(path: str) -> dict:
@@ -328,11 +347,15 @@ def utc_now_text() -> str:
 
 
 def _config() -> tuple:
-    """設定值（頻道、收件人、本機代號）；缺任何一個就回空字串。"""
+    """設定值（頻道、收件人、本機代號）；缺任何一個就回空字串。
+
+    #304：值還是範本的 ``place-holder-*`` 時也算沒設（``unset_value`` 換成空
+    字串），走與「設定不存在」相同的路徑——一行 journal、結束碼 0、不送訊息。
+    """
     return (
-        (os.environ.get("LGW_NOTIFY_CHANNEL") or "").strip(),
-        (os.environ.get("LGW_NOTIFY_TO") or "").strip(),
-        (os.environ.get("LGW_NOTIFY_LABEL") or "").strip(),
+        unset_value(os.environ.get("LGW_NOTIFY_CHANNEL")),
+        unset_value(os.environ.get("LGW_NOTIFY_TO")),
+        unset_value(os.environ.get("LGW_NOTIFY_LABEL")),
     )
 
 
