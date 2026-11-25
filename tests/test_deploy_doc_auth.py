@@ -481,5 +481,68 @@ class IoPrerequisiteTests(unittest.TestCase):
                 db.close()
 
 
+class V05TransientServiceTests(unittest.TestCase):
+    """#320：8.18.1 的 transient service 範本與 unit 屬性一致；步驟指到真的工具與斷言。
+
+    範本是文件，不是程式：這裡只比對「共用屬性」的值與 unit 檔相同，以及步驟裡的
+    關鍵字樣（工具名、三項斷言、停損）還在。`ReadWritePaths` 與 `WorkingDirectory`
+    刻意不同，不比對。
+    """
+
+    SHARED = ("User", "Group", "TasksMax", "MemoryMax", "LimitNOFILE", "OOMPolicy",
+              "TimeoutStopSec", "KillMode", "NoNewPrivileges", "ProtectSystem", "PrivateTmp")
+
+    def setUp(self):
+        self.doc = read_doc()
+        self.section = between(self.doc, "### 8.18.1 ", "### 8.19 ")
+
+    def _unit_service_props(self):
+        unit = (REPO_ROOT / "deploy" / "units" / "llmgateway.service").read_text(encoding="utf-8")
+        props = {}
+        for line in unit.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line and not line.startswith("["):
+                key, _, value = line.partition("=")
+                props[key] = value
+        return props
+
+    def _template_props(self):
+        start = self.section.index("```bash")
+        block = self.section[start + len("```bash"):self.section.index("```", start + 7)]
+        joined = block.replace("\\\n", " ")
+        # 範本第一條指令到 lgwd 參數為止；<...> 佔位那一段不是 shell 字，shlex 會把它當一個字。
+        tokens = shlex.split(joined)
+        props = {}
+        for token in tokens:
+            if token.startswith("--property="):
+                key, _, value = token[len("--property="):].partition("=")
+                props[key] = value
+        return tokens, props
+
+    def test_shared_properties_match_unit_file(self):
+        unit = self._unit_service_props()
+        _, template = self._template_props()
+        for key in self.SHARED:
+            self.assertIn(key, template, key)
+            self.assertEqual(template[key], unit[key], key)
+
+    def test_template_uses_exec_type_and_no_restart(self):
+        tokens, template = self._template_props()
+        self.assertIn("--service-type=exec", tokens)
+        self.assertEqual(template["Restart"], "no")
+        self.assertEqual(self._unit_service_props()["Type"], "exec")
+
+    def test_section_names_the_tools_and_the_three_assertions(self):
+        for needle in ("tests.v0_prepare", "tests.v0_load_client", "--auth-per-key-max 1000000",
+                       "cgroup.procs", "20 秒", "503", "connection_refused", "停損",
+                       "沒有驗到的", "不碰 `/opt/llmgateway/current`"):
+            self.assertIn(needle, self.section, needle)
+
+    def test_v06_rows_untouched_by_v05_section(self):
+        table = between(self.doc, "### 8.18 上線前清單", "### 8.18.1 ")
+        self.assertEqual(len([l for l in table.splitlines() if l.startswith("| V-0.6b |")]), 1)
+        self.assertEqual(len([l for l in table.splitlines() if l.startswith("| V-0.6 |")]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
