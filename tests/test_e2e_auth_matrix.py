@@ -71,6 +71,7 @@ CHECK_PATCHES = (
     (check, "_check_policy", lambda *a, **k: None),
     (check, "_check_gh_repo", lambda *a, **k: None),
     (check, "_check_auth_stores", lambda *a, **k: None),
+    (check, "_check_auth_busy", lambda *a, **k: None),
 )
 
 UNAUTHORIZED = b'{"error": "unauthorized"}'

@@ -793,6 +793,11 @@ def test_C828_check_run_lists_the_three_items(box):
     """C-828：`check.run` 真的會列出三項（不是只有測試直接呼叫的函式）。"""
     seed_stores(box, registry_bytes())
     write_status(box, status_document())
+    # #312：auth-busy 要一份新鮮的計數檔（沒有就是 todo，rc 會變 2）。
+    box.write(sandbox_paths(box).busy_status, json.dumps({
+        "schema": 1, "mode": "enforce", "since": int(time.time()) - 3600,
+        "updated": int(time.time()), "store_busy_total": 0,
+        "store_busy_30m": 0, "store_busy_60m": 0}, separators=(",", ":")), 0o644)
     layout = make_layout(box)
     report = Report(out=lambda line: None)
     with mock.patch.object(check, "_check_units", lambda *a, **k: (False, "missing")), \
@@ -802,7 +807,7 @@ def test_C828_check_run_lists_the_three_items(box):
             mock.patch.object(check, "_check_policy", lambda *a, **k: None), \
             mock.patch.object(check, "_check_gh_repo", lambda *a, **k: None):
         rc = check.run(layout, report=report, no_remote=True)
-    for name in ("auth-heartbeat", "auth-water", "auth-stores"):
+    for name in ("auth-heartbeat", "auth-water", "auth-stores", "auth-busy"):
         assert report.level_of(name) == "ok", report.lines
     assert rc == 0, report.lines
 

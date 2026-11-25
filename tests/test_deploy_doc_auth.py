@@ -236,7 +236,7 @@ class DeployDocConsistencyTests(unittest.TestCase):
     def test_c834_3_check_items_exist_in_report_calls(self):
         source = (REPO_ROOT / "lgwctl" / "check.py").read_text(encoding="utf-8")
         for name in ("auth-local", "auth-heartbeat", "auth-water", "auth-stores",
-                     "auth-degraded", "check-timer"):
+                     "auth-busy", "auth-degraded", "check-timer"):
             self.assertIn(name, self.chapter, name)
             self.assertRegex(source, r'report\.(?:ok|todo|fail)\(\s*"' + re.escape(name) + r'"',
                              name)
