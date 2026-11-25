@@ -621,7 +621,7 @@ class V06MeasurementTests(unittest.TestCase):
         self.assertIn("可以共用同一次 C-612 執行", row)
         self.assertIn("同一個 scope", row)
         self.assertIn(".auth-busy.status", row)
-        self.assertIn("結束前讀它", row)
+        self.assertIn("結束前讀（暫存目錄結束即刪）", row)
         self.assertNotIn("要確認", row)
         self.assertNotIn("推論：", row)
 
