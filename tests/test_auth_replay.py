@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime as _dt
 import os
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import warnings
 from unittest import mock
 
 from lgwd.auth_db import DEFAULT_BUSY_TIMEOUT, AuthDb, create_stores
@@ -40,10 +43,22 @@ UTC = _dt.timezone.utc
 # 並行測試的期限：正式預設是 5 秒（`DEFAULT_BUSY_TIMEOUT`）。測試機是多 session 共用的
 # 高負載機器（實測 load average 30–55，16 核），fsync 變慢時尾端等鎖會超過 5 秒而變成
 # StoreBusy；功能那一支放長期限，把「並行下有沒有一個邏輯層面的不可寫」與「機器有多慢」
-# 分開。時間那一支仍用正式預設 5 秒，判準（等鎖 p99 < 1 秒）不變。
+# 分開。時間那一支仍用正式預設 5 秒（見下面 TIME_* 的固定到達率量法）。
 CONCURRENT_BUSY_TIMEOUT = 30.0
 CONCURRENT_THREADS = 32
 CONCURRENT_PER_THREAD = 500
+
+# 時間支（#311）的量法與判準。新判準是「在設計操作點下鎖不會成為瓶頸」：以固定到達率
+# 持續 15 秒，只量等鎖 p99 與 StoreBusy 並印出（不 gating；#311 fix1 裁定 (c)）。到達率 30/s
+# 是 (d) 的操作點（設計持續率 50/s 的 60%）；(d) 在受控共載下假失敗超過一次，所以降為觀察。
+# 100 筆/秒與背靠背 32×500 同為不 gating 的觀察（LGW_SLOW_TESTS=1）。
+TIME_RATE_PER_SECOND = 30
+TIME_DURATION_SECONDS = 15.0
+LOCK_WAIT_P99_LIMIT = 1.0           # 判準：等鎖 p99 < 1 秒，且零失敗（StoreBusy）
+LOAD_SKIP_FACTOR = 2                # 開始前 load1 > 2×核數：最外層的舊規則，仍 skip
+IO_SOME_AVG10_LIMIT = 40.0          # 跑期間 /proc/pressure/io some avg10（%）超過就 skip
+IO_FULL_AVG10_LIMIT = 30.0          # full avg10（%）超過就 skip
+HOLD_P99_FALLBACK_LIMIT = 0.200     # 無 /proc/pressure 時的退路：持鎖 p99（秒）超過就 skip
 
 
 def _oversubscribed() -> tuple[float, int, bool]:
@@ -58,7 +73,104 @@ def _oversubscribed() -> tuple[float, int, bool]:
         load = float(os.getloadavg()[0])
     except OSError:  # pragma: no cover - 非 POSIX
         return 0.0, cores, False
-    return load, cores, load > 2 * cores
+    return load, cores, load > LOAD_SKIP_FACTOR * cores
+
+
+def _parse_io_pressure(text: str | None) -> tuple[float, float] | None:
+    """解析 /proc/pressure/io 的文字，回 (some avg10, full avg10)；讀不懂回 None。
+
+    格式：`some avg10=0.54 avg60=... avg300=... total=...` 與同形的 `full` 行。
+    """
+    try:
+        avg10 = {}
+        for line in text.splitlines():
+            kind, *fields = line.split()
+            avg10[kind] = float(dict(field.split("=", 1) for field in fields)["avg10"])
+        return avg10["some"], avg10["full"]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _read_io_pressure() -> tuple[float, float] | None:
+    """目前的 IO 壓力 (some avg10, full avg10)；沒有 /proc/pressure 回 None。"""
+    try:
+        with open("/proc/pressure/io", encoding="ascii") as handle:
+            return _parse_io_pressure(handle.read())
+    except OSError:
+        return None
+
+
+def _read_cpu_some() -> str:
+    """目前 CPU 壓力的 some avg10（只用來記錄進訊息）；讀不到回 n/a。"""
+    try:
+        with open("/proc/pressure/cpu", encoding="ascii") as handle:
+            first = handle.readline().split()
+        return first[1].split("=", 1)[1]
+    except (OSError, IndexError):
+        return "n/a"
+
+
+def _time_branch_skip(load_before: float | None, cores: int | None,
+                      io_before: tuple[float, float] | None,
+                      io_after: tuple[float, float] | None,
+                      hold_p99: float | None) -> tuple[bool, str]:
+    """時間支該不該 skip（純函式，不碰機器）：回 (skip, 說明)。
+
+    依序判斷，第一個成立的決定結果：
+    1. 開始前 load1 > 2×核數：外層的舊規則，仍 skip（說明帶 load1 與核數）。
+    2. 有 /proc/pressure/io：取開始前與跑完後較大的 some／full avg10；任一超過門檻就 skip。
+       門檻 some > 40、full > 30 的依據（REPORT-310-impl §2、§7）：乾淨樣本的 some 最大
+       約 38（中位 26）；失敗樣本 some 落在 30～63，失敗時 full 最高 31.2。
+       這兩個數只表示「環境已經壞到量不出設計值」，不是判定失敗的依據。
+    3. 沒有 /proc/pressure：退路是實測持鎖 p99（本次 accept 交易的 body＋commit）超過
+       0.2 秒，代表磁碟慢到連單筆都量不準，skip。
+    4. 兩者皆無：照常斷言。
+
+    skip 的說明一律帶量到的數值，供報告引用。
+    """
+    if load_before is not None and cores and load_before > LOAD_SKIP_FACTOR * cores:
+        return True, "開始前 load1={0:.2f} > {1}×{2} 核（外層舊規則）".format(
+            load_before, LOAD_SKIP_FACTOR, cores)
+    pressures = [item for item in (io_before, io_after) if item is not None]
+    if pressures:
+        some = max(item[0] for item in pressures)
+        full = max(item[1] for item in pressures)
+        detail = "io 壓力（開始前與跑完後較大者）some avg10={0:.2f} full avg10={1:.2f}".format(
+            some, full)
+        if some > IO_SOME_AVG10_LIMIT or full > IO_FULL_AVG10_LIMIT:
+            return True, "{0}，超過門檻 some>{1:g} 或 full>{2:g}".format(
+                detail, IO_SOME_AVG10_LIMIT, IO_FULL_AVG10_LIMIT)
+        return False, "{0}，未超門檻".format(detail)
+    if hold_p99 is not None:
+        if hold_p99 > HOLD_P99_FALLBACK_LIMIT:
+            return True, "無 /proc/pressure；實測持鎖 p99={0:.3f}s > {1:g}s（磁碟太慢）".format(
+                hold_p99, HOLD_P99_FALLBACK_LIMIT)
+        return False, "無 /proc/pressure；實測持鎖 p99={0:.3f}s，未超 {1:g}s".format(
+            hold_p99, HOLD_P99_FALLBACK_LIMIT)
+    return False, "無 /proc/pressure 且讀不到持鎖；照常斷言"
+
+
+def _p99(values: list[float]) -> float:
+    """與舊測試同一個取法：sorted 後取 int(n×0.99)−1 的位置。"""
+    ordered = sorted(values)
+    return ordered[int(len(ordered) * 0.99) - 1]
+
+
+def _record_hold_times(db, holds: list) -> None:
+    """在這個 AuthDb 物件上包一層 `txn`，把每筆「交易本體＋commit＋釋鎖」的秒數記進 holds。
+
+    不含等鎖與 BEGIN（那是等鎖的一部分）；只改測試用的這個實例，不動 lgwd。
+    """
+    real_txn = db.txn
+
+    @contextlib.contextmanager
+    def timed_txn(deadline=None):
+        with real_txn(deadline) as cur:
+            started = time.monotonic()
+            yield cur
+        holds.append(time.monotonic() - started)
+
+    db.txn = timed_txn
 
 
 def _at(seconds: int) -> _dt.datetime:
@@ -545,32 +657,116 @@ class ConcurrencyTests(ReplayTestBase):
         self.assertEqual(failures[:5], [])
         self.assertEqual(store.row_count(), CONCURRENT_THREADS * CONCURRENT_PER_THREAD)
 
-    def test_c305_concurrent_lock_p99_under_one_second(self) -> None:
-        """C-305 (b) 時間：等鎖 p99 < 1 秒，用正式預設 5 秒期限。
+    def _paced_accepts(self, store: ReplayStore, rate: float, duration: float) -> tuple[list, int]:
+        """32 條執行緒各自按固定間隔打 accept，整體約 `rate` 筆/秒，持續 `duration` 秒。
 
-        只有這支（時間量測）允許在機器被別的 session 共載時 skip；功能那一支不 skip。
+        每條執行緒的排程以開始時刻為基準（不累加誤差）；各執行緒的起點錯開一小段，讓到達
+        是平均的而不是 32 條同時撞上。回 (失敗清單, 送出筆數)；失敗＝例外型別或 `outcome:reason`。
         """
-        load, cores, oversubscribed = _oversubscribed()
-        if oversubscribed:
-            self.skipTest(
-                "機器共載：load1={0:.2f} > 2×{1} 核，等鎖 p99 量到的是共用磁碟競爭不是"
-                "設計值；判準 p99<1 秒不變（同一支在 load1≈33 時 p99=0.862s max=3.471s "
-                "通過；load1>50 時 p99=2.400s max=8.352s）".format(load, cores)
-            )
+        interval = CONCURRENT_THREADS / rate
+        per_thread = int(duration / interval)
+        start = time.monotonic() + 0.5
+        lock = threading.Lock()
+        failures: list = []
+
+        def worker(index: int) -> None:
+            key = "k{0:02d}".format(index)
+            offset = index * interval / CONCURRENT_THREADS
+            for number in range(per_thread):
+                pause = start + offset + number * interval - time.monotonic()
+                if pause > 0:
+                    time.sleep(pause)
+                try:
+                    result = store.accept(key, "p{0:04d}".format(number), self.now)
+                except Exception as exc:  # 任何例外都算失敗
+                    with lock:
+                        failures.append(type(exc).__name__)
+                    continue
+                if not result.ok:
+                    with lock:
+                        failures.append("{0}:{1}".format(result.outcome, result.reason))
+
+        workers = [threading.Thread(target=worker, args=(index,))
+                   for index in range(CONCURRENT_THREADS)]
+        for thread in workers:
+            thread.start()
+        for thread in workers:
+            thread.join(duration + 120)
+        return failures, per_thread * CONCURRENT_THREADS
+
+    def _observe_paced(self, rate: float, label: str) -> None:
+        """固定到達率的等鎖觀察：只印統計與警示，**不斷言**（#311 fix1，(c)）。
+
+        `_time_branch_skip` 的結果只寫進說明（環境是否已壓到量不出設計值），不決定通過與否。
+        """
+        load, cores, _ = _oversubscribed()
+        io_before = _read_io_pressure()
+        store = self.store(per_key_max=600, busy_timeout=DEFAULT_BUSY_TIMEOUT,
+                           collect_lock_waits=True)
+        holds: list = []
+        _record_hold_times(store.db, holds)
+        started = time.monotonic()
+        failures, offered = self._paced_accepts(store, rate, TIME_DURATION_SECONDS)
+        elapsed = time.monotonic() - started
+        io_after = _read_io_pressure()
+        waits = sorted(store.db.lock_waits or [])
+        hold_mean = sum(holds) / len(holds) if holds else float("nan")
+        p99 = _p99(waits) if waits else float("nan")
+        skip, why = _time_branch_skip(load, cores, io_before, io_after,
+                                      _p99(holds) if holds else None)
+        line = ("{0}（觀察，不 gating）：rate={1:.1f}/s n={2} failures={3} wait_p99={4:.3f}s "
+                "wait_max={5:.3f}s hold_mean={6:.4f}s hold_p99={7:.3f}s load1={8:.2f} cores={9} "
+                "io_some={10} cpu_some={11}；環境判定={12}（{13}）").format(
+            label, offered / elapsed, offered, len(failures), p99,
+            waits[-1] if waits else float("nan"), hold_mean,
+            _p99(holds) if holds else float("nan"), load, cores,
+            "{0:.2f}/{1:.2f}".format(io_before[0], io_after[0]) if io_before and io_after else "n/a",
+            _read_cpu_some(), "環境壓力" if skip else "未達環境壓力", why)
+        sys.stderr.write(line + "\n")
+        if failures or p99 >= LOCK_WAIT_P99_LIMIT:
+            warnings.warn(line, stacklevel=1)
+
+    def test_c305_paced_30_observation_not_gating(self) -> None:
+        """C-305 時間支（#311 fix1 裁定 (c)）：固定到達率 30 筆/秒、15 秒，**不 gating**。
+
+        沿革：#311 原判準是等鎖 p99 < 1 秒（50/s，再改 25/s、30/s）。受控共載下 (d) 的假失敗超過一次
+        （REPORT-311-fix1 §2），依 BRIEF-311-fix1 降為觀察：只印統計與警示，不斷言 p99，也不斷言零
+        StoreBusy。要設 LGW_SLOW_TESTS=1 才跑。**代價**：CI 沒有鎖退化的自動 gating；鎖退化的自動訊號
+        只剩功能支 `test_c305_concurrent_distinct_nonces_zero_unavailable`（30 秒期限，零 unavailable）。
+        """
+        if os.environ.get("LGW_SLOW_TESTS") != "1":
+            self.skipTest("等鎖觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
+        self._observe_paced(TIME_RATE_PER_SECOND, "paced30")
+
+    def test_c305_paced_100_observation_not_gating(self) -> None:
+        """C-305 固定到達率 100 筆/秒觀察（#311 fix1；**不 gating**）：設計操作點的 4 倍。
+
+        同一套 `_paced_accepts`、15 秒、正式預設 5 秒期限；只印統計與警示，**不斷言**。
+        要設 LGW_SLOW_TESTS=1 才跑。用來看單寫者在這台機器上的容量邊界。
+        """
+        if os.environ.get("LGW_SLOW_TESTS") != "1":
+            self.skipTest("100 筆/秒觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
+        self._observe_paced(100, "paced100")
+
+    def test_c305_stress_backtoback_observation_not_gating(self) -> None:
+        """C-305 背靠背壓力觀察（#311；**不 gating**）：32 條執行緒背靠背各 500 次 accept。
+
+        這是悲觀上界（遠超設計持續率，見 `test_c305_paced_30_observation_not_gating`），
+        只印統計與警示，**不斷言 p99**。要設 LGW_SLOW_TESTS=1 才跑。
+        """
+        if os.environ.get("LGW_SLOW_TESTS") != "1":
+            self.skipTest("壓力觀察（不 gating）：設 LGW_SLOW_TESTS=1 才跑")
+        load, cores, _ = _oversubscribed()
         store = self.store(per_key_max=600, busy_timeout=DEFAULT_BUSY_TIMEOUT,
                            collect_lock_waits=True)
         failures = self._hammer_distinct_nonces(store)
-        self.assertEqual(failures[:5], [])
         waits = sorted(store.db.lock_waits or [])
-        self.assertEqual(len(waits), CONCURRENT_THREADS * CONCURRENT_PER_THREAD)  # 每次 accept 一筆
-        p99 = waits[int(len(waits) * 0.99) - 1]
-        # 契約判準：等鎖 p99 < 1 秒（max 與 load 另記在訊息裡，供報告引用）。
-        self.assertLess(
-            p99, 1.0,
-            msg="p99={0:.3f}s max={1:.3f}s load1={2:.2f} cores={3}".format(
-                p99, waits[-1], load, cores),
-        )
-        self.assertEqual(store.row_count(), CONCURRENT_THREADS * CONCURRENT_PER_THREAD)
+        line = ("stress（悲觀上界，不 gating）：n={0} failures={1} wait_p99={2:.3f}s "
+                "wait_max={3:.3f}s load1={4:.2f} cores={5}").format(
+            len(waits), len(failures), _p99(waits), waits[-1], load, cores)
+        sys.stderr.write(line + "\n")
+        if failures or _p99(waits) >= LOCK_WAIT_P99_LIMIT:
+            warnings.warn(line, stacklevel=1)
 
     def test_c305_purge_and_replay_interleave_at_most_once(self) -> None:
         """到期前一刻重放與清除交錯 1000 輪，每輪至多接受一次。"""
@@ -611,6 +807,76 @@ class ConcurrencyTests(ReplayTestBase):
                 msg="round {0}".format(round_number),
             )
         self.assertEqual(accepted, 1000)
+
+
+class TimeBranchSkipRuleTests(unittest.TestCase):
+    """#311：時間支 skip 決定（純函式表格測試，不碰機器）。"""
+
+    def decide(self, load, cores, io_before, io_after, hold):
+        return _time_branch_skip(load, cores, io_before, io_after, hold)
+
+    def test_parse_io_pressure_reads_some_and_full_avg10(self):
+        text = ("some avg10=1.37 avg60=1.17 avg300=1.83 total=65210540783\n"
+                "full avg10=1.14 avg60=1.01 avg300=1.48 total=26248009840\n")
+        self.assertEqual(_parse_io_pressure(text), (1.37, 1.14))
+
+    def test_parse_io_pressure_rejects_garbage(self):
+        for text in (None, "", "some avg60=1.0\nfull avg60=1.0\n", "nonsense", "some avg10=x\nfull avg10=1\n"):
+            self.assertIsNone(_parse_io_pressure(text), repr(text))
+
+    def test_outer_load_rule_still_skips_first(self):
+        skip, detail = self.decide(33.0, 16, (0.0, 0.0), (0.0, 0.0), 0.01)
+        self.assertTrue(skip)
+        self.assertIn("load1=33.00", detail)
+        self.assertIn("16", detail)
+
+    def test_load_exactly_twice_cores_does_not_skip(self):
+        skip, _ = self.decide(32.0, 16, (0.0, 0.0), (0.0, 0.0), 0.01)
+        self.assertFalse(skip)
+
+    def test_clean_pressure_does_not_skip(self):
+        skip, detail = self.decide(3.0, 16, (1.37, 1.14), (2.0, 1.5), 0.02)
+        self.assertFalse(skip, detail)
+        self.assertIn("some avg10=2.00", detail)
+
+    def test_clean_baseline_max_38_does_not_skip(self):
+        # REPORT-310-impl 乾淨基線 some 最大約 38（中位 26）：不得因此 skip。
+        skip, detail = self.decide(9.5, 16, (26.0, 10.0), (37.8, 12.0), 0.03)
+        self.assertFalse(skip, detail)
+
+    def test_pressure_before_run_alone_skips(self):
+        skip, detail = self.decide(9.0, 16, (45.3, 10.0), None, 0.03)
+        self.assertTrue(skip)
+        self.assertIn("some avg10=45.30", detail)
+
+    def test_pressure_after_run_alone_skips(self):
+        skip, detail = self.decide(9.0, 16, (1.0, 1.0), (10.0, 31.2), 0.03)
+        self.assertTrue(skip)
+        self.assertIn("full avg10=31.20", detail)
+
+    def test_some_over_limit_skips(self):
+        skip, detail = self.decide(9.0, 16, (41.0, 0.0), (0.0, 0.0), 0.03)
+        self.assertTrue(skip, detail)
+
+    def test_no_pressure_uses_hold_fallback_slow_disk_skips(self):
+        skip, detail = self.decide(9.0, 16, None, None, 0.35)
+        self.assertTrue(skip)
+        self.assertIn("磁碟太慢", detail)
+        self.assertIn("0.350s", detail)
+
+    def test_no_pressure_fast_disk_asserts(self):
+        skip, detail = self.decide(9.0, 16, None, None, 0.05)
+        self.assertFalse(skip, detail)
+
+    def test_no_pressure_and_no_hold_asserts(self):
+        skip, detail = self.decide(9.0, 16, None, None, None)
+        self.assertFalse(skip, detail)
+        self.assertIn("照常斷言", detail)
+
+    def test_pressure_available_takes_precedence_over_hold(self):
+        # 有 /proc/pressure 時不看持鎖退路：壓力正常、持鎖慢也不因退路 skip。
+        skip, detail = self.decide(9.0, 16, (1.0, 1.0), (1.0, 1.0), 0.9)
+        self.assertFalse(skip, detail)
 
 
 if __name__ == "__main__":  # pragma: no cover
