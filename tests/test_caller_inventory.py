@@ -16,7 +16,7 @@
 
 - C-962：`docs/auth-rollout.md` 的跨 repo 清單與三層判定，每一列有「誰簽回、日期、
   依據」；寫「已完成」的列，依據欄不得是空的，也不得是「未」；白話版要照現況寫（D6a
-  已完成、D6b 的測試已寫好並審查通過但等合併），而且要有「做完之後仍然存在的風險」。
+  已完成、D6b 的測試已寫好並審查通過、已合併），而且要有「做完之後仍然存在的風險」。
 
 只用標準函式庫；只讀 repo 內的檔案，不碰憑證、不連真機。
 """
@@ -555,10 +555,10 @@ class AuthRolloutDocTests(unittest.TestCase):
                        for line in text.splitlines())
         for token in (
             "D6a",               # 已經驗過的那一段
-            "D6b",               # 還沒合併的那一段
-            "等合併",             # 現況：不是已完成，也不是沒做
+            "D6b",               # D6b 的那一段
+            "已合併",             # 現況：已於 11-24 合併（PR #301）
             "審查通過",
-            "合併後才算數",        # 驗證證據的時點
+            "以合併後的驗收報告為準",  # 驗證證據的時點；逐格尚未核對
             "換鑰", "撤銷", "重放", "回退", "修復",   # D6b 的範圍要看得到
             "同一個帳號",          # 殘餘風險 1：任何人都讀得到隧道金鑰
             "隧道金鑰",
@@ -613,8 +613,13 @@ class AuthRolloutDocTests(unittest.TestCase):
         self.assertIn("26fd98f", " ".join(rows[3]))
         self.assertIn("#290", " ".join(rows[2]))
         self.assertIn("#291", " ".join(rows[2]))
-        self.assertIn("V-0 計畫 v2", " ".join(rows[6]))
-        self.assertIn("lgw-v0", " ".join(rows[6]))
+        self.assertIn("8.18", " ".join(rows[6]))
+        self.assertIn("不停正式服務", " ".join(rows[6]))
+        # 第 1、3 列的狀態欄要明說「已合」，而且要帶「未驗」限定語，不得寫成已驗。
+        for index in (1, 3):
+            status = rows[index][2]
+            self.assertIn("已合", status, rows[index])
+            self.assertIn("未驗", status, rows[index])
         # 第 4、5 列維持未成立。
         self.assertTrue(rows[4][2].strip().startswith("未"), rows[4])
         self.assertTrue(rows[5][2].strip().startswith("未"), rows[5])

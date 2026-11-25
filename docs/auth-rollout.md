@@ -20,8 +20,8 @@ repo 內的呼叫方由測試守著（`tests/test_caller_inventory.py`，契約 
 
 | 項目 | 狀態 | 依據 |
 | --- | --- | --- |
-| ① repo 內呼叫方清冊（D6c） | 已完成（待合） | `tests/test_caller_inventory.py`（C-961）在本 PR；整套測試綠 |
-| ② 跨 repo 簽回 | 未 | MLP 11-24 回覆：sidecar 與 capability 探針都還沒改好（§2） |
+| ① repo 內呼叫方清冊（D6c） | 已完成（已合，PR #299） | `tests/test_caller_inventory.py`（C-961），PR #299（`fe5f60f`，11-24 merged） |
+| ② 跨 repo 簽回 | 未 | MLP 11-24 回覆：sidecar 還沒改好；capability 探針 #1741 已 11-24 合併，但還沒簽回（§2） |
 | ③ 正式主機 warn 觀察期 | 未 | 還沒開 warn；要等 V-0 通過之後才做（§3、§5） |
 | 結論 | 未 | ② 與 ③ 都還沒成立，現在不切 `enforce` |
 
@@ -34,7 +34,7 @@ MLP 11-24 回覆的重點：**MLP 只有兩個呼叫方**——sidecar（X1，�
 | # | 呼叫方 | 打什麼 | enforce 下的處置 | 誰改 | 誰簽回 | 日期 | 依據 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | X1 | MLP sidecar（自己用 urllib 送 HTTP） | list、resolve、cooldown | 簽章（sidecar signer） | MLP | 未 | 未 | MLP 11-24 回覆：這是簽章對象，MyLinuxPool#1740 還沒完成 |
-| X2 | MLP capability 健康檢查 | 先 `healthz`，拿到 404 才退回 list | 改成只打 healthz | MLP | 未 | 未 | MLP 11-24 回覆：MyLinuxPool#1741 還沒完成；新服務一定有 healthz，不會退回 |
+| X2 | MLP capability 健康檢查 | 先 `healthz`，拿到 404 才退回 list | 改成只打 healthz | MLP | 未 | 未 | MyLinuxPool#1741 已 MERGED（11-24 05:31Z）；仍未由 MLP 簽回，故誰簽回與日期維持「未」；新服務一定有 healthz，不會退回 |
 | X3 | 本人的 Mac（curl 或 Python client，經 SSH 轉發） | 全部 | 用 Mac 的私鑰簽（P-D4） | 本人 | 未 | 未 | 本人還沒實測（MLP 11-24 回覆轉述）：ssh-agent 與「金鑰帶密語時不會卡住」都還沒測（P-D4） |
 | X4 | worker 內的 PM 與 agent 程序，經本機埠或 sidecar | 全部 | 由 X1 的 sidecar 路徑涵蓋 | MLP 盤點 | 未 | 未 | MLP 11-24 回覆：除 sidecar 外沒有固定呼叫方；是否有人用腳本直接打 4710，只能靠 warn 觀察期的 `reason=missing` 發現（§3 ③） |
 | X5 | 手機轉發、臨時 curl、Actions | 視情況 | 臨時查詢改用 `lgw` 或 `llmgwctl usage` | 本人與 MLP | 未 | 未 | MLP 11-24 回覆：手機在設計上到不了 4710、Actions 不呼叫；臨時 curl 改用會簽章的 `lgw` 或本機管理 principal 的 `llmgwctl usage` |
@@ -53,8 +53,8 @@ MLP 11-24 回覆的重點：**MLP 只有兩個呼叫方**——sidecar（X1，�
 
 | 層 | 怎麼證明 | 什麼時候 | 誰簽回 | 日期 | 依據 |
 | --- | --- | --- | --- | --- | --- |
-| ① repo 內 | 靜態掃描 `lgw`、`lgwctl`、`ops-scripts`、`deploy`、`docs`，每一處打 lgwd 的地方都必須在清冊裡並分類（簽章／healthz／只限 off 的本機／舊版）；新增一處沒分類的就紅 | D6c | 不適用（repo 內測試） | 2026-11-24 | `tests/test_caller_inventory.py` 的 `INVENTORY`（C-961），已完成（待合）；變異 8 會轉紅 |
-| ② 跨 repo | MLP 書面回答「所有呼叫方、版本 pin、誰改」，並簽回 X1～X5 都改好；本人確認 X3、X5 | V-0 之前（跨 repo 前置） | MLP 與本人 | 未 | 未；MLP 11-24 回覆只到「有兩個呼叫方、都還沒改好」，還不是簽回（§2） |
+| ① repo 內 | 靜態掃描 `lgw`、`lgwctl`、`ops-scripts`、`deploy`、`docs`，每一處打 lgwd 的地方都必須在清冊裡並分類（簽章／healthz／只限 off 的本機／舊版）；新增一處沒分類的就紅 | D6c | 不適用（repo 內測試） | 2026-11-24 | `tests/test_caller_inventory.py` 的 `INVENTORY`（C-961），已完成（已合，PR #299）；變異 8 會轉紅 |
+| ② 跨 repo | MLP 書面回答「所有呼叫方、版本 pin、誰改」，並簽回 X1～X5 都改好；本人確認 X3、X5 | V-0 之前（跨 repo 前置） | MLP 與本人 | 未 | 未；MLP 11-24 回覆：sidecar 還沒改好，capability 探針 #1741 已合併，但還不是簽回（§2） |
 | ③ 執行期 | 正式主機開 `warn` 觀察：所有已知 principal 都是 `outcome=pass`，而且至少一個完整工作日沒有 `reason=missing` 的 deny。lgwd 不記來源，看到「有人沒簽」就回到 ② 找人 | V-0 之後、`enforce` 之前 | 本人（看觀察期結果決定） | 未 | 未；還沒開 warn；觀察期定義見 §6 |
 
 ① 的邊界：靜態掃描抓不到把路由字樣拆開拼接（例如字串相加）或動態產生的路徑；這種情況由 ③ 的 `warn` 觀察期（`reason=missing`）兜底。
@@ -65,12 +65,12 @@ MLP 11-24 回覆的重點：**MLP 只有兩個呼叫方**——sidecar（X1，�
 
 | # | 條件 | 狀態 | 依據 |
 | --- | --- | --- | --- |
-| 1 | D6a、D6b、D6c 都已合，驗收報告每一格都有測試名稱，全套綠，skip 的原因只是共載或 Mac 專用 | 已合（D6a／b／c 三張） | D6a：PR #293（`c73ed97`，11-24 merged）；D6b：PR #301（`b9c7c46`，11-24 merged）；D6c：PR #299（`fe5f60f`，11-24 merged）。以上是 `gh pr view` 與 `git log` 查到的合併事實；驗收報告每一格與全套綠未在本單重新查證 |
+| 1 | D6a、D6b、D6c 都已合，驗收報告每一格都有測試名稱，全套綠，skip 的原因只是共載或 Mac 專用 | 已合（D6a／b／c 三張）；驗收報告與全套綠：未驗 | D6a：PR #293（`c73ed97`，11-24 merged）；D6b：PR #301（`b9c7c46`，11-24 merged）；D6c：PR #299（`fe5f60f`，11-24 merged）。以上是 `gh pr view` 與 `git log` 查到的合併事實；驗收報告每一格與全套綠未在本單重新查證 |
 | 2 | d 單-1 已合；d 單-2 已合，或本人書面接受不做 | 已完成 | d 單-1：PR #290（`7e90320`，`docs/mac-fallback.md` 的判斷指令改打 `/healthz`）；d 單-2：PR #291（`d966aae`，#288 的降級滿 1 小時告警 `auth-degraded`）。兩個 commit 都在 git log 上，本單重新查證 |
-| 3 | D5d 段二已合：C-612 在低負載下重跑，報告附原始取樣；資源三鍵已定值 | 已合（段二）；C-612 低負載複測已完成 | 段二：PR #307（`26fd98f`，11-25 merged），資源三鍵 `TasksMax=512`、`MemoryMax=1536M`、`LimitNOFILE=4096` 已定值（`deploy/units/llmgateway.service`）。C-612 低負載複測：依工單說法 11-24 完成，`docs/deploy.md` 8.17.1 引用 `PM-C612-samples.csv`（5860 個樣本）；本單在本機找不到該檔，完成日期與取樣內容未驗 |
+| 3 | D5d 段二已合：C-612 在低負載下重跑，報告附原始取樣；資源三鍵已定值 | 已合（段二）；C-612 複測：未驗 | 段二：PR #307（`26fd98f`，11-25 merged），資源三鍵 `TasksMax=512`、`MemoryMax=1536M`、`LimitNOFILE=4096` 已定值（`deploy/units/llmgateway.service`）。C-612 低負載複測：依工單說法 11-24 完成，`docs/deploy.md` 8.17.1 引用 `PM-C612-samples.csv`（5860 個樣本）；本單在本機找不到該檔，完成日期與取樣內容未驗 |
 | 4 | P-D4 結果已記錄：Mac 與 worker 的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 未 | MLP 11-24 回覆：Mac 的 ssh-agent 與帶密語不卡住都還沒測 |
 | 5 | 跨 repo：MLP 的 sidecar signer 與 capability 探針已合到 MLP，聯合向量已通過，問題 4 的清單已簽回 | 未 | MyLinuxPool#1740（X1 sidecar 簽章）仍 OPEN；#1741（X2 capability 探針）已 MERGED，但 X1 未合，條件仍不成立（§2）；問題 4 的清單只回到「兩個呼叫方」 |
-| 6 | `docs/deploy.md` 8.18 的 V-0 清單（V-0.1～V-0.7，含 V-0.6b）作為 V-0 的執行計畫 | 未 | 依 V-0 計畫 v2（工單 BRIEF-321 轉述；repo 內找不到 v2 計畫文件可對照）：8.18 為執行計畫；V-0 不停正式服務，用 lgw-v0。#313 在 8.18 新增 V-0.6b，清單已經變動；要 PM 重新確認這份執行計畫（原與 `REPORT-D6-arch.md` §3.2 一致的說法已不成立） |
+| 6 | `docs/deploy.md` 8.18 的 V-0 清單（V-0.1～V-0.7，含 V-0.6b）作為 V-0 的執行計畫 | 未 | V-0 的執行計畫＝8.18；V-0 不停正式服務。#313 在 8.18 新增 V-0.6b，清單已經變動；要 PM 重新確認這份執行計畫（原與 `REPORT-D6-arch.md` §3.2 一致的說法已不成立） |
 
 ## 5. V-0 前置（真機檢查，要本人單次授權）
 
@@ -113,17 +113,16 @@ V-0 全部通過之後才在正式主機開 `warn` 跑觀察期，觀察期過�
 > 測試環境目前完成了第一段（D6a）：用真的程式、真的簽章工具、假的金鑰，驗過三種模式
 > （關閉、只記錄、強制）下每一個會呼叫 Gateway 的程式都照預期運作，而且所有輸出裡都
 > 找不到簽章、金鑰或憑證。第二段（D6b：換鑰、撤銷、重放攻擊、回退與資料庫損毀後的
-> 修復）的測試已寫好並審查通過（#294），**等合併**；這一段的驗證證據在 #294 合併後
-> 才算數，合併後會把結果補進來。
+> 修復）的測試已寫好並審查通過（#294），已於 11-24 合併（PR #301）；這一段的驗證證據
+> 以合併後的驗收報告為準，本文件尚未逐格核對。
 >
 > 請您授權 V-0 之前，還要這幾件事都完成：
 >
-> 1. 測試環境的整合驗收全部通過：D6a 已完成；**D6b（#294）測試已寫好並審查通過，等
->    合併**（生命週期的驗證證據在合併後才算數）；D6c（呼叫方清冊）隨這份文件一起交付。
+> 1. 測試環境的整合驗收全部通過：D6a 已完成；**D6b（#294，PR #301 已合併）的驗收報告尚未逐格核對**；D6c（呼叫方清冊，PR #299 已合併）隨這份文件一起交付。
 > 2. 服務的資源上限已經用低負載的實測定好（D5d 段二）。
 > 3. 您的 Mac 能正常產生簽章（包含用 ssh-agent，以及金鑰有密語時不會卡住）。
 > 4. MyLinuxPool 那邊的呼叫程式已經改成會簽章，並書面確認沒有漏掉的呼叫方
->    （目前 MLP 回覆只有 sidecar 與 capability 探針兩個，兩邊都還沒改好）。
+>    （MLP 只有 sidecar 與 capability 探針兩個呼叫方；capability 探針 #1741 已合併，sidecar 簽章 #1740 還沒改好，也還沒書面確認）。
 >
 > V-0 會在正式主機做 8 項檢查（8.18 的 V-0.1～V-0.7，其中 V-0.6 另加 V-0.6b 的 IO 量測），最重要的是：正式主機的 OpenSSH（10.2p1）回報的訊息
 > 和我們測過的版本一致；字樣不一樣就停下，不會為了通過而放寬。V-0 只檢查，
