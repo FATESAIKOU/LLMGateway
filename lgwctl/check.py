@@ -27,8 +27,9 @@
 - ``check-notify``（#296；C-996／C-999）：check 失敗時的通知有沒有設定好。只會 ok
   或 todo（不會 fail）：``/etc/llmgateway/check-notify.env`` 的三個鍵齊全、
   ``LGW_NOTIFY_LABEL`` 符合 ``[A-Za-z0-9._-]{1,32}``、找得到 ``aicomm`` 就是 ok，
-  否則 todo「失敗不會通知 PMO（…）」寫明缺哪一項。只有這一版的 ``deploy/units/``
-  有 notify unit 檔時才列。不送訊息。
+  否則 todo「失敗不會通知 PMO（…）」寫明缺哪一項。**#304**：值還是範本的
+  ``place-holder-*``（去頭尾空白、不分大小寫）時視為未設定，todo 只寫鍵名。
+  只有這一版的 ``deploy/units/`` 有 notify unit 檔時才列。不送訊息。
 - ``list-remote``：經會合點的探針（``llmgateway-tunnel --probe-once``，模式以
   環境變數 ``LGW_PROBE_API_MODE`` 傳）；``--no-remote`` 時整項不列。
 - ``keysync``：``lgwd`` 寫的 ``.keysync.status``（T2 的格式）：不存在→todo
@@ -55,7 +56,8 @@ from . import run as runmod
 from .layout import (CHECK_NOTIFY_AICOMM, CHECK_NOTIFY_ENV_KEYS,
                      CHECK_NOTIFY_LABEL_PATTERN, CHECK_NOTIFY_NAME,
                      CHECK_TIMER_NAME, ENV_CHECK_JOURNAL, KEYS_REPO,
-                     SERVICE_NAME, TUNNEL_SERVICE_NAME, parse_env_file)
+                     SERVICE_NAME, TUNNEL_SERVICE_NAME,
+                     check_notify_placeholder, parse_env_file)
 from .report import Report
 
 # .keysync.status 的 reason 白名單（低-8）：writer（lgwd/keysync.py、sync.py）
@@ -233,6 +235,8 @@ def _check_notify(layout, report) -> None:
     - ``/etc/llmgateway/check-notify.env`` 的三個鍵（頻道、收件人、本機代號）
       齊全、``LGW_NOTIFY_LABEL`` 符合 ``[A-Za-z0-9._-]{1,32}``，而且 ``PATH`` 上
       找得到 ``aicomm`` → ok；
+    - #304：值還是範本的 ``place-holder-*``（去頭尾空白、不分大小寫）也算未設定，
+      與腳本「當成沒設、不送」一致；todo 只寫出是哪一個鍵，**不印值**；
     - 否則 todo，寫明缺的是設定檔、代號格式還是 aicomm（不含任何值）。
     """
     if not os.path.isfile(_version_unit(layout, CHECK_NOTIFY_NAME)):
@@ -244,6 +248,13 @@ def _check_notify(layout, report) -> None:
         report.todo("check-notify",
                     "失敗不會通知 PMO（缺 check-notify.env 或 aicomm）："
                     "check-notify.env 缺 " + "、".join(missing))
+        return
+    placeholders = [key for key in CHECK_NOTIFY_ENV_KEYS
+                    if check_notify_placeholder(values.get(key))]
+    if placeholders:
+        report.todo("check-notify",
+                    "失敗不會通知 PMO：check-notify.env 還是範本的佔位值，"
+                    "要換成這一台的設定：" + "、".join(placeholders))
         return
     label = values.get("LGW_NOTIFY_LABEL").strip()
     if re.fullmatch(CHECK_NOTIFY_LABEL_PATTERN, label) is None:

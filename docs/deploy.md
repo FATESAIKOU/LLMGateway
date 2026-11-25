@@ -1315,7 +1315,7 @@ sudoedit /etc/llmgateway/check-notify.env
 | `ANGAREION_IDENTITY` | 送件身分（aicomm 讀的環境變數） |
 | `LGW_NOTIFY_LABEL` | 這一台的代號，會填進訊息（1～32 字元；只收英數與 `. _ -`，格式不對就當成沒設：腳本跳過不送、`check-notify` 是 `todo`） |
 
-這些值都不是祕密，也不得放 token、金鑰或身分檔的路徑。`check` 的 `check-notify` 項目（只在這一版有 notify unit 檔時才列）在三個鍵齊全、`LGW_NOTIFY_LABEL` 符合 `[A-Za-z0-9._-]{1,32}`、`PATH` 上找得到 `aicomm` 時是 `ok`，否則 `todo`（缺哪一項就寫哪一項）——它不會 `fail`，也不送訊息。
+這些值都不是祕密，也不得放 token、金鑰或身分檔的路徑。**值仍是範本的 `place-holder-*` 時視為未設定**（去頭尾空白、不分大小寫；複製範本後忘了改就是這種情況）：`check` 的 `check-notify` 會是 `todo` 並提示是哪一個鍵還是佔位值（只寫鍵名、不印值），通知腳本則與「設定不存在」相同——寫一行 `notify skipped: not configured`、結束碼 0、不送訊息。`check` 的 `check-notify` 項目（只在這一版有 notify unit 檔時才列）在三個鍵齊全、`LGW_NOTIFY_LABEL` 符合 `[A-Za-z0-9._-]{1,32}`、`PATH` 上找得到 `aicomm` 時是 `ok`，否則 `todo`（缺哪一項就寫哪一項）——它不會 `fail`，也不送訊息。
 
 訊息只有這幾段（一行、白名單字元、最長 300 字元；不含主機名、位址、路徑、帳號、金鑰或 fail 行的說明文字）：
 
@@ -1332,7 +1332,7 @@ llmgateway-check failed label=<本機代號> result=<類別> items=<項目名,�
 | journal 行 | 意思 |
 | --- | --- |
 | `notify sent` | 已送出（同時寫入去重狀態） |
-| `notify skipped: not configured` | 設定檔不在或鍵不齊 |
+| `notify skipped: not configured` | 設定檔不在、鍵不齊，或值還是範本的 `place-holder-*` |
 | `notify skipped: invalid label` | `LGW_NOTIFY_LABEL` 不是 `[A-Za-z0-9._-]{1,32}`（當成沒設，不送） |
 | `notify skipped: aicomm not available` | `PATH` 上找不到 `aicomm` |
 | `notify failed: aicomm exit <n>` | `aicomm send` 回非 0（下一次 check 失敗會再試） |

@@ -69,6 +69,11 @@
   `test_c999_invalid_label_is_treated_as_unset`、
   `test_c999_length_boundaries`、`test_c999_check_item_reports_a_bad_label`、
   `test_c999_pattern_is_shared_with_the_docs_and_the_example`。
+- #304（範本的 `place-holder-*` 算未設定）：check 的 `check-notify` 回 todo 並只寫
+  鍵名、腳本走 `notify skipped: not configured` 不送；兩處規則由測試鎖住一致：
+  `CheckNotifyItemTests.test_304_*`、`PlaceholderValueTests.test_304_*`、
+  `PlaceholderRuleTests.test_304_*`、
+  `DeployDocNotifyTests.test_304_docs_and_example_say_placeholder_is_unset`。
 
 全部離線：腳本用假的 `journalctl`／`systemctl`／`aicomm`（暫存目錄，暫存 PATH），
 lgwctl 用 `tests/lgwctl_fakes.Sandbox` 的假 systemctl；不讀憑證、不送真訊息、
@@ -780,6 +785,95 @@ class CheckNotifyItemTests(unittest.TestCase):
         self.assertEqual(self.check()[0], 0)
         self.assertFalse(os.path.exists(log), "check 不能送訊息")
 
+    # -- #304：範本留下的 place-holder-* 佔位值算未設定 ----------------------
+
+    REAL = {"LGW_NOTIFY_CHANNEL": "team-test-w1",
+            "LGW_NOTIFY_TO": "pmo-test",
+            "LGW_NOTIFY_LABEL": "gw-test"}
+    TEMPLATE = {"LGW_NOTIFY_CHANNEL": "place-holder-channel",
+                "LGW_NOTIFY_TO": "place-holder-recipient",
+                "LGW_NOTIFY_LABEL": "place-holder-label"}
+
+    def _write_values(self, values) -> None:
+        self.write_env("".join(key + "=" + value + "\n"
+                               for key, value in values.items()))
+
+    def _notify_line(self, out) -> str:
+        return next(line for line in out.splitlines() if " check-notify" in line)
+
+    def _assert_placeholder_todo(self, keys, values):
+        rc, out, err = self.check()
+        self.assertEqual(rc, 2, out + err)
+        line = self._notify_line(out)
+        self.assertIn("todo", line)
+        self.assertIn("佔位值", line)
+        for key in keys:
+            self.assertIn(key, line)
+        for key in set(values) - set(keys):
+            self.assertNotIn(key, line)
+        # 只寫鍵名，不印值（範本的值一個字都不能出現在輸出裡）。
+        for value in values.values():
+            self.assertNotIn(value, line)
+
+    def test_304_check_flags_each_placeholder_key(self):
+        for key in self.TEMPLATE:
+            with self.subTest(key=key):
+                values = dict(self.REAL)
+                values[key] = self.TEMPLATE[key]
+                self._write_values(values)
+                self._assert_placeholder_todo([key], values)
+
+    def test_304_check_flags_all_placeholders(self):
+        values = dict(self.TEMPLATE)
+        self._write_values(values)
+        self._assert_placeholder_todo(list(self.TEMPLATE), values)
+
+    def test_304_check_flags_when_only_one_key_is_real(self):
+        values = dict(self.TEMPLATE)
+        values["LGW_NOTIFY_CHANNEL"] = "team-test-w1"
+        self._write_values(values)
+        self._assert_placeholder_todo(["LGW_NOTIFY_TO", "LGW_NOTIFY_LABEL"], values)
+
+    def test_304_check_ignores_case_whitespace_and_quotes(self):
+        self.write_env('LGW_NOTIFY_CHANNEL="  Place-Holder-Channel  "\n'
+                       "LGW_NOTIFY_TO=PLACE-HOLDER-RECIPIENT\n"
+                       "LGW_NOTIFY_LABEL=Place-Holder-Label\n")
+        rc, out, err = self.check()
+        self.assertEqual(rc, 2, out + err)
+        line = self._notify_line(out)
+        self.assertIn("佔位值", line)
+        for key in self.TEMPLATE:
+            self.assertIn(key, line)
+        for value in self.TEMPLATE.values():
+            self.assertNotIn(value, line)
+
+    def test_304_check_missing_beats_placeholder(self):
+        """空鍵走既有的「缺鍵」訊息；不要把它跟佔位值混在一起。"""
+        self.write_env("LGW_NOTIFY_CHANNEL=\n"
+                       "LGW_NOTIFY_TO=place-holder-recipient\n"
+                       "LGW_NOTIFY_LABEL=place-holder-label\n")
+        rc, out, err = self.check()
+        self.assertEqual(rc, 2, out + err)
+        line = self._notify_line(out)
+        self.assertIn("缺 LGW_NOTIFY_CHANNEL", line)
+        self.assertNotIn("LGW_NOTIFY_TO", line)
+        self.assertNotIn("LGW_NOTIFY_LABEL", line)
+
+    def test_304_check_ok_when_all_values_are_real(self):
+        self._write_values(self.REAL)
+        rc, out, err = self.check()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "check-notify", "ok"), out)
+
+    def test_304_check_only_the_prefix_counts(self):
+        """只有「開頭就是」佔位值才算未設定；名字裡剛好有不算。"""
+        values = dict(self.REAL)
+        values["LGW_NOTIFY_CHANNEL"] = "x-place-holder-channel"
+        self._write_values(values)
+        rc, out, err = self.check()
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(has_line(out, "check-notify", "ok"), out)
+
 
 class CutoverCheckCodeTests(unittest.TestCase):
     """C-996：遷移的停損門檻不能被「通知還沒設定」的 todo 觸發。"""
@@ -977,6 +1071,98 @@ class LabelFormatTests(ScriptFixture):
                       (REPO_ROOT / "docs" / "deploy.md").read_text(encoding="utf-8"))
 
 
+class PlaceholderValueTests(ScriptFixture):
+    """#304：腳本把範本的 `place-holder-*` 當成未設定（與「設定不存在」同一條路）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.module = script_module()
+
+    REAL = {"LGW_NOTIFY_CHANNEL": "team-test-w1",
+            "LGW_NOTIFY_TO": "pmo-test",
+            "LGW_NOTIFY_LABEL": "gw-test"}
+    TEMPLATE = {"LGW_NOTIFY_CHANNEL": "place-holder-channel",
+                "LGW_NOTIFY_TO": "place-holder-recipient",
+                "LGW_NOTIFY_LABEL": "place-holder-label"}
+
+    def _assert_skipped(self, **overrides):
+        rc, out, err = self.run_script(**overrides)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(err, "")
+        self.assertEqual(out.splitlines(), ["notify skipped: not configured"])
+        self.assertEqual(self.aicomm_calls(), [], "不該嘗試送訊息")
+        self.assertFalse(os.path.exists(self.state_path()))
+        # 連 journalctl 都不會跑（設定不完整就停）。
+        self.assertEqual(self.calls("journalctl"), [])
+
+    def test_304_script_treats_each_placeholder_key_as_unset(self):
+        for key in self.TEMPLATE:
+            with self.subTest(key=key):
+                self._assert_skipped(**{key: self.TEMPLATE[key]})
+
+    def test_304_script_treats_all_placeholders_as_unset(self):
+        self._assert_skipped(**self.TEMPLATE)
+
+    def test_304_script_treats_one_real_value_as_unset(self):
+        overrides = dict(self.TEMPLATE)
+        overrides["LGW_NOTIFY_CHANNEL"] = "team-test-w1"
+        self._assert_skipped(**overrides)
+
+    def test_304_script_ignores_case_and_whitespace(self):
+        for value in ("  Place-Holder-Channel  ", "PLACE-HOLDER-CHANNEL",
+                      "\tplace-Holder-Channel"):
+            with self.subTest(value=value):
+                self._assert_skipped(LGW_NOTIFY_CHANNEL=value)
+
+    def test_304_script_sends_when_all_values_are_real(self):
+        rc, out, err = self.run_script()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(out.splitlines(), ["notify sent"])
+        self.assertEqual(len(self.aicomm_calls()), 1)
+
+    def test_304_script_only_the_prefix_counts(self):
+        """名字裡剛好有 place-holder 不算（只有開頭就是才算）。"""
+        for value in ("x-place-holder-channel", "place-holder",
+                      "my-place-holder-team"):
+            with self.subTest(value=value):
+                if os.path.exists(self.state_path()):
+                    os.unlink(self.state_path())      # 去重會擋掉同一組失敗
+                rc, out, err = self.run_script(LGW_NOTIFY_CHANNEL=value)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(out.splitlines(), ["notify sent"])
+                self.assertEqual(self.aicomm_calls()[-1][2], value)
+
+
+class PlaceholderRuleTests(unittest.TestCase):
+    """#304：check 與腳本的判斷規則一致（同一個字串、同一組輸入同一種結果）。"""
+
+    def setUp(self):
+        self.module = script_module()
+
+    def test_304_prefix_is_shared(self):
+        self.assertEqual(layoutmod.CHECK_NOTIFY_PLACEHOLDER_PREFIX,
+                         self.module.PLACEHOLDER_PREFIX)
+        self.assertEqual(layoutmod.CHECK_NOTIFY_PLACEHOLDER_PREFIX,
+                         "place-holder-")
+
+    def test_304_both_sides_agree_on_every_shape(self):
+        samples = ("place-holder-channel", "place-holder-recipient",
+                   "place-holder-label", "PLACE-HOLDER-X", "Place-Holder-Y",
+                   "  place-holder-z  ", "\tplace-holder-q\n",
+                   "place-holder", "xplace-holder-y", "my-place-holder-team",
+                   "team-test-w1", "pmo-test", "gw-test", "a", "", "   ")
+        for value in samples:
+            with self.subTest(value=value):
+                expected = ("" if layoutmod.check_notify_placeholder(value)
+                            else value.strip())
+                self.assertEqual(self.module.unset_value(value), expected)
+        # 佔位值的各種大小寫／空白變體兩邊都算未設定。
+        for value in ("place-holder-x", "PLACE-HOLDER-X", " Place-Holder-X\t"):
+            with self.subTest(value=value):
+                self.assertTrue(layoutmod.check_notify_placeholder(value))
+                self.assertEqual(self.module.unset_value(value), "")
+
+
 class DeployDocNotifyTests(unittest.TestCase):
     """C-997：8.21 節與設定範本跟程式一致。"""
 
@@ -1044,6 +1230,20 @@ class DeployDocNotifyTests(unittest.TestCase):
         _check_notify(Layout.from_env({"LLMGW_PREFIX": "/tmp/lgw-296-nowhere"}),
                       report)
         self.assertEqual(report.lines, [], "這一版目錄沒有 notify unit → 不列這一項")
+
+    def test_304_docs_and_example_say_placeholder_is_unset(self):
+        """#304：範本與 8.21 節都要寫明「值還是範本的佔位值就算未設定」。"""
+        prefix = layoutmod.CHECK_NOTIFY_PLACEHOLDER_PREFIX
+        self.assertIn(prefix, self.example)
+        self.assertIn("視為未設定", self.example)
+        start = self.doc.find("### 8.21 ")
+        self.assertGreaterEqual(start, 0, "docs/deploy.md 缺 8.21 節")
+        section = self.doc[start:]
+        self.assertIn(prefix, section)
+        self.assertIn("視為未設定", section)
+        self.assertIn("佔位值", section)
+        # 腳本端走的路徑也寫在文件裡（與「設定不存在」同一行 journal）。
+        self.assertIn("notify skipped: not configured", section)
 
 
 if __name__ == "__main__":

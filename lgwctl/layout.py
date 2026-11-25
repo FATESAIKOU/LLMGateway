@@ -71,6 +71,11 @@ CHECK_NOTIFY_ENV_NAME = "check-notify.env"
 CHECK_NOTIFY_ENV_KEYS = ("LGW_NOTIFY_CHANNEL", "LGW_NOTIFY_TO", "LGW_NOTIFY_LABEL")
 #: 本機代號的格式（#296 架構師低-2）：與腳本的 ``LABEL_PATTERN`` 是同一個字串。
 CHECK_NOTIFY_LABEL_PATTERN = r"[A-Za-z0-9._-]{1,32}"
+#: #304：範本（``deploy/check-notify.env.example``）的佔位值都以此開頭。複製範本後
+#: 忘了換掉的值（去頭尾空白、大小寫不分）一律**視為未設定**：``check`` 的
+#: ``check-notify`` 回 todo 並寫出鍵名，通知腳本走「not configured」不送訊息。
+#: 與腳本的 ``PLACEHOLDER_PREFIX`` 是同一個字串（測試會比對兩處一致）。
+CHECK_NOTIFY_PLACEHOLDER_PREFIX = "place-holder-"
 CHECK_NOTIFY_STATE_NAME = "check-notify.state"
 CHECK_NOTIFY_LOCK_NAME = "check-notify.lock"
 CHECK_NOTIFY_AICOMM = "aicomm"
@@ -186,6 +191,16 @@ def parse_env_file(path: str, *, raise_permission: bool = False) -> dict:
     except OSError:
         return {}
     return parse_env_text(text)
+
+
+def check_notify_placeholder(value) -> bool:
+    """這個 check-notify 設定值是不是**範本的佔位值**（#304）。
+
+    去頭尾空白後（不分大小寫）以 ``CHECK_NOTIFY_PLACEHOLDER_PREFIX`` 開頭就是
+    佔位值；空值不算（那走既有的「缺鍵」路徑）。通知腳本的 ``unset_value`` 用
+    同一個規則把佔位值當成空字串（兩處一致由測試鎖住）。
+    """
+    return (value or "").strip().lower().startswith(CHECK_NOTIFY_PLACEHOLDER_PREFIX)
 
 
 _EC_CURVES = {
