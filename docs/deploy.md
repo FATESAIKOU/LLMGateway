@@ -1262,6 +1262,8 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
 
 這一節的 `<repo>` 是另 clone 的目標 tag（不用 `/opt/llmgateway/current`），`<TMPDIR>` 是與 V-0.6b 同一套檢查後選定的目錄（llmgw 可寫）。取樣檔與 unittest 輸出都寫在 `<TMPDIR>`。
 
+**順序很重要**：步驟 4 的 `systemd-run` 是前景指令，會阻塞約 10 分鐘。所以 A 取樣（步驟 2）、B 取樣與「前一次讀 peak」（步驟 3）要在步驟 4 **之前**起來；keysync 與用量抓取（步驟 5）在步驟 4 **執行期間**從另一個終端觸發；步驟 6 在步驟 4 結束後、收尾之前再讀一次 B 的 peak。步驟 2 起來後**立刻**跑步驟 4（中間不要停）：A 取樣只等 scope 出現 `A_WAIT` 秒（預設 60），超過就寫錯誤並結束，之後的 scope 就沒有取樣。
+
 0. **取 repo 並記 sha**：
 
 ```bash
@@ -1271,15 +1273,15 @@ git -C <repo> rev-parse HEAD
 
 1. **TMPDIR**：照 V-0.6b，`findmnt -T /var/lib/llmgateway -no SOURCE,TARGET` 與 `findmnt -T <TMPDIR> -no SOURCE,TARGET` 對得上才用；建好並讓 llmgw 可寫：`sudo install -d -o llmgw -g llmgw <TMPDIR>`。先 `sudo -v` 把 sudo 憑證快取起來，後面的背景 `sudo` 才不會卡在密碼。
 
-2. **先起 A 組取樣**（在 scope 之前）。整段在 `sudo sh` 裡跑，取樣檔也由它寫，所以不靠呼叫者的寫入權限。等 scope 出現最多 60 秒；起不來就寫一行錯誤並結束。每秒記 `memory.current`、`pids.current`，以及每個 lgwd 行程的 fd 數；結束時寫 fd、memory、pids 的最大值（取樣上界）。scope 不見了就自己結束。`echo "A: pid=$$"` 會把取樣行程的 pid 寫進檔，收尾時只 kill 那個 pid。
+2. **A 組取樣**（在 scope 之前，背景）。整段在 `sudo sh` 裡跑，取樣檔也由它寫，所以不靠呼叫者的寫入權限。等 scope 出現最多 `A_WAIT` 秒（預設 60；要留更久就先 `export A_WAIT=300`）；起不來就寫一行錯誤並結束。每秒記 `memory.current`、`pids.current`，以及每個 lgwd 行程的 fd 數；結束時寫 fd、memory、pids 的最大值（取樣上界）。scope 不見了就自己結束。`echo "A: pid=$$"` 會把取樣行程的 pid 寫進檔，收尾時只 kill 那個 pid。
 
 ```bash
 SCOPE=lgw-v06-c612-$(date +%s).scope
 OUT=<TMPDIR>/v06-samples.txt
 sudo sh -c '
   i=0; CG=""
-  while [ $i -lt 60 ]; do CG=$(systemctl show -p ControlGroup --value "$1"); [ -n "$CG" ] && [ -d /sys/fs/cgroup$CG ] && break; i=$((i+1)); sleep 1; done
-  if [ -z "$CG" ] || [ ! -d /sys/fs/cgroup$CG ]; then echo "A: scope $1 not started within 60s" >> "$2"; exit 1; fi
+  while [ $i -lt "$3" ]; do CG=$(systemctl show -p ControlGroup --value "$1"); [ -n "$CG" ] && [ -d /sys/fs/cgroup$CG ] && break; i=$((i+1)); sleep 1; done
+  if [ -z "$CG" ] || [ ! -d /sys/fs/cgroup$CG ]; then echo "A: scope $1 not started within $3s" >> "$2"; exit 1; fi
   echo "A: pid=$$ scope=$1 cg=$CG" >> "$2"
   fdmax=0; memmax=0; pidsmax=0
   while [ -d /sys/fs/cgroup$CG ]; do
@@ -1293,25 +1295,10 @@ sudo sh -c '
     echo "$(date +%T) A mem=$m pids=$q" >> "$2"
     sleep 1
   done
-  echo "A: max fd=$fdmax mem.current=$memmax pids.current=$pidsmax（取樣上界）" >> "$2"' sampler "$SCOPE" "$OUT" &
+  echo "A: max fd=$fdmax mem.current=$memmax pids.current=$pidsmax（取樣上界）" >> "$2"' sampler "$SCOPE" "$OUT" "${A_WAIT:-60}" &
 ```
 
-3. **C-612 跑在 A 組 scope 裡**。外層 `sh` 也在 scope 裡，測試結束後它還能讀到 scope 的 `pids.peak`／`memory.peak`，然後才退出（scope 一結束 cgroup 就沒了）。`-p` 只開 accounting，**不設** `MemoryMax`／`TasksMax`，否則會把量到的高峰壓成上限。scope 不套服務層的 `User=`、`ProtectSystem=`、`PrivateTmp=`（推論，未實測），所以身分用 `runuser -u llmgw` 換、TMPDIR 用 `env` 指定；這些屬性的實際行為歸 V-0.7 與 transient service（#320）。unittest 的輸出寫進 `<TMPDIR>/c612-unittest.txt`。
-
-```bash
-sudo systemd-run --scope --unit="$SCOPE" \
-  -p MemoryAccounting=yes -p TasksAccounting=yes -p IOAccounting=yes \
-  sh -c 'cd <repo> && runuser -u llmgw -- env TMPDIR=<TMPDIR> LGW_SLOW_TESTS=1 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_main_auth_rate_263 >> <TMPDIR>/c612-unittest.txt 2>&1; rc=$?
-  echo "ControlGroup=$(systemctl show -p ControlGroup --value "$1")"
-  CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "scope=$CG"
-  cat $CG/pids.peak $CG/memory.peak 2>/dev/null || echo "peak 檔有缺：該欄改用 A 組取樣上界"
-  exit $rc' sh "$SCOPE"
-echo "systemd-run exit=$?"
-```
-
-判讀 unittest：`c612-unittest.txt` 最後一行要是 `OK`，而且沒有 `skipped=`；出現 `skipped`（沒設 `LGW_SLOW_TESTS=1`）或 `FAILED` 這次作廢。
-
-4. **B 組：服務 cgroup 基線**（與 step 3 同一段時間，服務照跑）。取樣在 `sudo sh` 裡，每秒記 `memory.current`、`pids.current`；收到 TERM 時寫最大值，然後結束。它跑到被 kill 為止，pid 寫在檔裡。`pids.peak`／`memory.peak` 任一不存在，該欄就用這組的最大值。
+3. **B 組：服務 cgroup 基線取樣，與「前一次讀 peak」**（在步驟 4 之前，背景）。取樣在 `sudo sh` 裡，每秒記 `memory.current`、`pids.current`；收到 TERM 時寫最大值，然後結束。它跑到被 kill 為止，pid 寫在檔裡。`pids.peak`／`memory.peak` 任一不存在，該欄就用這組的最大值。起來之後先讀一次服務 cgroup 的 peak（前一次），這一行是步驟 6 的對照基準。
 
 ```bash
 SVC=/sys/fs/cgroup/system.slice/llmgateway.service
@@ -1328,14 +1315,37 @@ sudo sh -c '
 cat $SVC/pids.peak $SVC/memory.peak 2>/dev/null
 ```
 
-前後各讀一次服務 cgroup 的 peak（上面最後一行，觸發前後各跑一次）。**觸發 keysync 與用量抓取的指令本文件目前沒有定義，未知**：要 PMO 或本人指定，而且要本人確認過才觸發，PM 不自己猜。讀到的 peak 是自服務啟動以來的累計最大值；紀錄要寫服務的啟動時間（`systemctl show -p ActiveEnterTimestamp --value llmgateway.service`）。要乾淨數字需要本人決定是否重啟服務，PM 不自行決定。
+4. **C-612 跑在 A 組 scope 裡**（前景，約 10 分鐘，阻塞；步驟 2、3 已起來之後才跑）。外層 `sh` 也在 scope 裡，測試結束後它還能讀到 scope 的 `pids.peak`／`memory.peak`，然後才退出（scope 一結束 cgroup 就沒了）。`-p` 只開 accounting，**不設** `MemoryMax`／`TasksMax`，否則會把量到的高峰壓成上限。scope 不套服務層的 `User=`、`ProtectSystem=`、`PrivateTmp=`（推論，未實測），所以身分用 `runuser -u llmgw` 換、TMPDIR 用 `env` 指定；這些屬性的實際行為歸 V-0.7 與 transient service（#320）。unittest 的輸出寫進 `<TMPDIR>/c612-unittest.txt`。
 
-5. **收尾**：
+```bash
+sudo systemd-run --scope --unit="$SCOPE" \
+  -p MemoryAccounting=yes -p TasksAccounting=yes -p IOAccounting=yes \
+  sh -c 'cd <repo> && runuser -u llmgw -- env TMPDIR=<TMPDIR> LGW_SLOW_TESTS=1 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_main_auth_rate_263 >> <TMPDIR>/c612-unittest.txt 2>&1; rc=$?
+  echo "ControlGroup=$(systemctl show -p ControlGroup --value "$1")"
+  CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "scope=$CG"
+  cat $CG/pids.peak $CG/memory.peak 2>/dev/null || echo "peak 檔有缺：該欄改用 A 組取樣上界"
+  exit $rc' sh "$SCOPE"
+echo "systemd-run exit=$?"
+```
+
+判讀 unittest：`c612-unittest.txt` 最後一行要是 `OK`，而且沒有 `skipped=`；出現 `skipped`（沒設 `LGW_SLOW_TESTS=1`）或 `FAILED` 這次作廢。
+
+5. **觸發 keysync 與用量抓取**（在步驟 4 執行期間，**另開一個終端**，同一台主機）。各觸發一次，時間點記下來。**觸發的指令本文件目前沒有定義，未知**：要 PMO 或本人指定，而且要本人確認過才觸發，PM 不自己猜。
+
+6. **收尾前再讀 B 的 peak**（步驟 4 結束後、kill B 之前；服務 cgroup 還在）。與步驟 3 的「前一次」一起記下來，兩次之差看的是步驟 5 的影響。
+
+```bash
+cat $SVC/pids.peak $SVC/memory.peak 2>/dev/null
+```
+
+讀到的 peak 是自服務啟動以來的累計最大值；紀錄要寫服務的啟動時間（`systemctl show -p ActiveEnterTimestamp --value llmgateway.service`）。要乾淨數字需要本人決定是否重啟服務，PM 不自行決定。
+
+7. **收尾**：
 - B 組：`sudo kill <B 的 pid>`（從 `OUT` 的 `B: pid=` 行取；只 kill 這個 pid），它會寫入最大值後結束。
 - A 組：`systemctl is-active "$SCOPE"` 應該是 inactive，A 組取樣行程應已自行結束；還在跑的話，`sudo kill <A 的 pid>`（從 `A: pid=` 行取）。
 - 讀 `OUT` 與 `c612-unittest.txt` 原樣記入部署紀錄。
 
-6. **紀錄要寫的值**：repo tag 與 sha（step 0）；`ControlGroup=` 與 `scope=` 原樣（step 3）；A 的 `pids.peak`、`memory.peak`，缺的欄用 A 組上界；lgwd 的 fd 高峰用 A 組 log 的 `max fd`（每秒一次的上界，取所有 lgwd pid 的最大值）；B 的 `pids.peak`、`memory.peak`（或 B 組上界）與服務啟動時間。兩組分表列，不加總顯示；判準用 A＋B 的和（見上表）。
+8. **紀錄要寫的值**：repo tag 與 sha（步驟 0）；`ControlGroup=` 與 `scope=` 原樣（步驟 4）；A 的 `pids.peak`、`memory.peak`，缺的欄用 A 組上界；lgwd 的 fd 高峰用 A 組 log 的 `max fd`（每秒一次的上界，取所有 lgwd pid 的最大值）；B 的步驟 3 與步驟 6 兩次 peak、B 組上界、服務啟動時間，以及步驟 5 的觸發時間。兩組分表列，不加總顯示；判準用 A＋B 的和（見上表）。
 
 ### 8.19 定時檢查（timer）（r）
 

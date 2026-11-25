@@ -526,7 +526,7 @@ class V06MeasurementTests(unittest.TestCase):
             "python3 -m unittest -v tests.test_main_auth_rate_263",
             "/proc/self/cgroup", "cat $CG/pids.peak", "$CG/memory.peak",
             "ControlGroup=", "git -C <repo> rev-parse HEAD",
-            "-lt 60", "/proc/$p/fd", "sudo sh -c", "sampler", "trap ",
+            '-lt "$3"', "A_WAIT", "/proc/$p/fd", "sudo sh -c", "sampler", "trap ",
             "fdmax", "pids.current", "memory.current",
         ):
             self.assertIn(needle, code, needle)
@@ -577,9 +577,31 @@ class V06MeasurementTests(unittest.TestCase):
     def test_v06_sampler_has_timeout_and_fd_max(self):
         # 低-1：scope 起不來要逾時結束並記錄；低-2：fd 取最大值並記錄。
         code = self.code()
-        self.assertIn("not started within 60s", code)
+        self.assertIn('not started within $3s', code)
+        self.assertIn('${A_WAIT:-60}', code)
         self.assertIn("max fd=", code)
         self.assertIn("max fd", self.procedure)
+
+    def test_v06_sampler_call_lines_are_exact(self):
+        # 低-新3：取樣呼叫的整行要完全等於這裡寫的，任何後加的重導（呼叫者的 >>、2>&1）都會紅。
+        code_lines = [l.strip() for l in self.code().splitlines()]
+        for ending in ("""' sampler "$SCOPE" "$OUT" "${A_WAIT:-60}" &""", """' sampler-b "$SVC" "$OUT" &"""):
+            self.assertTrue(any(l.endswith(ending) for l in code_lines), ending)
+
+    def test_v06_steps_run_in_order(self):
+        # 中-新1：B 取樣與前一次讀 peak 在前景 scope（步驟 4）之前；觸發在步驟 4 執行期間；收尾前再讀。
+        proc = self.procedure
+        markers = ["\n2. **A 組取樣**", "\n3. **B 組", "\n4. **C-612 跑在", "\n5. **觸發",
+                   "\n6. **收尾前再讀", "\n7. **收尾**"]
+        positions = [proc.index(m) for m in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("前一次讀 peak", proc[positions[1]:positions[2]])
+        self.assertIn("另開一個終端", proc[positions[3]:positions[4]])
+        self.assertIn("步驟 4 執行期間", proc[positions[3]:positions[4]])
+        self.assertIn("步驟 4 結束後", proc[positions[4]:positions[5]])
+        self.assertIn("**順序很重要**", proc)
+        self.assertIn("立刻", proc)
+        self.assertIn("A_WAIT", proc)
 
     def test_v06b_no_longer_leaves_inference_open(self):
         row = self.row("| V-0.6b |")
