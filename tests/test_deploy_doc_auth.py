@@ -780,5 +780,103 @@ class V06MeasurementTests(unittest.TestCase):
         self.assertNotIn("整個 cgroup 的", line)
 
 
+class RolloutV0ResultTests(unittest.TestCase):
+    """2026-11-26 V-0 結果回寫 auth-rollout.md：§5 每列都有結果、缺口有編號、兩個 sha 在。
+
+    只鎖文件的字樣（狀態欄不是「未」、#331／#332 在對的列、sha 前 7 碼在），不驗真機結果本身。
+    P-D4 還沒做，所以維持「未」。
+    """
+
+    def setUp(self):
+        self.rollout = (REPO_ROOT / "docs" / "auth-rollout.md").read_text(encoding="utf-8")
+        self.section5 = between(self.rollout, "## 5. V-0 前置", "## 6. ")
+
+    def rows(self):
+        return [l for l in self.section5.splitlines() if re.match(r"^\| (V-0\.\w+|P-D4) \|", l)]
+
+    def row(self, prefix):
+        rows = [l for l in self.rows() if l.startswith(prefix)]
+        self.assertEqual(len(rows), 1, prefix)
+        return rows[0]
+
+    @staticmethod
+    def status(line):
+        return [c.strip() for c in line.strip().strip("|").split("|")][2]
+
+    def test_every_v0_row_has_a_result_not_pending(self):
+        # 中-1：§5 的 V-0 列（8 列）狀態都不是「未」，且寫了結果日期。
+        v0_rows = [l for l in self.rows() if l.startswith("| V-0.")]
+        self.assertEqual(len(v0_rows), 8)
+        for line in v0_rows:
+            status = self.status(line)
+            self.assertFalse(status.startswith("未"), line)
+            self.assertIn("2026-11-26", status, line)
+
+    def test_p_d4_stays_pending(self):
+        self.assertEqual(self.status(self.row("| P-D4 |")), "未")
+
+    def test_v06_row_names_gap_331(self):
+        row = self.row("| V-0.6 |")
+        self.assertIn("A＋B 判準 PASS；B 組未量到 claude 子行程（#331）", self.status(row))
+        self.assertIn("pids.peak", row)
+        self.assertIn("memory.peak", row)
+
+    def test_v07_row_names_gap_332(self):
+        row = self.row("| V-0.7 |")
+        self.assertIn("寫入 PASS；名冊讀取未驗（#332）", self.status(row))
+        self.assertIn("名冊", row)
+
+    def test_v04_records_v008_rc1_and_v009_rc0(self):
+        # 中-2：current＝v0.8.0 時 verify rc=1（check-notify 不存在），換 v0.9.0 路徑後 rc=0。
+        row = self.row("| V-0.4 |")
+        for needle in ("lgw-v0.8.0", "rc=1", "check-notify", "v0.9.0", "verify_rc=0"):
+            self.assertIn(needle, row, needle)
+
+    def test_v05_records_stop_timing_deviation(self):
+        # 中-2：斷言 2 改量 systemctl stop 耗時，要明寫偏差，不能假裝照文件做。
+        row = self.row("| V-0.5 |")
+        self.assertIn("偏差", row)
+        self.assertIn("systemctl stop", row)
+        self.assertIn("ExecMainExitTimestampMonotonic", row)
+
+    def test_header_records_both_shas_tag_and_service_version(self):
+        # 中-3：目標 tag、文件修正 sha（前 7 碼）與正式服務版本都要寫在表前。
+        header = between(self.rollout, "**V-0 結果（2026-11-26）**", "| # | 內容")
+        for needle in ("lgw-v0.9.0", "4090b20", "#329", "32352b5", "lgw-v0.8.0"):
+            self.assertIn(needle, header, needle)
+
+    def test_current_service_status_paragraph(self):
+        # 換版補充：§5 前有「正式服務現況」，寫 lgw-v0.9.0、auth off，且 warn／enforce 沒開。
+        status = between(self.rollout, "**正式服務現況（2026-11-27）**", "**V-0 結果（2026-11-26）**")
+        for needle in ("lgw-v0.9.0", "auth 維持 `off`", "warn 與 enforce **都還沒開**",
+                       "P-D4、X1、X2 **都還沒完成**", "check-notify"):
+            self.assertIn(needle, status, needle)
+        self.assertNotIn("已開 warn", status)
+        self.assertNotIn("warn 已開", self.rollout)
+
+    def test_no_stale_not_yet_v0_sentences(self):
+        # 中-4：沒有任何一行同時提到 V-0 與「還沒做」（舊的「V-0 還沒做」句子都已改掉）。
+        for line in self.rollout.splitlines():
+            if "V-0" in line:
+                self.assertNotIn("還沒做", line, line)
+        self.assertNotIn("要等 V-0 通過之後", self.rollout)
+        self.assertNotIn("V-0 全部通過之後才", self.rollout)
+
+    def test_warn_enforce_and_gates_not_claimed_done(self):
+        # 不得把 warn 觀察期、enforce、P-D4、X1／X2 寫成已成立。
+        self.assertNotIn("已開 warn", self.rollout)
+        self.assertNotIn("已切 enforce", self.rollout)
+        self.assertNotIn("已切換 enforce", self.rollout)
+        ledger = [l for l in self.rollout.splitlines() if l.startswith("| ③ 正式主機 warn 觀察期 |")]
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0].split("|")[2].strip(), "未")
+        conclusion = [l for l in self.rollout.splitlines() if l.startswith("| 結論 |")]
+        self.assertEqual(conclusion[0].split("|")[2].strip(), "未")
+        self.assertEqual(self.status(self.row("| P-D4 |")), "未")
+        for xrow in ("| X1 |", "| X2 |"):
+            line = next(l for l in self.rollout.splitlines() if l.startswith(xrow))
+            self.assertEqual(line.split("|")[6].strip(), "未", line)
+
+
 if __name__ == "__main__":
     unittest.main()
