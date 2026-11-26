@@ -873,12 +873,32 @@ class RolloutV0ResultTests(unittest.TestCase):
         head = section5.index("**開 warn 的固定步驟**")
         steps = section5[head:]
         for needle in ("lgw-registry-sync", "root", "group／world 可寫", "systemd-run", "User=llmgw",
-                       "ProtectSystem=strict", "/etc/llmgateway/auth-registry.json", "test -r",
+                       "ProtectSystem=strict", "/etc/llmgateway/auth-registry.json", "[ -r ",
                        "P-D4、X1／X2", "再次單次授權", "warn", "restart", "degraded",
                        "journalctl -t llmgwctl-check", "reason=missing"):
             self.assertIn(needle, steps, needle)
         for n in range(1, 7):
             self.assertRegex(steps, rf"(?m)^{n}\. ", n)
+        self.assertNotIn("唯一的觀察來源", self.rollout)
+
+    def test_fixed_step6_splits_check_and_caller_observation(self):
+        # W4：6a 看 check 的 journal（-t llmgwctl-check）；6b 看 lgwd 的日誌（-u llmgateway、reason=missing、outcome=pass）。
+        lines = self.section5.splitlines()
+        six_a = next(l for l in lines if "(6a)" in l)
+        six_b = next(l for l in lines if "(6b)" in l)
+        self.assertIn("journalctl -t llmgwctl-check -p warning", six_a)
+        self.assertIn("journalctl -u llmgateway", six_b)
+        self.assertIn("reason=missing", six_b)
+        self.assertIn("outcome=pass", six_b)
+        self.assertIn("auth mode=… outcome=… reason=… route=… principal=… count=…", six_b)
+
+    def test_step2_has_sandbox_command_marked_unverified(self):
+        # N3：固定步驟 2 給 sandbox 指令，並標明「未在名冊存在時驗過」。
+        for needle in ("systemd-run --wait --pipe --collect", "-p User=llmgw", "-p Group=llmgw",
+                       "-p NoNewPrivileges=true", "-p ProtectSystem=strict", "-p PrivateTmp=true",
+                       "[ -r /etc/llmgateway/auth-registry.json ]", "stat -c %s",
+                       "未在名冊存在時驗過"):
+            self.assertIn(needle, self.section5, needle)
 
     def test_decisions_are_settled_not_open(self):
         # 11-27 決定：check-notify 不設通知；#331 not planned；#332 結案。不寫成待決或待補。

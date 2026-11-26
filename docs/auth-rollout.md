@@ -102,11 +102,19 @@ V-0 已通過（附缺口 #331、#332，見上）。開 warn 前仍需 P-D4、X1
 **開 warn 的固定步驟**（依本人 11-27 決定；check-notify 不設通知，所以改用人工看日誌）：
 
 1. 名冊由 `lgw-registry-sync` 產生、PMO 核可後安裝；檔案 root 擁有，不得 group／world 可寫。
-2. 裝完立刻在 sandbox 內驗 lgwd 讀得到名冊：用 `systemd-run` oneshot，`User=llmgw`、`ProtectSystem=strict`，讀 `/etc/llmgateway/auth-registry.json` 做 `test -r` 與大小檢查。
+2. 裝完立刻在 sandbox 內驗 lgwd 讀得到名冊（**未在名冊存在時驗過**；下面的指令形狀依 V0-PASTE BLOCK 5，名冊裝上後才實跑）：
+
+   ```
+   sudo systemd-run --wait --pipe --collect -p User=llmgw -p Group=llmgw -p NoNewPrivileges=true -p ProtectSystem=strict -p PrivateTmp=true sh -c '[ -r /etc/llmgateway/auth-registry.json ] && stat -c %s /etc/llmgateway/auth-registry.json'
+   ```
+
+   `[ -r … ]` 失敗（exit 非 0）就停，不開 warn；成功時 `stat -c %s` 印出名冊大小（位元組）。
 3. P-D4、X1／X2 與呼叫方清單簽回確認（§2、§4）。
 4. 本人再次單次授權。
 5. 設 `warn` 並 restart，看日誌無 degraded。
-6. 觀察期每天看一次 `journalctl -t llmgwctl-check` 與 `reason=missing` 的計數（因為不設通知，這一步是唯一的觀察來源）。
+6. 觀察期每天看兩項（因為不設通知，要人自己看）：
+   - **(6a) check 的結果**：`journalctl -t llmgwctl-check -p warning`（check timer 的輸出，見 `docs/deploy.md` 8.19）。
+   - **(6b) 呼叫方簽章**：看 lgwd 自己的日誌 `journalctl -u llmgateway`，行格式 `auth mode=… outcome=… reason=… route=… principal=… count=…`（`lgwd/auth.py` 的 AuthLog）。判準（§6）：各已知呼叫方至少各一次 `outcome=pass`，而且至少一個完整工作日 `reason=missing` 的 deny 為 0。
 
 ## 6. warn 觀察期與切 enforce 的決定
 
