@@ -82,6 +82,26 @@ class PrepareTest(unittest.TestCase):
             for name in _fetcher_providers():
                 self.assertEqual(policy["usage"][name], {"enabled": False}, name)
 
+    def test_stdout_stays_three_lines_and_owner_note_goes_to_stderr(self):
+        # #329：提醒只走 stderr；stdout 仍恰三行、順序不變。
+        with tempfile.TemporaryDirectory() as d:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = v0_prepare.main(["--dir", d, "--mode", "warn", "--port", str(_free_port())])
+            self.assertEqual(rc, 0)
+            lines = out.getvalue().splitlines()
+            self.assertEqual(len(lines), 3, out.getvalue())
+            self.assertTrue(lines[0].startswith("lgwd-args: "), lines)
+            self.assertTrue(lines[1].startswith("client-env: "), lines)
+            self.assertTrue(lines[2].startswith("client-key-id: "), lines)
+            self.assertNotIn("note:", out.getvalue())
+            self.assertEqual(err.getvalue().count("note: registry.json must be owned by root"), 1,
+                             err.getvalue())
+            expected = (f"note: registry.json must be owned by root (sudo chown root:root "
+                        f"{Path(d) / 'registry.json'}) before starting lgwd")
+            # 整行比對：路徑後多出任何字元都要紅（不用子字串比對）。
+            self.assertIn(expected, err.getvalue().splitlines(), err.getvalue())
+
     def test_secret_files_are_0600_and_directory_must_be_empty(self):
         with tempfile.TemporaryDirectory() as d:
             v0_prepare.prepare(d, "warn", _free_port())
