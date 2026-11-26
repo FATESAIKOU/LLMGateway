@@ -493,5 +493,146 @@ class IoPrerequisiteTests(unittest.TestCase):
                 db.close()
 
 
+class V06MeasurementTests(unittest.TestCase):
+    """V-0.6 改用 scope 量測（#319）：量 C-612 的 scope 組與服務 cgroup 基線，分開標示、判準不放寬。
+
+    推論的依據是 `tests/test_main_auth_rate_263.py` 的 `subprocess.Popen`（子行程繼承 pytest 的 cgroup）；
+    這裡只鎖文件的字樣與判準數字，不驗 systemd 的行為（沙箱沒有 systemd）。
+    """
+
+    def setUp(self):
+        self.doc = read_doc()
+        self.table_section = between(self.doc, "### 8.18 上線前清單", "### 8.19 ")
+        self.procedure = between(self.doc, "#### V-0.6 量測步驟", "### 8.19 ")
+        self.rollout = (REPO_ROOT / "docs" / "auth-rollout.md").read_text(encoding="utf-8")
+
+    def row(self, prefix):
+        rows = [line for line in self.table_section.splitlines() if line.startswith(prefix)]
+        self.assertEqual(len(rows), 1, prefix)
+        return rows[0]
+
+    def test_v06_names_scope_method_and_service_baseline(self):
+        row = self.row("| V-0.6 |")
+        for needle in ("systemd-run --scope", "systemctl show -p ControlGroup --value", "pids.peak",
+                       "memory.peak", "兩組、分開標示", "A＝scope 組", "B＝服務 cgroup 基線",
+                       "含客戶端的上界", "subprocess.Popen", "scope 方法不依賴這個推論"):
+            self.assertIn(needle, row, needle)
+
+    def test_v06_criteria_not_loosened(self):
+        # 判準：A＋B 的和比 256／768M／2048（保守上界）；字樣不得放寬。
+        row = self.row("| V-0.6 |")
+        for needle in ("用 A＋B 的和比較", "`pids.peak` ≤ 256", "`memory.peak` ≤ 768M",
+                       "fd 高峰 ≤ 2048", "不放寬", "不放寬到 `infinity`"):
+            self.assertIn(needle, row, needle)
+
+    def code(self):
+        # 只比對 fenced 程式碼區塊（指令範本）；說明文字裡提到 MemoryMax 等不算。
+        return "\n".join(line for block in code_blocks(self.procedure) for line in block)
+
+    def test_v06_procedure_code_pins_commands(self):
+        code = self.code()
+        for needle in (
+            "sudo systemd-run --scope", "--unit=\"$SCOPE\"", "-p MemoryAccounting=yes",
+            "-p TasksAccounting=yes", "-p IOAccounting=yes", "runuser -u llmgw",
+            "env TMPDIR=<TMPDIR>", "LGW_SLOW_TESTS=1", "PYTHONDONTWRITEBYTECODE=1",
+            "python3 -m unittest -v tests.test_main_auth_rate_263",
+            "/proc/self/cgroup", "cat $CG/pids.peak", "$CG/memory.peak",
+            "ControlGroup=", "git -C <repo> rev-parse HEAD",
+            '-lt "$3"', "A_WAIT", "/proc/$p/fd", "sudo sh -c", "sampler", "trap ",
+            "fdmax", "pids.current", "memory.current",
+        ):
+            self.assertIn(needle, code, needle)
+        # 不設上限（見說明文）；pytest 不再是指令的一部分。
+        for banned in ("MemoryMax", "TasksMax", "pytest"):
+            self.assertNotIn(banned, code, banned)
+        # TMPDIR 的 findmnt 檢查是步驟文字（與 V-0.6b 一致），不在指令範本裡。
+        self.assertIn("findmnt -T /var/lib/llmgateway", self.procedure)
+
+    def test_v06_every_systemctl_targets_the_scope(self):
+        # 高-1：ControlGroup 與 is-active 一律對到 scope 單元，不能是無後綴的名字（會被補成 .service）。
+        code = self.code()
+        # 範本裡的 sh -c 會收 "$1"，呼叫端必須把 "$SCOPE"（已含 .scope）傳進去。
+        lines = [l for l in self.procedure.splitlines()
+                 if "systemctl" in l and ("ControlGroup" in l or "is-active" in l)]
+        self.assertGreaterEqual(len(lines), 3)  # 取樣 CG、內層 CG、收尾 is-active
+        for line in lines:
+            self.assertTrue(any(s in line for s in ("$SCOPE", ".scope", '"$1"')), line)
+        self.assertIn('sh "$SCOPE"', code)
+        self.assertIn('sampler "$SCOPE"', code)
+        self.assertNotIn('"$UNIT"', self.procedure)
+        self.assertIn('SCOPE=lgw-v06-c612-$(date +%s).scope', code)
+
+    def test_v06_sampler_output_is_written_under_sudo(self):
+        # 中-1：取樣輸出在 sudo 內寫（`>> "$2"` 在 sh -c 的字串裡），不是呼叫者的 >>。
+        code = self.code()
+        # 每個 sudo sh -c 取樣腳本裡的每一個 >> 都要寫到 "$2"（外層傳進來的輸出檔）。
+        scripts = re.findall(r"sudo sh -c '(.*?)' sampler", code, re.S)
+        self.assertEqual(len(scripts), 2, "A 與 B 兩個取樣腳本")
+        for script in scripts:
+            script = script.replace('\\"', '"').replace("\\$", "$")
+            targets = re.findall(r">>\s*([^\s;]+)", script)
+            self.assertTrue(targets, script)
+            for target in targets:
+                self.assertEqual(target, '"$2"', script)
+        self.assertNotIn('sampler "$SCOPE" >>', code)
+        self.assertNotIn('sampler-b "$SVC" >>', code)
+
+    def test_v06_b_group_has_fallback_and_kill_by_pid(self):
+        # 中-3：B 組也有 *.current 取樣退路；收尾只 kill 記下的 pid。
+        procedure = self.procedure
+        self.assertIn("sampler-b", procedure)
+        self.assertIn("memory.current", procedure)
+        self.assertIn("kill <B 的 pid>", procedure)
+        self.assertNotIn("5.3 以上", procedure)
+        self.assertIn("兩者不存在就都用取樣", self.row("| V-0.6 |"))
+
+    def test_v06_sampler_has_timeout_and_fd_max(self):
+        # 低-1：scope 起不來要逾時結束並記錄；低-2：fd 取最大值並記錄。
+        code = self.code()
+        self.assertIn('not started within $3s', code)
+        self.assertIn('${A_WAIT:-60}', code)
+        self.assertIn("max fd=", code)
+        self.assertIn("max fd", self.procedure)
+
+    def test_v06_sampler_call_lines_are_exact(self):
+        # 低-新3：取樣呼叫的整行要完全等於這裡寫的，任何後加的重導（呼叫者的 >>、2>&1）都會紅。
+        code_lines = [l.strip() for l in self.code().splitlines()]
+        for ending in ("""' sampler "$SCOPE" "$OUT" "${A_WAIT:-60}" &""", """' sampler-b "$SVC" "$OUT" &"""):
+            self.assertTrue(any(l.endswith(ending) for l in code_lines), ending)
+
+    def test_v06_steps_run_in_order(self):
+        # 中-新1：B 取樣與前一次讀 peak 在前景 scope（步驟 4）之前；觸發在步驟 4 執行期間；收尾前再讀。
+        proc = self.procedure
+        markers = ["\n2. **A 組取樣**", "\n3. **B 組", "\n4. **C-612 跑在", "\n5. **觸發",
+                   "\n6. **收尾前再讀", "\n7. **收尾**"]
+        positions = [proc.index(m) for m in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("前一次讀 peak", proc[positions[1]:positions[2]])
+        self.assertIn("另開一個終端", proc[positions[3]:positions[4]])
+        self.assertIn("步驟 4 執行期間", proc[positions[3]:positions[4]])
+        self.assertIn("步驟 4 結束後", proc[positions[4]:positions[5]])
+        self.assertIn("**順序很重要**", proc)
+        self.assertIn("立刻", proc)
+        self.assertIn("A_WAIT", proc)
+
+    def test_v06b_no_longer_leaves_inference_open(self):
+        row = self.row("| V-0.6b |")
+        self.assertIn("scope 方法不依賴該推論", row)
+        self.assertIn("可以共用同一次 C-612 執行", row)
+        self.assertIn("同一個 scope", row)
+        self.assertIn(".auth-busy.status", row)
+        self.assertIn("結束前讀（暫存目錄結束即刪）", row)
+        self.assertNotIn("要確認", row)
+        self.assertNotIn("推論：", row)
+
+    def test_rollout_v06_row_matches_scope_method(self):
+        line = next(l for l in self.rollout.splitlines() if l.startswith("| V-0.6 |"))
+        self.assertIn("systemd-run --scope", line)
+        self.assertIn("服務 cgroup 基線", line)
+        self.assertIn("A＋B", line)
+        self.assertIn("不放寬", line)
+        self.assertNotIn("整個 cgroup 的", line)
+
+
 if __name__ == "__main__":
     unittest.main()
