@@ -475,7 +475,7 @@ class IoPrerequisiteTests(unittest.TestCase):
         self.assertIn("V-0.6b", rollout_ids)
         v0_count = len([i for i in deploy_ids if i.startswith("V-0.")])
         self.assertEqual(v0_count, 8)
-        self.assertIn(f"V-0 會在正式主機做 {v0_count} 項檢查", rollout)
+        self.assertIn(f"V-0 在正式主機做了 {v0_count} 項檢查", rollout)
 
     def test_behavior_open_rw_sets_wal_and_full_sync(self):
         # 行為支：不靠字串。改掉 PRAGMA 會讓 configure() 的讀回驗證失敗，open_rw 就丟例外。
@@ -778,6 +778,172 @@ class V06MeasurementTests(unittest.TestCase):
         self.assertIn("A＋B", line)
         self.assertIn("不放寬", line)
         self.assertNotIn("整個 cgroup 的", line)
+
+
+class RolloutV0ResultTests(unittest.TestCase):
+    """2026-11-26 V-0 結果回寫 auth-rollout.md：§5 每列都有結果、缺口有編號、兩個 sha 在。
+
+    只鎖文件的字樣（狀態欄不是「未」、#331／#332 在對的列、sha 前 7 碼在），不驗真機結果本身。
+    P-D4 還沒做，所以維持「未」。
+    """
+
+    def setUp(self):
+        self.rollout = (REPO_ROOT / "docs" / "auth-rollout.md").read_text(encoding="utf-8")
+        self.section5 = between(self.rollout, "## 5. V-0 前置", "## 6. ")
+
+    def rows(self):
+        return [l for l in self.section5.splitlines() if re.match(r"^\| (V-0\.\w+|P-D4) \|", l)]
+
+    def row(self, prefix):
+        rows = [l for l in self.rows() if l.startswith(prefix)]
+        self.assertEqual(len(rows), 1, prefix)
+        return rows[0]
+
+    @staticmethod
+    def status(line):
+        return [c.strip() for c in line.strip().strip("|").split("|")][2]
+
+    def test_every_v0_row_has_a_result_not_pending(self):
+        # 中-1：§5 的 V-0 列（8 列）狀態都不是「未」，且寫了結果日期。
+        v0_rows = [l for l in self.rows() if l.startswith("| V-0.")]
+        self.assertEqual(len(v0_rows), 8)
+        for line in v0_rows:
+            status = self.status(line)
+            self.assertFalse(status.startswith("未"), line)
+            self.assertIn("2026-11-26", status, line)
+
+    def test_p_d4_stays_pending(self):
+        self.assertEqual(self.status(self.row("| P-D4 |")), "未")
+
+    def test_v06_row_names_gap_331(self):
+        row = self.row("| V-0.6 |")
+        self.assertIn("A＋B 判準 PASS；B 組未量到 claude 子行程（#331，not planned）", self.status(row))
+        self.assertIn("pids.peak", row)
+        self.assertIn("memory.peak", row)
+
+    def test_v07_row_names_gap_332(self):
+        row = self.row("| V-0.7 |")
+        self.assertIn("寫入 PASS；名冊讀取＝開 warn 固定步驟（2）（#332 結案）", self.status(row))
+        self.assertIn("名冊", row)
+        self.assertIn("固定步驟", row)
+
+    def test_v04_records_v008_rc1_and_v009_rc0(self):
+        # 中-2：current＝v0.8.0 時 verify rc=1（check-notify 不存在），換 v0.9.0 路徑後 rc=0。
+        row = self.row("| V-0.4 |")
+        for needle in ("lgw-v0.8.0", "rc=1", "check-notify", "v0.9.0", "verify_rc=0"):
+            self.assertIn(needle, row, needle)
+
+    def test_v05_records_stop_timing_deviation(self):
+        # 中-2：斷言 2 改量 systemctl stop 耗時，要明寫偏差，不能假裝照文件做。
+        row = self.row("| V-0.5 |")
+        self.assertIn("偏差", self.status(row))
+        self.assertIn("偏差", row)
+        self.assertIn("systemctl stop", row)
+        self.assertIn("ExecMainExitTimestampMonotonic", row)
+
+    def test_header_records_both_shas_tag_and_service_version(self):
+        # 中-3：目標 tag、文件修正 sha（前 7 碼）與正式服務版本都要寫在表前。
+        header = between(self.rollout, "**V-0 結果（2026-11-26）**", "| # | 內容")
+        for needle in ("lgw-v0.9.0", "4090b20", "#329", "32352b5", "lgw-v0.8.0"):
+            self.assertIn(needle, header, needle)
+
+    def test_current_service_status_paragraph(self):
+        # 換版補充：§5 前有「正式服務現況」，寫 lgw-v0.9.0、auth off，且 warn／enforce 沒開。
+        status = between(self.rollout, "**正式服務現況（2026-11-26 UTC）**", "**V-0 結果（2026-11-26）**")
+        for needle in ("lgw-v0.9.0", "auth 維持 `off`", "warn 與 enforce **都還沒開**",
+                       "P-D4、X1、X2 **都還沒完成**", "check-notify"):
+            self.assertIn(needle, status, needle)
+        self.assertNotIn("已開 warn", status)
+        self.assertNotIn("warn 已開", self.rollout)
+
+    def test_s7_has_no_stale_pre_v0_sentences(self):
+        # W1：§7 白話版在 V-0 之後要是現況；過時的「請您授權 V-0」「V-0 通過後，下一步」不得留。
+        for stale in ("請您授權 V-0", "V-0 通過後，下一步", "現在要請您決定的，是「可不可以在正式主機上做上線前的實機檢查（V-0）」"):
+            self.assertNotIn(stale, self.rollout, stale)
+        s7 = between(self.rollout, "## 7. 白話版", "**做完之後仍然存在的風險**")
+        self.assertIn("warn", s7)
+        self.assertIn("#332", s7)
+        self.assertIn("#331", s7)
+        self.assertIn("lgw-v0.9.0", s7)
+        self.assertIn("不會打開強制認證", s7)
+
+    def test_fixed_warn_steps_list_is_pinned(self):
+        # 11-27 補充：開 warn 的固定步驟（6 步）在 §5 末，鎖住關鍵字樣；check-notify 不設通知。
+        section5 = self.section5
+        head = section5.index("**開 warn 的固定步驟**")
+        steps = section5[head:]
+        for needle in ("lgw-registry-sync", "root", "group／world 可寫", "systemd-run", "User=llmgw",
+                       "ProtectSystem=strict", "/etc/llmgateway/auth-registry.json", "[ -r ",
+                       "P-D4、X1／X2", "再次單次授權", "warn", "restart", "degraded",
+                       "journalctl -t llmgwctl-check", "reason=missing"):
+            self.assertIn(needle, steps, needle)
+        for n in range(1, 7):
+            self.assertRegex(steps, rf"(?m)^{n}\. ", n)
+        self.assertNotIn("唯一的觀察來源", self.rollout)
+
+    def test_fixed_step6_splits_check_and_caller_observation(self):
+        # W4：6a 看 check 的 journal（-t llmgwctl-check）；6b 看 lgwd 的日誌（-u llmgateway、reason=missing、outcome=pass）。
+        lines = self.section5.splitlines()
+        six_a = next(l for l in lines if "(6a)" in l)
+        six_b = next(l for l in lines if "(6b)" in l)
+        self.assertIn("journalctl -t llmgwctl-check -p warning", six_a)
+        self.assertIn("journalctl -u llmgateway", six_b)
+        self.assertIn("reason=missing", six_b)
+        self.assertIn("outcome=pass", six_b)
+        self.assertIn("auth mode=… outcome=… reason=… route=… principal=… count=…", six_b)
+
+    def test_step2_has_sandbox_command_marked_unverified(self):
+        # N3：固定步驟 2 給 sandbox 指令，並標明「未在名冊存在時驗過」。
+        for needle in ("systemd-run --wait --pipe --collect", "-p User=llmgw", "-p Group=llmgw",
+                       "-p NoNewPrivileges=true", "-p ProtectSystem=strict", "-p PrivateTmp=true",
+                       "[ -r /etc/llmgateway/auth-registry.json ]", "stat -c %s",
+                       "未在名冊存在時驗過"):
+            self.assertIn(needle, self.section5, needle)
+
+    def test_decisions_are_settled_not_open(self):
+        # 11-27 決定：check-notify 不設通知；#331 not planned；#332 結案。不寫成待決或待補。
+        self.assertIn("不設通知", self.rollout)
+        self.assertIn("#331，not planned", self.rollout)
+        self.assertIn("#332 結案", self.rollout)
+        for open_word in ("二選一", "通知路徑待決", "待補", "待決"):
+            self.assertNotIn(open_word, self.rollout, open_word)
+
+    def test_s5_tail_says_p_d4_and_pre_warn_gates(self):
+        # W2：§5 結尾要寫開 warn 前還要 P-D4、X1、X2 與再次授權，不能只寫「下一步是開 warn」。
+        lines = self.section5.splitlines()
+        last_row = max(i for i, l in enumerate(lines) if l.startswith("|"))
+        tail = "\n".join(lines[last_row + 1:])
+        self.assertIn("P-D4", tail)
+        self.assertIn("開 warn 前", tail)
+        self.assertIn("X1", tail)
+        self.assertIn("X2", tail)
+
+    def test_status_time_is_utc_not_mixed_with_jst(self):
+        # N2：時區統一；不得出現 JST 的 2026-11-27 日期。
+        self.assertNotIn("2026-11-27", self.rollout)
+
+    def test_no_stale_not_yet_v0_sentences(self):
+        # 中-4：沒有任何一行同時提到 V-0 與「還沒做」（舊的「V-0 還沒做」句子都已改掉）。
+        for line in self.rollout.splitlines():
+            if "V-0" in line:
+                self.assertNotIn("還沒做", line, line)
+        self.assertNotIn("要等 V-0 通過之後", self.rollout)
+        self.assertNotIn("V-0 全部通過之後才", self.rollout)
+
+    def test_warn_enforce_and_gates_not_claimed_done(self):
+        # 不得把 warn 觀察期、enforce、P-D4、X1／X2 寫成已成立。
+        self.assertNotIn("已開 warn", self.rollout)
+        self.assertNotIn("已切 enforce", self.rollout)
+        self.assertNotIn("已切換 enforce", self.rollout)
+        ledger = [l for l in self.rollout.splitlines() if l.startswith("| ③ 正式主機 warn 觀察期 |")]
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0].split("|")[2].strip(), "未")
+        conclusion = [l for l in self.rollout.splitlines() if l.startswith("| 結論 |")]
+        self.assertEqual(conclusion[0].split("|")[2].strip(), "未")
+        self.assertEqual(self.status(self.row("| P-D4 |")), "未")
+        for xrow in ("| X1 |", "| X2 |"):
+            line = next(l for l in self.rollout.splitlines() if l.startswith(xrow))
+            self.assertEqual(line.split("|")[6].strip(), "未", line)
 
 
 if __name__ == "__main__":
