@@ -63,6 +63,8 @@ MLP 11-24 回覆的重點：**MLP 只有兩個呼叫方**——sidecar（X1，�
 
 全部成立，才請本人授權 V-0；V-0 不是「打開強制認證」，只是上線前的實機檢查。
 
+註（2026-11-26）：V-0 已由本人授權並執行（§5）。本表第 1、4、5 列現在是「開 warn 前」的條件，不再是 V-0 的前置條件。
+
 | # | 條件 | 狀態 | 依據 |
 | --- | --- | --- | --- |
 | 1 | D6a、D6b、D6c 都已合，驗收報告每一格都有測試名稱，全套綠，skip 的原因只是共載或 Mac 專用 | 已合（D6a／b／c 三張）；驗收報告與全套綠：未驗 | D6a：PR #293（`c73ed97`，11-24 merged）；D6b：PR #301（`b9c7c46`，11-24 merged）；D6c：PR #299（`fe5f60f`，11-24 merged）。以上是 `gh pr view` 與 `git log` 查到的合併事實；驗收報告每一格與全套綠未在本單重新查證 |
@@ -78,7 +80,7 @@ V-0 是「可不可以在正式主機上做上線前的實機檢查」，不是�
 本人單次授權，由 PMO 申請、PM 執行；字樣不同就停下，不擴充分類表。細項判準見
 `docs/deploy.md` 8.18。
 
-**正式服務現況（2026-11-27）**：正式服務已從 `lgw-v0.8.0` 換成 `lgw-v0.9.0`（11-26 15:35 UTC 完成；auth 維持 `off`）。warn 與 enforce **都還沒開**；P-D4、X1、X2 **都還沒完成**。check-notify 的通知路徑待決：正式主機沒有 aicomm，失敗通知目前只寫 journal。
+**正式服務現況（2026-11-26 UTC）**：正式服務已從 `lgw-v0.8.0` 換成 `lgw-v0.9.0`（2026-11-26 15:35 UTC 完成；auth 維持 `off`）。warn 與 enforce **都還沒開**；P-D4、X1、X2 **都還沒完成**。check-notify 不設通知（本人 11-27 決定）：失敗只寫 journal；check 的 todo 照舊存在。
 
 **V-0 結果（2026-11-26）**：目標 tag `lgw-v0.9.0`（`4090b20…`）；文件／工具修正 #329（PR #330，merge `32352b5…`）；V-0 當時正式服務版本 `lgw-v0.8.0`（之後已換，見上）。V-0 驗證的是 `lgw-v0.9.0` 的新程式（臨時 transient service）加上正式服務 `lgw-v0.8.0` 的資源基線（B 組）。結論：**通過，附兩個缺口**（#331、#332）；warn 觀察期還沒開。
 
@@ -89,13 +91,22 @@ V-0 是「可不可以在正式主機上做上線前的實機檢查」，不是�
 | V-0.3 | `prlimit` 存在，且以 llmgw 身分能對子行程設限 | 通過（2026-11-26） | prlimit、ssh-keygen 皆 root、可執行；在 `--cpu=2 --as=268435456 --nofile=32` 與 sandbox 下 `ssh-keygen: /nonexistent-v0-probe: No such file or directory`，rc=255（非 124） |
 | V-0.4 | `systemd --version` ≥ 251（失敗通知的 `MONITOR_*` 需要），`systemd-analyze verify` 乾淨 | 通過（2026-11-26，附註） | systemd 259（≥251、≥243）。verify：current＝`lgw-v0.8.0` 時 `llmgateway-check-notify.service: Command … is not executable`，rc=1（check-notify 是 #296，只在 v0.9.0）；換成 v0.9.0 路徑後 5 個 unit 一起驗 `verify_rc=0` |
 | V-0.5 | 壓測中執行 `systemctl stop`，503 為 0，停止後 cgroup 沒有殘留行程 | 通過（2026-11-26；偏差：斷言 2 改量 `systemctl stop` 耗時） | lgw-v0（enforce）；`systemctl stop 花了 0.89s`；statuses {"200":6563} 無 503；ConnectionResetError 6 筆、`error_window.first=1795705701.14` 晚於 `STOP_EPOCH=1795705700.392`（停止後 0.75 s）；connection_refused 21998（停止後，不算 503）；unit inactive、cgroup.procs 不存在。偏差：文件寫的 `ExecMainExitTimestampMonotonic` 在 transient unit 停止後即回收、讀不到，改量 `systemctl stop` 耗時（等到主行程結束且 cgroup 清乾淨才返回，更嚴） |
-| V-0.6 | C-612 在正式主機重跑：用 `systemd-run --scope` 量 C-612 的 scope 組（A，含客戶端的上界），另量 llmgateway.service 的 cgroup 基線（B，服務 cgroup 基線），判準用 A＋B 的和、不放寬（步驟見 `docs/deploy.md` 8.18） | A＋B 判準 PASS；B 組未量到 claude 子行程（#331）（2026-11-26） | A（scope，含客戶端上界）`pids.peak` 94、`memory.peak` 81641472（取樣上界 fd 74、mem.current 79896576、pids 87）；B（正式 `lgw-v0.8.0` cgroup，自啟動累計 peak）前後皆 pids 16、memory 105402368（取樣上界 mem 61849600、pids 12）；和：pids 110≤256、memory ≈187 MB≤768M、fd 74≤2048。缺口 1：B 的 peak 在 10 分鐘（含 keysync 與 2 次用量抓取）前後完全不變，沒有 claude 子行程被起來，「含 claude／gh 子行程的合計高峰」未量到 |
+| V-0.6 | C-612 在正式主機重跑：用 `systemd-run --scope` 量 C-612 的 scope 組（A，含客戶端的上界），另量 llmgateway.service 的 cgroup 基線（B，服務 cgroup 基線），判準用 A＋B 的和、不放寬（步驟見 `docs/deploy.md` 8.18） | A＋B 判準 PASS；B 組未量到 claude 子行程（#331，not planned）（2026-11-26） | A（scope，含客戶端上界）`pids.peak` 94、`memory.peak` 81641472（取樣上界 fd 74、mem.current 79896576、pids 87）；B（正式 `lgw-v0.8.0` cgroup，自啟動累計 peak）前後皆 pids 16、memory 105402368（取樣上界 mem 61849600、pids 12）；和：pids 110≤256、memory ≈187 MB≤768M、fd 74≤2048。B 組未量到 claude 子行程——正式機沒有部署 Claude Code 用量抓取，該子行程不會起；以設計估算（claude 約 300 MB，合計約 490 MB ≤ 768M，推論）為準，不補量（#331 not planned） |
 | V-0.6b | 認證庫 IO 前提（#313）：C-612 的 10 分鐘版，TMPDIR 與認證庫同一檔案系統，記錄磁碟種類與 `/proc/pressure/io`，503 數為上界 | 通過（2026-11-26） | `Ran 1 test in 603.788s OK`；`elapsed=602.47 rate=104.19/s statuses={200: 62769} errors=[] wait_count=62789 p50=0.2127 p99=0.5873 max=0.7972`；`load_start=(0.264, 1.169, 0.800) load_end=(7.234, 6.708, 4.074) cores=4`；IO `full avg10` 最大 9.84；fs ext4、ROTA=0；TMPDIR 與認證庫同檔案系統 |
-| V-0.7 | `ProtectSystem=strict` 下的檔案存取：讀得到名冊、寫得了 `/var/lib/llmgateway/` | 寫入 PASS；名冊讀取未驗（#332）（2026-11-26） | `ProtectSystem=strict`：寫入 OK、刪除 OK；`/etc/llmgateway/.should-fail: Read-only file system`；名冊 `/etc/llmgateway/auth-registry.json` 不存在，讀取項未驗（缺口 2：安裝名冊後、開 warn 前補驗） |
+| V-0.7 | `ProtectSystem=strict` 下的檔案存取：讀得到名冊、寫得了 `/var/lib/llmgateway/` | 寫入 PASS；名冊讀取＝開 warn 固定步驟（2）（#332 結案）（2026-11-26） | `ProtectSystem=strict`：寫入 OK、刪除 OK；`/etc/llmgateway/.should-fail: Read-only file system`；名冊 `/etc/llmgateway/auth-registry.json` 不存在，讀取項於 2026-11-26 未驗。#332 結案、不另立追蹤，改由「開 warn 的固定步驟」（§5 末）第 2 步在 sandbox 內驗 |
 | P-D4 | Mac 與 worker 的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 未 | 未做；本人或 PMO；與 V-0 其他項無依賴；MLP 11-24 回覆說 ssh-agent 與帶密語還沒測 |
 
-V-0 已通過（附缺口 #331、#332，見上）。下一步是在正式主機開 `warn` 觀察期；warn 還沒開，
-觀察期與切 `enforce` 都要再問本人（§6）。
+V-0 已通過（附缺口 #331、#332，見上）。開 warn 前仍需 P-D4、X1、X2（§2、§4）與本人再次授權；
+之後才進觀察期。觀察期與切 `enforce` 都要再問本人（§6）。
+
+**開 warn 的固定步驟**（依本人 11-27 決定；check-notify 不設通知，所以改用人工看日誌）：
+
+1. 名冊由 `lgw-registry-sync` 產生、PMO 核可後安裝；檔案 root 擁有，不得 group／world 可寫。
+2. 裝完立刻在 sandbox 內驗 lgwd 讀得到名冊：用 `systemd-run` oneshot，`User=llmgw`、`ProtectSystem=strict`，讀 `/etc/llmgateway/auth-registry.json` 做 `test -r` 與大小檢查。
+3. P-D4、X1／X2 與呼叫方清單簽回確認（§2、§4）。
+4. 本人再次單次授權。
+5. 設 `warn` 並 restart，看日誌無 degraded。
+6. 觀察期每天看一次 `journalctl -t llmgwctl-check` 與 `reason=missing` 的計數（因為不設通知，這一步是唯一的觀察來源）。
 
 ## 6. warn 觀察期與切 enforce 的決定
 
@@ -111,29 +122,30 @@ V-0 已通過（附缺口 #331、#332，見上）。下一步是在正式主機�
 
 ## 7. 白話版（可以原樣轉給本人）
 
-> **現在要請您決定的，是「可不可以在正式主機上做上線前的實機檢查（V-0）」，還不是
-> 「打開強制認證」。**
+> **現在要請您決定的，是「什麼時候在正式主機開『只記錄』（warn）觀察期」。** 開 warn
+> 不會打開強制認證；強制（enforce）要等觀察期結束後再問您。
 >
-> 測試環境目前完成了第一段（D6a）：用真的程式、真的簽章工具、假的金鑰，驗過三種模式
+> 測試環境完成了第一段（D6a）：用真的程式、真的簽章工具、假的金鑰，驗過三種模式
 > （關閉、只記錄、強制）下每一個會呼叫 Gateway 的程式都照預期運作，而且所有輸出裡都
 > 找不到簽章、金鑰或憑證。第二段（D6b：換鑰、撤銷、重放攻擊、回退與資料庫損毀後的
 > 修復）的測試已寫好並審查通過（#294），已於 11-24 合併（PR #301）；這一段的驗證證據
 > 以合併後的驗收報告為準，本文件尚未逐格核對。
 >
-> 請您授權 V-0 之前，還要這幾件事都完成：
+> V-0 已於 2026-11-26 通過。V-0 在正式主機做了 8 項檢查（8.18 的 V-0.1～V-0.7，其中 V-0.6 另加
+> V-0.6b 的 IO 量測），正式主機的 OpenSSH（10.2p1）字樣與我們測過的版本一致。附兩個結案的缺口：B 組的 claude 子行程不量（#331，not planned；
+> 正式機沒有部署用量抓取，以設計估算為準），名冊讀取改由開 warn 固定步驟第 2 步驗（#332 結案）。
+> 正式服務已換成 `lgw-v0.9.0`（2026-11-26 UTC），認證仍是關閉（`off`）；check-notify 不設通知，
+> 失敗只寫 journal。
 >
-> 1. 測試環境的整合驗收全部通過：D6a 已完成；**D6b（#294，PR #301 已合併）的驗收報告尚未逐格核對**；D6c（呼叫方清冊，PR #299 已合併）隨這份文件一起交付。
-> 2. 服務的資源上限已經用低負載的實測定好（D5d 段二）。
-> 3. 您的 Mac 能正常產生簽章（包含用 ssh-agent，以及金鑰有密語時不會卡住）。
-> 4. MyLinuxPool 那邊的呼叫程式已經改成會簽章，並書面確認沒有漏掉的呼叫方
->    （MLP 只有 sidecar 與 capability 探針兩個呼叫方；capability 探針 #1741 已合併，sidecar 簽章 #1740 還沒改好，也還沒書面確認）。
+> 開 warn 之前，還要完成這幾件事，並再次單次授權：
 >
-> V-0 會在正式主機做 8 項檢查（8.18 的 V-0.1～V-0.7，其中 V-0.6 另加 V-0.6b 的 IO 量測），最重要的是：正式主機的 OpenSSH（10.2p1）回報的訊息
-> 和我們測過的版本一致；字樣不一樣就停下，不會為了通過而放寬。V-0 只檢查，
-> **不會打開強制認證**。
+> 1. 名冊安裝並在 sandbox 內驗讀取（§5 固定步驟 1–2）。
+> 2. MLP 的 sidecar 簽章（X1，#1740）改好，capability 探針（X2，#1741）已合併；雙方書面簽回呼叫方清單（§2）。
+> 3. 您的 Mac 能正常產生簽章（包含用 ssh-agent，以及金鑰有密語時不會卡住）（P-D4）。
+> 4. 您再次單次授權開 warn。
 >
-> V-0 通過後，下一步是在正式主機開「只記錄」模式觀察：每個呼叫方都看到成功簽章，
-> 而且至少一整個工作日沒有未簽章的請求，才會再來請您同意打開「強制」。
+> 開 warn 之後的觀察期：每個呼叫方都看到成功簽章，而且至少一整個工作日沒有未簽章的請求，
+> 結束後才會再來請您同意打開「強制」。觀察期的日誌看法見 §5 固定步驟第 6 步。
 >
 > **做完之後仍然存在的風險**
 >
