@@ -977,6 +977,8 @@ sudo llmgwctl check
 ```
 `warn` 下 `auth-local` 會報 `todo`、`check` 結束碼為 2，屬正常；切到 `enforce` 之後才會全綠。
 
+首次啟用的名冊若是 **seed 名冊**（`generation 1`、只含 `local-admin` principal），步驟 3 的候選檔就是它；seed 只能在 warn 開了之後 install（lgwd 不載入 warn 以外的名冊），開 warn 的順序與授權見 `docs/auth-rollout.md` §5 第 1～3 步。之後加入 MLP 的 worker 名冊，改走 8.20 的首次使用。
+
 `auth-store init` 建庫時把鎖檔與兩個庫設成 `llmgw` 擁有、0600；lgwd 在 warn／enforce 啟動時以 `llmgw` 身分開鎖檔（`O_RDWR|O_CREAT`，0600）並取獨佔 `flock`，所以 init 之後 lgwd 拿得到鎖。lgwd **在任何模式都不建庫**：任一庫缺檔或識別不一致，enforce 拒絕啟動、warn 告警並以驗證不可判定照舊處理。
 
 ### 8.3 本機管理 principal（c）
@@ -1486,6 +1488,34 @@ sudo llmgwctl auth-registry install <候選檔>
 ```
 
 `install` 回 0 才算完成。若 plan 之後別人先裝了別的名冊，install 會以 `generation_not_increased` 回 1；重跑 plan 再核可，不要手改世代。**不提供「撤回上一次」**：撤銷是不可逆的（墓碑規則），誤撤銷的 worker 只能換一把新鑰重新加入。名冊也不得用備份還原（8.12）。
+
+#### 首次使用（seed 名冊之後的第一次同步，#337）
+
+名冊剛換成 seed（`generation 1`、只含 `local-admin`）時，第一次 plan 的規則：
+
+- **基準要先載入**：`plan` 會先確認 `auth-registry status` 的 `loaded_hash` 等於現行檔案雜湊、`result=ok`；seed 沒 install、或 lgwd 沒在 warn 下載入，plan 會以 `registry_not_loaded` 停（不產生候選檔）。
+- **新 name 數量**：首次幾乎全部是新 name。預設上限 2，依 #337 的規劃首次約 9 台，要本人確認台數後才以 `--allow-new <確認的台數>` 放行；不要為了省事寫一個大數字。
+- **取清單**（MLP#1739，確切方法由 MLP 提供）：在有 MLP repo Variables: read 權限的環境（Mac 或 provider）執行下面指令，**不能在 worker 上跑**（worker 低權 token 是 403，設計如此）：
+
+  ```
+  gh api 'repos/FATESAIKOU/MyLinuxPool/actions/variables?per_page=100' --paginate | <MLP 工作副本>/scripts/list-tunnel-keys.sh --json
+  ```
+
+  輸出是 JSON 陣列（`version`、`name`、`public_key`、`fingerprint`、`source`、`status`）；`duplicate`、`invalid` 不要匯入（`duplicate` 會讓 sync 整份停，`invalid` 只會被 skip）。`worker` 重建會換隧道鑰，同 name 換鑰由「換 key ID、舊的標 revoked」處理；worker 被刪除時 MLP 不通知 LGW，撤銷要靠明確 `--revoke <name>`（MLP 的 `--since` 輸出 `removed` 可協助找）。`SIDECAR_SIGNERS`（MLP#1529）是另一條，不混進來。
+- **key ID 規則（sidecar 簽章必須逐字相同，#337 補充 2）**：principal＝`mlp-<name>`；key ID＝`mlp-<name>-<fp12>`。`<name>` 是清單的 `name` 原樣（不改大小寫、不加減前綴）；`fp12` 是公鑰 SSH blob 的 SHA-256 前 12 個**小寫** hex。等價算法：清單的 `fingerprint`（`SHA256:<b64>`）去掉 `SHA256:` 前綴、補上 `=` 到 4 的倍數、base64 解碼，取 hex 前 12 個。名冊的 key ID 合法字元是 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`（≤64）；`mlp-`（4）＋ name（≤47）＋ `-`（1）＋ 12 剛好 64。sidecar 必須在簽章當下由**自己現在的公鑰**算 key ID，不得寫死；換鑰＝換 key ID，舊的標 `revoked`。
+
+  測試向量（`tests/test_deploy_doc_auth.py` 用 `ops-scripts/lgw-registry-sync` 的 `_parse_public_key`、`_fp12` 實算，向量一變測試就紅）：
+
+  | 項目 | 值 |
+  | --- | --- |
+  | public_key | `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAZ6BM9XEM+FOeS1stgh0YAH2U4YdfTdx/6yS6w1B/+O` |
+  | fingerprint | `SHA256:vzs1gYCu8dp09iou3qFMOfppx1ZZX82uZvIuNyPizmU` |
+  | fp12 | `bf3b358180ae` |
+  | name | `mlp-fh-l-default-45799726300` |
+  | principal | `mlp-mlp-fh-l-default-45799726300` |
+  | key ID | `mlp-mlp-fh-l-default-45799726300-bf3b358180ae`（45 字元） |
+
+- **順序**：plan → 每一筆 add 做 fingerprint 帶外比對 → PMO 核可 → `check --against-trust` → `install`；完整步驟見 `docs/auth-rollout.md` §5 第 4 步。
 
 ### 8.21 check 失敗時通知 PMO（失敗通知 unit，#296）
 

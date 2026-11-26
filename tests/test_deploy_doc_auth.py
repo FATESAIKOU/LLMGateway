@@ -893,12 +893,13 @@ class RolloutV0ResultTests(unittest.TestCase):
         self.assertIn("auth mode=… outcome=… reason=… route=… principal=… count=…", six_b)
 
     def test_step2_has_sandbox_command_marked_unverified(self):
-        # N3：固定步驟 2 給 sandbox 指令，並標明「未在名冊存在時驗過」。
+        # N3：sandbox 指令要標明「seed 裝上後才實跑」（#337 把它移到 install seed 之後）。
         for needle in ("systemd-run --wait --pipe --collect", "-p User=llmgw", "-p Group=llmgw",
                        "-p NoNewPrivileges=true", "-p ProtectSystem=strict", "-p PrivateTmp=true",
                        "[ -r /etc/llmgateway/auth-registry.json ]", "stat -c %s",
-                       "未在名冊存在時驗過"):
+                       "seed 裝上後才實跑"):
             self.assertIn(needle, self.section5, needle)
+        self.assertNotIn("未在名冊存在時驗過", self.rollout)
 
     def test_decisions_are_settled_not_open(self):
         # 11-27 決定：check-notify 不設通知；#331 not planned；#332 結案。不寫成待決或待補。
@@ -948,3 +949,142 @@ class RolloutV0ResultTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FirstRegistryOrderTests(unittest.TestCase):
+    """#337：首次名冊順序鎖在文件裡（seed → init → 授權 → warn＋install seed → MLP 名冊）。
+
+    只鎖文件字樣與步驟先後，不跑真機。改了順序或拿掉關鍵字，這裡要紅。
+    """
+
+    def setUp(self):
+        self.rollout = (REPO_ROOT / "docs" / "auth-rollout.md").read_text(encoding="utf-8")
+        self.steps = between(self.rollout, "**開 warn 的固定步驟**", "## 6. ")
+        self.doc = read_doc()
+        self.s82 = between(self.doc, "### 8.2 首次啟用", "### 8.3 ")
+        self.s820 = between(self.doc, "### 8.20 從 MLP 清單同步名冊", "### 8.21 ")
+        self.first_use = self.s820[self.s820.index("#### 首次使用"):]
+
+    def test_seed_is_generation_1_and_local_admin_only(self):
+        for needle in ("seed", "generation 1", "local-admin", "llmgwctl-local-admin"):
+            self.assertIn(needle, self.steps, needle)
+        self.assertIn("seed 名冊", self.s82)
+        self.assertIn("generation 1", self.s82)
+        self.assertIn("generation 1", self.first_use)
+
+    def test_order_init_gates_warn_install_then_mlp(self):
+        # 順序：init 在前；授權（再次單次授權）在 warn 之前；install seed 在 warn 之後；
+        # MLP 的 --allow-new 在 install seed 之後。
+        pos = self.steps.index
+        init = pos("auth-store init --confirm")
+        gate = pos("再次單次授權")
+        warn = pos("LGWD_AUTH_MODE=warn")
+        seed_install = pos("auth-registry install <seed>")
+        allow_new = pos("--allow-new")
+        self.assertLess(init, gate)
+        self.assertLess(gate, warn)
+        self.assertLess(warn, seed_install)
+        self.assertLess(seed_install, allow_new)
+
+    def test_loaded_hash_is_the_plan_baseline(self):
+        self.assertIn("loaded_hash", self.steps)
+        self.assertIn("loaded_hash", self.first_use)
+        self.assertIn("registry_not_loaded", self.first_use)
+
+    def test_allow_new_and_unknown_list_path_are_stated(self):
+        self.assertIn("--allow-new", self.steps)
+        self.assertIn("--allow-new", self.first_use)
+        self.assertIn("預設上限 2", self.first_use)
+        self.assertNotIn("目前未知", self.steps)
+        self.assertNotIn("目前未知", self.first_use)
+        for part in (self.steps, self.first_use):
+            self.assertIn("list-tunnel-keys.sh --json", part)
+            self.assertIn("Variables: read", part)
+            self.assertIn("worker", part)
+
+    def test_fixed_steps_still_numbered_one_to_six_with_6a_6b(self):
+        for n in range(1, 7):
+            self.assertRegex(self.steps, rf"(?m)^{n}\. ", n)
+        self.assertIn("(6a)", self.steps)
+        self.assertIn("(6b)", self.steps)
+
+    def test_deploy_82_points_to_auth_rollout_seed_steps(self):
+        self.assertIn("docs/auth-rollout.md", self.s82)
+        self.assertIn("§5", self.s82)
+
+
+class KeyIdVectorTests(unittest.TestCase):
+    """#337 補充 2：key ID 規則與測試向量。文件寫的值要等於 lgw-registry-sync 實算的結果。
+
+    腳本沒有 .py 副檔名，用 importlib 以路徑載入；只呼叫 `_parse_public_key`、`_fp12`。
+    向量一變（文件或腳本算法變了）這裡就紅。
+    """
+
+    PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAZ6BM9XEM+FOeS1stgh0YAH2U4YdfTdx/6yS6w1B/+O"
+    FINGERPRINT = "SHA256:vzs1gYCu8dp09iou3qFMOfppx1ZZX82uZvIuNyPizmU"
+    FP12 = "bf3b358180ae"
+    NAME = "mlp-fh-l-default-45799726300"
+    KEY_ID = "mlp-mlp-fh-l-default-45799726300-bf3b358180ae"
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.machinery
+        import importlib.util
+        path = str(REPO_ROOT / "ops-scripts" / "lgw-registry-sync")
+        loader = importlib.machinery.SourceFileLoader("lgw_registry_sync_vec", path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        cls.sync = module
+
+    def setUp(self):
+        self.doc = read_doc()
+        self.s820 = between(self.doc, "### 8.20 從 MLP 清單同步名冊", "### 8.21 ")
+
+    def test_program_computes_the_documented_vector(self):
+        raw = self.sync._parse_public_key(self.PUBLIC_KEY, self.NAME)
+        fp12 = self.sync._fp12(raw)
+        self.assertEqual(fp12, self.FP12)
+        key_id = self.sync.OURS_PREFIX + self.NAME + "-" + fp12
+        self.assertEqual(key_id, self.KEY_ID)
+        self.assertEqual(len(key_id), 45)
+
+    def test_fp12_is_the_fingerprint_prefix_per_the_stated_equivalence(self):
+        # 等價算法：fingerprint 去 SHA256:、補 =、base64 解碼、hex 取前 12。
+        import base64
+        b64 = self.FINGERPRINT[len("SHA256:"):]
+        blob = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+        self.assertEqual(blob.hex()[:12], self.FP12)
+
+    def test_key_id_fits_registry_id_pattern_and_length_budget(self):
+        from lgwd.auth_registry import ID_PATTERN
+        self.assertIsNotNone(ID_PATTERN.match(self.KEY_ID))
+        self.assertLessEqual(len(self.KEY_ID), 64)
+        self.assertLessEqual(len(self.NAME), 47)
+
+    def test_vector_table_rows_are_exact(self):
+        # 每一列要逐列等於期望值（只靠子字串會被「改了別列、其他列還含原值」騙過）。
+        rows = {}
+        for line in self.s820.splitlines():
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) == 2 and cells[0] in {"public_key", "fingerprint", "fp12", "name",
+                                                "principal", "key ID"}:
+                rows[cells[0]] = cells[1]
+        self.assertEqual(rows, {
+            "public_key": "`" + self.PUBLIC_KEY + "`",
+            "fingerprint": "`" + self.FINGERPRINT + "`",
+            "fp12": "`" + self.FP12 + "`",
+            "name": "`" + self.NAME + "`",
+            "principal": "`mlp-mlp-fh-l-default-45799726300`",
+            "key ID": "`" + self.KEY_ID + "`（45 字元）",
+        })
+
+    def test_doc_states_the_rule_and_the_vector(self):
+        for needle in (
+            "principal＝`mlp-<name>`", "key ID＝`mlp-<name>-<fp12>`",
+            "SHA-256 前 12 個**小寫** hex", "[A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+            "不得寫死", "換鑰＝換 key ID",
+            self.PUBLIC_KEY, self.FINGERPRINT, self.FP12, self.NAME, self.KEY_ID,
+            "（45 字元）",
+        ):
+            self.assertIn(needle, self.s820, needle)
