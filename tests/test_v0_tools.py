@@ -248,12 +248,22 @@ class LoadClientTest(unittest.TestCase):
 
     def test_reset_window_ends_before_garbage_window_begins(self):
         # 中-2 的機制：前段 RST、後段 garbage；兩個 window 必須能分開。
-        result, log = self._with_fake_server("reset_then_garbage")
+        # #335：concurrency 用 1，客戶端的回報就照請求順序（同一條 consumer 先 fail 再送下一筆），
+        # 不靠多執行緒在同一毫秒內的先後。concurrency 4 時 reset 最後一次與 garbage 第一次的時間戳
+        # 會落在同一毫秒（4/30 次失敗，全部是 reset.last == garbage.first），那是排程交錯，不是計法錯。
+        result, log = self._with_fake_server("reset_then_garbage", concurrency="1")
         self.assertGreater(result["connection_reset"], 0, result)
         self.assertGreater(result["bad_status_line"], 0, result)
         reset_window = result["error_window"]["ConnectionResetError"]
         garbage_window = result["error_window"]["bad_status_line"]
-        self.assertLess(reset_window["last"], garbage_window["first"], result)
+        # 伺服器端的順序是確定的：所有 reset 都在所有 garbage 之前（與時間戳精度無關）。
+        kinds = [kind for kind, _ in log]
+        self.assertEqual(kinds, ["reset"] * kinds.count("reset") + ["garbage"] * kinds.count("garbage"), log)
+        self.assertGreater(kinds.count("reset"), 0, log)
+        self.assertGreater(kinds.count("garbage"), 0, log)
+        # 客戶端端的 window 也要分開：reset 的 first／last 都不晚於 garbage 的 first（毫秒取整，故用 <=）。
+        self.assertLessEqual(reset_window["first"], reset_window["last"], result)
+        self.assertLessEqual(reset_window["last"], garbage_window["first"], result)
         self.assertEqual(log[0][0], "reset", log)
         self.assertEqual(log[-1][0], "garbage", log)
 
