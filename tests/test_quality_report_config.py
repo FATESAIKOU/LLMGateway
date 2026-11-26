@@ -44,6 +44,42 @@ def _job_block(text, name):
     return "\n".join(lines[start:end])
 
 
+def _job_permissions(block):
+    """回傳 job 層 ``permissions:`` 的 {權限: 值}；沒有這一段就是空的。"""
+    perms = {}
+    inside = False
+    for line in block.splitlines():
+        if re.match(r"^    permissions:\s*$", line):
+            inside = True
+            continue
+        if inside:
+            m = re.match(r"^      (\S+):\s*(\S+)\s*$", line)
+            if not m:
+                break
+            perms[m.group(1)] = m.group(2)
+    return perms
+
+
+def _task_if(text):
+    """task job 的 ``if:``（``>-`` 折疊寫法），空白正規化後的整段運算式。"""
+    lines = _job_block(text, "task").splitlines()
+    start = next(i for i, l in enumerate(lines) if re.match(r"^    if: >-\s*$", l))
+    body = []
+    for line in lines[start + 1:]:
+        if not line.startswith("      "):
+            break
+        body.append(line)
+    return " ".join(" ".join(body).split())
+
+
+TASK_IF = (
+    "(github.event_name == 'issues' && contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), "
+    "github.event.issue.author_association)) "
+    "|| github.event.schedule == '41 2 * * *' "
+    "|| (github.event_name == 'workflow_dispatch' && inputs.tickets != '')"
+)
+
+
 class TaskQualityConfigTest(unittest.TestCase):
     def setUp(self):
         self.config = _load_config()
@@ -108,11 +144,9 @@ class QualityReportWorkflowTest(unittest.TestCase):
         self.assertEqual(code_cmp, [CODE_CRON])
         self.assertEqual(task_cmp, [TASK_CRON])
 
-    def test_task_job_gates_issue_events_on_author_association(self):
-        block = _job_block(self.text, "task")
-        self.assertIn("author_association", block)
-        for role in ("OWNER", "MEMBER", "COLLABORATOR"):
-            self.assertIn(role, block)
+    def test_task_job_if_expression_is_exact(self):
+        # 整段 if 運算式（空白正規化後）逐字比對，守門不能移到 || 之外或被弱化
+        self.assertEqual(_task_if(self.text), TASK_IF)
 
     def test_code_matrix_targets(self):
         block = _job_block(self.text, "code")
@@ -120,6 +154,20 @@ class QualityReportWorkflowTest(unittest.TestCase):
         self.assertIsNotNone(m)
         targets = [t.strip() for t in m.group(1).split(",")]
         self.assertEqual(sorted(targets), sorted(["lgwd", "lgwctl", "lgw"]))
+
+    def test_code_job_src_tests_target_inputs(self):
+        lines = {l.strip() for l in _job_block(self.text, "code").splitlines()}
+        self.assertIn("src: ${{ matrix.target }}", lines)
+        self.assertIn("tests: tests", lines)
+        self.assertIn("target: ${{ matrix.target }}", lines)
+
+    def test_job_permissions_are_read_only_and_minimal(self):
+        self.assertEqual(
+            _job_permissions(_job_block(self.text, "task")),
+            {"contents": "read", "issues": "read", "pull-requests": "read", "actions": "read"},
+        )
+        self.assertEqual(_job_permissions(_job_block(self.text, "code")), {"contents": "read"})
+        self.assertNotIn("write", self.text)
 
     def test_top_level_permissions_are_empty(self):
         top = [l for l in self.text.splitlines() if re.match(r"^permissions:", l)]
