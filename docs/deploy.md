@@ -1254,6 +1254,70 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
 | V-0.7 | `ProtectSystem=strict` 下的檔案存取 | lgwd 讀得到 `/etc/llmgateway/auth-registry.json`、寫得了 `/var/lib/llmgateway/` |
 | P-D4 | Mac 與 worker 映像的 `ssh -V`、`-Y sign` 的 180 bytes、ssh-agent、有密語時不卡住 | 由本人或 PMO 做 |
 
+### 8.18.1 V-0.5：transient service 的 stop 驗證（#320）
+
+**root：** 要（`systemd-run` 建 transient service）。**lgwd 停止：** 不停正式服務；只停 transient service `lgw-v0`。
+
+V-0.5 不在正式服務上做：正式的 `llmgateway.service` 不停、mode 與名冊不改。做法是另起一個 transient service `lgw-v0`，它的 lgwd 用**假 keys**、**暫存名冊**、**暫存庫**，policy 是「所有用量抓取都關掉」的那一份（list／resolve 也可能觸發 `claude` 子行程，見 8.18 的 V-0 架構師補充）。負載來自 repo 內的外部埠客戶端 `tests.v0_load_client`，它只當客戶端，不起 lgwd。
+
+**先決條件：** 目標 tag 另外 clone 到 `/var/lib/llmgateway-v0/src`（與認證庫同一個檔案系統；不碰 `/opt/llmgateway/current`），以 llmgw 身分操作，並記下 commit sha。
+
+**屬性對照：** 下面的範本逐項對照 `deploy/units/llmgateway.service`（以那個檔為準；改了 unit，範本要跟著改，`tests/test_deploy_doc_auth.py` 會比對）。
+
+| unit 屬性 | 範本 | 不同之處與理由 |
+| --- | --- | --- |
+| `User`／`Group`＝`llmgw` | 同 | — |
+| `TasksMax`／`MemoryMax`／`LimitNOFILE` | 同（512／1536M／4096） | — |
+| `OOMPolicy`＝`continue`、`KillMode`＝`mixed`、`TimeoutStopSec`＝30 | 同 | — |
+| `NoNewPrivileges`、`ProtectSystem=strict`、`PrivateTmp` | 同 | — |
+| `ReadWritePaths` | `/var/lib/llmgateway-v0` | 不同路徑，避免碰正式的 `/var/lib/llmgateway` |
+| `Type=exec` | `--service-type=exec` | 同義 |
+| `WorkingDirectory` | `/var/lib/llmgateway-v0/src` | 跑的是目標 tag 的 clone，不是 `current` |
+| `Restart=on-failure` | `Restart=no` | 壓測中的 lgwd 若死掉，要留現場，不自動重啟 |
+| `EnvironmentFile`、`LoadCredential` | 不設 | 假 keys 與埠直接由參數給；不碰 `/etc/llmgateway` |
+
+```bash
+systemd-run --unit=lgw-v0 --service-type=exec --working-directory=/var/lib/llmgateway-v0/src \
+  --property=Restart=no \
+  --property=User=llmgw --property=Group=llmgw \
+  --property=TasksMax=512 --property=MemoryMax=1536M --property=LimitNOFILE=4096 \
+  --property=OOMPolicy=continue --property=TimeoutStopSec=30 --property=KillMode=mixed \
+  --property=NoNewPrivileges=true --property=ProtectSystem=strict \
+  --property=ReadWritePaths=/var/lib/llmgateway-v0 --property=PrivateTmp=true \
+  --setenv=PYTHONDONTWRITEBYTECODE=1 \
+  /usr/bin/python3 -m lgwd <貼上 v0_prepare 印出的 lgwd-args 那一行>
+```
+
+**步驟：**
+
+1. 建空目錄 `/var/lib/llmgateway-v0/run`（用 `mkdir` 新建，不重用舊的）。
+2. 準備：在 `/var/lib/llmgateway-v0/src` 下執行 `PYTHONDONTWRITEBYTECODE=1 python3 -m tests.v0_prepare --dir /var/lib/llmgateway-v0/run --mode enforce --port <埠>`。它印出三行：`lgwd-args:`（貼進上面的 `systemd-run`）、`client-env:`（客戶端要的環境變數名，只有名字沒有值）與 `client-key-id:`（簽章金鑰的 ID，記進部署紀錄；客戶端不靠它給參數，它寫死在 `tests/v0_prepare.py`）。埠要是 127.0.0.1 上沒有別人在用的埠。輸出不含金鑰內容；`keys.env` 與私鑰是 0600。`v0_prepare` 會多給 `--auth-per-key-max 1000000`（與 C-612 同值）：出廠 600 是 65 秒視窗（約 9 筆／秒），負載會被 429 擋掉，量到的就不是 V-0.5 要的東西。
+3. 啟動：貼上面的 `systemd-run`；等 `127.0.0.1:<埠>` 的 `/healthz` 回 200 之後才開負載（這一步只確認服務起來，不拿它當驗收）。
+4. 負載（分三行。不寫成 `cd … && … &`：那樣 `$!` 會是子 shell，不是客戶端）：
+
+   ```bash
+   cd /var/lib/llmgateway-v0/src
+   LGW_V0_DIR=/var/lib/llmgateway-v0/run LGW_V0_PORT=<埠> PYTHONDONTWRITEBYTECODE=1 python3 -m tests.v0_load_client --duration 120 --concurrency 32 > /var/lib/llmgateway-v0/load.json 2> /var/lib/llmgateway-v0/load.err &
+   LOAD_PID=$!
+   ps -p "$LOAD_PID" -o cmd=
+   ```
+
+   `ps` 的輸出必須是 `python3 -m tests.v0_load_client …`；如果是 `bash`／`sh` 或別的東西，就停下、不 kill 任何東西，回報。停的時候只 kill 這個 `LOAD_PID`（不用 pkill）。（推論：單一簡單指令前面加環境變數時，`$!` 是 python 本身；未在真機驗，所以用 `ps` 確認。）
+5. 負載跑約 60 秒後，先記下停止開始的時刻 `STOP_EPOCH=$(date +%s.%N)` 與 `T0=$(cut -d' ' -f1 /proc/uptime)`，再執行 `systemctl stop lgw-v0`。
+6. 等客戶端自己結束（它在 120 秒時結束，或收到 SIGTERM 時乾淨結束並印出 JSON）。讀 `load.json`。
+
+**三項斷言（全部成立才算 V-0.5 通過）：**
+
+1. **期間無 503，切斷類錯誤只能出現在停止之後**：`load.json` 的 `statuses` 沒有 `"503"` 鍵；`connection_refused` 單獨計，停止後的新連線被拒**不算** 503。`load.json` 的 `errors` 原樣寫進部署紀錄（整個物件，不只挑幾項）。另看 `connection_reset`（`ConnectionResetError`）與 `bad_status_line`：它們在 `error_window` 裡的 `first`（epoch 秒）**不得早於** `STOP_EPOCH`；之後出現的才算停止過程中的正常現象。停止之前出現任一項即未達。
+2. **主行程 20 秒內結束**：用單調時間差算。`(systemctl show lgw-v0 -p ExecMainExitTimestampMonotonic --value 的值 ÷ 1000000) − T0 ≤ 20` 才算過（微秒值，自開機起算；`T0` 是步驟 5 停止前讀的 `/proc/uptime` 第一欄，也是自開機起算的秒數）。值為 `0` 表示主行程沒有結束過，視為未達。`TimeoutStopSec=30` 是上限，超過就是停損。（推論：`/proc/uptime` 與 systemd 的單調時間同一個起點；未在真機驗。若真機差距明顯，改用 `InactiveEnterTimestampMonotonic` 同樣取法，並把差異記入紀錄。）
+3. **cgroup 沒有殘留**：`cat /sys/fs/cgroup/system.slice/lgw-v0.service/cgroup.procs` 為空；**檔案不存在**（unit 已 inactive、cgroup 已移除）也算空；或 `systemctl is-active lgw-v0` 是 `inactive`。檔案存在且有 pid 即未達。
+
+**停損：** 任一項未達，就**不要**改正式服務，照下面的清理做，把原樣輸出與未達的那一項寫進部署紀錄。不得為了過斷言而放寬 `TimeoutStopSec`、改 `KillMode`，或把連線被拒算成 200。
+
+**清理：** kill 自己記下的客戶端 pid；`systemctl stop lgw-v0`（若還在）；確認 `systemctl is-active llmgateway` 仍是 `active`、`/healthz` 仍是 200、正式的 mode 與名冊 sha 與 S0 記錄相同；刪除 `/var/lib/llmgateway-v0/run` 與 `/var/lib/llmgateway-v0/load.*`（刪之前先看一眼路徑，確認是這一次建的）。
+
+**沒有驗到的：** 這一節的工具（`v0_prepare`、`v0_load_client`）與範本的屬性對照，在 repo 裡以離線測試驗過（真起 lgwd 子行程，見 `tests/test_v0_tools.py`）。**transient service 在正式主機上的行為**（`systemd-run` 的屬性是否全部生效、stop 時主行程的實際結束時間、cgroup 的殘留）沒有實測；以 V-0.5 的真機結果為準。
+
 #### V-0.6 量測步驟（scope 方法）
 
 **root：** 要（`systemd-run --scope`、讀 cgroup、root 寫取樣檔）。**lgwd 停止：** 不用（C-612 自己起 lgwd；B 那一組在服務照跑時量）。

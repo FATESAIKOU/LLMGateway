@@ -493,6 +493,114 @@ class IoPrerequisiteTests(unittest.TestCase):
                 db.close()
 
 
+class V05TransientServiceTests(unittest.TestCase):
+    """#320：8.18.1 的 transient service 範本與 unit 屬性一致；步驟指到真的工具與斷言。
+
+    範本是文件，不是程式：這裡只比對「共用屬性」的值與 unit 檔相同，以及步驟裡的
+    關鍵字樣（工具名、三項斷言、停損）還在。`ReadWritePaths` 與 `WorkingDirectory`
+    刻意不同，不比對。
+    """
+
+    SHARED = ("User", "Group", "TasksMax", "MemoryMax", "LimitNOFILE", "OOMPolicy",
+              "TimeoutStopSec", "KillMode", "NoNewPrivileges", "ProtectSystem", "PrivateTmp")
+
+    def setUp(self):
+        self.doc = read_doc()
+        self.section = between(self.doc, "### 8.18.1 ", "### 8.19 ")
+
+    def _unit_service_props(self):
+        unit = (REPO_ROOT / "deploy" / "units" / "llmgateway.service").read_text(encoding="utf-8")
+        props = {}
+        for line in unit.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line and not line.startswith("["):
+                key, _, value = line.partition("=")
+                props[key] = value
+        return props
+
+    def _template_props(self):
+        start = self.section.index("```bash")
+        block = self.section[start + len("```bash"):self.section.index("```", start + 7)]
+        joined = block.replace("\\\n", " ")
+        # 範本第一條指令到 lgwd 參數為止；<...> 佔位那一段不是 shell 字，shlex 會把它當一個字。
+        tokens = shlex.split(joined)
+        props = {}
+        for token in tokens:
+            if token.startswith("--property="):
+                key, _, value = token[len("--property="):].partition("=")
+                props[key] = value
+        return tokens, props
+
+    def test_shared_properties_match_unit_file(self):
+        unit = self._unit_service_props()
+        _, template = self._template_props()
+        for key in self.SHARED:
+            self.assertIn(key, template, key)
+            self.assertEqual(template[key], unit[key], key)
+
+    def test_template_uses_exec_type_and_no_restart(self):
+        tokens, template = self._template_props()
+        self.assertIn("--service-type=exec", tokens)
+        self.assertEqual(template["Restart"], "no")
+        self.assertEqual(self._unit_service_props()["Type"], "exec")
+
+    def test_section_names_the_tools_and_the_three_assertions(self):
+        for needle in ("tests.v0_prepare", "tests.v0_load_client", "--auth-per-key-max 1000000",
+                       "cgroup.procs", "20 秒", "503", "connection_refused", "停損",
+                       "沒有驗到的", "不碰 `/opt/llmgateway/current`"):
+            self.assertIn(needle, self.section, needle)
+
+    def _step(self, prefix):
+        lines = [line for line in self.section.splitlines() if line.startswith(prefix)]
+        self.assertEqual(len(lines), 1, prefix)
+        return lines[0]
+
+    def test_prepare_step_says_three_lines_with_key_id(self):
+        step = self._step("2. 準備：")
+        self.assertIn("它印出三行", step)
+        for name in ("lgwd-args:", "client-env:", "client-key-id:"):
+            self.assertIn(name, step)
+
+    def test_load_start_has_no_subshell_and_checks_pid_with_ps(self):
+        # 中-1：cd 與背景指令分行；$! 取到的是 python 本身；用 ps 確認。
+        self.assertIn("LOAD_PID=$!", self.section)
+        self.assertIn('ps -p "$LOAD_PID" -o cmd=', self.section)
+        self.assertIn("python3 -m tests.v0_load_client", self.section)
+        load_lines = [l for l in self.section.splitlines() if "tests.v0_load_client --duration" in l]
+        self.assertEqual(len(load_lines), 1)
+        self.assertNotIn("&&", load_lines[0])
+        self.assertTrue(load_lines[0].rstrip().endswith("&"), load_lines[0])
+        self.assertIn("不用 pkill", self.section)
+
+    def test_assertion1_separates_cut_errors_by_stop_time(self):
+        # 中-2：切斷類錯誤只能出現在停止之後；errors 原樣進紀錄。
+        line = self._step("1. **期間無 503")
+        for needle in ("`errors`", "`connection_reset`", "`bad_status_line`", "`error_window`",
+                       "`STOP_EPOCH`", "不得早於", "停止之前出現任一項即未達"):
+            self.assertIn(needle, line, needle)
+        self.assertIn("STOP_EPOCH=$(date +%s.%N)", self.section)
+
+    def test_assertion2_is_the_20_second_sentence_with_monotonic_method(self):
+        # 低-2：「20 秒內結束」鎖在斷言 2 那一句，判準是單調時間差。
+        line = self._step("2. **主行程 20 秒內結束**")
+        for needle in ("ExecMainExitTimestampMonotonic", "/proc/uptime", "T0",
+                       "≤ 20", "值為 `0`", "未在真機驗"):
+            self.assertIn(needle, line, needle)
+        self.assertIn("T0=$(cut -d' ' -f1 /proc/uptime)", self.section)
+        self.assertNotIn("InactiveEnterTimestamp ", self._step("2. **主行程 20 秒內結束"))
+
+    def test_assertion3_locks_full_cgroup_path_and_absent_counts_as_empty(self):
+        # 低-1：完整字串；檔案不存在也算空。
+        line = self._step("3. **cgroup 沒有殘留**")
+        self.assertIn("/sys/fs/cgroup/system.slice/lgw-v0.service/cgroup.procs", line)
+        self.assertIn("檔案不存在", line)
+        self.assertIn("也算空", line)
+
+    def test_v06_rows_untouched_by_v05_section(self):
+        table = between(self.doc, "### 8.18 上線前清單", "### 8.18.1 ")
+        self.assertEqual(len([l for l in table.splitlines() if l.startswith("| V-0.6b |")]), 1)
+        self.assertEqual(len([l for l in table.splitlines() if l.startswith("| V-0.6 |")]), 1)
+
 class V06MeasurementTests(unittest.TestCase):
     """V-0.6 改用 scope 量測（#319）：量 C-612 的 scope 組與服務 cgroup 基線，分開標示、判準不放寬。
 
