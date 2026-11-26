@@ -947,9 +947,6 @@ class RolloutV0ResultTests(unittest.TestCase):
             self.assertEqual(line.split("|")[6].strip(), "未", line)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class FirstRegistryOrderTests(unittest.TestCase):
     """#337：首次名冊順序鎖在文件裡（seed → init → 授權 → warn＋install seed → MLP 名冊）。
@@ -1001,6 +998,32 @@ class FirstRegistryOrderTests(unittest.TestCase):
             self.assertIn("list-tunnel-keys.sh --json", part)
             self.assertIn("Variables: read", part)
             self.assertIn("worker", part)
+
+    def test_w1_restart_degraded_is_expected_before_install(self):
+        # W1：seed 還沒 install 時 restart 後的 area=registry degraded 是預期；判準移到 install 之後。
+        self.assertIn("area=registry kind=registry", self.steps)
+        self.assertIn("預期", self.steps)
+        self.assertNotIn("restart，看日誌無 degraded", self.steps)
+        self.assertIn("沒有新的 `area=registry` degraded", self.steps)
+        self.assertLess(self.steps.index("預期"), self.steps.index("沒有新的 `area=registry` degraded"))
+
+    def test_n1_worker_403_and_no_worker_listing_are_pinned(self):
+        # N1：403（設計）與「不能在 worker 上取清單／跑」在 auth-rollout 與 deploy 各鎖一次。
+        self.assertIn("403（設計）", self.steps)
+        self.assertIn("不能在 worker 上取清單", self.steps)
+        self.assertIn("403", self.first_use)
+        self.assertIn("不能在 worker 上跑", self.first_use)
+
+    def test_n1_key_id_upper_bound_is_64(self):
+        self.assertIn("≤64", self.first_use)
+        self.assertIn("{0,63}", self.first_use)
+
+    def test_n3_no_result_ok_claim_left(self):
+        # N3：腳本實際檢查 loaded_hash 與 loaded generation；文件不再寫 result=ok。
+        self.assertNotIn("result=ok", self.steps)
+        self.assertNotIn("result=ok", self.s820)
+        self.assertIn("loaded_generation", self.steps)
+        self.assertIn("loaded_generation", self.s820)
 
     def test_fixed_steps_still_numbered_one_to_six_with_6a_6b(self):
         for n in range(1, 7):
@@ -1088,3 +1111,7 @@ class KeyIdVectorTests(unittest.TestCase):
             "（45 字元）",
         ):
             self.assertIn(needle, self.s820, needle)
+
+
+if __name__ == "__main__":
+    unittest.main()

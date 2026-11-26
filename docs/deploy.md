@@ -1475,7 +1475,7 @@ sudo ops-scripts/lgw-registry-sync plan --list /root/mlp-keys.json \
 ```
 
 - 新的 name 預設上限 2；一次加入更多要人工確認後用 `--allow-new N` 放行。
-- 基準是**目前已載入**的名冊（檔案雜湊要等於 `auth-registry status` 的 `loaded_hash`、`result=ok`）；有變更時世代＋1，沒有變更就不產生候選檔（回 0）。
+- 基準是**目前已載入**的名冊（檔案雜湊要等於 `auth-registry status` 的 `loaded_hash`，且 `loaded_generation` 要等於名冊的 generation；腳本檢查的就是這兩項）；有變更時世代＋1，沒有變更就不產生候選檔（回 0）。
 - 候選檔一定先過 `check --against-trust`（回 0 才算 plan 成功），先寫暫存檔、驗過才 rename 成 `--out`（root 0640）。腳本寫一筆 `auth-audit.log`，狀態檔只記上次輸入的雜湊與時刻。摘要會印候選檔的內容雜湊（`candidate generation <N> (sha256:…)`）；install 前用 `check` 印出的 `content_hash` 再對一次，避免 plan 與 install 之間被換檔。
 - **正式機不要用 `--llmgwctl` 覆寫**：`check` 的判定必須來自正式安裝的 `llmgwctl`（sudo 預設也會清掉 `LGW_SYNC_LLMGWCTL`）；這個旗標只給沒有 wrapper 的 checkout 與離線測試。
 - **每次用新的 `--out` 檔名，或先刪舊檔**：「無變更」與失敗時不會刪掉舊的候選檔；拿上一次留下的檔案去 install 會被 `check` 的雜湊比對或 `generation_not_increased` 擋下，但不要靠它。
@@ -1493,7 +1493,7 @@ sudo llmgwctl auth-registry install <候選檔>
 
 名冊剛換成 seed（`generation 1`、只含 `local-admin`）時，第一次 plan 的規則：
 
-- **基準要先載入**：`plan` 會先確認 `auth-registry status` 的 `loaded_hash` 等於現行檔案雜湊、`result=ok`；seed 沒 install、或 lgwd 沒在 warn 下載入，plan 會以 `registry_not_loaded` 停（不產生候選檔）。
+- **基準要先載入**：`plan` 會先確認 `auth-registry status` 的 `loaded_hash` 等於現行檔案雜湊、`loaded_generation` 等於名冊的 generation；seed 沒 install、或 lgwd 沒在 warn 下載入，plan 會以 `registry_not_loaded` 停（不產生候選檔）。
 - **新 name 數量**：首次幾乎全部是新 name。預設上限 2，依 #337 的規劃首次約 9 台，要本人確認台數後才以 `--allow-new <確認的台數>` 放行；不要為了省事寫一個大數字。
 - **取清單**（MLP#1739，確切方法由 MLP 提供）：在有 MLP repo Variables: read 權限的環境（Mac 或 provider）執行下面指令，**不能在 worker 上跑**（worker 低權 token 是 403，設計如此）：
 

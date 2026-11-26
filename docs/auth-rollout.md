@@ -108,8 +108,8 @@ V-0 已通過（附缺口 #331、#332，見上）。開 warn 前仍需 P-D4、X1
    - 名冊由 `lgw-registry-sync` 產生的 MLP 名冊（generation 2 起）不在這一步，見第 4 步。
 2. **開 warn 前的條件**：P-D4、X1／X2 與呼叫方清單簽回確認（§2、§4）；再取得本人再次單次授權。這一步沒完成前，不設 warn、不 install seed。
 3. **設 warn、install seed、sandbox 驗讀**：
-   - 把 `LGWD_AUTH_MODE=warn` 寫進 `/etc/llmgateway/llmgateway.env`，restart，看日誌無 degraded。
-   - `sudo llmgwctl auth-registry install <seed>` 等 lgwd 載入確認，回 0 才算完成；之後 `auth-registry status` 的 `loaded_hash` 要等於 seed 檔案雜湊、`result=ok`（這就是第 4 步 plan 的基準）。
+   - 把 `LGWD_AUTH_MODE=warn` 寫進 `/etc/llmgateway/llmgateway.env`，restart。**seed 還沒 install 時，日誌第一行預期有 `auth event=degraded area=registry kind=registry store=-`**（沒有名冊檔的預期狀態，服務仍 serving）。這不是失敗，也**不是**「無 degraded」的判準。
+   - `sudo llmgwctl auth-registry install <seed>` 等 lgwd 載入確認，回 0 才算完成；之後 `auth-registry status` 的 `loaded_hash` 要等於 seed 檔案雜湊，且 `loaded_generation` 要等於 seed 的 generation（腳本檢查的就是這兩項，這就是第 4 步 plan 的基準）。install 回 0 後，`journalctl -u llmgateway` 應看到載入成功、之後**沒有新的 `area=registry` degraded**；名冊相關的「無 degraded」判準就是這個，不需要為此再 restart。
    - 名冊裝上後，在 sandbox 內驗 lgwd 讀得到名冊（**seed 裝上後才實跑**；指令形狀依 V0-PASTE BLOCK 5）：
 
    ```
