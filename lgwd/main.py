@@ -318,6 +318,8 @@ class Gateway:
         self._current = _Current(self, self._service)
         self.api_server = make_api_server(self._current, config.api_host, config.api_port,
                                           gate=auth_runtime.gate if auth_runtime else None)
+        if auth_runtime is not None:
+            auth_runtime.auth_log = self.api_server.auth_log  # C-607 收尾（#315）
         # 停止時只等「在途請求」，不等閒置／慢連線；連線執行緒維持 daemon
         # （與 D1 相同，#263 高-1：設成 False 會讓 server_close() 無限期 join）。
         self._inflight = _track_inflight(self.api_server)

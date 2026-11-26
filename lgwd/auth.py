@@ -450,14 +450,21 @@ def _record(mode: str, verdict: Verdict, route: str, log: "AuthLog | None") -> N
 # ---------------------------------------------------------------------------
 
 class AuthLog:
-    """認證事件的 60 秒聚合（C-607）。
+    """認證事件的 60 秒聚合（C-607；#315 語意）。
 
     - 每一行只含 `mode`、`outcome`、白名單 `reason`、路由模板、已驗證 principal 與聚合
       計數；不含標頭值、簽章、nonce、query、body、公鑰、key ID、`Reject.kind`、
       `Outcome.value`、`StoreUnavailable.kind` 或 stderr 原文。
-    - 同一組鍵在同一個 60 秒視窗內至多一行：第一次立刻寫（`count=1`，不會把單一事件
-      藏起來），之後只累加；視窗過了以後的下一筆事件會先把上一個視窗的累計寫出來
-      （`count>1` 才有資訊量），再開新視窗。
+    - **count＝這一行之前尚未被任何一行記錄的事件數**：同一鍵所有行的 count 加總＝該鍵
+      的事件總數（flush 之後）。鍵的第一筆事件立刻寫 `count=1`（不把單一事件藏起來）；
+      之後同一視窗內的事件只累加、不寫；視窗到期時由下列三處之一寫出累計（pending>0 才寫）
+      並刪掉這個鍵：(a) 同鍵下一筆事件進來（先寫舊累計，再開新視窗寫 `count=1`）；
+      (b) 背景 `flush_expired()`（watcher 的 tick）；(c) 關機 `flush_all()`（不管到期，全寫出）。
+    - 每鍵每視窗至多兩行（開頭 1、收尾 pending）；收尾行最晚約「視窗＋watcher 輪詢間隔」
+      之後出現。`_windows` 只保留未到期的鍵，記憶體有界。
+    - 已知限制：沒有 watcher（warn 降級）時沒有背景 flush，收尾行只在同鍵下一筆事件或關機
+      時出現；關機 drain 逾時後才 record 的尾數，可能在 `flush_all()` 之後漏寫（不補寫）。
+    - clock 必須單調（`time.monotonic` 或等價）；時鐘回退時鍵不會到期，直到時鐘追上。
     - 鍵是 `(mode, outcome, reason, 路由模板, principal)`。design 的聚合鍵沒列 principal；
       但 pass 事件帶 principal，若不分開計數會把不同身分混在同一行——那反而讓「已驗證的
       principal」失去意義。這一點列在報告的「待決」。
@@ -468,6 +475,7 @@ class AuthLog:
         self.window = float(window)
         self._sink = sink if sink is not None else _LOG.info
         self._clock = clock if clock is not None else time.monotonic
+        # key -> [視窗起點, pending]；pending＝已發生但還沒寫出的事件數（不含立刻寫出的第一筆）。
         self._windows: dict[tuple, list] = {}
         self._lock = threading.Lock()
         self.lines = 0
@@ -486,17 +494,47 @@ class AuthLog:
         with self._lock:
             entry = self._windows.get(key)
             if entry is None:
-                self._windows[key] = [now, 1]
+                self._windows[key] = [now, 0]
                 self._emit(key, 1)
                 return
             if now - entry[0] < self.window:
                 entry[1] += 1
                 return
-            total = entry[1]
-            self._windows[key] = [now, 1]
-            if total > 1:
-                self._emit(key, total)
+            # 視窗到期：先寫舊視窗的收尾（pending>0 才寫），再開新視窗立刻寫 1。
+            del self._windows[key]
+            if entry[1] > 0:
+                self._emit(key, entry[1])
+            self._windows[key] = [now, 0]
             self._emit(key, 1)
+
+    def flush_expired(self) -> int:
+        """寫出已到期鍵的 pending 並刪掉這些鍵；回傳這次嘗試寫出的行數（含 sink 丟例外者）。
+
+        只給 watcher 的背景 tick 用（`AuthRuntime._log_tick`），不持有任何 lgwd 其他鎖。
+        未到期的鍵不動；pending=0 的到期鍵只刪不寫。
+        """
+        now = self._clock()
+        with self._lock:
+            before = self.lines
+            for key in [k for k, e in self._windows.items() if now - e[0] >= self.window]:
+                entry = self._windows.pop(key)
+                if entry[1] > 0:
+                    self._emit(key, entry[1])
+            return self.lines - before
+
+    def flush_all(self) -> int:
+        """不管到期與否，寫出所有鍵的 pending 並清空；回傳這次嘗試寫出的行數。
+
+        只給關機用（`AuthRuntime.stop`，在請求已停下、watcher 已停止之後）。清空後同鍵
+        下一筆事件照「鍵不存在」立刻寫 1。
+        """
+        with self._lock:
+            before = self.lines
+            for key, entry in self._windows.items():
+                if entry[1] > 0:
+                    self._emit(key, entry[1])
+            self._windows.clear()
+            return self.lines - before
 
     def _emit(self, key: tuple, count: int) -> None:
         mode, outcome, reason, route, principal = key
@@ -814,6 +852,8 @@ class AuthRuntime:
         self.verifier = None
         self.purge: PurgeTimer | None = None
         self.gate: AuthGate | None = None
+        # C-607 聚合（#315）：由 Gateway 在建好 API server 後接上（`make_api_server` 建的那一個）。
+        self.auth_log: AuthLog | None = None
         # StoreBusy 計數與計數檔（#312；warn／enforce 才建，`_open` 裡建立）。
         self.busy_counter: BusyCounter | None = None
         self.busy_window: BusyWindow | None = None
@@ -987,7 +1027,7 @@ class AuthRuntime:
             self.trust,
             self.clock,
             on_snapshot=self._on_snapshot,
-            extra_ticks=(self._extra_tick, self._busy_tick),
+            extra_ticks=(self._extra_tick, self._busy_tick, self._log_tick),
             poll_interval=self.cfg.poll_interval,
             owner_uid=self.registry_owner_uid,
         )
@@ -1076,6 +1116,26 @@ class AuthRuntime:
         self._busy_pending = False
         self._busy_last_write = now
 
+    def _log_tick(self) -> None:
+        """C-607 收尾（#315）：視窗到期的鍵由背景補寫；只在 watcher 的背景執行緒上跑，不持任何鎖。
+
+        延遲上限＝視窗＋`poll_interval`。`auth_log` 還沒接上（啟動的前幾輪）就什麼都不做。
+        """
+        log = self.auth_log
+        if log is None:
+            return
+        log.flush_expired()
+
+    def _flush_log(self) -> None:
+        """關機時把 pending 全部寫出（#315 C-1017）；失敗不擋後續收尾。"""
+        log = self.auth_log
+        if log is None:
+            return
+        try:
+            log.flush_all()
+        except Exception:  # 日誌收尾不能讓關機失敗
+            pass
+
     def _retry_signers(self) -> None:
         gate = self.gate
         if gate is None:
@@ -1129,6 +1189,9 @@ class AuthRuntime:
         if self.watcher is not None:
             self.watcher.stop()
             self.watcher = None
+        # 收尾行（#315）：watcher 已停（不會再有背景 flush）、請求已停下；watcher 為 None
+        # 的降級路徑也要寫，所以放在 watcher 區塊之外。
+        self._flush_log()
         if self.purge is not None:
             self.purge.stop()
             self.purge = None

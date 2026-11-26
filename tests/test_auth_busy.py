@@ -348,11 +348,12 @@ class RealStoreBusyTests(RealStoreBase):
         auth.apply("enforce", verdict, route="/v1/subscriptions", log=log)
         self.assertEqual(verdict.reason, auth.REASON_STORE_BUSY)
         self.assertEqual(self.counter.total(), n1 + 1)
-        # 日誌行序列（修訂 3）：第一視窗開頭即時通知 1、滾動寫出的第一視窗累計 N1、
-        # 新視窗開頭即時通知 1。不把 count 加總（AuthLog 的 count 不可相加）。
+        # 日誌行序列（#315 語意）：第一視窗開頭即時通知 1、滾動寫出的第一視窗收尾 N1−1
+        # （不含第一筆）、新視窗開頭即時通知 1。同鍵所有行的 count 加總＝次數（N1＋1）。
         counts = [int(line.rsplit("count=", 1)[1]) for line in lines
                   if " reason=store_busy " in line]
-        self.assertEqual(counts, [1, n1, 1])
+        self.assertEqual(counts, [1, n1 - 1, 1])
+        self.assertEqual(sum(counts), n1 + 1)
 
     def test_C1004_counter_is_exact_across_threads(self):
         counter = BusyCounter()

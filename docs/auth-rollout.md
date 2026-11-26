@@ -133,7 +133,7 @@ V-0 已通過（附缺口 #331、#332，見上）。開 warn 前仍需 P-D4、X1
 5. **加入後再驗一次**：第 4 步 install 回 0 後，第 3 步的 sandbox 指令再跑一次（名冊已換成新世代）；`llmgwctl check` 的結果照 `docs/deploy.md` 8.2 步驟 8 看，warn 下 `auth-local` 報 `todo`、結束碼 2 屬正常。
 6. 觀察期每天看兩項（因為不設通知，要人自己看）：
    - **(6a) check 的結果**：`journalctl -t llmgwctl-check -p warning`（check timer 的輸出，見 `docs/deploy.md` 8.19）。
-   - **(6b) 呼叫方簽章**：看 lgwd 自己的日誌 `journalctl -u llmgateway`，行格式 `auth mode=… outcome=… reason=… route=… principal=… count=…`（`lgwd/auth.py` 的 AuthLog）。判準（§6）：各已知呼叫方至少各一次 `outcome=pass`，而且至少一個完整工作日 `reason=missing` 的 deny 為 0。
+   - **(6b) 呼叫方簽章**：看 lgwd 自己的日誌 `journalctl -u llmgateway`，行格式 `auth mode=… outcome=… reason=… route=… principal=… count=…`（`lgwd/auth.py` 的 AuthLog）。判準（§6）：各已知呼叫方至少各一次 `outcome=pass`，而且至少一個完整工作日 `reason=missing` 的 deny 為 0。`count` 可相加，加總＝次數；收尾行最晚約 62 秒後出現，關機時補寫；warn 降級（信任庫打不開）時收尾行只在同鍵下一筆事件或關機時出現。
 
 ## 6. warn 觀察期與切 enforce 的決定
 
