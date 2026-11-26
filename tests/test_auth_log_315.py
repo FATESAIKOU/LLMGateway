@@ -265,6 +265,18 @@ class C607SinkFailureTests(unittest.TestCase):
         self.assertEqual(ret, self.log.lines - before)
         self.assertEqual(ret, 1)
 
+    def test_C1020_flush_all_return_value_counts_failing_pending_lines(self):
+        # W-1（REPORT-315-review.md）：pending>0 且 sink 每次都丟例外時，flush_all 回傳值
+        # 仍計入那一行（嘗試寫出），且等於 lines 的增量。
+        rec(self.log)                       # 第一筆 count=1：sink 丟例外
+        rec(self.log)                       # pending 1
+        before = self.log.lines
+        ret = self.log.flush_all()
+        self.assertEqual(ret, 1)
+        self.assertEqual(ret, self.log.lines - before)
+        self.assertEqual(self.lines, [])
+        self.assertEqual(self.log._windows, {})
+
     def test_C1020_sink_always_failing_never_raises_and_counts_attempts(self):
         rec(self.log)                       # 第一筆（寫出時 sink 丟例外）
         rec(self.log)                       # pending
