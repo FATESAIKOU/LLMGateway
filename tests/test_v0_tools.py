@@ -97,7 +97,10 @@ class PrepareTest(unittest.TestCase):
             self.assertNotIn("note:", out.getvalue())
             self.assertEqual(err.getvalue().count("note: registry.json must be owned by root"), 1,
                              err.getvalue())
-            self.assertIn(f"sudo chown root:root {Path(d) / 'registry.json'}", err.getvalue())
+            expected = (f"note: registry.json must be owned by root (sudo chown root:root "
+                        f"{Path(d) / 'registry.json'}) before starting lgwd")
+            # 整行比對：路徑後多出任何字元都要紅（不用子字串比對）。
+            self.assertIn(expected, err.getvalue().splitlines(), err.getvalue())
 
     def test_secret_files_are_0600_and_directory_must_be_empty(self):
         with tempfile.TemporaryDirectory() as d:

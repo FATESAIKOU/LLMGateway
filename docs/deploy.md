@@ -1292,7 +1292,7 @@ systemd-run --unit=lgw-v0 --service-type=exec --working-directory=/var/lib/llmga
 
 1. 建空目錄 `/var/lib/llmgateway-v0/run`（用 `mkdir` 新建，不重用舊的）。
 2. 準備：在 `/var/lib/llmgateway-v0/src` 下執行 `PYTHONDONTWRITEBYTECODE=1 python3 -m tests.v0_prepare --dir /var/lib/llmgateway-v0/run --mode enforce --port <埠>`。它印出三行：`lgwd-args:`（貼進上面的 `systemd-run`）、`client-env:`（客戶端要的環境變數名，只有名字沒有值）與 `client-key-id:`（簽章金鑰的 ID，記進部署紀錄；客戶端不靠它給參數，它寫死在 `tests/v0_prepare.py`）。埠要是 127.0.0.1 上沒有別人在用的埠。輸出不含金鑰內容；`keys.env` 與私鑰是 0600。`v0_prepare` 會多給 `--auth-per-key-max 1000000`（與 C-612 同值）：出廠 600 是 65 秒視窗（約 9 筆／秒），負載會被 429 擋掉，量到的就不是 V-0.5 要的東西。stderr 另會印一行 `note: registry.json must be owned by root …` 提醒，它不是 stdout 的一部分，stdout 仍是三行。
-   - **名冊擁有者（啟動前必做）**：執行 `sudo chown root:root /var/lib/llmgateway-v0/run/registry.json`。lgwd 要求名冊由 root 擁有；`v0_prepare` 產生的檔屬於執行者（llmgw），不改的話 warn 會降級，enforce 會因 `insecure_file` 以 exit 78 結束。名冊目錄與檔案不得 group／world 可寫；若 lgwd 仍報 `insecure_file`，先看這裡與檔案權限。
+   - **名冊擁有者（啟動前必做）**：執行 `sudo chown root:root /var/lib/llmgateway-v0/run/registry.json`。lgwd 要求名冊由 root 擁有；`v0_prepare` 產生的檔屬於執行者（llmgw），不改的話 warn 會降級，enforce 會因 `insecure_file` 以 exit 78 結束。**檔案**不得 group／world 可寫（0644 即可）；lgwd 只檢查名冊檔（擁有者、權限、一般檔、非 symlink），不檢查所在目錄。目錄權限另是安全建議（能寫目錄的人可以換掉檔案，建議目錄也不給 group／world 寫），不是 lgwd 的判準。若 lgwd 仍報 `insecure_file`，先看檔案的擁有者與權限。
 3. 啟動：貼上面的 `systemd-run`；等 `127.0.0.1:<埠>` 的 `/healthz` 回 200 之後才開負載（這一步只確認服務起來，不拿它當驗收）。起來後看 journal（`journalctl -u lgw-v0 --no-pager`）：**不得出現 `auth event=degraded`**（warn 降級，area=registry）。**停損**：出現 `auth event=degraded`，或 exit 78（`cannot start authentication`），就停：取 journal 原樣回報，不開負載、不改權限硬過。
 4. 負載（分三行。不寫成 `cd … && … &`：那樣 `$!` 會是子 shell，不是客戶端）：
 

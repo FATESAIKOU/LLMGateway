@@ -575,6 +575,16 @@ class V05TransientServiceTests(unittest.TestCase):
         self.assertLess(self.section.index("2. 準備："), pos)
         self.assertLess(pos, self.section.index("3. 啟動："))
 
+    def test_owner_bullet_says_file_perms_only_and_dir_is_advice(self):
+        # #329 fix1：lgwd 只檢查名冊檔、不檢查目錄；目錄權限寫成安全建議，不寫成判準。
+        bullet = [l for l in self.section.splitlines() if "名冊擁有者（啟動前必做）" in l]
+        self.assertEqual(len(bullet), 1, bullet)
+        line = bullet[0]
+        for needle in ("**檔案**不得 group／world 可寫（0644 即可）", "只檢查名冊檔",
+                       "不檢查所在目錄", "安全建議", "不是 lgwd 的判準"):
+            self.assertIn(needle, line, needle)
+        self.assertNotIn("名冊目錄與檔案不得", line)
+
     def test_start_step_stops_on_degraded_or_exit_78(self):
         # #329：起來後 journal 不得有 auth event=degraded；degraded 或 exit 78 就停、取 journal 回報。
         line = self._step("3. 啟動：")
