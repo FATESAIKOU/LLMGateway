@@ -4,7 +4,8 @@
 
 - 建認證狀態（`create_stores`）與臨時 ed25519 簽章金鑰（0600，只存在該目錄）；
 - 寫只含該金鑰的名冊、假 keys.env（0600）、**所有用量抓取關掉**的 policy；
-- 印出兩行：(1) 可貼進 `systemd-run` 的 lgwd 參數行；(2) 客戶端要的環境變數名。
+- 印出三行到 stdout：(1) 可貼進 `systemd-run` 的 lgwd 參數行；(2) 客戶端要的環境變數名；(3) 簽章金鑰 ID。
+- stderr 多印一行 `note:`：名冊 `registry.json` 要 root 擁有（lgwd 的 `insecure_file` 檢查），提醒先 `sudo chown root:root`。
 
 不印任何金鑰內容（私鑰、keys.env 的值都不出現在輸出裡）。
 
@@ -109,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
     print("lgwd-args: " + shlex.join(lgwd_args))
     print(f"client-env: {ENV_DIR} {ENV_PORT}")
     print(f"client-key-id: {V0_KEY_ID}")
+    registry = lgwd_args[lgwd_args.index("--auth-registry") + 1]
+    print(f"note: registry.json must be owned by root (sudo chown root:root {registry}) "
+          "before starting lgwd", file=sys.stderr)
     return 0
 
 

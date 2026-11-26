@@ -561,6 +561,34 @@ class V05TransientServiceTests(unittest.TestCase):
         for name in ("lgwd-args:", "client-env:", "client-key-id:"):
             self.assertIn(name, step)
 
+    def test_prepare_step_has_inline_chown_between_prepare_and_start(self):
+        # #329：名冊要 root 擁有；指令在步驟 2 之後、步驟 3 之前，用行內程式碼（不另開 bash 區塊，
+        # 以免 _template_props 取錯區塊）。
+        self._step("2. 準備：")
+        self.assertIn("note: registry.json must be owned by root", self.section)
+        self.assertIn("stdout 仍是三行", self.section)
+        lines = [l for l in self.section.splitlines()
+                 if "sudo chown root:root /var/lib/llmgateway-v0/run/registry.json" in l]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertNotIn("```", lines[0])
+        pos = self.section.index(lines[0])
+        self.assertLess(self.section.index("2. 準備："), pos)
+        self.assertLess(pos, self.section.index("3. 啟動："))
+
+    def test_start_step_stops_on_degraded_or_exit_78(self):
+        # #329：起來後 journal 不得有 auth event=degraded；degraded 或 exit 78 就停、取 journal 回報。
+        line = self._step("3. 啟動：")
+        for needle in ("`auth event=degraded`", "journalctl -u lgw-v0 --no-pager", "exit 78",
+                       "cannot start authentication", "停損", "不開負載"):
+            self.assertIn(needle, line, needle)
+
+    def test_v02_row_also_requires_no_degraded_line(self):
+        # #329：V-0.2 判準多一句 degraded 檢查。
+        table = between(self.doc, "### 8.18 上線前清單", "### 8.18.1 ")
+        rows = [l for l in table.splitlines() if l.startswith("| V-0.2 |")]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("日誌沒有 self-test 失敗，也沒有 `auth event=degraded`", rows[0])
+
     def test_load_start_has_no_subshell_and_checks_pid_with_ps(self):
         # 中-1：cd 與背景指令分行；$! 取到的是 python 本身；用 ps 確認。
         self.assertIn("LOAD_PID=$!", self.section)
