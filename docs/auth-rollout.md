@@ -99,19 +99,38 @@ V-0 是「可不可以在正式主機上做上線前的實機檢查」，不是�
 V-0 已通過（附缺口 #331、#332，見上）。開 warn 前仍需 P-D4、X1、X2（§2、§4）與本人再次授權；
 之後才進觀察期。觀察期與切 `enforce` 都要再問本人（§6）。
 
-**開 warn 的固定步驟**（依本人 11-27 決定；check-notify 不設通知，所以改用人工看日誌）：
+**開 warn 的固定步驟**（依本人 11-27 決定；check-notify 不設通知，所以改用人工看日誌）。
+順序合成自 `docs/deploy.md` 8.2（首次啟用）與 8.20（名冊同步）。**名冊只有 warn／enforce 才會被 lgwd 載入**，所以 seed 名冊的 install 與 `loaded_hash` 的建立，都要等 warn 開了、第 2 步的條件與授權都齊了才做。
 
-1. 名冊由 `lgw-registry-sync` 產生、PMO 核可後安裝；檔案 root 擁有，不得 group／world 可寫。
-2. 裝完立刻在 sandbox 內驗 lgwd 讀得到名冊（**未在名冊存在時驗過**；下面的指令形狀依 V0-PASTE BLOCK 5，名冊裝上後才實跑）：
+1. **首次名冊（seed）與 init（離線，未開 warn）**：
+   - (a) 建本機管理私鑰（`docs/deploy.md` 8.3，不覆蓋既有的）。手寫 seed 名冊：`generation 1`，只含 `local-admin` principal 與它的 `llmgwctl-local-admin` 公鑰（格式照 8.4）；候選檔放 root 家目錄（例如 `/root/auth-registry.json`），`root:llmgw` 0640，不得 group／world 可寫；`sudo llmgwctl auth-registry check <檔>` 離線驗過。
+   - (b) 停服務、`sudo llmgwctl auth-store init --confirm`（8.2 步驟 1～2）。
+   - 名冊由 `lgw-registry-sync` 產生的 MLP 名冊（generation 2 起）不在這一步，見第 4 步。
+2. **開 warn 前的條件**：P-D4、X1／X2 與呼叫方清單簽回確認（§2、§4）；再取得本人再次單次授權。這一步沒完成前，不設 warn、不 install seed。
+3. **設 warn、install seed、sandbox 驗讀**：
+   - 把 `LGWD_AUTH_MODE=warn` 寫進 `/etc/llmgateway/llmgateway.env`，restart。**seed 還沒 install 時，日誌第一行預期有 `auth event=degraded area=registry kind=registry store=-`**（沒有名冊檔的預期狀態，服務仍 serving）。這不是失敗，也**不是**「無 degraded」的判準。
+   - `sudo llmgwctl auth-registry install <seed>` 等 lgwd 載入確認，回 0 才算完成；之後 `auth-registry status` 的 `loaded_hash` 要等於 seed 檔案雜湊，且 `loaded_generation` 要等於 seed 的 generation（腳本檢查的就是這兩項，這就是第 4 步 plan 的基準）。install 回 0 後，`journalctl -u llmgateway` 應看到載入成功、之後**沒有新的 `area=registry` degraded**；名冊相關的「無 degraded」判準就是這個，不需要為此再 restart。
+   - 名冊裝上後，在 sandbox 內驗 lgwd 讀得到名冊（**seed 裝上後才實跑**；指令形狀依 V0-PASTE BLOCK 5）：
 
    ```
    sudo systemd-run --wait --pipe --collect -p User=llmgw -p Group=llmgw -p NoNewPrivileges=true -p ProtectSystem=strict -p PrivateTmp=true sh -c '[ -r /etc/llmgateway/auth-registry.json ] && stat -c %s /etc/llmgateway/auth-registry.json'
    ```
 
-   `[ -r … ]` 失敗（exit 非 0）就停，不開 warn；成功時 `stat -c %s` 印出名冊大小（位元組）。
-3. P-D4、X1／X2 與呼叫方清單簽回確認（§2、§4）。
-4. 本人再次單次授權。
-5. 設 `warn` 並 restart，看日誌無 degraded。
+   `[ -r … ]` 失敗（exit 非 0）就停，不進第 4 步；成功時 `stat -c %s` 印出名冊大小（位元組）。
+4. **加入 MLP 名冊（8.20）**：
+   - 取清單（MLP#1739 的公鑰交付；確切方法由 MLP 提供，見 MLP `docs/RUNBOOK.md` §29「公鑰交付」）：在**有 MLP repo Variables: read 權限的環境**（Mac 或 provider，不在 worker 上）執行：
+
+   ```
+   gh api 'repos/FATESAIKOU/MyLinuxPool/actions/variables?per_page=100' --paginate | <MLP 工作副本>/scripts/list-tunnel-keys.sh --json
+   ```
+
+   - 輸出是 JSON 陣列，每筆 `{"version":1,"name":…,"public_key":"ssh-ed25519 …","fingerprint":"SHA256:…","source":"worker|node","status":"ok|duplicate|invalid"}`；只含公鑰與 fingerprint（非機密）。結束碼 0＝列出（duplicate 只是警告）、1＝至少一筆 invalid、2＝用法錯。
+   - **worker 的低權 token 是 403（設計）**，所以不能在 worker 上取清單；取到的檔再交到正式主機給 `plan --list`。
+   - `SIDECAR_SIGNERS`（MLP#1529 的 sidecar 認證名冊）是另一條，**不混進**這份清單。
+   - `sudo ops-scripts/lgw-registry-sync plan --list <清單檔> --out <新的候選檔> --allow-new <N>`。新 name 預設上限 2；依 #337 的規劃首次約 9 台，超過上限要本人人工確認後，才以 `--allow-new <本人確認的台數>` 放行。
+   - 每一筆 add 與 replace 都做 fingerprint 帶外比對（worker 的 PM 或 sidecar 回報 `ssh-keygen -lf` 的輸出，與摘要逐字相同），再請 PMO 核可。
+   - 核可後：`sudo llmgwctl auth-registry check --against-trust <候選檔>`，再 `sudo llmgwctl auth-registry install <候選檔>`，回 0 才算完成。
+5. **加入後再驗一次**：第 4 步 install 回 0 後，第 3 步的 sandbox 指令再跑一次（名冊已換成新世代）；`llmgwctl check` 的結果照 `docs/deploy.md` 8.2 步驟 8 看，warn 下 `auth-local` 報 `todo`、結束碼 2 屬正常。
 6. 觀察期每天看兩項（因為不設通知，要人自己看）：
    - **(6a) check 的結果**：`journalctl -t llmgwctl-check -p warning`（check timer 的輸出，見 `docs/deploy.md` 8.19）。
    - **(6b) 呼叫方簽章**：看 lgwd 自己的日誌 `journalctl -u llmgateway`，行格式 `auth mode=… outcome=… reason=… route=… principal=… count=…`（`lgwd/auth.py` 的 AuthLog）。判準（§6）：各已知呼叫方至少各一次 `outcome=pass`，而且至少一個完整工作日 `reason=missing` 的 deny 為 0。
