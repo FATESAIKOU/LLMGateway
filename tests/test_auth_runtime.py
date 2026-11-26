@@ -3,8 +3,19 @@
 - C-605（程式庫層）：`open_runtime` 的順序、每種拒絕分類、warn 的降級與「不重開庫」。
 - C-610：REPORT-D2c-arch §2.3 的 W-1～W-20（各案例在測試名或 docstring 標編號；
   已在其他檔驗過的案例在對應測試的 docstring 註明）。
-- C-611：30 秒短版持續率（功能支一律執行；時間支只在機器未被**外部**共載時斷言：開始前
-  就過載，或跑完後過載且開始前機器就不是閒置的；預設 5 秒商店期限與 2 秒驗章期限，不放寬）。
+- C-611：30 秒短版持續率。功能支一律執行且仍 gating（零例外、零非 200、每筆都寫進 replay 庫）。
+  時間支（接受率 ≥ 50/s、等鎖 p99 < 1 秒）是**不 gating 的觀察**（#318，承 #311 的裁定）：
+  只印統計；超過門檻只發 `LockObservationWarning`，不讓測試失敗。預設 5 秒商店期限與 2 秒
+  驗章期限，不放寬。
+
+時間支由誰、何時跑：目前沒有排程或人被指派；需要時手動跑
+`LGW_SLOW_TESTS=1 python3 -m pytest -q -rs -s -k C611 tests/test_auth_runtime.py`
+（`-s` 才會看到 stderr 的統計行）。repo 沒有 CI 設這個旗標，所以 CI 預設不跑時間支。
+
+為什麼不 gating：單寫者鎖在 fsync 壓力下的容量會隨機器負載變動，同一把鎖的假失敗已有紀錄——
+#310／#311 受控共載下 30/s 有 5/18（28%）假失敗；PR #330（head 1a789c2）的全套自然發生一次
+C-611 紅（load1≈17.8、16 核，rate=79.3/s、p99=1.4795s）；正式主機（4 核 SSD）C-612 10 分鐘版
+rate=104.19/s、p99=0.5873（綠）。判準數值（50/s、p99<1 秒）不因此放寬，只是不再因環境而 fail。
 
 全部用暫存目錄、真的暫存金鑰與真的 `ssh-keygen`；不碰 `/var/lib`、`/etc`、不讀憑證、
 不連真機。
@@ -16,10 +27,12 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import warnings
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -32,6 +45,8 @@ from lgwd.http import make_api_server
 from tests.auth_fakes import write_registry_file
 from tests.auth_signer import Signer, b64url, key_entry, registry_bytes
 from tests.test_auth_gate import FakeVerifier, Headers, make_framing, nonce
+# 同一個警示類別（不另開一個同名類別，免得 -W 篩選對不到）。
+from tests.test_auth_replay import LockObservationWarning
 
 try:  # python3 -m pytest
     from .test_http import FakeService
@@ -727,9 +742,15 @@ def _load1() -> float | None:
 
 def _should_skip_time_branch(load_before: float | None, load_after: float | None,
                              cores: int | None) -> tuple[bool, str]:
-    """時間支該不該 skip（純函式，不碰機器也不讀 load）：回 (skip, 說明)。
+    """環境壓力的判定（純函式，不碰機器也不讀 load）：回 (是否環境壓力, 說明)。
 
-    skip 只有兩種情況，都是「機器在跑的期間被**外部**共載到量不出設計值」：
+    **#318 起只用來寫觀察行的環境說明，不 skip 任何測試，也不決定通過與否**；時間支是
+    不 gating 的觀察（見 `test_C611_throughput_hit_rate_and_lock_p99`）。保留這條規則，
+    是為了讓觀察輸出能說明「量到的值是在外部共載下量的」。和 `tests/test_auth_replay.py`
+    的 `_time_branch_skip`（io 壓力＋持鎖退路）是不同規則：這裡多看跑完後的 load，
+    那裡不看；兩邊各自保留，不互相匯入。
+
+    環境壓力只有兩種情況，都是「機器在跑的期間被**外部**共載到量不出設計值」：
 
     1. 負載**開始之前**就過載：load_before > 2×核數。
     2. 跑完後過載，而且開始前機器就不是閒置的：load_after > 2×核數 且 load_before > 核數。
@@ -764,7 +785,11 @@ def _should_skip_time_branch(load_before: float | None, load_after: float | None
 
 
 class TimeBranchSkipRuleTests(unittest.TestCase):
-    """C-611 時間支 skip 口徑的表格測試（純函式；不跑 30 秒負載、不讀機器）。"""
+    """C-611 時間支的環境判定表格測試（純函式；不跑 30 秒負載、不讀機器）。
+
+    判定只用來寫觀察行的說明（#318 起時間支不 skip、也不 gating）；表格仍保留，確保說明
+    文字的口徑不會無聲改變。`tests/test_auth_replay.py::ReplayTimeBranchSkipTableTests` 是另一套規則。
+    """
 
     def decide(self, load_before, load_after, cores):
         return _should_skip_time_branch(load_before, load_after, cores)
@@ -837,13 +862,11 @@ class RateTests(unittest.TestCase):
 
     拆成兩支（慣例同 PR-3 中-3-3），共用同一次量測（`_run_sample`）：
 
-    - 功能支（**永遠執行**，不受機器負載影響）：零例外、零假 503／非 200、每一筆都
-      ACCEPTED（`200`）且都寫進 replay 庫（列數＝接受數）。
-    - 時間支（外部共載時 skip）：接受率 ≥ 50 req/s、等鎖 p99 < 1 秒；只在機器沒有被
-      **外部**共載時斷言——開始前 load1 就 > 2×核數，或跑完後 load1 > 2×核數而且開始前
-      就 > 核數（口徑與表格見 `_should_skip_time_branch` 與 `TimeBranchSkipRuleTests`）。
-      閒置的機器不會因為跑完後被這一支自己推高而 skip。共載時 `skipTest`，訊息帶量到的
-      rate／p99／load1／核數。功能判準在另一支，不會跟著 skip。
+    - 功能支（**永遠執行，仍 gating**，不受機器負載影響）：零例外、零假 503／非 200、
+      每一筆都 ACCEPTED（`200`）且都寫進 replay 庫（列數＝接受數）。
+    - 時間支（**不 gating 的觀察**，#318）：接受率 ≥ 50 req/s、等鎖 p99 < 1 秒是警示門檻，
+      超過只發 `LockObservationWarning`，不讓測試失敗；`LGW_SLOW_TESTS=1` 才跑。量到的
+      數字與環境判定（`_should_skip_time_branch`，只作說明）一律印到 stderr，供報告引用。
 
     量到的數字一律印出來供報告引用。驗章期限用預設 2 秒、商店 `busy_timeout` 用預設
     5 秒（不放寬，也不拿放寬當時間判準的依據）。簽章由 4 條 producer 執行緒在視窗內
@@ -997,14 +1020,14 @@ class RateTests(unittest.TestCase):
         rate = len(snapshot) / elapsed
         ordered = sorted(waits)
         p99 = ordered[int(len(ordered) * 0.99) - 1] if ordered else 0.0
-        skip, skip_detail = _should_skip_time_branch(load, load_after, cores)
+        env_pressure, env_detail = _should_skip_time_branch(load, load_after, cores)
         print("C-611 elapsed={0:.1f}s accepted={1} rows={2} rate={3:.1f}/s "
               "p99_lock={4:.4f}s loadavg={5} (after {6}) cores={7} "
-              "time_branch={8} ({9})".format(
+              "env={8} ({9})".format(
                   elapsed, len(snapshot), rows, rate, p99,
                   "n/a" if load is None else "{0:.2f}".format(load),
                   "n/a" if load_after is None else "{0:.2f}".format(load_after),
-                  cores, "skip" if skip else "run", skip_detail))
+                  cores, "環境壓力" if env_pressure else "未達環境壓力", env_detail))
         return {
             "elapsed": elapsed,
             "statuses": snapshot,
@@ -1017,8 +1040,8 @@ class RateTests(unittest.TestCase):
             "load": load,
             "load_after": load_after,
             "cores": cores,
-            "skip": skip,
-            "skip_detail": skip_detail,
+            "env_pressure": env_pressure,
+            "env_detail": env_detail,
         }
 
     def test_C611_throughput_functional_always_accepted(self):
@@ -1034,28 +1057,34 @@ class RateTests(unittest.TestCase):
         self.assertGreaterEqual(sample["produced"], len(sample["statuses"]))
 
     def test_C611_throughput_hit_rate_and_lock_p99(self):
-        """C-611 時間：接受率 ≥ 50 req/s、等鎖 p99 < 1 秒（判準不放寬）。
+        """C-611 時間支（**不 gating 的觀察**，#318）：接受率 ≥ 50 req/s、等鎖 p99 < 1 秒是
+        警示門檻（判準數值不變），超過只發 `LockObservationWarning`，**不斷言**。
 
-        只在機器沒有被**外部**共載時斷言：開始前 load1 就 > 2×核數，或跑完後 load1 > 2×核數
-        而且開始前就 > 核數（開始前機器本來就有別人在跑）；口徑與表格見
-        `_should_skip_time_branch` 與 `TimeBranchSkipRuleTests`。閒置的機器不會因為跑完後
-        被這一支自己推高而 skip。共載時 `skipTest`，訊息帶量到的 rate／p99／load1／核數；
-        功能判準在另一支，不會因為這一支 skip 而消失。
+        由誰、何時跑：目前沒有排程或人被指派；需要時手動跑
+        `LGW_SLOW_TESTS=1 python3 -m pytest -q -rs -s -k C611 tests/test_auth_runtime.py`。
+        repo 沒有 CI 設這個旗標，所以 CI 預設不跑、也不會看到這一支的輸出。
+
+        為什麼不 gating：單寫者鎖在 fsync 壓力下的容量隨機器負載變動，同一把鎖的假失敗已有
+        紀錄（見模組 docstring 與 `tests/test_auth_replay.py` 的 `test_c305_paced_30_observation_not_gating`）。
+        **代價**：合併後 CI 沒有 C-611 時間支的 gating；鎖退化的自動訊號由 C-612（V-0.6）與
+        #312 的 store_busy 告警補強。功能支（`test_C611_throughput_functional_always_accepted`）
+        仍 gating，不會因為這一支不 gating 而消失。
+
+        環境判定（`_should_skip_time_branch`）只寫進觀察行，說明量到的值是否在外部共載下量的。
         """
+        if os.environ.get("LGW_SLOW_TESTS") != "1":
+            self.skipTest("時間支（觀察，不 gating）：設 LGW_SLOW_TESTS=1 才跑")
         sample = self._run_sample()
-        detail = ("rate={0:.1f}/s p99={1:.4f}s 開始前 load1={2}（跑完 {3}）"
-                  " cores={4}").format(
-                      sample["rate"], sample["p99"], sample["load"],
-                      sample["load_after"], sample["cores"])
-        if sample["skip"]:
-            self.skipTest(
-                "機器共載：{0}；持續率與等鎖 p99 量到的是共用資源競爭不是設計值；"
-                "判準（rate≥50/s、p99<1s）不變：{1}".format(
-                    sample["skip_detail"], detail))
-        self.assertTrue(sample["waits"], "沒有收到等鎖樣本")
-        self.assertGreaterEqual(sample["rate"], 50.0,
-                                msg="接受率低於 50 req/s：" + detail)
-        self.assertLess(sample["p99"], 1.0, msg="等鎖 p99 必須低於 1 秒：" + detail)
+        line = ("C-611 時間支（觀察，不 gating）：rate={0:.1f}/s n={1} p99={2:.4f}s "
+                "開始前 load1={3}（跑完 {4}）cores={5}；環境判定={6}（{7}）").format(
+                    sample["rate"], len(sample["waits"]), sample["p99"], sample["load"],
+                    sample["load_after"], sample["cores"],
+                    "環境壓力" if sample["env_pressure"] else "未達環境壓力",
+                    sample["env_detail"])
+        sys.stderr.write(line + "\n")
+        if (not sample["waits"] or sample["rate"] < 50.0
+                or sample["p99"] >= 1.0):
+            warnings.warn(line, LockObservationWarning, stacklevel=1)
 
     @staticmethod
     def _stop(server, thread):
