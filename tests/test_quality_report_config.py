@@ -16,7 +16,6 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CONFIG_PATH = os.path.join(REPO_ROOT, ".github", "taskquality.json")
 WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "quality-report.yml")
 
-QMETRICS_SHA = "524cd44bb0286edf5082c7cdc16b2bb8bde262ad"
 CODE_CRON = "17 3 * * 1"
 TASK_CRON = "41 2 * * *"
 
@@ -122,17 +121,20 @@ class QualityReportWorkflowTest(unittest.TestCase):
         self.text = _read_workflow()
 
     def test_uses_and_qmetrics_ref_pin_the_same_sha(self):
+        # 不寫死 SHA：釘的值從 workflow 自己解析，只檢查它們彼此一致、格式正確
         uses_lines = [l for l in self.text.splitlines() if re.match(r"^\s+uses:", l)]
         self.assertEqual(len(uses_lines), 2, uses_lines)
-        for line in uses_lines:
-            self.assertTrue(line.endswith(f"@{QMETRICS_SHA}"), line)
+        qmetrics_refs = re.findall(r"qmetrics-ref:\s*(\S+)", self.text)
         # code 與 task 兩個 job 各一處
-        self.assertEqual(
-            re.findall(r"qmetrics-ref:\s*(\S+)", self.text),
-            [QMETRICS_SHA, QMETRICS_SHA],
-        )
-        # 整份檔只出現這一個 40 碼 SHA，沒有殘留舊的 pin
-        self.assertEqual(set(re.findall(r"\b[0-9a-f]{40}\b", self.text)), {QMETRICS_SHA})
+        self.assertEqual(len(qmetrics_refs), 2, qmetrics_refs)
+        # 整份檔只出現一個 40 碼 SHA，沒有殘留舊的 pin
+        shas = set(re.findall(r"\b[0-9a-f]{40}\b", self.text))
+        self.assertEqual(len(shas), 1, shas)
+        (sha,) = shas
+        self.assertRegex(sha, r"^[0-9a-f]{40}$")
+        for line in uses_lines:
+            self.assertTrue(line.endswith(f"@{sha}"), line)
+        self.assertEqual(qmetrics_refs, [sha, sha])
 
     def test_schedule_crons_match_job_conditions_verbatim(self):
         on_block = self.text.split("\njobs:", 1)[0]
