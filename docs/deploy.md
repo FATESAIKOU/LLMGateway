@@ -941,6 +941,8 @@ repo 側的舊靜態鍵文件與腳本殘留，另開 d 單清理；清理前不
 - `warn`：有名冊就驗章與授權，並把 would-deny 記進日誌，但**所有結果照舊處理業務**（仍會洩漏憑證）。名冊、`ssh-keygen` 或兩個庫不可用時不阻止啟動，記 `auth_unavailable` 並標示驗證不可判定，不誤報成功。
 - `enforce`：五條業務路由先驗章與授權才進業務。啟動須有有效名冊（或信任庫的已驗證快照）、可用且自測通過的 `ssh-keygen`、已存在且庫識別一致的兩個庫，否則拒絕啟動。
 
+**認證日誌怎麼讀（#315）**：行格式 `auth mode=… outcome=… reason=… route=… principal=… count=…`。`count` 是「這一行之前還沒被任何一行記錄的事件數」，所以同一組鍵（mode、outcome、reason、路由、principal）所有行的 `count` **加總就是事件次數**，不要取最後一行或單看一行。每組鍵在一個 60 秒視窗內最多兩行：第一筆事件立刻寫 `count=1`，視窗內其餘事件只累加，等視窗到期才寫出 `count=N−1`（沒有其餘事件就不寫）。收尾行最晚在視窗加上輪詢間隔（預設約 62 秒）之後出現；關機時會全部補寫。warn 降級（信任庫打不開）時沒有背景輪詢，收尾行只在同一組鍵的下一筆事件或關機時才出現。
+
 其他路徑一律由 `auth-state-dir` 推導，沒有另外的旗標：`auth-replay.sqlite`（可丟棄的防重放庫）、`auth-trust.sqlite`（世代水位、墓碑、已驗證快照）、`auth-store.lock`、`.auth-registry.status`、`.auth-busy.status`、`allowed_signers.<世代>`、`sshsig/`、`auth-audit.log`。
 
 結束碼：設定值不合法（含未知模式）以結束碼 2 結束；因認證理由拒絕啟動以結束碼 78 結束。2 仍照舊讓 systemd 重啟（OSError 等可能是暫時性的，例如 bind 失敗）；78 由 unit 的 `RestartPreventExitStatus=78` 擋下，不反覆重啟（見 8.17）。
@@ -1217,7 +1219,7 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
 
 會變成 503 的有兩條路徑：
 
-- **認證庫路徑**：排在單寫者鎖上的請求等滿 `busy_timeout`，StoreBusy 被 `except (StoreError, OSError)` 轉成 `unavailable`（`lgwd/auth.py:716`、`lgwd/auth.py:717`），enforce 回 **503 `auth_unavailable`**。
+- **認證庫路徑**：排在單寫者鎖上的請求等滿 `busy_timeout`，StoreBusy 被 `except (StoreError, OSError)` 轉成 `unavailable`（`lgwd/auth.py:754`、`lgwd/auth.py:755`），enforce 回 **503 `auth_unavailable`**。
 - **號誌路徑**：預驗章 framing 的號誌是 **32**（`lgwd/http.py:106`），取號誌最多等 **1 秒**（`lgwd/http.py:107`，`lgwd/http.py:416`）；等不到就以 `REASON_BUSY` 回 **503 `auth_unavailable`**（`lgwd/http.py:420`）。這一條與 `busy_timeout` 無關。驗章子行程的號誌是 **16**（`lgwd/sshsig.py:84`）。
 
 兩條都是 **fail-closed**：不放行、不重放，客戶端可以重試。warn 模式只記錄、照舊處理。

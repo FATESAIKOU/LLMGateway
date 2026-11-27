@@ -547,11 +547,11 @@ class C607LogTests(unittest.TestCase):
             self.now += 1.0
         self.assertEqual(len(self.lines), 1)
         self.assertIn("count=1", self.lines[0])
-        # 視窗過了：先補上一個視窗的累計，再開新視窗。
+        # 視窗過了：先補上一個視窗的收尾（#315：不含第一筆，所以是 4），再開新視窗。
         self.now += 60.0
         self.record()
         self.assertEqual(len(self.lines), 3)
-        self.assertIn("count=5", self.lines[1])
+        self.assertIn("count=4", self.lines[1])
         self.assertIn("count=1", self.lines[2])
 
     def test_C607_different_keys_are_separate(self):
