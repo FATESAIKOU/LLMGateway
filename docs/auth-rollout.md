@@ -132,7 +132,10 @@ V-0 已通過（附缺口 #331、#332，見上）。開 warn 前仍需 P-D4、X1
    - 核可後：`sudo llmgwctl auth-registry check --against-trust <候選檔>`，再 `sudo llmgwctl auth-registry install <候選檔>`，回 0 才算完成。
 5. **加入後再驗一次**：第 4 步 install 回 0 後，第 3 步的 sandbox 指令再跑一次（名冊已換成新世代）；`llmgwctl check` 的結果照 `docs/deploy.md` 8.2 步驟 8 看，warn 下 `auth-local` 報 `todo`、結束碼 2 屬正常。
 6. 觀察期每天看兩項（因為不設通知，要人自己看）：
-   - **(6a) check 的結果**：`journalctl -t llmgwctl-check -p warning`（check timer 的輸出，見 `docs/deploy.md` 8.19）。
+   - **(6a) check 的結果**：`journalctl -t llmgwctl-check -p warning`（check timer 的輸出，見 `docs/deploy.md` 8.19）。**只看這一條不夠**：check 服務啟動失敗、逾時或被殺時，可能沒有 `llmgwctl-check` 的輸出，所以還要看 (6a-1)～(6a-3)。四條裡任何一條看到「失效」，都回報 PMO，不要等到下一天。
+     - **(6a-1) timer 有在排程**：`systemctl list-timers llmgateway-check.timer`。正常：`NEXT` 有時間，`LAST` 在開機 5 分鐘後有值，之後 `LAST` 距今約 15 分鐘內（`OnUnitActiveSec=15min`，另加 `RandomizedDelaySec=60`、`AccuracySec=1min` 的誤差）。失效：列不出這一列（`list-timers` 只列 active 的，所以 timer 沒裝、沒 enable 或沒在跑都是這樣）、`NEXT` 空白，或 `LAST` 超過約 30 分鐘沒更新。
+     - **(6a-2) 最近一次的 unit 結果**：`systemctl show -p Result,ExecMainStatus,ExecMainExitTimestamp llmgateway-check.service`。正常：`Result=success` 且 `ExecMainStatus=0`（全好），或 `ExecMainStatus=2`（只有 todo；`SuccessExitStatus=2` 把它算成功，warn 下 `auth-local` 報 todo 是預期）。失效：`Result=exit-code` 且 `ExecMainStatus=1`（check 有 fail）；`Result=timeout`（超過 `TimeoutStartSec=5min`）；`Result=signal`（被訊號殺）；`Result` 或 `ExecMainStatus` 空白（unit 不存在或從沒跑過）；`ExecMainExitTimestamp` 比 (6a-1) 的 `LAST` 舊很多。
+     - **(6a-3) unit 自己的 journal**：`journalctl -u llmgateway-check.service --since '24 hours ago'`。這裡有 systemd 自己的失敗訊息（例如 `Failed with result`、`timed out`、`Main process exited`），啟動失敗或被殺時只有這裡看得到。正常：只有 `llmgwctl-check` 的行，沒有 systemd 的失敗訊息。失效：出現 systemd 的失敗訊息；或 (6a-1) 顯示 timer 在跑、這裡卻完全沒有紀錄。
    - **(6b) 呼叫方簽章**：看 lgwd 自己的日誌 `journalctl -u llmgateway`，行格式 `auth mode=… outcome=… reason=… route=… principal=… count=…`（`lgwd/auth.py` 的 AuthLog）。判準（§6）：各已知呼叫方至少各一次 `outcome=pass`，而且至少一個完整工作日 `reason=missing` 的 deny 為 0。`count` 可相加，加總＝次數；收尾行最晚約 62 秒後出現，關機時補寫；warn 降級（信任庫打不開）時收尾行只在同鍵下一筆事件或關機時出現。
 
 ## 6. warn 觀察期與切 enforce 的決定
