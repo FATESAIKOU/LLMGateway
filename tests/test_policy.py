@@ -100,7 +100,7 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertIn("openrouter/free", or_sub.models_allow)
         self.assertEqual(len(or_sub.models_allow), 2)
 
-    def test_出廠七筆訂閱的models_default(self):
+    def test_出廠八筆訂閱的models_default(self):
         # 出廠政策檔逐筆釘住：各筆各自有 default（#50 起 claude-personal 預設
         # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go；
         # #88 加 groq、#128 移除；#107 加 antigravity；#187 P4 加
