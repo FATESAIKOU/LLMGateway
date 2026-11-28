@@ -892,6 +892,23 @@ class RolloutV0ResultTests(unittest.TestCase):
         self.assertIn("outcome=pass", six_b)
         self.assertIn("auth mode=… outcome=… reason=… route=… principal=… count=…", six_b)
 
+    def test_fixed_step6a_checks_timer_unit_and_journal(self):
+        # #353：6a 只看 llmgwctl-check 的輸出不夠（啟動失敗、逾時、被殺可能沒有該 identifier）；
+        # 要同時看 timer 排程、unit 最近結果、unit 自己的 journal，三條指令的名稱要與單元檔一致。
+        lines = self.section5.splitlines()
+        start = next(i for i, l in enumerate(lines) if "(6a)" in l)
+        end = next(i for i, l in enumerate(lines) if "(6b)" in l)
+        block = "\n".join(lines[start:end])
+        for needle in ("(6a-1)", "(6a-2)", "(6a-3)",
+                       "systemctl list-timers llmgateway-check.timer",
+                       "systemctl show -p Result,ExecMainStatus,ExecMainExitTimestamp llmgateway-check.service",
+                       "journalctl -u llmgateway-check.service",
+                       "Result=timeout", "Result=signal", "ExecMainStatus=2", "ExecMainStatus=1"):
+            self.assertIn(needle, block, needle)
+        self.assertIn("journalctl -t llmgwctl-check -p warning", block)
+        for unit in ("llmgateway-check.timer", "llmgateway-check.service"):
+            self.assertTrue((REPO_ROOT / "deploy" / "units" / unit).is_file(), unit)
+
     def test_step2_has_sandbox_command_marked_unverified(self):
         # N3：sandbox 指令要標明「seed 裝上後才實跑」（#337 把它移到 install seed 之後）。
         for needle in ("systemd-run --wait --pipe --collect", "-p User=llmgw", "-p Group=llmgw",
