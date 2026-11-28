@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -177,6 +178,17 @@ class Store:
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, subscription, action, agent, until, provider, model, principal),
         )
+
+    def audit_role(self, cur, ts, subscription, slot, index, provider, principal, params, level, sha, skipped):
+        rows = list(skipped)
+        encoded = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
+        truncated = len(encoded.encode('utf-8')) > 2048
+        if truncated:
+            while rows and len(json.dumps(rows + [{'truncated': True}], ensure_ascii=False, separators=(',', ':')).encode('utf-8')) > 2048:
+                rows.pop()
+            encoded = json.dumps(rows + [{'truncated': True}], ensure_ascii=False, separators=(',', ':'))
+        cur.execute("INSERT INTO audit (ts, subscription, action, agent, provider, model, principal, role, slot, tier, family, effort, exclude_family, task_length, skipped, skipped_truncated, explicit_model, data, data_declared, ref, table_sha) VALUES (?, ?, 'resolve', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ts, subscription, slot.agent, provider, slot.model, principal, params['role'], str(index), slot.tier, slot.family, slot.effort, ','.join(params.get('exclude_family', [])), params['task_length'], encoded, '1' if truncated else '0', '1' if 'model' in params else '0', level, params.get('data'), params.get('ref'), sha))
 
     def audit_all(self) -> list[dict]:
         with self._lock:

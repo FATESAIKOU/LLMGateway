@@ -13,6 +13,12 @@
 
 由 `/model-rotation-survey` 每週手動更新（PMO 週例執行，有變化才開 PR，本人 comment 後再套用）。涵蓋五家：OpenRouter／Zen 免費、Ollama Cloud（付費）、Claude（訂閱，只能用在原版 Claude Code）、ChatGPT／codex（訂閱，provider=openai，只用原版 Codex CLI）。
 
+## 依角色選格
+
+`GET /v1/resolve?role=impl&task_length=short&data=public` 依角色表順序選第一個可用格；`task_length` 必填（`short` 或 `long`），`data` 缺省為 `real`。可用 `exclude`、`exclude_family` 排除訂閱或家族，並以 `ref` 關聯請求。回覆的 `meta.skipped` 說明跳過原因。
+
+`resolve?role=` 使用角色輪換表的格序；既有 `GET /v1/roles/{role}` 依 policy 的 `roles.<role>.order` 回候選訂閱，兩者順序各自獨立。
+
 ## 怎麼讀
 
 - 「主觀」是 AI 判斷，不是實測。
