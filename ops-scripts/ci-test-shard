@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""ci-test-shard：把 tests/test_*.py 依檔案大小均分成 N 批，印出第 K 批的檔案（每行一個）。
+
+給 .github/workflows/ci.yml 用：每批一個 job 平行跑 pytest。分法是確定性的
+（同一組檔案、同一個 N，每次分出同樣的批），而且每個測試檔恰好落在一批（不漏、不重複）：
+依檔案大小由大到小，逐一放進目前總大小最小的那一批（貪婪 LPT）；同大小依路徑排序。
+只用標準函式庫；不讀網路、不讀環境變數。
+
+用法：ops-scripts/ci-test-shard <批數 N> <第幾批 K（0 起算）> [tests 目錄，預設 tests]
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+
+def shards(paths: list[str], n: int) -> list[list[str]]:
+    if n < 1:
+        raise ValueError("批數至少 1")
+    sized = sorted(((os.path.getsize(p), p) for p in paths), key=lambda item: (-item[0], item[1]))
+    buckets: list[list[str]] = [[] for _ in range(n)]
+    totals = [0] * n
+    for size, path in sized:
+        index = min(range(n), key=lambda i: (totals[i], i))
+        buckets[index].append(path)
+        totals[index] += size
+    return [sorted(bucket) for bucket in buckets]
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) not in (3, 4):
+        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+        return 2
+    try:
+        n, k = int(argv[1]), int(argv[2])
+    except ValueError:
+        print("N 與 K 要是整數", file=sys.stderr)
+        return 2
+    root = argv[3] if len(argv) == 4 else "tests"
+    if not 0 <= k < n:
+        print("K 要在 0～N-1", file=sys.stderr)
+        return 2
+    paths = sorted(
+        os.path.join(root, name) for name in os.listdir(root)
+        if name.startswith("test_") and name.endswith(".py")
+    )
+    for path in shards(paths, n)[k]:
+        print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
