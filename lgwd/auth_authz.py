@@ -18,10 +18,12 @@
 404：維持「輸入形狀錯誤 400 優先」的既有 precedence（`registry.role_candidates` 與
 `registry._pick` 的 docstring）。
 
-`resolve` 的請求不帶 role，所以只能限制 agent，不能限制「以哪個角色 resolve」
-（C-903）；要做到依角色限制必須改 API，不在 D3。`cooldown`、`list`、`usage` 只判
-操作（C-904：schema 1 沒有「每個訂閱」的範圍）。「未列就是拒絕」：名冊沒有的操作、
-agent、role 一律拒絕，沒有萬用字元。
+`resolve?agent=` 的請求不帶 role，所以只能限制 agent，不能限制「以哪個角色 resolve」
+（C-903）。`resolve?role=` 由 `authorize_role_slot` 在選格之後判（#347 §5.2）：選中格的
+agent 必須在 `resolve_agents`，且 `roles[role]` 含該 agent，否則 `forbidden_agent`／
+`forbidden_role`；呼叫端宣告的 role 字串仍不是可信來源，限制的是「這把金鑰能以哪個角色
+拿到哪個 agent」。`cooldown`、`list`、`usage` 只判操作（C-904：schema 1 沒有「每個訂閱」的範圍）。
+「未列就是拒絕」：名冊沒有的操作、agent、role 一律拒絕，沒有萬用字元。
 """
 
 from __future__ import annotations
@@ -69,4 +71,14 @@ def authorize(permissions: PrincipalEntry, op: str, *, agent: str | None = None,
             if allowed is None or agent not in allowed:
                 return FORBIDDEN_ROLE
         return None
+    return None
+
+
+def authorize_role_slot(permissions, role, agent):
+    if not isinstance(permissions, PrincipalEntry):
+        raise TypeError("authorize_role_slot needs PrincipalEntry")
+    if agent not in permissions.resolve_agents:
+        return FORBIDDEN_AGENT
+    if role not in permissions.roles or agent not in permissions.roles[role]:
+        return FORBIDDEN_ROLE
     return None

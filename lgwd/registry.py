@@ -40,6 +40,7 @@ import logging
 
 from .clock import Clock, from_rfc3339, to_rfc3339
 from .errors import (
+    ApiError,
     agent_not_allowed,
     bad_request,
     invalid_until,
@@ -55,7 +56,7 @@ from .keys import KeyStore
 from .policy import AGENTS, PRIVACY_LEVELS, ROLES, Policy, SubscriptionPolicy
 from .providers import CredentialProvider, provider_for
 from .store import Store
-from .usage import INTERNAL, UsageService, available_again_at, internal_usage
+from .usage import INTERNAL, UsageService, available_again_at, internal_usage, exhausted_until
 
 _LOG = logging.getLogger("lgwd.registry")
 
@@ -320,6 +321,88 @@ class RegistryService:
             "env": env,
         }
 
+    def resolve_role(self, params, *, principal=None, authz=None):
+        role = params["role"]
+        if role in ("PM", "PMO"):
+            raise ApiError(400, "role_not_selectable")
+        table = self._roles_provider() if self._roles_provider is not None else None
+        if table is None:
+            raise ApiError(503, "roles_unavailable")
+        if role not in ROLES or role not in table.roles:
+            raise not_found()
+        slots = table.roles[role]
+        model = params.get("model")
+        if model is not None and not any(s.model == model for s in slots):
+            raise model_not_allowed()
+        level = _stricter_privacy(params.get("data") or "real", self._policy.roles[role].floor)
+        if not any((model is None or s.model == model) and PRIVACY_LEVELS.index(self._policy.subscriptions[s.subscription].privacy) >= PRIVACY_LEVELS.index(level) for s in slots):
+            raise privacy_not_allowed()
+        now = self._clock.now()
+        skipped = []
+        selected = None
+        def evaluate(cur, n, slot):
+            sub = self._policy.subscriptions[slot.subscription]
+            cd = self._cooldown(cur, sub.name, now)
+            mcds = self._model_cooldowns(cur, sub.name, now)
+            mcd = mcds.get(slot.model)
+            usage = self._safe_usage(sub.name, now)
+            times = [from_rfc3339(x["until"]) for x in (cd, mcd) if x]
+            ut = exhausted_until(usage, now)
+            if ut is not None:
+                times.append(ut)
+            lift = to_rfc3339(max(times)) if times else None
+            deployed = self._deployed(sub.name)
+            checks = ((model is not None and slot.model != model, "model_mismatch"),
+                      (PRIVACY_LEVELS.index(sub.privacy) < PRIVACY_LEVELS.index(level), "privacy_not_allowed"),
+                      (slot.short_only and params["task_length"] == "long", "short_only"),
+                      (sub.name in params.get("exclude", []), "excluded"),
+                      (slot.family in params.get("exclude_family", []), "excluded_family"),
+                      (not deployed, "not_deployed"), (bool(cd), "subscription_cooling"),
+                      (bool(mcd), "model_cooling"), (ut is not None, "usage_exhausted"))
+            reason = next((reason for cond, reason in checks if cond), None)
+            record = {"slot": n, "subscription": sub.name, "model": slot.model, "reason": reason, "until": lift}
+            return record, (n, slot, sub, cd, mcds, usage)
+
+        with self._store.txn() as cur:
+            for n, slot in enumerate(slots, 1):
+                record, candidate = evaluate(cur, n, slot)
+                if record["reason"] is None:
+                    selected = candidate
+                    break
+                skipped.append(record)
+        if selected is None:
+            cooling = [x for x in skipped if x['reason'] in ('subscription_cooling', 'model_cooling', 'usage_exhausted')]
+            excluded = [x for x in skipped if x['reason'] in ('short_only', 'excluded', 'excluded_family') and x['until']]
+            if cooling:
+                raise ApiError(409, 'cooling', until=min(x['until'] for x in cooling), skipped=skipped)
+            if any(x['reason'] == 'not_deployed' for x in skipped):
+                raise ApiError(409, 'not_deployed', skipped=skipped)
+            raise ApiError(409, 'no_candidate', until=min((x['until'] for x in excluded), default=None), skipped=skipped)
+        n, slot, sub, cd, mcds, usage = selected
+        if authz is not None:
+            authz(slot.agent)
+        info = provider_for(sub.name)
+        key = None if info.kind == 'local-login' else self._keys.get(sub.name)
+        if key is None and info.kind != 'local-login':
+            skipped.append({'slot': n, 'subscription': sub.name, 'model': slot.model, 'reason': 'not_deployed', 'until': None})
+            with self._store.txn() as cur:
+                for index, remaining in enumerate(slots[n:], n + 1):
+                    record, _ = evaluate(cur, index, remaining)
+                    skipped.append(record)
+            raise ApiError(409, 'not_deployed', skipped=skipped)
+        env = info.build_env(slot.agent, key, slot.model)
+        with self._store.txn() as cur:
+            self._store.audit_role(cur, to_rfc3339(now), sub.name, slot, n, info.provider,
+                                   principal, params, level, table.table_sha, skipped)
+        meta = {'subscription': sub.name, 'provider': info.provider, 'kind': info.kind,
+                'agent': slot.agent, 'model': slot.model, 'models': {'allow': list(sub.models_allow), 'default': sub.models_default},
+                'endpoint': info.endpoint, 'priority': sub.priority, 'data': params.get('data'),
+                'cooldown': cd, 'model_cooldowns': mcds, 'usage': usage, 'role': role, 'slot': n,
+                'effort': slot.effort, 'tier': slot.tier, 'family': slot.family,
+                'short_only': slot.short_only, 'unscored': slot.unscored, 'data_effective': level,
+                'task_length': params['task_length'], 'table_sha': table.table_sha, 'skipped': skipped}
+        return {'schema': RESOLVE_SCHEMA_VERSION, 'env_schema': ENV_SCHEMA_VERSION, 'meta': meta, 'env': env}
+
     def register_cooldown(self, subscription: str, body: dict, *,
                           principal: str | None = None) -> None:
         """POST /v1/subscriptions/{id}/cooldown {until[, model]}：成功為 None（HTTP 204）。
@@ -358,6 +441,7 @@ class RegistryService:
                 cur, stamp, subscription, "cooldown",
                 until=to_rfc3339(effective), model=model, principal=principal,
             )
+            cur.execute("UPDATE audit SET cooldown_mode = ?, prev_until = ? WHERE seq = last_insert_rowid()", ("extend", prev["until"] if prev is not None and from_rfc3339(prev["until"]) > now else None))
 
     def _cooldown_model(self, sub: SubscriptionPolicy, model) -> str | None:
         """驗登錄冷卻的選填 model；回有效的模型 id，或 None（沒給／null＝整把）。

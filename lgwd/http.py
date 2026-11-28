@@ -93,8 +93,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import auth as auth_mod
-from . import framing
-from .auth_authz import authorize
+from . import framing, rolequery
+from .auth_authz import authorize, authorize_role_slot
 from .errors import ApiError, bad_request, body_too_large, not_found
 
 _LOG = logging.getLogger("lgwd.http")
@@ -124,7 +124,7 @@ _RESOLVE_PARAMS = ("agent", "provider", "model", "subscription", "exclude", "dat
 
 # roles 認得的 query 參數與 resolve 的相同（#100 時另立含 data 的集合；#102 起 data
 # 進了 _RESOLVE_PARAMS 而重複，改成同一份別名；spec role-allocation）。
-_ROLES_PARAMS = _RESOLVE_PARAMS
+_ROLES_PARAMS = ("agent", "provider", "model", "subscription", "exclude", "data")
 
 
 def _parse_json_body(raw: bytes) -> dict:
@@ -245,7 +245,7 @@ def _resolve_query(query: str) -> dict:
 
     data 的值合法性由 service 驗（與 agent、model 同層），HTTP 層只管形狀。
     """
-    return _query(query, _RESOLVE_PARAMS)
+    return rolequery.resolve_query(query, _query, _RESOLVE_PARAMS)
 
 
 def _roles_query(query: str) -> dict:
@@ -437,6 +437,7 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
             finally:
                 if permit:
                     self._framing_sem.release()
+            pending = None
             if verdict is not None:
                 if verdict.outcome == auth_mod.OUTCOME_PASS:
                     # C-907：驗章與 accept 之後、apply／業務之前授權。C-909：agent／
@@ -451,7 +452,10 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                         # 換成 forbidden：apply 是模式對應與事件記錄的唯一一處。
                         verdict = auth_mod.forbidden(verdict.principal, reason)
                 # 號誌先放、再決定要回應什麼（REPORT-D2c-arch §2.2）。
-                if self._apply_verdict(verdict, template, method=method, log_path=path):
+                if (verdict.outcome == auth_mod.OUTCOME_PASS and parse_error is None
+                        and route[0] == "resolve" and params is not None and "role" in params):
+                    pending = verdict
+                elif self._apply_verdict(verdict, template, method=method, log_path=path):
                     return
                 if parse_error is not None:
                     # C-902：query 形狀錯不判授權，維持與 off 相同的業務 400。
@@ -479,7 +483,7 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                                                  auth_mod.OUTCOME_FORBIDDEN)
                          else None)
             self._respond(method, path, route, query, body, params=params,
-                          principal=principal)
+                          principal=principal, pending=pending, template=template)
 
         def _read_gated_body(self, length: int, template: str,
                              method: str, path: str):
@@ -495,8 +499,11 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                     method=method, log_path=path, close_on_warn=True)
                 return None
 
+        class _Responded(Exception):
+            pass
+
         def _respond(self, method: str, path: str, route, query: str, body=_UNREAD,
-                     params=None, principal=None):
+                     params=None, principal=None, pending=None, template=None):
             """路由 → service → 回應（含錯誤對應與 log）。off 與 gated 共用。
 
             ``params`` 是 gated 路徑已經解析好的 query dict（C-909：與授權用同一份）；
@@ -515,14 +522,33 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                     status, payload = 200, service.list_usage_summary()
                 elif route[0] == "resolve":
                     q = _resolve_query(query) if params is None else params
-                    payload = service.resolve(
-                        q.get("agent"), q.get("provider"),
-                        model=q.get("model"),
-                        subscription=q.get("subscription"),
-                        exclude=q.get("exclude"),
-                        data=q.get("data"),
-                        principal=principal,
-                    )
+                    if "role" in q:
+                        settled = False
+                        def settle(verdict):
+                            nonlocal settled
+                            if not settled:
+                                settled = True
+                                return self._apply_verdict(verdict, template, method=method, log_path=path)
+                            return False
+                        def authorize_slot(agent):
+                            reason = authorize_role_slot(pending.permissions, q["role"], agent)
+                            verdict = auth_mod.forbidden(pending.principal, reason) if reason else pending
+                            if settle(verdict):
+                                raise self._Responded()
+                        try:
+                            payload = service.resolve_role(q, principal=principal, authz=authorize_slot if pending else None)
+                        finally:
+                            if pending:
+                                settle(pending)
+                    else:
+                        payload = service.resolve(
+                            q.get("agent"), q.get("provider"),
+                            model=q.get("model"),
+                            subscription=q.get("subscription"),
+                            exclude=q.get("exclude"),
+                            data=q.get("data"),
+                            principal=principal,
+                        )
                     status = 200
                 elif route[0] == "roles":
                     q = _roles_query(query) if params is None else params
@@ -534,6 +560,8 @@ def _api_handler(service, mode: str, semaphore, gate=None, auth_log=None):
                         body = _read_json(self)
                     service.register_cooldown(route[1], body, principal=principal)
                     status, payload = 204, {}
+            except self._Responded:
+                return
             except ApiError as exc:
                 _LOG.info("%s %s -> %s", method, path, exc.status)
                 _send_json(self, exc.status, exc.body())

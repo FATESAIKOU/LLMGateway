@@ -1063,7 +1063,7 @@ sudo chmod 0600 /etc/llmgateway/local-admin-signing-key
 
 **root：** 不用。**lgwd 停止：** 不用。
 
-resolve 的請求不帶角色，名冊只能限制 agent（`resolve_agents`）。要依角色限制 resolve，需要 schema 2，不在本期範圍；不要把 role 字串當成可信來源。
+舊的 `resolve?agent=` 仍只能限制 agent。`resolve?role=…` 先依角色表選出一格，選中後才以驗章時同一份名冊快照檢查：該格的 agent 須在 `resolve_agents`，且在 `roles[role]` 內（否則 `forbidden_agent`／`forbidden_role`）。模式照舊：off 不檢查；warn 記下 would-deny 後照舊執行；enforce 回 403，而且取不到該格的金鑰。每個 role 請求只記一筆認證事件（最終結果）。`role` 字串由呼叫端宣告，限制的是「這把金鑰能以哪個角色拿到哪個 agent」，不是可信來源。
 
 ### 8.7 cooldown 粒度粗（g）
 
