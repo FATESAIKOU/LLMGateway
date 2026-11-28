@@ -20,7 +20,7 @@ from lgwd.keys import KEY_NAMES, KeyStore
 from lgwd.policy import UsageSetting, load_policy
 from lgwd.providers import AnthropicProvider, GoogleProvider, UsageDeps, provider_for
 from lgwd.registry import RegistryService
-from lgwd.store import Store
+from lgwd.store import _AUDIT_MIGRATE_COLUMNS, Store
 from lgwd import usage as lgwd_usage
 from lgwd.usage import FetchResult, UsageService, failure
 from lgwd.usage_ollama import OllamaUsageFetcher
@@ -626,6 +626,18 @@ class AuditAdditiveMigrationTest(unittest.TestCase):
             self.assertEqual(set(rows[0]), self.OLD_KEYS)  # audit_all() 欄位不因遷移而變
             self.assertIsNone(rows[0]["provider"])
             self.assertIsNone(rows[0]["principal"])
+            # audit_all() 只回 OLD_KEYS，看不到新欄：舊列的每個遷移欄直接 SELECT；欄名取自 lgwd/store.py，不在這裡抄一份
+            for name in _AUDIT_MIGRATE_COLUMNS:
+                with self.subTest(column=name):
+                    self.assertEqual(self._columns()[name], "TEXT")
+                    conn = sqlite3.connect(self.db)
+                    try:
+                        value = conn.execute(
+                            "SELECT {0} FROM audit WHERE seq = ?".format(name),
+                            (rows[0]["seq"],)).fetchone()[0]
+                    finally:
+                        conn.close()
+                    self.assertIsNone(value)
         finally:
             store.close()
 

@@ -645,8 +645,9 @@ class PipesContractTest(unittest.TestCase):
         self.assertNotIn("limit_remaining", dump)
 
 
-# 出廠四個 not_applicable 訂閱（design D5）
-FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity-gemini", "chatgpt-personal")
+# 出廠五個 not_applicable 訂閱（design D5；antigravity 拆兩管：gemini 與 claude-oss）
+FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity-gemini",
+                          "antigravity-claude-oss", "chatgpt-personal")
 FORBIDDEN_FOR_OK_UNKNOWN = {"no_quota_api", "unavailable"}
 
 
