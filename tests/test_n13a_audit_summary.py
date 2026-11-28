@@ -359,3 +359,28 @@ class ReadOnlyAndEntryTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NullKeyTests(_Base):
+    """L-11（#347 硬化）：tier／data 為 NULL 的 role_resolves 列，CLI 要能輸出，不 TypeError。"""
+
+    def test_l11_null_tier_and_data_rows_cli_exits_0_with_null_keys(self):
+        self.new_db()
+        self.add("2026-12-04T01:00:00Z", role="impl", tier=None, data=None)
+        self.add("2026-12-04T01:01:00Z", role="impl", tier="free", data="public")
+        self.add("2026-12-04T01:02:00Z", role="qa", tier=None, data="general")
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["role_resolves"], 3)
+        self.assertEqual(result["by_tier"], {"free": 1, "null": 2})
+        self.assertEqual(result["by_data"], {"general": 1, "null": 1, "public": 1})
+        self.assertEqual(result["by_data_tier"]["null"], {"null": 1})
+        self.assertEqual(result["by_data_tier"]["general"], {"null": 1})
+        # 鍵順序穩定：輸出兩次一致
+        self.assertEqual(self.run_cli()[1], out)
+
+    def test_l11_null_keys_helper_is_recursive_and_keeps_values(self):
+        value = {None: {None: 1, "a": [{None: 2}]}, "b": None}
+        self.assertEqual(audit_summary._null_keys(value),
+                         {"null": {"null": 1, "a": [{"null": 2}]}, "b": None})

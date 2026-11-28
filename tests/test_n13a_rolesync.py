@@ -25,6 +25,8 @@ def layout(tmp_path):
     Path(l.state_dir).mkdir(parents=True)
     shutil.copy(ROOT/'policy/default.json', Path(l.current_link,'policy/default.json'))
     Path(l.current_link,'policy/role-rotation.default.json').write_bytes(RAW)
+    Path(l.rolesync_script).parent.mkdir(parents=True)
+    Path(l.rolesync_script).write_text('#!/bin/sh\nexit 0\n'); os.chmod(l.rolesync_script, 0o755)  # 新版 release 才有 role-sync（H-1）
     return l
 
 def check(l):
@@ -48,6 +50,29 @@ def test_check_order(tmp_path):
     Path(l.rolesync_status_file).unlink()
     assert check(l)=='fail'
 
+def test_h1_rollback_release_without_rolesync_is_not_applicable(tmp_path):
+    # H-1：current 指向沒有 ops-scripts/role-sync 的舊版（回滾後）→ ok，不看表與狀態
+    l=layout(tmp_path); os.unlink(l.rolesync_script)
+    assert check(l)=='ok'
+    Path(l.role_table_file).write_bytes(b'bad')
+    Path(l.rolesync_status_file).write_text(json.dumps({'ts':time.time(),'ok':False,'ever_ok':True,'reason':'gh_auth'}))
+    Path(l.current_link,'policy/role-rotation.default.json').unlink()
+    assert check(l)=='ok'
+    Path(l.rolesync_status_file).write_text('bad')
+    assert check(l)=='ok'
+
+def test_h1_release_with_rolesync_both_tables_bad_still_fails(tmp_path):
+    l=layout(tmp_path)
+    Path(l.role_table_file).write_bytes(b'bad')
+    Path(l.current_link,'policy/role-rotation.default.json').write_bytes(b'bad')
+    Path(l.rolesync_status_file).write_text(json.dumps({'ts':time.time(),'ok':True,'ever_ok':True,'reason':'ok'}))
+    assert check(l)=='fail'
+
+def test_h1_release_with_rolesync_first_sync_is_todo(tmp_path):
+    l=layout(tmp_path)
+    assert not os.path.exists(l.rolesync_status_file)
+    assert check(l)=='todo'
+
 @pytest.mark.parametrize('value', ['bad', '[]', '{"ok":1}', json.dumps({'ts':True,'ok':True,'ever_ok':True,'reason':'ok'}), json.dumps({'ts':time.time()+300,'ok':True,'ever_ok':True,'reason':'ok'})])
 def test_bad_status(tmp_path,value):
     l=layout(tmp_path); Path(l.rolesync_status_file).write_text(value); assert check(l)=='fail'
@@ -55,7 +80,7 @@ def test_bad_status(tmp_path,value):
 def test_reload_retries_bad_same_stamp_and_success_does_not_retry(tmp_path):
     p=tmp_path/'roles'; p.write_bytes(RAW)
     g=object.__new__(main.Gateway); import threading
-    g._roles_path=str(p); g._role_policy=POLICY; g._roles_lock=threading.Lock(); g._roles=roletable.parse(RAW,POLICY); g._roles_stamp=main._stat_stamp(str(p))
+    g._roles_path=str(p); g._role_policy=POLICY; g._roles_lock=threading.Lock(); g._roles=roletable.parse(RAW,POLICY); g._roles_stamp=main._stat_stamp(str(p)); g._roles_warned_stamp=None
     p.write_bytes(b'bad'); old=g._roles
     with patch.object(roletable,'load_valid', wraps=roletable.load_valid) as load:
         assert not g.reload_roles_if_changed(); assert not g.reload_roles_if_changed(); assert load.call_count==2; assert g._roles is old
@@ -116,7 +141,7 @@ def test_provider_atomic_concurrent_reload(tmp_path):
     p=tmp_path/'roles'; p.write_bytes(RAW)
     other=json.loads(RAW); other['roles']['impl'][0]['tier']='normal'; raw_b=json.dumps(other).encode()
     a=roletable.parse(RAW,POLICY); b=roletable.parse(raw_b,POLICY)
-    g=object.__new__(main.Gateway); g._roles_path=str(p); g._role_policy=POLICY; g._roles_lock=threading.Lock(); g._roles=a; g._roles_stamp=main._stat_stamp(str(p))
+    g=object.__new__(main.Gateway); g._roles_path=str(p); g._role_policy=POLICY; g._roles_lock=threading.Lock(); g._roles=a; g._roles_stamp=main._stat_stamp(str(p)); g._roles_warned_stamp=None
     seen=[]
     def reader():
         for _ in range(80):
@@ -131,7 +156,7 @@ def test_provider_atomic_concurrent_reload(tmp_path):
 def test_concurrent_same_stamp_only_one_load(tmp_path):
     import threading
     p=tmp_path/'roles'; p.write_bytes(RAW)
-    g=object.__new__(main.Gateway); g._roles_path=str(p); g._role_policy=POLICY; g._roles_lock=threading.Lock(); g._roles=None; g._roles_stamp=None
+    g=object.__new__(main.Gateway); g._roles_path=str(p); g._role_policy=POLICY; g._roles_lock=threading.Lock(); g._roles=None; g._roles_stamp=None; g._roles_warned_stamp=None
     barrier=threading.Barrier(3)
     def reload(): barrier.wait(); g.reload_roles_if_changed()
     with patch.object(roletable,'load_valid', wraps=roletable.load_valid) as load:
@@ -287,3 +312,101 @@ def test_timer_stop_sigterms_its_child_and_lets_it_clean_up(tmp_path):
         assert ready.exists(), 'fake role-sync never installed its SIGTERM trap'
     finally: timer.stop()
     assert mark.exists() and mark.read_text()=='term\n'
+
+def _reload_gateway(path):
+    import threading
+    g=object.__new__(main.Gateway); g._roles_path=str(path); g._role_policy=POLICY; g._roles_lock=threading.Lock()
+    g._roles=roletable.parse(RAW,POLICY); g._roles_stamp=main._stat_stamp(str(path)); g._roles_warned_stamp=None
+    return g
+
+def test_m2_bad_table_retries_each_request_but_warns_once_per_stamp(tmp_path, caplog):
+    import logging
+    p=tmp_path/'roles'; p.write_bytes(RAW)
+    g=_reload_gateway(p)
+    replacement=tmp_path/'new'; replacement.write_bytes(b'bad-1'); replacement.replace(p)
+    with caplog.at_level(logging.WARNING, logger='lgwd.main'), patch.object(roletable,'load_valid', wraps=roletable.load_valid) as load:
+        for _ in range(5): assert not g.reload_roles_if_changed()
+    # 失敗不推進戳：同一個壞 stamp 每個請求都重試（C-1032 h1）
+    assert load.call_count==5
+    warns=[r for r in caplog.records if r.getMessage()=='role table reload failed']
+    assert len(warns)==1
+    # 檔案再變（stamp 變）→ 再警告一次
+    replacement=tmp_path/'new2'; replacement.write_bytes(b'bad-2'); replacement.replace(p)
+    with caplog.at_level(logging.WARNING, logger='lgwd.main'):
+        assert not g.reload_roles_if_changed(); assert not g.reload_roles_if_changed()
+    warns=[r for r in caplog.records if r.getMessage()=='role table reload failed']
+    assert len(warns)==2
+
+def test_m2_success_resets_warning_state(tmp_path, caplog):
+    import logging
+    p=tmp_path/'roles'; p.write_bytes(b'bad-0')
+    g=_reload_gateway(p); g._roles_stamp=None
+    with caplog.at_level(logging.WARNING, logger='lgwd.main'):
+        assert not g.reload_roles_if_changed()
+        assert g._roles_warned_stamp is not None
+        replacement=tmp_path/'good'; replacement.write_bytes(RAW); replacement.replace(p)
+        assert g.reload_roles_if_changed()
+        assert g._roles_warned_stamp is None
+        replacement=tmp_path/'bad'; replacement.write_bytes(b'bad-3'); replacement.replace(p)
+        assert not g.reload_roles_if_changed()
+    assert len([r for r in caplog.records if r.getMessage()=='role table reload failed'])==2
+
+@pytest.mark.parametrize('fallback_good,note', [
+    (False, 'role table unavailable; no usable table (role path disabled)'),
+    (True, 'role table unavailable; using tag fallback'),
+])
+def test_l3_startup_note_when_primary_and_fallback_bad(tmp_path, monkeypatch, fallback_good, note):
+    from tests.test_main import key_text, FAKE_KEYS
+    from tests.usage_fakes import refuse_http
+    from lgwd.providers import UsageDeps
+    monkeypatch.setenv('LLMGW_PREFIX', str(tmp_path))
+    d=tmp_path/'var/lib/llmgateway'; d.mkdir(parents=True); (d/'role-rotation.json').write_bytes(b'bad')
+    policy_dir=tmp_path/'policy'; policy_dir.mkdir(); shutil.copy(ROOT/'policy/default.json', policy_dir/'default.json')
+    (policy_dir/'role-rotation.default.json').write_bytes(RAW if fallback_good else b'bad')
+    keys=tmp_path/'keys'; keys.write_text(key_text(FAKE_KEYS))
+    cfg=main.Config(db=str(tmp_path/'db'), keys_path=str(keys), policy_path=str(policy_dir/'default.json'), api_port=0, keysync_interval=0)
+    gw=main.Gateway(cfg, usage_deps=UsageDeps(http_get=refuse_http))
+    try:
+        assert gw.startup_notes == [note]
+        assert (gw._service._roles_provider() is not None) == fallback_good
+    finally:
+        gw.api_server.server_close()
+
+def _fake_rolesync(tmp_path, body):
+    script=tmp_path/'fake-role-sync'; script.write_text('#!/bin/sh\n'+body); script.chmod(0o755)
+    d=tmp_path/'var/lib/llmgateway'; d.mkdir(parents=True, exist_ok=True)
+    return script, d, dict(os.environ, LLMGW_PREFIX=str(tmp_path))
+
+def test_l1_nonzero_exit_without_status_writes_failure_and_keeps_ever_ok(tmp_path):
+    script,d,env=_fake_rolesync(tmp_path,'exit 3\n')
+    (d/'.rolesync.status').write_text(json.dumps({'ts':time.time()-3600,'ok':True,'ever_ok':True,'reason':'ok'}))
+    timer=RoleSyncTimer(str(script),timeout=5,env=env)
+    assert not timer.run_once()
+    status=json.loads((d/'.rolesync.status').read_text())
+    assert status['ok'] is False and status['reason']=='exit_3' and status['ever_ok'] is True
+    assert type(status['ts']) in (int,float) and status['ts']>time.time()-60
+
+def test_l1_first_run_crash_records_ever_ok_false(tmp_path):
+    script,d,env=_fake_rolesync(tmp_path,'exit 1\n')
+    assert not RoleSyncTimer(str(script),timeout=5,env=env).run_once()
+    status=json.loads((d/'.rolesync.status').read_text())
+    assert status['ok'] is False and status['reason']=='exit_1' and status['ever_ok'] is False
+
+def test_l1_signal_death_records_signal_number(tmp_path):
+    script,d,env=_fake_rolesync(tmp_path,'kill -9 $$\n')
+    assert not RoleSyncTimer(str(script),timeout=5,env=env).run_once()
+    status=json.loads((d/'.rolesync.status').read_text())
+    assert status['ok'] is False and status['reason']=='signal_9' and status['ever_ok'] is False
+
+def test_l1_status_already_written_by_child_is_not_overwritten(tmp_path):
+    status='$LLMGW_PREFIX/var/lib/llmgateway/.rolesync.status'
+    body=('printf %s \'{"ts":1,"ok":false,"ever_ok":false,"reason":"gh_auth"}\' > "' + status + '.tmp" && mv -f "' + status + '.tmp" "' + status + '"\n'
+          'exit 3\n')
+    script,d,env=_fake_rolesync(tmp_path,body)
+    assert not RoleSyncTimer(str(script),timeout=5,env=env).run_once()
+    assert json.loads((d/'.rolesync.status').read_text())['reason']=='gh_auth'
+
+def test_l1_success_writes_nothing_extra(tmp_path):
+    script,d,env=_fake_rolesync(tmp_path,'exit 0\n')
+    assert RoleSyncTimer(str(script),timeout=5,env=env).run_once()
+    assert not (d/'.rolesync.status').exists()

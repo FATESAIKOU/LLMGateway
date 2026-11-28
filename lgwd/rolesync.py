@@ -24,10 +24,21 @@ class RoleSyncTimer:
         self._proc = None
         self._thread = None
 
-    def _failure(self, reason):
+    def _paths(self):
         env = os.environ if self.env is None else self.env
         directory = env.get('LLMGW_PREFIX', '').rstrip('/') + '/var/lib/llmgateway'
-        path = os.path.join(directory, '.rolesync.status')
+        return directory, os.path.join(directory, '.rolesync.status')
+
+    def _status_identity(self):
+        """status 檔的 (inode, mtime_ns, size)；沒有檔回 None。role-sync 用 rename 寫入，inode 會變。"""
+        try:
+            st = os.stat(self._paths()[1])
+        except OSError:
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def _failure(self, reason):
+        directory, path = self._paths()
         try:
             try:
                 with open(path, encoding='utf-8') as f:
@@ -50,6 +61,7 @@ class RoleSyncTimer:
         try:
             with self._lock:
                 if self._stop.is_set(): return False
+                before = self._status_identity()
                 self._proc = subprocess.Popen([self.script], env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 proc = self._proc
             try:
@@ -63,7 +75,13 @@ class RoleSyncTimer:
                     proc.wait()
                 if not self._stop.is_set(): self._failure("timeout")
                 return False
-            return proc.returncode == 0
+            if proc.returncode == 0: return True
+            # L-1：非零退出且 role-sync 沒有更新 status（例如寫 status 前就崩潰）→ 補寫一份失敗狀態。
+            # reason 只含退出碼或訊號編號，不含子行程的任何輸出。
+            if self._status_identity() == before and not self._stop.is_set():
+                rc = proc.returncode
+                self._failure('exit_%d' % rc if rc > 0 else 'signal_%d' % -rc)
+            return False
         except OSError:
             _LOG.warning('rolesync spawn failed')
             if not self._stop.is_set(): self._failure('spawn_failed')
