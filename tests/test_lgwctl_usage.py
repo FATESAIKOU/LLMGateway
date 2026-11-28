@@ -363,7 +363,7 @@ class UsageTests(unittest.TestCase):
         # 且不含「無額度 API」與「100%」。note 原文與 lgwd/usage.py 固定表一致。
         notes = {
             "chatgpt-personal": "額度只在 Codex 的 app-server 介面（需帳戶 session，登入在呼叫方機器上），Gateway 取不到。",
-            "antigravity": "額度只在 agy 的 /usage 與設定頁，沒有公開 API；登入在呼叫方機器上，Gateway 取不到。",
+            "antigravity-gemini": "額度只在 agy 的 /usage 與設定頁，沒有公開 API；登入在呼叫方機器上，Gateway 取不到。",
             "opencode-zen": ZEN_NOTE,
             "opencode-go": GO_NOTE,
         }

@@ -7,6 +7,7 @@
 - 兩者互不覆蓋：輪換表不列角色，分配表不列模型；改一張不等於改另一張。
 - 挑模型時先由 `roles` 取候選訂閱（依 `rank`，資料等級不夠的已被 Gateway 篩掉、不會降級），再在這張表裡挑該把訂閱可用的模型。
 - 分配表的規則與設計見 `openspec/changes/role-subscription-allocation/`，不在此重抄。
+- privacy 現況（2026-11-28，本人核准）：agy 兩管（`antigravity-gemini`、`antigravity-claude-oss`）與 `chatgpt-personal` 為 `real`（原為 `public`／`general`）；免費的 `opencode-zen`、`openrouter` 仍為 `public`，不碰真資料；`opencode-go`、`ollama-cloud`、`claude-personal` 不變。
 
 這張表是 PMO／PM 挑模型的參考，**不自動改** `policy/default.json`；政策變更仍走獨立 PR。
 
@@ -129,7 +130,9 @@
 
 ※ policy 的 chatgpt-personal allow 實為 7 個（含 `gpt-5.5`）。
 
-### ② agy（antigravity 可見模型；實際 allow 見 `policy/default.json`，neon 只放 low）
+### ② agy（antigravity 可見模型；實際 allow 見 `policy/default.json`）
+
+**現況（2026-11-28）**：agy 分兩管——`antigravity-gemini`（Gemini 系：flash、neon、carbon、argon、hydrogen、orchestrator，共 20 個 id）與 `antigravity-claude-oss`（Claude Opus／Sonnet 5.5 共 6 個 id，加 `gpt-oss-120b-medium`），分組依 `agy models` 原樣輸出；兩管都是 `real`。`gemini-4-neon` 的 low／medium／high／xhigh 四格都已在 allow 內（先前只放 low）。下面的表與分數仍是當時的評估，不因分管而改。
 
 **額度**：官方 `agy` 的 `/usage` 文件（https://antigravity.google/docs/cli/commands/usage/ ，2026-11-20 讀取）寫「Gemini models」等同一模型組共用一個週上限與一個 5 小時上限；本人 2026-11-20 提醒（MyPMO#451）`gemini-4-neon` 吃 agy「Gemini models」那一管額度，與 `gemini-3.8-flash` 共用同一管。官方沒有逐字點名 Neon 屬於「Gemini models」組，這一步來自本人提醒。**推論**（未驗）：同管用盡時上游會同時拒絕這兩支；Gateway 的冷卻是逐模型登錄的（`openspec/specs/subscription-cooldown`），一支撞 429 不會讓另一支自動顯示冷卻，派工要自己避開。所以把 neon-low 排進 review／架構師來源時，會與 flash 的其他用途搶同一份額度，不要把它當成獨立額度來源。
 

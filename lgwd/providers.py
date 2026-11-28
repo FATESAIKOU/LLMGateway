@@ -196,7 +196,8 @@ PROVIDERS: dict[str, CredentialProvider] = {
     "opencode-go": OpenCodeGoProvider(),
     "groq": GroqProvider(),
     "ollama-cloud": OllamaCloudProvider(),
-    "antigravity": GoogleProvider(),
+    "antigravity-gemini": GoogleProvider(),
+    "antigravity-claude-oss": GoogleProvider(),
     "chatgpt-personal": OpenAIProvider(),
 }
 

@@ -47,7 +47,13 @@ CREATE TABLE IF NOT EXISTS audit (
 # v5 schema（gateway-v0）的 audit 沒有的欄位；啟動時以 PRAGMA table_info 檢查、
 # ALTER TABLE ADD COLUMN 補上（只增不改；舊資料的新欄位為 null）。
 # principal 是 D3b 加的（沒有應用層認證的舊 DB 沒有這一欄）。
-_AUDIT_MIGRATE_COLUMNS = ("provider", "model", "principal")
+# #347 §4.1 的 role 路徑欄位（全 TEXT、additive）也在這裡補；寫入端在後續 PR，舊列為 NULL。
+_AUDIT_MIGRATE_COLUMNS = (
+    "provider", "model", "principal",
+    "role", "slot", "tier", "family", "effort", "exclude_family", "task_length",
+    "skipped", "skipped_truncated", "explicit_model", "data", "data_declared",
+    "ref", "table_sha", "cooldown_mode", "prev_until", "os_user",
+)
 
 
 class Store:

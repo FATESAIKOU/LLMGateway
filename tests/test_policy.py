@@ -54,8 +54,10 @@ class LoadDefaultPolicyTests(unittest.TestCase):
     def test_default_policy_loads(self):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         order = [s.name for s in policy.in_priority_order()]
+        # #347 §5.1：agy 拆兩管（gemini priority 35、claude-oss 36）
         self.assertEqual(order, ["opencode-zen", "opencode-go", "openrouter",
-                                 "ollama-cloud", "antigravity", "chatgpt-personal",
+                                 "ollama-cloud", "antigravity-gemini",
+                                 "antigravity-claude-oss", "chatgpt-personal",
                                  "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].agents, ("claude-code",))
         self.assertEqual(policy.subscriptions["opencode-zen"].agents, ("opencode",))
@@ -63,7 +65,9 @@ class LoadDefaultPolicyTests(unittest.TestCase):
                          ("*:free", "openrouter/free"))
         self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
         self.assertIn("claude-code", policy.subscriptions["ollama-cloud"].agents)
-        self.assertEqual(policy.subscriptions["antigravity"].agents, ("agy",))
+        self.assertEqual(policy.subscriptions["antigravity-gemini"].agents, ("agy",))
+        self.assertEqual(policy.subscriptions["antigravity-claude-oss"].agents, ("agy",))
+        self.assertNotIn("antigravity", policy.subscriptions)  # 舊 id 已移除（§5.1）
         # #187 P4：Codex 的個人訂閱（agent codex、provider openai）
         self.assertEqual(policy.subscriptions["chatgpt-personal"].agents, ("codex",))
         self.assertEqual(policy.until_max_ahead_seconds, 691200)
@@ -76,11 +80,12 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         self.assertEqual(set(policy.subscriptions),
                          {"claude-personal", "opencode-zen", "opencode-go",
-                          "openrouter", "ollama-cloud", "antigravity",
-                          "chatgpt-personal"})
+                          "openrouter", "ollama-cloud", "antigravity-gemini",
+                          "antigravity-claude-oss", "chatgpt-personal"})
         self.assertEqual([s.name for s in policy.in_priority_order()],
                          ["opencode-zen", "opencode-go", "openrouter",
-                          "ollama-cloud", "antigravity", "chatgpt-personal",
+                          "ollama-cloud", "antigravity-gemini",
+                          "antigravity-claude-oss", "chatgpt-personal",
                           "claude-personal"])
         self.assertEqual(policy.subscriptions["claude-personal"].models_default,
                          "claude-sonnet-5-5")
@@ -96,10 +101,10 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(len(or_sub.models_allow), 2)
 
     def test_出廠七筆訂閱的models_default(self):
-        # 出廠政策檔逐筆釘住：七筆各自有 default（#50 起 claude-personal 預設
+        # 出廠政策檔逐筆釘住：各筆各自有 default（#50 起 claude-personal 預設
         # claude-sonnet-5-5，claude-company 已移除；#77 加 opencode-go；
         # #88 加 groq、#128 移除；#107 加 antigravity；#187 P4 加
-        # chatgpt-personal）。非 null 的 default 必須被同一筆的 allow 樣式涵蓋
+        # chatgpt-personal；#347 §5.1 antigravity 拆兩管）。非 null 的 default 必須被同一筆的 allow 樣式涵蓋
         # （allow 是 fnmatch 樣式；lgwd 沒有現成的比對函式，測試內用 fnmatchcase 檢查）。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         expected = {
@@ -108,7 +113,8 @@ class LoadDefaultPolicyTests(unittest.TestCase):
             "opencode-go": "beam-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
-            "antigravity": "gemini-3.8-flash-low",
+            "antigravity-gemini": "gemini-3.8-flash-low",
+            "antigravity-claude-oss": "claude-sonnet-5-5-medium",
             # #187 P4：default 為官方推薦、非退役的 gpt-6.1-sol
             "chatgpt-personal": "gpt-6.1-sol",
         }
@@ -156,57 +162,59 @@ class LoadDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(_covered(go, "big-pickle"))  # #149
         self.assertFalse(_covered(go, "kimi-k3"))  # 付費的 id
 
-    def test_antigravity出廠17個字面模型id(self):
-        # 出廠 antigravity allow 17 個（#107 本人從 `agy models` 抄的 12＋#198 的 hydrogen 4＋#217 的 neon-low 1）；agy models 另有不放行的 id（見 docs/model-rotation.md §②）。
-        # 出廠政策只放字面 id（不含萬用字元）：錯字在 resolve 就是 403，不會延到 agy。
+    def test_antigravity兩管出廠27個字面模型id(self):
+        # #347 §5.1（修訂 3f）：antigravity 拆兩管，依 `agy models`（2026-11-28 原樣輸出）
+        # 分組：Gemini 系 20 個進 antigravity-gemini，Claude＋gpt-oss 7 個進 antigravity-claude-oss，
+        # 兩份清單合起來正好 27 個、不重疊。出廠政策只放字面 id（不含萬用字元）：錯字在
+        # resolve 就是 403，不會延到 agy。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
-        sub = policy.subscriptions["antigravity"]
-        expected = (
-            "gemini-3.8-flash-low",
-            "gemini-3.8-flash-medium",
-            "gemini-3.8-flash-high",
-            "gemini-4-argon-low",
-            "gemini-4-argon-medium",
-            "gemini-4-argon-high",
-            "gemini-4-hydrogen-low",
-            "gemini-4-hydrogen-medium",
-            "gemini-4-hydrogen-high",
+        gemini_expected = (
+            "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
+            "gemini-4-neon-low", "gemini-4-neon-medium", "gemini-4-neon-high", "gemini-4-neon-xhigh",
+            "gemini-4-carbon-low", "gemini-4-carbon-medium", "gemini-4-carbon-high",
+            "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
+            "gemini-4-hydrogen-low", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-high",
             "gemini-4-hydrogen-xhigh",
-            "gemini-4-neon-low",
-            "claude-opus-5-5-low",
-            "claude-opus-5-5-medium",
-            "claude-opus-5-5-high",
-            "claude-sonnet-5-5-low",
-            "claude-sonnet-5-5-medium",
-            "claude-sonnet-5-5-high",
+            "gemini-pro-orchestrator", "gemini-pro-orchestrator-neon",
+            "gemini-pro-orchestrator-argon",
         )
-        self.assertEqual(sub.models_allow, expected)
-        self.assertEqual(sub.models_default, "gemini-3.8-flash-low")
-        self.assertEqual(sub.agents, ("agy",))
-        self.assertEqual(sub.priority, 35)
-        self.assertEqual(sub.privacy, "public")
-        for model_id in expected:
-            with self.subTest(model=model_id):
-                self.assertTrue(_covered(sub, model_id))
-                self.assertNotIn("*", model_id)
-                self.assertNotIn("?", model_id)
-        # 不在清單裡的（含前綴與 GPT-OSS）都不被涵蓋
-        self.assertFalse(_covered(sub, "gemini-9-fake"))
-        self.assertFalse(_covered(sub, "google/gemini-3.8-flash-low"))
-        self.assertFalse(_covered(sub, "gpt-oss-120b"))
-        # #217：neon 只放 low；medium／high／xhigh 與組合管線 orchestrator 不放行
-        for model_id in ("gemini-4-neon-medium", "gemini-4-neon-high",
-                         "gemini-4-neon-xhigh", "gemini-pro-orchestrator-neon",
-                         "gemini-pro-orchestrator-g1-pro", "gpt-oss-120b-medium"):
-            with self.subTest(model=model_id):
-                self.assertFalse(_covered(sub, model_id))
+        oss_expected = (
+            "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high",
+            "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high",
+            "gpt-oss-120b-medium",
+        )
+        gemini = policy.subscriptions["antigravity-gemini"]
+        oss = policy.subscriptions["antigravity-claude-oss"]
+        self.assertEqual(gemini.models_allow, gemini_expected)
+        self.assertEqual(oss.models_allow, oss_expected)
+        self.assertEqual(len(gemini_expected) + len(oss_expected), 27)
+        self.assertFalse(set(gemini_expected) & set(oss_expected))
+        self.assertEqual(gemini.models_default, "gemini-3.8-flash-low")
+        self.assertEqual(oss.models_default, "claude-sonnet-5-5-medium")
+        for sub, expected in ((gemini, gemini_expected), (oss, oss_expected)):
+            self.assertEqual(sub.agents, ("agy",))
+            self.assertEqual(sub.priority, 35 if sub.name == "antigravity-gemini" else 36)
+            self.assertEqual(sub.privacy, "real")  # §5a 本人 2026-11-28 核准
+            for model_id in expected:
+                with self.subTest(sub=sub.name, model=model_id):
+                    self.assertTrue(_covered(sub, model_id))
+                    self.assertNotIn("*", model_id)
+                    self.assertNotIn("?", model_id)
+        # 不在清單裡的（含前綴）都不被涵蓋；Gemini 管不放行 Claude／gpt-oss，反之亦然
+        self.assertFalse(_covered(gemini, "gemini-9-fake"))
+        self.assertFalse(_covered(gemini, "google/gemini-3.8-flash-low"))
+        self.assertFalse(_covered(oss, "gpt-oss-120b"))
+        self.assertFalse(_covered(gemini, "gpt-oss-120b-medium"))
+        self.assertFalse(_covered(oss, "gemini-3.8-flash-low"))
+        self.assertFalse(_covered(gemini, "gemini-pro-orchestrator-g1-pro"))
 
-    def test_roles不含antigravity(self):
-        # #107 本人裁定：roles 不納入（不改 roles 段）。
+    def test_roles不含舊id_antigravity(self):
+        # #347 §5.1：#107 的「roles 不納入」已被 arch 與兩管補進 order 取代；舊 id 移除後不得殘留。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         for role, rp in policy.roles.items():
             with self.subTest(role=role):
                 self.assertNotIn("antigravity", rp.order)
+                self.assertTrue(set(rp.order) <= set(policy.subscriptions))
 
     def test_priority_order_stable_on_ties(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -307,13 +315,13 @@ class PolicyValidationTests(unittest.TestCase):
         self.assertEqual(policy.subscriptions["openrouter"].agents, ("opencode",))
 
     def test_antigravity可載入且agents只給agy(self):
-        # #107：沒有憑證的訂閱（kind local-login）。PR 1 不動出廠政策，用臨時政策檔。
+        # #107：沒有憑證的訂閱（kind local-login）。用臨時政策檔（出廠政策另有測試）。
         obj = _good_policy()
-        obj["subscriptions"]["antigravity"] = _sub(
+        obj["subscriptions"]["antigravity-gemini"] = _sub(
             35, ("agy",), ("gemini-test-id",), "gemini-test-id")
         policy = self._reload(obj)
-        self.assertEqual(policy.subscriptions["antigravity"].agents, ("agy",))
-        self.assertEqual(policy.subscriptions["antigravity"].models_default,
+        self.assertEqual(policy.subscriptions["antigravity-gemini"].agents, ("agy",))
+        self.assertEqual(policy.subscriptions["antigravity-gemini"].models_default,
                          "gemini-test-id")
 
     def test_antigravity的agents必須剛好agy(self):
@@ -322,7 +330,7 @@ class PolicyValidationTests(unittest.TestCase):
             with self.subTest(agents=agents):
                 with self.assertRaises(PolicyError) as ctx:
                     obj = _good_policy()
-                    obj["subscriptions"]["antigravity"] = _sub(
+                    obj["subscriptions"]["antigravity-gemini"] = _sub(
                         35, agents, ("gemini-test-id",), None)
                     self._reload(obj)
                 # 例外訊息不含檔案裡的值
@@ -338,22 +346,51 @@ class PolicyValidationTests(unittest.TestCase):
         self.assertIn("agy", str(ctx.exception))
 
     def test_local_login對照表與錯誤訊息固定(self):
-        # C-1／C-9a：對照表為 antigravity→agy、chatgpt-personal→codex；兩條錯誤訊息逐字不變、不帶檔案裡的值
+        # C-1／C-9a（#347 H1 改寫）：對照表為兩管→agy、chatgpt-personal→codex；
+        # 正向錯誤訊息不變（不帶檔案裡的值）；反向錯誤在 agy 有兩管時改為多訂閱字樣。
         from lgwd.policy import LOCAL_LOGIN_AGENT
-        self.assertEqual(LOCAL_LOGIN_AGENT, {"antigravity": "agy", "chatgpt-personal": "codex"})
+        self.assertEqual(LOCAL_LOGIN_AGENT, {"antigravity-gemini": "agy",
+                                             "antigravity-claude-oss": "agy",
+                                             "chatgpt-personal": "codex"})
         obj = _good_policy()
-        obj["subscriptions"]["antigravity"] = _sub(35, ["claude-code"], ("m",), None)
+        obj["subscriptions"]["antigravity-gemini"] = _sub(35, ["claude-code"], ("m",), None)
         with self.assertRaises(PolicyError) as ctx:
             self._reload(obj)
-        self.assertEqual(str(ctx.exception), "antigravity must only allow agy")
+        self.assertEqual(str(ctx.exception), "antigravity-gemini must only allow agy")
         obj = _good_policy()
         obj["subscriptions"]["ollama-cloud"] = _sub(30, ("agy",))
         with self.assertRaises(PolicyError) as ctx:
             self._reload(obj)
-        self.assertEqual(str(ctx.exception), "agy is only allowed for antigravity")
+        self.assertEqual(str(ctx.exception), "agy is only allowed for local-login subscriptions")
+        # 單一訂閱對應的 agent 仍沿用舊字樣（codex→chatgpt-personal）
+        obj = _good_policy()
+        obj["subscriptions"]["ollama-cloud"] = _sub(30, ("codex",))
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertEqual(str(ctx.exception), "codex is only allowed for chatgpt-personal")
+
+    def test_H1兩管並存不互擋(self):
+        # C-1043（H1 正例）：兩把 agy 本地訂閱同時存在，各自 agents 剛好 agy，載入不拋錯。
+        obj = _good_policy()
+        obj["subscriptions"]["antigravity-gemini"] = _sub(35, ("agy",), ("g-test",), None)
+        obj["subscriptions"]["antigravity-claude-oss"] = _sub(35, ("agy",), ("c-test",), None)
+        policy = self._reload(obj)
+        self.assertEqual(policy.subscriptions["antigravity-gemini"].agents, ("agy",))
+        self.assertEqual(policy.subscriptions["antigravity-claude-oss"].agents, ("agy",))
+
+    def test_H1反例非本地訂閱含agy拒收_多訂閱字樣(self):
+        # C-1043（H1 反例）：有憑證的訂閱含 agy → 拋錯；兩管存在時訊息為多訂閱字樣
+        obj = _good_policy()
+        obj["subscriptions"]["antigravity-gemini"] = _sub(35, ("agy",), ("g-test",), None)
+        obj["subscriptions"]["antigravity-claude-oss"] = _sub(35, ("agy",), ("c-test",), None)
+        obj["subscriptions"]["ollama-cloud"] = _sub(30, ("agy",))
+        with self.assertRaises(PolicyError) as ctx:
+            self._reload(obj)
+        self.assertEqual(str(ctx.exception), "agy is only allowed for local-login subscriptions")
+        self.assertNotIn("ollama-cloud", str(ctx.exception))
 
     def test_agy以外的新鍵仍拒收(self):
-        # 白名單仍是固定集合：只有 antigravity 被接受，其他新鍵照樣拒收
+        # 白名單仍是固定集合：只有兩管 agy 與 chatgpt-personal 等固定 id 被接受，其他新鍵照樣拒收
         obj = _good_policy()
         obj["subscriptions"]["google"] = obj["subscriptions"].pop("openrouter")
         with self.assertRaises(PolicyError) as ctx:
@@ -666,9 +703,10 @@ class RoleAndPrivacyPolicyTests(PolicyValidationTests):
                 "opencode-go": "general",
                 "openrouter": "public",
                 "ollama-cloud": "real",
-                "antigravity": "public",
-                # #187 P4（Q9）：Plus、已關訓練→○，最高 general、不碰真資料
-                "chatgpt-personal": "general",
+                # #347 §5a（本人 2026-11-28 核准）：agy 兩管與 chatgpt-personal 放寬為 real
+                "antigravity-gemini": "real",
+                "antigravity-claude-oss": "real",
+                "chatgpt-personal": "real",
             },
         )
         self.assertEqual(
@@ -677,12 +715,20 @@ class RoleAndPrivacyPolicyTests(PolicyValidationTests):
                 "PMO": ("real", ("claude-personal", "ollama-cloud")),
                 "PM": ("real", ("claude-personal", "ollama-cloud")),
                 "impl": ("public", ("opencode-zen", "opencode-go", "openrouter",
+                                    "antigravity-gemini", "antigravity-claude-oss",
                                     "ollama-cloud", "chatgpt-personal",
                                     "claude-personal")),
                 "rev": ("public", ("openrouter", "opencode-zen", "opencode-go",
-                                   "ollama-cloud", "claude-personal")),
+                                   "antigravity-gemini", "antigravity-claude-oss",
+                                   "ollama-cloud", "chatgpt-personal",
+                                   "claude-personal")),
                 "qa": ("public", ("opencode-zen", "opencode-go", "openrouter",
-                                  "ollama-cloud", "chatgpt-personal")),
+                                  "antigravity-gemini", "antigravity-claude-oss",
+                                  "ollama-cloud", "chatgpt-personal",
+                                  "claude-personal")),
+                # #347 §5.1：arch 角色（floor public；兩管＋chatgpt-personal＋claude-personal＋ollama-cloud）
+                "arch": ("public", ("antigravity-gemini", "antigravity-claude-oss",
+                                    "chatgpt-personal", "claude-personal", "ollama-cloud")),
             },
         )
         # groq 不在任何 order
@@ -717,26 +763,50 @@ class RoleAndPrivacyPolicyTests(PolicyValidationTests):
         self.assertFalse(_covered(sub, "gpt-9-fake"))
         self.assertFalse(_covered(sub, "codex/gpt-6.1-sol"))
 
+    def test_5a隱私矩陣_政策層(self):
+        # #347 §5a（本人 2026-11-28 核准）：real 以上的訂閱、免費（public）的訂閱各是哪些；
+        # 角色 order 在 real 宣告下不得含免費（public）訂閱（免費格不碰真資料）。
+        policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
+        rank = {"public": 0, "general": 1, "real": 2}
+        by_level = lambda floor: {n for n, s in policy.subscriptions.items()  # noqa: E731
+                                  if rank[s.privacy] >= rank[floor]}
+        self.assertEqual(by_level("real"),
+                         {"claude-personal", "ollama-cloud", "antigravity-gemini",
+                          "antigravity-claude-oss", "chatgpt-personal"})
+        self.assertEqual(by_level("general") - by_level("real"), {"opencode-go"})
+        self.assertEqual({n for n, s in policy.subscriptions.items() if s.privacy == "public"},
+                         {"opencode-zen", "openrouter"})
+        for role in ("impl", "rev", "qa", "arch"):
+            with self.subTest(role=role):
+                real_order = [x for x in policy.roles[role].order if x in by_level("real")]
+                self.assertNotIn("opencode-zen", real_order)
+                self.assertNotIn("openrouter", real_order)
+                self.assertTrue(real_order)
+
     def test_C20_impl與qa的order優先chatgpt_personal(self):
-        # C-20（#187 P4）：roles.impl／roles.qa 的 order 含 chatgpt-personal，且
-        # impl 排在 claude-personal 之前（qa 沒有 claude-personal：排在
-        # ollama-cloud 之後）；既有角色的候選相對順序不變、其他角色不受影響。
+        # C-20（#187 P4；#347 §5.1 補齊）：roles.impl／roles.qa／roles.rev 的 order 含
+        # chatgpt-personal，且 impl 排在 claude-personal 之前；qa 的 claude-personal 由
+        # #347 §5.1 補進（排最後）。既有角色的候選相對順序不變（拿掉 agy 兩管與補進的項目後
+        # 逐字相同）；PMO／PM 不受影響。
         policy = load_policy(str(REPO_ROOT / "policy" / "default.json"))
         impl = policy.roles["impl"].order
         qa = policy.roles["qa"].order
+        rev = policy.roles["rev"].order
         self.assertIn("chatgpt-personal", impl)
         self.assertLess(impl.index("chatgpt-personal"), impl.index("claude-personal"))
         self.assertIn("chatgpt-personal", qa)
-        self.assertNotIn("claude-personal", qa)
-        # 拿掉新加入的那一把後，順序與 P4 之前逐字相同（相對順序不變）
-        self.assertEqual(tuple(x for x in impl if x != "chatgpt-personal"),
+        self.assertIn("claude-personal", qa)
+        self.assertIn("chatgpt-personal", rev)
+        agy_subs = ("antigravity-gemini", "antigravity-claude-oss")
+        # 拿掉 agy 兩管後，順序與 P4 之前逐字相同（相對順序不變）
+        self.assertEqual(tuple(x for x in impl if x not in agy_subs),
                          ("opencode-zen", "opencode-go", "openrouter",
-                          "ollama-cloud", "claude-personal"))
-        self.assertEqual(tuple(x for x in qa if x != "chatgpt-personal"),
+                          "ollama-cloud", "chatgpt-personal", "claude-personal"))
+        self.assertEqual(tuple(x for x in qa if x not in agy_subs),
                          ("opencode-zen", "opencode-go", "openrouter",
-                          "ollama-cloud"))
-        # 其餘角色不加（rev／PMO／PM）
-        for role in ("PMO", "PM", "rev"):
+                          "ollama-cloud", "chatgpt-personal", "claude-personal"))
+        # PMO／PM 不加（#347 §5.1 只補 impl/qa/rev/arch）
+        for role in ("PMO", "PM"):
             with self.subTest(role=role):
                 self.assertNotIn("chatgpt-personal", policy.roles[role].order)
 

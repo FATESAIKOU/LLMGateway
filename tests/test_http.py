@@ -1105,7 +1105,7 @@ class LocalLoginHttpTest(ServerCase):
         with open(Path(__file__).resolve().parent.parent / "policy" / "default.json",
                   encoding="utf-8") as fh:
             obj = json.load(fh)
-        obj["subscriptions"]["antigravity"] = {
+        obj["subscriptions"]["antigravity-gemini"] = {
             "priority": 35,
             "privacy": "public",
             "agents": ["agy"],
@@ -1135,7 +1135,7 @@ class LocalLoginHttpTest(ServerCase):
         self.assertEqual(data["env"], {})
         self.assertEqual(data["env_schema"], 1)
         meta = data["meta"]
-        self.assertEqual(meta["subscription"], "antigravity")
+        self.assertEqual(meta["subscription"], "antigravity-gemini")
         self.assertEqual(meta["provider"], "google")
         self.assertEqual(meta["kind"], "local-login")
         self.assertEqual(meta["agent"], "agy")
@@ -1147,7 +1147,7 @@ class LocalLoginHttpTest(ServerCase):
         status, payload = self.call("GET", "/v1/subscriptions")
         self.assertEqual(status, 200)
         item = {i["id"]: i for i in self.json_of(payload)["subscriptions"]}[
-            "antigravity"]
+            "antigravity-gemini"]
         self.assertTrue(item["available"])
         self.assertIsNone(item["available_again_at"])
         self.assertEqual(item["usage"]["status"], "not_applicable")
@@ -1161,26 +1161,22 @@ class LocalLoginHttpTest(ServerCase):
 
 
 class FactoryAntigravityHttpTest(ServerCase):
-    """#107 PR 2（tasks 3.1／3.2）：出廠政策的 antigravity 經 HTTP 的端到端。"""
+    """#107 PR 2（tasks 3.1／3.2）：出廠政策的 agy 兩管經 HTTP 的端到端（#347 §5.1 拆兩管）。"""
 
-    MODELS = (
-        "gemini-3.8-flash-low",
-        "gemini-3.8-flash-medium",
-        "gemini-3.8-flash-high",
-        "gemini-4-argon-low",
-        "gemini-4-argon-medium",
-        "gemini-4-argon-high",
-        "gemini-4-hydrogen-low",
-        "gemini-4-hydrogen-medium",
-        "gemini-4-hydrogen-high",
+    # 每個 id 屬於哪一管（依 `agy models` 分組）；兩管合起來 27 個
+    GEMINI_MODELS = (
+        "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
+        "gemini-4-neon-low", "gemini-4-neon-medium", "gemini-4-neon-high", "gemini-4-neon-xhigh",
+        "gemini-4-carbon-low", "gemini-4-carbon-medium", "gemini-4-carbon-high",
+        "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
+        "gemini-4-hydrogen-low", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-high",
         "gemini-4-hydrogen-xhigh",
-        "gemini-4-neon-low",
-        "claude-opus-5-5-low",
-        "claude-opus-5-5-medium",
-        "claude-opus-5-5-high",
-        "claude-sonnet-5-5-low",
-        "claude-sonnet-5-5-medium",
-        "claude-sonnet-5-5-high",
+        "gemini-pro-orchestrator", "gemini-pro-orchestrator-neon", "gemini-pro-orchestrator-argon",
+    )
+    OSS_MODELS = (
+        "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high",
+        "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high",
+        "gpt-oss-120b-medium",
     )
 
     def setUp(self):
@@ -1204,8 +1200,10 @@ class FactoryAntigravityHttpTest(ServerCase):
     def json_of(self, payload):
         return json.loads(payload.decode())
 
-    def test_resolve17個模型id回200(self):
-        for model in self.MODELS:
+    def test_resolve27個模型id回200(self):
+        cases = [(m, "antigravity-gemini") for m in self.GEMINI_MODELS] + \
+                [(m, "antigravity-claude-oss") for m in self.OSS_MODELS]
+        for model, sub in cases:
             with self.subTest(model=model):
                 status, payload = self.call(
                     "GET", "/v1/resolve?agent=agy&provider=google&model=" + model)
@@ -1214,7 +1212,7 @@ class FactoryAntigravityHttpTest(ServerCase):
                 self.assertEqual(data["env"], {})
                 self.assertEqual(data["env_schema"], 1)
                 meta = data["meta"]
-                self.assertEqual(meta["subscription"], "antigravity")
+                self.assertEqual(meta["subscription"], sub)
                 self.assertEqual(meta["agent"], "agy")
                 self.assertEqual(meta["provider"], "google")
                 self.assertEqual(meta["kind"], "local-login")
@@ -1222,9 +1220,11 @@ class FactoryAntigravityHttpTest(ServerCase):
                 self.assertIsNone(meta["endpoint"])
 
     def test_resolve不帶model回預設(self):
+        # PM 裁定：gemini priority 35 先於 claude-oss 36；舊路徑不帶 model 落到 gemini 管
         status, payload = self.call("GET", "/v1/resolve?agent=agy&provider=google")
         self.assertEqual(status, 200)
         data = self.json_of(payload)
+        self.assertEqual(data["meta"]["subscription"], "antigravity-gemini")
         self.assertEqual(data["meta"]["model"], "gemini-3.8-flash-low")
         self.assertEqual(data["env"], {})
 
@@ -1241,14 +1241,19 @@ class FactoryAntigravityHttpTest(ServerCase):
     def test_list的available與usage(self):
         status, payload = self.call("GET", "/v1/subscriptions")
         self.assertEqual(status, 200)
-        item = {i["id"]: i for i in self.json_of(payload)["subscriptions"]}[
-            "antigravity"]
-        self.assertTrue(item["available"])
-        self.assertIsNone(item["available_again_at"])
-        self.assertEqual(item["usage"]["status"], "not_applicable")
-        self.assertEqual(item["models"]["default"], "gemini-3.8-flash-low")
-        self.assertEqual(item["models"]["allow"], list(self.MODELS))
-        self.assertNotIn("key", item)
+        items = {i["id"]: i for i in self.json_of(payload)["subscriptions"]}
+        for sub, default, allow in (
+                ("antigravity-gemini", "gemini-3.8-flash-low", self.GEMINI_MODELS),
+                ("antigravity-claude-oss", "claude-sonnet-5-5-medium", self.OSS_MODELS)):
+            with self.subTest(subscription=sub):
+                item = items[sub]
+                self.assertTrue(item["available"])
+                self.assertIsNone(item["available_again_at"])
+                self.assertEqual(item["usage"]["status"], "not_applicable")
+                self.assertEqual(item["models"]["default"], default)
+                self.assertEqual(item["models"]["allow"], list(allow))
+                self.assertNotIn("key", item)
+        self.assertNotIn("antigravity", items)
 
 
 class GetRemovedRealHttpTest(ServerCase):

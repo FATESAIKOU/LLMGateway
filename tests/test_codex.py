@@ -166,10 +166,10 @@ class CodexListTest(_Base):
 
     def test_C18_出廠政策有chatgpt_personal且list的row可用(self):
         # C-18（#187 P4）：出廠政策載入成功，list 多一筆 chatgpt-personal
-        # （available true、privacy 為 general）。P2 的「出廠政策沒有它」是 P2 的
-        # 完成判準，P4 必然過期——改成本條的新預期。
+        # （available true；privacy 原為 general，#347 §5a 本人 2026-11-28 核准改為 real）。
+        # P2 的「出廠政策沒有它」是 P2 的完成判準，P4 必然過期——改成本條的新預期。
         policy = load_policy(POLICY_PATH)
-        self.assertEqual(policy.subscriptions[SUB].privacy, "general")
+        self.assertEqual(policy.subscriptions[SUB].privacy, "real")
         self.assertEqual(policy.subscriptions[SUB].agents, ("codex",))
         service = self.service(_factory_obj())
         item = self.item(service)
@@ -208,7 +208,7 @@ class CodexPolicyShapeTest(_Base):
         self.assertEqual(str(ctx.exception), f"codex is only allowed for {SUB}")
         # antigravity 也不能含 codex
         obj = _factory_obj()
-        obj["subscriptions"]["antigravity"]["agents"] = ["agy", "codex"]
+        obj["subscriptions"]["antigravity-gemini"]["agents"] = ["agy", "codex"]
         with self.assertRaises(PolicyError):
             self._load(obj)
 

@@ -620,7 +620,7 @@ class PipesContractTest(unittest.TestCase):
 
     def test_C9_not_applicable的pipes是空陣列且不觸發取用量(self):
         service = UsageService(FakeClock(BASE))
-        for p in ("opencode-zen", "opencode-go", "antigravity"):
+        for p in ("opencode-zen", "opencode-go", "antigravity-gemini"):
             with self.subTest(provider=p):
                 u = service.usage_for(p)
                 self.assertEqual(u["status"], "not_applicable")
@@ -646,7 +646,7 @@ class PipesContractTest(unittest.TestCase):
 
 
 # 出廠四個 not_applicable 訂閱（design D5）
-FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity", "chatgpt-personal")
+FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity-gemini", "chatgpt-personal")
 FORBIDDEN_FOR_OK_UNKNOWN = {"no_quota_api", "unavailable"}
 
 
@@ -759,6 +759,90 @@ class NoteContractTest(unittest.TestCase):
         self.assertEqual(got, {"status": "unknown", "source": "fake-source", "fetched_at": None,
                                "stale": None, "reason": "upstream_error", "note": None,
                                "session": None, "weekly": None, "pipes": []})
+
+
+
+class ExhaustedUntilTest(unittest.TestCase):
+    """C-1034b（#347 §2.4）：exhausted_until 只看 usage、逐窗口驗證、壞窗口只跳過、fail-open。"""
+
+    NOW = from_rfc3339("2026-11-28T10:00:00Z")
+    LATER = "2026-11-28T12:00:00Z"
+    LATEST = "2026-11-28T15:00:00Z"
+    PAST = "2026-11-28T09:00:00Z"
+
+    @staticmethod
+    def ok(**windows_):
+        return {"status": "ok", **windows_}
+
+    @staticmethod
+    def win(pct, resets):
+        return {"remaining_percent": pct, "resets_at": resets}
+
+    def test_1_status不是ok回None(self):
+        for usage in ({"status": "unknown", "session": self.win(0, self.LATER)},
+                      {"status": "not_applicable", "session": self.win(0, self.LATER)},
+                      {"session": self.win(0, self.LATER)}):
+            with self.subTest(usage=usage["status"] if "status" in usage else "missing"):
+                self.assertIsNone(usage_mod.exhausted_until(usage, self.NOW))
+
+    def test_2_混合壞窗口與合法耗盡窗口_回合法那一個(self):
+        bad_then_good = self.ok(session=self.win(0, "not-a-time"),
+                                weekly=self.win(0, self.LATER))
+        self.assertEqual(usage_mod.exhausted_until(bad_then_good, self.NOW),
+                         from_rfc3339(self.LATER))
+        good_then_bad = self.ok(session=self.win(0, self.LATER),
+                                weekly=self.win(0, "2026-11-28T11:00:00"))  # 缺時區
+        self.assertEqual(usage_mod.exhausted_until(good_then_bad, self.NOW),
+                         from_rfc3339(self.LATER))
+
+    def test_3_remaining_percent非數或bool或非有限_跳過該窗口(self):
+        for bad in ("0", True, False, None, float("nan"), float("inf"), [0]):
+            with self.subTest(remaining_percent=repr(bad)):
+                usage = self.ok(session=self.win(bad, self.LATER),
+                                weekly=self.win(0, self.PAST))
+                self.assertIsNone(usage_mod.exhausted_until(usage, self.NOW))
+                usage = self.ok(session=self.win(bad, self.LATER),
+                                weekly=self.win(0, self.LATEST))
+                self.assertEqual(usage_mod.exhausted_until(usage, self.NOW),
+                                 from_rfc3339(self.LATEST))
+
+    def test_4_兩個合法耗盡窗口_取最大(self):
+        usage = self.ok(session=self.win(0, self.LATER), weekly=self.win(-3, self.LATEST))
+        self.assertEqual(usage_mod.exhausted_until(usage, self.NOW), from_rfc3339(self.LATEST))
+
+    def test_5_剩餘0點2不算用完_0算(self):
+        self.assertIsNone(usage_mod.exhausted_until(
+            self.ok(session=self.win(0.2, self.LATER)), self.NOW))
+        self.assertEqual(usage_mod.exhausted_until(
+            self.ok(session=self.win(0.0, self.LATER)), self.NOW), from_rfc3339(self.LATER))
+
+    def test_6_resets_at已過或等於now不算(self):
+        self.assertIsNone(usage_mod.exhausted_until(
+            self.ok(session=self.win(0, self.PAST)), self.NOW))
+        self.assertIsNone(usage_mod.exhausted_until(
+            self.ok(session=self.win(0, "2026-11-28T10:00:00Z")), self.NOW))
+
+    def test_7_窗口不是dict或usage不是dict_跳過或放行(self):
+        self.assertIsNone(usage_mod.exhausted_until(
+            self.ok(session=None, weekly="x"), self.NOW))
+        self.assertEqual(usage_mod.exhausted_until(
+            self.ok(session=["bad"], weekly=self.win(0, self.LATER)), self.NOW),
+            from_rfc3339(self.LATER))
+        self.assertIsNone(usage_mod.exhausted_until(None, self.NOW))
+        self.assertIsNone(usage_mod.exhausted_until("ok", self.NOW))
+
+    def test_8_過程丟例外_fail_open放行(self):
+        class Exploding(dict):
+            def get(self, *_args, **_kwargs):
+                raise RuntimeError("boom")
+        self.assertIsNone(usage_mod.exhausted_until(Exploding(status="ok"), self.NOW))
+
+    def test_9_回傳值是UTC時間且不改available_again_at(self):
+        value = usage_mod.exhausted_until(self.ok(session=self.win(0, self.LATER)), self.NOW)
+        self.assertEqual(value.utcoffset(), _dt.timedelta(0))
+        # 舊的 available_again_at 行為不變（list／roles 仍用它）
+        usage = {"session": self.win(0, self.LATER), "weekly": None}
+        self.assertEqual(available_again_at(usage, None, self.NOW, True), self.LATER)
 
 
 if __name__ == "__main__":
