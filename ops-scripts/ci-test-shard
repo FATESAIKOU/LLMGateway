@@ -41,10 +41,17 @@ def main(argv: list[str]) -> int:
     if not 0 <= k < n:
         print("K 要在 0～N-1", file=sys.stderr)
         return 2
-    paths = sorted(
-        os.path.join(root, name) for name in os.listdir(root)
-        if name.startswith("test_") and name.endswith(".py")
-    )
+    paths = []
+    for name in sorted(os.listdir(root)):
+        if not (name.startswith("test_") and name.endswith(".py")):
+            continue
+        path = os.path.join(root, name)
+        if "\n" in path:
+            # 輸出是每行一個路徑，含換行會被 CI 的 mapfile 切成兩個參數；寧可明確失敗
+            print("測試檔路徑含換行，拒絕分批：%r" % path, file=sys.stderr)
+            return 2
+        if os.path.isfile(path):
+            paths.append(path)
     for path in shards(paths, n)[k]:
         print(path)
     return 0

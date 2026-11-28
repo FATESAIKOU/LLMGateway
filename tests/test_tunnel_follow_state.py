@@ -13,7 +13,7 @@ import time
 import unittest
 
 from tests.test_tunnel_follow import TOKEN, ed25519_key, tun
-from tests.tunnel_fakes import Harness, MockGitHub, REPO_ROOT, TUNNEL, wait_until
+from tests.tunnel_fakes import Harness, MockGitHub, REPO_ROOT, TUNNEL, frozen_clock_env, wait_until
 
 SVC = "svc"
 OLD_IP, NEW_IP = "203.0.113.10", "203.0.113.20"
@@ -119,6 +119,18 @@ class StateBase(unittest.TestCase):
     def probe_count(self):
         return sum("[-W]" in line for line in self.ssh_lines())
 
+    def event_count(self, event):
+        # daemon 每處理完一次探針就在 stderr 記一行事件（probe_fail＝探針回了非 200）
+        return self.h.stderr().splitlines().count(event)
+
+    def assert_quiet_for(self, seconds):
+        # 最短觀察窗：整段期間 GitHub 請求恆為 0、行程仍在跑
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self.assertEqual(self.github.request_count, 0, "觀察期間出現 GitHub 請求")
+            self.assertIsNone(self.h.proc.poll(), "觀察期間行程結束")
+            time.sleep(0.05)
+
     def stop_daemon(self, grace=20):
         # 先送 SIGTERM，等它自己結束（最多 grace 秒）；rc 照舊要是 0
         proc = self.h.proc
@@ -137,7 +149,8 @@ class ZeroPollingAndRotationTests(StateBase):
     def test_healthy_connection_never_touches_github(self):
         self.seed_follow()
         self.start()
-        self.assertTrue(wait_until(lambda: self.probe_count() >= 5, 15))   # 等到 ≥5 個探針週期，不靠固定 sleep
+        self.assertTrue(wait_until(lambda: self.probe_count() >= 5, 15))   # 完成上限 15 秒，等到 ≥5 個探針週期
+        self.assert_quiet_for(2.5)                                          # 最短觀察窗，與原本的 2.5 秒相同
         self.assertIsNone(self.h.proc.poll())
         self.assertGreaterEqual(self.probe_count(), 5)
         self.assertEqual(self.github.request_count, 0)
@@ -146,6 +159,8 @@ class ZeroPollingAndRotationTests(StateBase):
     def test_static_baseline_healthy_also_never_touches_github(self):
         self.start()
         self.assertTrue(wait_until(lambda: len(self.tunnel_argvs()) == 1 and self.probe_count() >= 2, 15))
+        self.assert_quiet_for(1.5)                                          # 最短觀察窗，與原本的 1.5 秒相同
+        self.assertEqual(len(self.tunnel_argvs()), 1)
         self.assertEqual(self.github.request_count, 0)
         self.assertIn("[-l] [svc] [--] [static.example]", self.tunnel_argvs()[0])
         self.assertFalse(self.h.exists(".tunnel_generation"))     # 靜態基準沒有世代可記
@@ -163,7 +178,7 @@ class ZeroPollingAndRotationTests(StateBase):
         self.assertTrue(wait_until(lambda: "gateway_updated" in self.h.stderr(), 10))
         # gateway_updated 先記錄、之後才啟動第二次 ssh：高負載下第二個 argv 可能晚於事件出現
         self.assertTrue(wait_until(lambda: len(self.tunnel_argvs()) == 2, 10))
-        probes_at_switch = self.probe_count()
+        fails_at_switch = self.event_count("probe_fail")
         pid = self.h.proc.pid
         self.assertIsNone(self.h.proc.poll(), "同一個行程內重連，不是結束後讓 systemd 重開")
         self.assertEqual(self.github.request_count, 1)
@@ -178,8 +193,8 @@ class ZeroPollingAndRotationTests(StateBase):
         self.assertEqual(self.h.read_text(".tunnel_known_hosts"), "%s %s\n" % (NEW_IP, K_NEW))
         self.assertEqual(stat.S_IMODE(os.stat(self.h.path("gateway.json")).st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(os.stat(self.h.path(".tunnel_known_hosts")).st_mode), 0o600)
-        # 首次探針 200 之前不預寫新世代、也不歸零連敗：等新連線實際探了 3 次（都是 503）再看
-        self.assertTrue(wait_until(lambda: self.probe_count() >= probes_at_switch + 3, 10))
+        # 首次探針 200 之前不預寫新世代、也不歸零連敗：等 daemon 把新連線的 3 次 503 都處理完（probe_fail 事件）再看
+        self.assertTrue(wait_until(lambda: self.event_count("probe_fail") >= fails_at_switch + 3, 10))
         self.assertEqual(self.h.read_json(".tunnel_generation")["generation"], 1)
         self.assertEqual(self.h.read_json(".tunnel_fetch_backoff")["consecutive_failures"], 2)
         self.h.set_fake("probe", "200")
@@ -449,6 +464,22 @@ class DualWatermarkTests(StateBase):
         self.assertEqual(os.stat(self.h.path("gateway.json")).st_mtime_ns, before)  # 不覆寫
         self.assertEqual(self.h.read_text(".tunnel_known_hosts"), known_before)
         self.assertEqual(self.h.read_json(".tunnel_fetch_state")["status"], "ok")
+
+    def test_b_cooldown_is_exactly_fetch_min_interval(self):
+        # 精確：守護程式在 acquire 取得的 now 與寫入的 next_allowed 都用同一個（凍結的）牆鐘，
+        # 所以冷卻必須恰等於 now + FETCH_MIN_INTERVAL（=1），不是只落在 [抓取前, 抓取後] 包絡內
+        self.setup_unverified_new_generation()
+        self.seed_backoff(failures=2)
+        self.github.set_gateway(**gw(NEW_IP, 2, K_NEW))
+        self.h.set_fake("tunnel_exit", "1")
+        now = 1900000000.0
+        self.start(extra_env=frozen_clock_env(self.tmp.name, now))
+        self.assertEqual(self.h.wait(30), 1)
+        self.assertIn("unverified_retry", self.h.stderr())
+        self.assertEqual(self.github.request_count, 1)
+        backoff = self.h.read_json(".tunnel_fetch_backoff")
+        self.assertEqual(backoff["next_allowed_epoch"], now + 1)
+        self.assertEqual(backoff["consecutive_failures"], 2)
 
     def test_c_verified_generation_with_different_fields_is_follow_invalid(self):
         old, new = self.setup_unverified_new_generation()

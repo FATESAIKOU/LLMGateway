@@ -127,6 +127,24 @@ def wait_until(predicate, timeout=10.0, step=0.05):
     return predicate()
 
 
+# 只給要精確數字的測試用：守護程式行程的 sitecustomize 把 time.time 固定成 LGW_TEST_FROZEN_TIME
+# （守護程式本身不改；monotonic 不動，迴圈與逾時照常）。未載入時精確斷言會失敗，不會誤過。
+FROZEN_CLOCK_SITECUSTOMIZE = """import os
+import time
+if os.environ.get("LGW_TEST_FROZEN_TIME"):
+    _FROZEN = float(os.environ["LGW_TEST_FROZEN_TIME"])
+    time.time = lambda: _FROZEN
+"""
+
+
+def frozen_clock_env(root, now):
+    shim = os.path.join(root, "clockshim")
+    os.makedirs(shim, exist_ok=True)
+    with open(os.path.join(shim, "sitecustomize.py"), "w") as f:
+        f.write(FROZEN_CLOCK_SITECUSTOMIZE)
+    return {"PYTHONPATH": shim, "LGW_TEST_FROZEN_TIME": repr(now)}
+
+
 def have_real_ssh():
     return all(os.path.exists(p) for p in (SSHD, "/usr/bin/ssh", "/usr/bin/ssh-keygen")) \
         and os.path.isdir("/run/sshd")
