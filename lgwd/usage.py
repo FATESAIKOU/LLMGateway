@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 import signal
 import subprocess
 import threading
@@ -51,8 +52,10 @@ NOT_APPLICABLE_TABLE = {
                      "額度與預算只在 opencode 的本機 server 端點與 Console 網頁，Gateway 取不到。"),
     "opencode-go": (UNAVAILABLE,
                     "週額度只在 opencode 的本機 server 端點（需 server 認證），Gateway 取不到。"),
-    "antigravity": (UNAVAILABLE,
-                    "額度只在 agy 的 /usage 與設定頁，沒有公開 API；登入在呼叫方機器上，Gateway 取不到。"),
+    "antigravity-gemini": (UNAVAILABLE,
+                           "額度只在 agy 的 /usage 與設定頁，沒有公開 API；登入在呼叫方機器上，Gateway 取不到。"),
+    "antigravity-claude-oss": (UNAVAILABLE,
+                               "額度只在 agy 的 /usage 與設定頁，沒有公開 API；登入在呼叫方機器上，Gateway 取不到。"),
     "chatgpt-personal": (UNAVAILABLE,
                          "額度只在 Codex 的 app-server 介面（需帳戶 session，登入在呼叫方機器上），Gateway 取不到。"),
 }
@@ -229,6 +232,40 @@ def available_again_at(usage: dict, cooldown_until: _dt.datetime | None, now: _d
         if window is not None and window["remaining_percent"] <= 0:
             candidates.append(from_rfc3339(window["resets_at"]))
     return to_rfc3339(max(candidates)) if candidates else None
+
+
+def exhausted_until(usage: dict, now: _dt.datetime) -> _dt.datetime | None:
+    """role 路徑專用（#347 §2.4）：只看 usage，回「耗盡窗口」中最晚的 resets_at；無則 None。
+
+    不收 cooldown（整把與單模型冷卻由呼叫方另外取）；舊的 available_again_at 不動。
+    status 不是 ok、usage 不是 dict、或過程丟例外 → None（fail-open：整把放行）。
+    逐窗口驗證：窗口不是 dict、remaining_percent 不是有限的 int／float（bool 不算）、
+    resets_at 不是可解析的 RFC 3339 字串，都只跳過該窗口，不影響其他窗口。
+    remaining_percent <= 0（0.2 不算）且 resets_at > now 的合法窗口為候選。
+    """
+    try:
+        if not isinstance(usage, dict) or usage.get("status") != STATUS_OK:
+            return None
+    except Exception:  # fail-open
+        return None
+    candidates = []
+    for name in WINDOWS:
+        try:
+            window = usage.get(name)
+            if not isinstance(window, dict):
+                continue
+            pct = window.get("remaining_percent")
+            if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+                continue
+            resets_at = window.get("resets_at")
+            if not isinstance(resets_at, str):
+                continue
+            resets = from_rfc3339(resets_at)
+            if pct <= 0 and resets > now:
+                candidates.append(resets)
+        except Exception:  # 壞窗口只跳過；其他窗口照算
+            continue
+    return max(candidates) if candidates else None
 
 
 class UsageService:

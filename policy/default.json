@@ -31,15 +31,22 @@
       "agents": ["claude-code", "opencode"],
       "models": {"allow": ["*"], "default": "deepseek-v4.1-flash"}
     },
-    "antigravity": {
+    "antigravity-gemini": {
       "priority": 35,
-      "privacy": "public",
+      "privacy": "real",
       "agents": ["agy"],
       "models": {
         "allow": [
           "gemini-3.8-flash-low",
           "gemini-3.8-flash-medium",
           "gemini-3.8-flash-high",
+          "gemini-4-neon-low",
+          "gemini-4-neon-medium",
+          "gemini-4-neon-high",
+          "gemini-4-neon-xhigh",
+          "gemini-4-carbon-low",
+          "gemini-4-carbon-medium",
+          "gemini-4-carbon-high",
           "gemini-4-argon-low",
           "gemini-4-argon-medium",
           "gemini-4-argon-high",
@@ -47,20 +54,33 @@
           "gemini-4-hydrogen-medium",
           "gemini-4-hydrogen-high",
           "gemini-4-hydrogen-xhigh",
-          "gemini-4-neon-low",
+          "gemini-pro-orchestrator",
+          "gemini-pro-orchestrator-neon",
+          "gemini-pro-orchestrator-argon"
+        ],
+        "default": "gemini-3.8-flash-low"
+      }
+    },
+    "antigravity-claude-oss": {
+      "priority": 36,
+      "privacy": "real",
+      "agents": ["agy"],
+      "models": {
+        "allow": [
           "claude-opus-5-5-low",
           "claude-opus-5-5-medium",
           "claude-opus-5-5-high",
           "claude-sonnet-5-5-low",
           "claude-sonnet-5-5-medium",
-          "claude-sonnet-5-5-high"
+          "claude-sonnet-5-5-high",
+          "gpt-oss-120b-medium"
         ],
-        "default": "gemini-3.8-flash-low"
+        "default": "claude-sonnet-5-5-medium"
       }
     },
     "chatgpt-personal": {
       "priority": 38,
-      "privacy": "general",
+      "privacy": "real",
       "agents": ["codex"],
       "models": {
         "allow": [
@@ -79,9 +99,10 @@
   "roles": {
     "PMO": {"floor": "real", "order": ["claude-personal", "ollama-cloud"]},
     "PM": {"floor": "real", "order": ["claude-personal", "ollama-cloud"]},
-    "impl": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud", "chatgpt-personal", "claude-personal"]},
-    "rev": {"floor": "public", "order": ["openrouter", "opencode-zen", "opencode-go", "ollama-cloud", "claude-personal"]},
-    "qa": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud", "chatgpt-personal"]}
+    "impl": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "antigravity-gemini", "antigravity-claude-oss", "ollama-cloud", "chatgpt-personal", "claude-personal"]},
+    "rev": {"floor": "public", "order": ["openrouter", "opencode-zen", "opencode-go", "antigravity-gemini", "antigravity-claude-oss", "ollama-cloud", "chatgpt-personal", "claude-personal"]},
+    "qa": {"floor": "public", "order": ["opencode-zen", "opencode-go", "openrouter", "antigravity-gemini", "antigravity-claude-oss", "ollama-cloud", "chatgpt-personal", "claude-personal"]},
+    "arch": {"floor": "public", "order": ["antigravity-gemini", "antigravity-claude-oss", "chatgpt-personal", "claude-personal", "ollama-cloud"]}
   },
   "usage": {"claude-personal": {"enabled": true}},
   "until_max_ahead_seconds": 691200

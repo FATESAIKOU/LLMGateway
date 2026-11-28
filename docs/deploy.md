@@ -423,7 +423,7 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
   | `stale_expired` | 最後一次成功超過 6 小時 |
   | `internal` | 取用量路徑內部例外（只記型別名） |
   | `no_quota_api` | `not_applicable`：研究文件或官方文件明載上游沒有額度資訊來源。出廠政策目前沒有訂閱符合，碼保留給日後有實證者 |
-  | `unavailable` | `not_applicable`：上游有額度資訊，但 Gateway 取不到（例如只在帳戶 session 或呼叫方本機登入的介面上）。出廠的 `opencode-zen`、`opencode-go`、`antigravity`、`chatgpt-personal` 都是這一類 |
+  | `unavailable` | `not_applicable`：上游有額度資訊，但 Gateway 取不到（例如只在帳戶 session 或呼叫方本機登入的介面上）。出廠的 `opencode-zen`、`opencode-go`、`antigravity-gemini`、`antigravity-claude-oss`、`chatgpt-personal` 都是這一類 |
 
   **注意**：`not_applicable` 的 `reason` 由舊版的 `null` 變為上表兩個碼之一；讀取方若以「`reason` 為 null」判斷，要改。
 
@@ -456,22 +456,29 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
 
 `models.default`（非 null）載入時必須被同一筆的 `models.allow` 樣式涵蓋，否則 lgwd 不啟動（fail-closed）。
 
-### 5.9 沒有憑證的訂閱（`antigravity`）的政策範例與限度
+### 5.9 沒有憑證的訂閱（`antigravity-gemini`／`antigravity-claude-oss`）的政策範例與限度
 
-`antigravity` 是 agy（Antigravity CLI）用的訂閱：**沒有憑證**，agy 自己在 Mac 上用本機登入，Gateway 不代管、不匯出 OAuth 憑證。它的 `kind` 是 `local-login`、`endpoint` 為 `null`，`agents` 只能剛好是 `["agy"]`；模型只走 resolve 的 `meta.model`（裸 id，不能帶 `agy/` 或 `google/` 前綴）。
+`antigravity-gemini` 與 `antigravity-claude-oss` 是 agy（Antigravity CLI）用的兩管訂閱（依 `agy models` 分組：Gemini 系一管、Claude 與 gpt-oss 一管）：**沒有憑證**，agy 自己在 Mac 上用本機登入，Gateway 不代管、不匯出 OAuth 憑證。它們的 `kind` 是 `local-login`、`endpoint` 為 `null`，`agents` 只能剛好是 `["agy"]`；模型只走 resolve 的 `meta.model`（裸 id，不能帶 `agy/` 或 `google/` 前綴）。兩管的 `privacy` 為 `real`（本人 2026-11-28 核准）。
 
-政策檔的一筆範例如下（只有 id，不含任何憑證）：
+政策檔的一筆範例如下（Gemini 管；只有 id，不含任何憑證；Claude 管的寫法相同，`allow` 改為 `claude-*` 與 `gpt-oss-120b-medium` 七個 id，`default` 為 `claude-sonnet-5-5-medium`）：
 
 ```json
-"antigravity": {
+"antigravity-gemini": {
   "priority": 35,
-  "privacy": "public",
+  "privacy": "real",
   "agents": ["agy"],
   "models": {
     "allow": [
       "gemini-3.8-flash-low",
       "gemini-3.8-flash-medium",
       "gemini-3.8-flash-high",
+      "gemini-4-neon-low",
+      "gemini-4-neon-medium",
+      "gemini-4-neon-high",
+      "gemini-4-neon-xhigh",
+      "gemini-4-carbon-low",
+      "gemini-4-carbon-medium",
+      "gemini-4-carbon-high",
       "gemini-4-argon-low",
       "gemini-4-argon-medium",
       "gemini-4-argon-high",
@@ -479,24 +486,22 @@ list 的每一筆多 `usage` 與 `available_again_at`，resolve 的 `meta` 多�
       "gemini-4-hydrogen-medium",
       "gemini-4-hydrogen-high",
       "gemini-4-hydrogen-xhigh",
-      "gemini-4-neon-low",
-      "claude-opus-5-5-low",
-      "claude-opus-5-5-medium",
-      "claude-opus-5-5-high",
-      "claude-sonnet-5-5-low",
-      "claude-sonnet-5-5-medium",
-      "claude-sonnet-5-5-high"
+      "gemini-pro-orchestrator",
+      "gemini-pro-orchestrator-neon",
+      "gemini-pro-orchestrator-argon"
     ],
     "default": "gemini-3.8-flash-low"
   }
 }
 ```
 
+兩管並存是合法的（同為 `agy` 的本地登入訂閱，互不擋）；任何**有憑證**的訂閱若含 `agy`，政策載入即拒收（錯誤訊息為 `agy is only allowed for local-login subscriptions`）。舊 id `antigravity` 已移除：政策檔裡不得再出現它。
+
 `models.allow` 寫的是**字面 id**（不含萬用字元）：清單外的 id（含帶前綴的）在 resolve 就是 403 `model_not_allowed`，錯誤不會延到 agy 才爆。`models.default` 是 `model` 省略時的推導值，必須被同一筆的 `allow` 涵蓋。
 
 > [!IMPORTANT]
 > **限度（advisory，不是存取控制）：這把只在 Mac 能用，但 Gateway 擋不住誤用。**
-> 出廠政策是所有實例共用的一份（同一份 `policy/default.json`），所以 worker 實例的 `GET /v1/subscriptions` 也會對 `antigravity` 顯示 `available: true`、`usage.status` 為 `not_applicable`——那是「沒有憑證但恆算已部署」，不是「這台可以用」。worker 誤用時會拿到 200 與空的 `env`，直到 agy 在該台找不到而失敗（503）才會發現。Gateway 的 `off` 模式沒有呼叫方／主機概念，也不驗應用層認證（只有 loopback＋SSH 轉發；`warn`／`enforce` 見第 8 節），因此「只給 Mac」只能靠部署與自律（worker 的 sidecar 不要求 agy），不能寫成擋得住。
+> 出廠政策是所有實例共用的一份（同一份 `policy/default.json`），所以 worker 實例的 `GET /v1/subscriptions` 也會對 `antigravity-gemini`、`antigravity-claude-oss` 顯示 `available: true`、`usage.status` 為 `not_applicable`——那是「沒有憑證但恆算已部署」，不是「這台可以用」。worker 誤用時會拿到 200 與空的 `env`，直到 agy 在該台找不到而失敗（503）才會發現。Gateway 的 `off` 模式沒有呼叫方／主機概念，也不驗應用層認證（只有 loopback＋SSH 轉發；`warn`／`enforce` 見第 8 節），因此「只給 Mac」只能靠部署與自律（worker 的 sidecar 不要求 agy），不能寫成擋得住。
 
 
 ### 5.10 啟動、停止與重啟服務（`start`／`stop`／`restart`）
@@ -1023,7 +1028,8 @@ sudo chmod 0600 /etc/llmgateway/local-admin-signing-key
         "PM": ["claude-code", "opencode", "agy", "codex"],
         "impl": ["claude-code", "opencode", "agy", "codex"],
         "rev": ["claude-code", "opencode", "agy", "codex"],
-        "qa": ["claude-code", "opencode", "agy", "codex"]
+        "qa": ["claude-code", "opencode", "agy", "codex"],
+        "arch": ["claude-code", "opencode", "agy", "codex"]
       }
     },
     "local-admin": {
@@ -1034,7 +1040,8 @@ sudo chmod 0600 /etc/llmgateway/local-admin-signing-key
         "PM": ["claude-code", "opencode", "agy", "codex"],
         "impl": ["claude-code", "opencode", "agy", "codex"],
         "rev": ["claude-code", "opencode", "agy", "codex"],
-        "qa": ["claude-code", "opencode", "agy", "codex"]
+        "qa": ["claude-code", "opencode", "agy", "codex"],
+        "arch": ["claude-code", "opencode", "agy", "codex"]
       }
     }
   },

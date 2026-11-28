@@ -298,6 +298,8 @@ class DeployDocConsistencyTests(unittest.TestCase):
 
         # 範例本身是規格：節點 principal 是 B（五種操作全開、agent 與 roles 填滿），
         # 本機管理 principal 只能 list／usage／roles、不得 resolve 或 cooldown。
+        # #347 §5.1：ROLES 含 arch；範例名冊的 roles 必須逐一列到 ROLES（含 arch）
+        self.assertEqual(ROLES, ("PMO", "PM", "impl", "rev", "qa", "arch"))
         all_roles = {role: tuple(AGENTS) for role in ROLES}
         worker = registry.principals["w1-worker"]
         self.assertEqual(worker.ops, frozenset(OPS))

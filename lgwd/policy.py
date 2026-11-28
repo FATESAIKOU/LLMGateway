@@ -2,8 +2,8 @@
 
 load_policy(path) 讀 JSON、驗證、回傳 Policy；不合法丟 PolicyError。
 政策檔只管 priority、agents、models（與 provider 有關的欄位在 lgwd/providers.py）。
-訂閱 id 是固定集合（SUBSCRIPTIONS）；其中 antigravity 是沒有憑證的訂閱（provider 的
-kind 為 local-login），只給 agy（#107）。
+訂閱 id 是固定集合（SUBSCRIPTIONS）；其中 antigravity-gemini、antigravity-claude-oss 是沒有
+憑證的訂閱（provider 的 kind 為 local-login），只給 agy（#107；#347 修訂 3f 起拆兩管）。
 PolicyError 的訊息只用固定字串與固定的訂閱 id，不回顯檔案裡的其他字串（值永不進例外）。
 
 載入時機：只在啟動時（lgwd 啟動失敗就不啟動）。v5 沒有熱重載、沒有 SIGHUP，
@@ -19,14 +19,17 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 SUBSCRIPTIONS = ("claude-personal", "claude-company", "opencode-zen", "opencode-go",
-                 "groq", "openrouter", "ollama-cloud", "antigravity", "chatgpt-personal")
+                 "groq", "openrouter", "ollama-cloud", "antigravity-gemini",
+                 "antigravity-claude-oss", "chatgpt-personal")
 AGENTS = ("claude-code", "opencode", "agy", "codex")
 
 # 隱私等級（public < general < real）；缺省 public（fail-closed）。
 PRIVACY_LEVELS = ("public", "general", "real")
 
-# 角色鍵（政策檔 roles 段的鍵只能是這五個）。
-ROLES = ("PMO", "PM", "impl", "rev", "qa")
+# 角色鍵（政策檔 roles 段的鍵只能是這六個）。
+ROLES = ("PMO", "PM", "impl", "rev", "qa", "arch")
+# 走依角色選格（resolve?role=）的角色；PMO／PM 不入表（#347 §2.3）。
+SELECTABLE_ROLES = ("impl", "rev", "qa", "arch")
 
 # 條款與設計的否定約束（固定字串的錯誤訊息）
 _CLAUDE_ONLY = ("claude-personal", "claude-company")
@@ -35,7 +38,13 @@ _OPENCODE_ONLY = ("opencode-zen", "opencode-go", "groq")
 # 每筆訂閱的 agents 只能剛好是 (該 agent,)，其他訂閱的 agents 也 MUST NOT 含該
 # agent（否則 api-key 的 row 會用空 env 被選中）。providers.build_env 的防線集合
 # 由同一張表導出。policy.py 必須能單獨 import（升級 dry-run 只保證它在），所以表放這。
-LOCAL_LOGIN_AGENT = MappingProxyType({"antigravity": "agy", "chatgpt-personal": "codex"})
+# 同一個 agent 可以有多筆本地登入訂閱（agy 兩管：antigravity-gemini、antigravity-claude-oss），
+# 反查 agent -> 允許的訂閱集合見 _local_login_allowed()。
+LOCAL_LOGIN_AGENT = MappingProxyType({
+    "antigravity-gemini": "agy",
+    "antigravity-claude-oss": "agy",
+    "chatgpt-personal": "codex",
+})
 
 
 _OPENROUTER_ALLOW = ("*:free", "openrouter/free")
@@ -229,6 +238,14 @@ def _parse_roles(data: object, subs: dict[str, SubscriptionPolicy]) -> dict[str,
     return out
 
 
+def _local_login_allowed() -> dict[str, tuple[str, ...]]:
+    """agent -> 允許它當本地登入的訂閱 id（依 LOCAL_LOGIN_AGENT 反查，順序照表）。"""
+    out: dict[str, list[str]] = {}
+    for ll_name, agent in LOCAL_LOGIN_AGENT.items():
+        out.setdefault(agent, []).append(ll_name)
+    return {agent: tuple(names) for agent, names in out.items()}
+
+
 def load_policy(path: str) -> Policy:
     """驗證規則（不合法丟 PolicyError，訊息說明哪裡錯、不含檔案字串）：
     - subscriptions 的鍵只能是 SUBSCRIPTIONS；
@@ -237,8 +254,9 @@ def load_policy(path: str) -> Policy:
       Claude Code 接法；groq 的端點是 OpenAI 相容，見 providers.py）；
     - openrouter 的 agents 只能剛好是 ["opencode"]（免費模型只經過 opencode；design 決定 3）；
     - openrouter 的 models.allow 只能是 ["*:free", "openrouter/free"]（只允許免費模型）；
-    - antigravity（沒有憑證的訂閱）的 agents 只能剛好是 ["agy"]（條款）；其他訂閱的
-      agents 不能含 agy；
+    - antigravity-gemini／antigravity-claude-oss（沒有憑證的訂閱）的 agents 只能剛好是
+      ["agy"]（條款）；其他訂閱的 agents 不能含 agy（#347 H1：兩管並存，反檢以「允許的
+      本地訂閱集合」判斷，不是逐一拿單一 id 比對）；
     - 非 null 的 models.default 必須被同一筆的 models.allow 樣式涵蓋（fnmatch；fail-closed）；
     - priority 為非負整數；cooldown 的 until 上限為正整數；
     - 選填的頂層 `usage`（#60）：見 _parse_usage，不合法 fail-closed。
@@ -273,12 +291,16 @@ def load_policy(path: str) -> Policy:
     for name, agent in LOCAL_LOGIN_AGENT.items():
         if name in parsed_subs and parsed_subs[name].agents != (agent,):
             raise PolicyError(f"{name} must only allow {agent}")
+    allowed = _local_login_allowed()
     for name, sub in parsed_subs.items():
-        for ll_name, agent in LOCAL_LOGIN_AGENT.items():
-            if name != ll_name and agent in sub.agents:
+        for agent, ll_names in allowed.items():
+            if name not in ll_names and agent in sub.agents:
                 # 反向的條款：local-login 的 agent 只准出現在沒有憑證的那筆訂閱；不然
                 # api-key 的 row 會用空 env 被選中（spec「共通 JSON schema」）。
-                raise PolicyError(f"{agent} is only allowed for {ll_name}")
+                # 只有單一訂閱對應該 agent 時沿用舊字樣（codex→chatgpt-personal）。
+                if len(ll_names) == 1:
+                    raise PolicyError(f"{agent} is only allowed for {ll_names[0]}")
+                raise PolicyError(f"{agent} is only allowed for local-login subscriptions")
     if "openrouter" in parsed_subs and parsed_subs["openrouter"].agents != ("opencode",):
         # 免費模型只經過 opencode（v5 既有 MUST，本 change 補上檢查；design 決定 3）。
         raise PolicyError("openrouter must only allow opencode")

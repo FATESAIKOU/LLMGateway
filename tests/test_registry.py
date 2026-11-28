@@ -20,6 +20,7 @@ from lgwd.keys import KEY_NAMES, KeyStore
 from lgwd.policy import UsageSetting, load_policy
 from lgwd.providers import AnthropicProvider, GoogleProvider, UsageDeps, provider_for
 from lgwd.registry import RegistryService
+from lgwd.store import _AUDIT_MIGRATE_COLUMNS, Store
 from lgwd import usage as lgwd_usage
 from lgwd.usage import FetchResult, UsageService, failure
 from lgwd.usage_ollama import OllamaUsageFetcher
@@ -133,7 +134,8 @@ class JsonSchemaTest(RegistryCase):
             "opencode-go": ("opencode-go", "api-key",
                             "https://opencode.ai/inference/go/openai/v1"),
             "ollama-cloud": ("ollama-cloud", "api-key", "https://ollama.com"),
-            "antigravity": ("google", "local-login", None),
+            "antigravity-gemini": ("google", "local-login", None),
+            "antigravity-claude-oss": ("google", "local-login", None),
             # #187 P4：ChatGPT 個人訂閱（沒有憑證的 local-login）
             "chatgpt-personal": ("openai", "local-login", None),
         }
@@ -154,7 +156,8 @@ class JsonSchemaTest(RegistryCase):
             "ollama-cloud": "https://ollama.com",
             "opencode-zen": "https://opencode.ai/zen/v1",
             "opencode-go": "https://opencode.ai/inference/go/openai/v1",
-            "antigravity": None,
+            "antigravity-gemini": None,
+            "antigravity-claude-oss": None,
             "chatgpt-personal": None,
         }
         agents = {
@@ -163,7 +166,8 @@ class JsonSchemaTest(RegistryCase):
             "ollama-cloud": "opencode",
             "opencode-zen": "opencode",
             "opencode-go": "opencode",
-            "antigravity": "agy",
+            "antigravity-gemini": "agy",
+            "antigravity-claude-oss": "agy",
             "chatgpt-personal": "codex",
         }
         listed = _by_id(self.list_items())
@@ -213,7 +217,8 @@ class JsonSchemaTest(RegistryCase):
             "opencode-go": "beam-free",
             "openrouter": "openrouter/free",
             "ollama-cloud": "deepseek-v4.1-flash",
-            "antigravity": "gemini-3.8-flash-low",
+            "antigravity-gemini": "gemini-3.8-flash-low",
+            "antigravity-claude-oss": "claude-sonnet-5-5-medium",
             # #187 P4：Codex 的個人訂閱（default 走官方推薦、非退役的 gpt-6.1-sol）
             "chatgpt-personal": "gpt-6.1-sol",
         }
@@ -301,13 +306,13 @@ class _GuardAgyKeys:
         self.agy_calls = []
 
     def get(self, subscription):
-        if subscription == "antigravity":
+        if subscription == "antigravity-gemini":
             self.agy_calls.append("get")
             raise AssertionError("antigravity 沒有憑證，不應讀 key")
         return self._inner.get(subscription)
 
     def deployed(self, subscription):
-        if subscription == "antigravity":
+        if subscription == "antigravity-gemini":
             self.agy_calls.append("deployed")
             raise AssertionError("antigravity 沒有憑證，不應查部署")
         return self._inner.deployed(subscription)
@@ -323,14 +328,19 @@ class LocalLoginTest(RegistryCase):
 
     def _policy_obj(self, *, include_in_roles=False, allow=("*",)):
         obj = json.loads(Path(POLICY_PATH).read_text(encoding="utf-8"))
-        obj["subscriptions"]["antigravity"] = {
+        # 出廠的 agy 兩管拿掉，只留這裡注入的單一 agy 訂閱（否則 order 會重複、列表多出兩管）
+        for sid in ("antigravity-gemini", "antigravity-claude-oss"):
+            obj["subscriptions"].pop(sid, None)
+            for rp in obj["roles"].values():
+                rp["order"] = [x for x in rp["order"] if x != sid]
+        obj["subscriptions"]["antigravity-gemini"] = {
             "priority": 35,
             "privacy": "public",
             "agents": ["agy"],
             "models": {"allow": list(allow), "default": self.MODEL},
         }
         if include_in_roles:
-            obj["roles"]["impl"]["order"].append("antigravity")
+            obj["roles"]["impl"]["order"].append("antigravity-gemini")
         return obj
 
     def _service(self, obj, keys=None):
@@ -339,7 +349,7 @@ class LocalLoginTest(RegistryCase):
         return RegistryService(self.db_path, load_policy(str(path)),
                                keys or self.keys, self.clock)
 
-    def _item(self, service, subscription="antigravity"):
+    def _item(self, service, subscription="antigravity-gemini"):
         return _by_id(service.list_subscriptions()["subscriptions"])[subscription]
 
     # --- 共通 JSON 與 list ---
@@ -364,7 +374,7 @@ class LocalLoginTest(RegistryCase):
         self.assertEqual(
             [item["id"] for item in items],
             ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud",
-             "antigravity", "chatgpt-personal", "claude-personal"],
+             "antigravity-gemini", "chatgpt-personal", "claude-personal"],
         )
 
     def test_list的available與usage(self):
@@ -378,7 +388,7 @@ class LocalLoginTest(RegistryCase):
             self.assertNotIn("key", item)
             # 有未來的整把冷卻 → available false；available_again_at 只由冷卻算
             service.register_cooldown(
-                "antigravity", {"until": "2026-10-11T15:00:00Z"})
+                "antigravity-gemini", {"until": "2026-10-11T15:00:00Z"})
             item = self._item(service)
         finally:
             service.close()
@@ -397,7 +407,7 @@ class LocalLoginTest(RegistryCase):
         self.assertEqual(payload["env"], {})
         self.assertEqual(payload["env_schema"], 1)
         meta = payload["meta"]
-        self.assertEqual(meta["subscription"], "antigravity")
+        self.assertEqual(meta["subscription"], "antigravity-gemini")
         self.assertEqual(meta["provider"], "google")
         self.assertEqual(meta["kind"], "local-login")
         self.assertEqual(meta["agent"], "agy")
@@ -423,7 +433,7 @@ class LocalLoginTest(RegistryCase):
         finally:
             service.close()
         self.assertEqual([row["id"] for row in payload["candidates"]],
-                         ["antigravity"])
+                         ["antigravity-gemini"])
         self.assertEqual(payload["candidates"][0]["rank"], 1)
         self.assertTrue(payload["candidates"][0]["available"])
 
@@ -450,7 +460,7 @@ class LocalLoginTest(RegistryCase):
 
     def test_沒有usage_fetcher(self):
         # design §2.1 的不變式：main.py 的 _usage_key／deployed 才不會被觸發
-        self.assertIsNone(provider_for("antigravity").make_usage_fetcher(UsageDeps()))
+        self.assertIsNone(provider_for("antigravity-gemini").make_usage_fetcher(UsageDeps()))
 
     # --- 冷卻的 model 前綴（#107 起的收緊） ---
 
@@ -459,13 +469,13 @@ class LocalLoginTest(RegistryCase):
         service = self._service(self._policy_obj(allow=("*",)))
         try:
             err = self.assert_api_error(
-                400, "bad_request", service.register_cooldown, "antigravity",
+                400, "bad_request", service.register_cooldown, "antigravity-gemini",
                 {"until": "2026-10-11T15:00:00Z",
                  "model": f"agy/{self.MODEL}"})
             self.assertEqual(self._item(service)["model_cooldowns"], {})
             # 對照：裸 id 可以登錄
             service.register_cooldown(
-                "antigravity", {"until": "2026-10-11T15:00:00Z",
+                "antigravity-gemini", {"until": "2026-10-11T15:00:00Z",
                                 "model": self.MODEL})
             self.assertEqual(self._item(service)["model_cooldowns"],
                              {self.MODEL: {"until": "2026-10-11T15:00:00Z"}})
@@ -492,36 +502,33 @@ class LocalLoginTest(RegistryCase):
 
 
 class FactoryAntigravityTest(RegistryCase):
-    """#107 PR 2（tasks 3.1／3.2）：出廠政策裡真的有一筆 antigravity 的端到端。"""
+    """#107 PR 2（tasks 3.1／3.2）：出廠政策裡真的有 agy 兩管的端到端（#347 §5.1 拆兩管）。"""
 
-    MODELS = (
-        "gemini-3.8-flash-low",
-        "gemini-3.8-flash-medium",
-        "gemini-3.8-flash-high",
-        "gemini-4-argon-low",
-        "gemini-4-argon-medium",
-        "gemini-4-argon-high",
-        "gemini-4-hydrogen-low",
-        "gemini-4-hydrogen-medium",
-        "gemini-4-hydrogen-high",
+    GEMINI_MODELS = (
+        "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
+        "gemini-4-neon-low", "gemini-4-neon-medium", "gemini-4-neon-high", "gemini-4-neon-xhigh",
+        "gemini-4-carbon-low", "gemini-4-carbon-medium", "gemini-4-carbon-high",
+        "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
+        "gemini-4-hydrogen-low", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-high",
         "gemini-4-hydrogen-xhigh",
-        "gemini-4-neon-low",
-        "claude-opus-5-5-low",
-        "claude-opus-5-5-medium",
-        "claude-opus-5-5-high",
-        "claude-sonnet-5-5-low",
-        "claude-sonnet-5-5-medium",
-        "claude-sonnet-5-5-high",
+        "gemini-pro-orchestrator", "gemini-pro-orchestrator-neon", "gemini-pro-orchestrator-argon",
+    )
+    OSS_MODELS = (
+        "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high",
+        "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high",
+        "gpt-oss-120b-medium",
     )
 
-    def test_resolve17個模型id都回200且env空(self):
-        for model in self.MODELS:
+    def test_resolve27個模型id都回200且env空(self):
+        cases = [(m, "antigravity-gemini") for m in self.GEMINI_MODELS] + \
+                [(m, "antigravity-claude-oss") for m in self.OSS_MODELS]
+        for model, sub in cases:
             with self.subTest(model=model):
                 payload = self.resolve("agy", "google", model=model)
                 self.assertEqual(payload["env"], {})
                 self.assertEqual(payload["env_schema"], 1)
                 meta = payload["meta"]
-                self.assertEqual(meta["subscription"], "antigravity")
+                self.assertEqual(meta["subscription"], sub)
                 self.assertEqual(meta["agent"], "agy")
                 self.assertEqual(meta["provider"], "google")
                 self.assertEqual(meta["kind"], "local-login")
@@ -531,29 +538,130 @@ class FactoryAntigravityTest(RegistryCase):
 
     def test_resolve不帶model回政策預設(self):
         payload = self.resolve("agy", "google")
+        self.assertEqual(payload["meta"]["subscription"], "antigravity-gemini")
+        self.assertEqual(payload["meta"]["model"], "gemini-3.8-flash-low")
+        self.assertEqual(payload["env"], {})
+
+    def test_舊路徑agy缺model釘住gemini管(self):
+        # PM 裁定：claude-oss priority 36、gemini 35；舊路徑 resolve?agent=agy&provider=google
+        # 不帶 model 必須落到 gemini 管的 gemini-3.8-flash-low（不因兩管並存而換管）
+        priorities = {s.name: s.priority for s in load_policy(POLICY_PATH).subscriptions.values()
+                      if s.name.startswith("antigravity")}
+        self.assertEqual(priorities, {"antigravity-gemini": 35, "antigravity-claude-oss": 36})
+        payload = self.resolve("agy", "google")
+        self.assertEqual(payload["meta"]["subscription"], "antigravity-gemini")
         self.assertEqual(payload["meta"]["model"], "gemini-3.8-flash-low")
         self.assertEqual(payload["env"], {})
 
     def test_model不在清單回403(self):
         for model in ("gemini-9-fake", "google/gemini-3.8-flash-low",
-                      "gpt-oss-120b", "gemini-4-neon-medium",
-                      "gemini-4-neon-high", "gemini-4-neon-xhigh",
-                      "gemini-pro-orchestrator-neon",
-                      "gemini-pro-orchestrator-g1-pro", "gpt-oss-120b-medium"):
+                      "gpt-oss-120b", "gemini-pro-orchestrator-g1-pro",
+                      "claude-haiku-5-5"):
             with self.subTest(model=model):
                 self.assert_api_error(
                     403, "model_not_allowed", self.resolve, "agy", "google", model)
 
     def test_list的available與usage(self):
-        item = _by_id(self.list_items())["antigravity"]
-        self.assertEqual((item["provider"], item["kind"], item["endpoint"]),
-                         ("google", "local-login", None))
-        self.assertTrue(item["available"])
-        self.assertIsNone(item["available_again_at"])
-        self.assertEqual(item["usage"]["status"], "not_applicable")
-        self.assertEqual(item["models"]["default"], "gemini-3.8-flash-low")
-        self.assertEqual(item["models"]["allow"], list(self.MODELS))
-        self.assertNotIn("key", item)
+        items = _by_id(self.list_items())
+        for sub, default, allow in (
+                ("antigravity-gemini", "gemini-3.8-flash-low", self.GEMINI_MODELS),
+                ("antigravity-claude-oss", "claude-sonnet-5-5-medium", self.OSS_MODELS)):
+            with self.subTest(subscription=sub):
+                item = items[sub]
+                self.assertEqual((item["provider"], item["kind"], item["endpoint"]),
+                                 ("google", "local-login", None))
+                self.assertTrue(item["available"])
+                self.assertIsNone(item["available_again_at"])
+                self.assertEqual(item["usage"]["status"], "not_applicable")
+                self.assertEqual(item["models"]["default"], default)
+                self.assertEqual(item["models"]["allow"], list(allow))
+                self.assertNotIn("key", item)
+        self.assertNotIn("antigravity", items)
+
+
+class AuditAdditiveMigrationTest(unittest.TestCase):
+    """#347 §4.1／C-1041（PR1 部分）：audit 的 additive 遷移——新欄全 TEXT、舊列為 NULL、
+    重開不出錯、audit_all() 欄位不變（只增欄，不重建表）。"""
+
+    NEW_COLUMNS = ("role", "slot", "tier", "family", "effort", "exclude_family", "task_length",
+                   "skipped", "skipped_truncated", "explicit_model", "data", "data_declared",
+                   "ref", "table_sha", "cooldown_mode", "prev_until", "os_user")
+    OLD_KEYS = {"seq", "ts", "subscription", "action", "agent", "until", "provider", "model",
+                "principal"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "llm.db")
+        # 升級前的舊庫：audit 沒有 provider／model／principal 也沒有 #347 的欄
+        conn = sqlite3.connect(self.db)
+        conn.executescript(
+            "CREATE TABLE audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,"
+            " subscription TEXT NOT NULL, action TEXT NOT NULL, agent TEXT, until TEXT);"
+            "INSERT INTO audit (ts, subscription, action, agent, until)"
+            " VALUES ('2026-10-11T15:00:00Z', 'claude-personal', 'cooldown', NULL,"
+            " '2026-10-11T16:00:00Z');")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _columns(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return {row[1]: row[2] for row in conn.execute("PRAGMA table_info(audit)")}
+        finally:
+            conn.close()
+
+    def test_舊庫補欄_新欄全TEXT_舊列為NULL(self):
+        store = Store(self.db)
+        try:
+            cols = self._columns()
+            for name in self.NEW_COLUMNS + ("provider", "model", "principal"):
+                with self.subTest(column=name):
+                    self.assertIn(name, cols)
+                    self.assertEqual(cols[name], "TEXT")
+            rows = store.audit_all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(set(rows[0]), self.OLD_KEYS)  # audit_all() 欄位不因遷移而變
+            self.assertIsNone(rows[0]["provider"])
+            self.assertIsNone(rows[0]["principal"])
+            # audit_all() 只回 OLD_KEYS，看不到新欄：舊列的每個遷移欄直接 SELECT；欄名取自 lgwd/store.py，不在這裡抄一份
+            for name in _AUDIT_MIGRATE_COLUMNS:
+                with self.subTest(column=name):
+                    self.assertEqual(self._columns()[name], "TEXT")
+                    conn = sqlite3.connect(self.db)
+                    try:
+                        value = conn.execute(
+                            "SELECT {0} FROM audit WHERE seq = ?".format(name),
+                            (rows[0]["seq"],)).fetchone()[0]
+                    finally:
+                        conn.close()
+                    self.assertIsNone(value)
+        finally:
+            store.close()
+
+    def test_重開不重補_不出錯(self):
+        Store(self.db).close()
+        before = self._columns()
+        store = Store(self.db)
+        try:
+            self.assertEqual(self._columns(), before)
+            self.assertEqual(len(store.audit_all()), 1)
+        finally:
+            store.close()
+
+    def test_舊簽章的audit_add仍可寫入(self):
+        store = Store(self.db)
+        try:
+            with store.txn() as cur:
+                store.audit_add(cur, "2026-11-28T10:00:00Z", "claude-personal", "resolve",
+                                agent="claude-code")
+            rows = store.audit_all()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(set(rows[-1]), self.OLD_KEYS)
+        finally:
+            store.close()
 
 
 class ListTest(RegistryCase):
@@ -572,7 +680,8 @@ class ListTest(RegistryCase):
         self.assertEqual(
             [item["id"] for item in items],
             ["opencode-zen", "opencode-go", "openrouter", "ollama-cloud",
-             "antigravity", "chatgpt-personal", "claude-personal"],
+             "antigravity-gemini", "antigravity-claude-oss", "chatgpt-personal",
+             "claude-personal"],
         )
 
     def test_冷卻反映在list(self):
@@ -2964,7 +3073,8 @@ class ExternalHostsTest(unittest.TestCase):
 # --- #204 PR1：usage 九鍵、reason 細分、note（契約 C-2～C-4c；spec usage-reporting；design D5、D9）---
 
 NOT_APPLICABLE_REASONS = ("no_quota_api", "unavailable")
-FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity", "chatgpt-personal")
+FACTORY_NOT_APPLICABLE = ("opencode-zen", "opencode-go", "antigravity-gemini",
+                          "antigravity-claude-oss", "chatgpt-personal")
 
 # C-4c 的快照：PR1 前（現行 main 的 usage 組裝）以 list 與 resolve 的非 usage 欄位輸出，手抄成常數；policy 的 allow 變更時要同步此常數（不是凍結的歷史快照）。
 # 設定：空的 UsageService（沒注入取用量實作）、claude-personal 冷卻至 2026-10-11T00:30:00Z、FakeClock 預設時間。
@@ -3022,12 +3132,19 @@ _PRE_PR1_SNAPSHOT = {'list': [{'agents': ['opencode'],
            'available_again_at': None,
            'cooldown': None,
            'endpoint': None,
-           'id': 'antigravity',
+           'id': 'antigravity-gemini',
            'kind': 'local-login',
            'model_cooldowns': {},
            'models': {'allow': ['gemini-3.8-flash-low',
                                 'gemini-3.8-flash-medium',
                                 'gemini-3.8-flash-high',
+                                'gemini-4-neon-low',
+                                'gemini-4-neon-medium',
+                                'gemini-4-neon-high',
+                                'gemini-4-neon-xhigh',
+                                'gemini-4-carbon-low',
+                                'gemini-4-carbon-medium',
+                                'gemini-4-carbon-high',
                                 'gemini-4-argon-low',
                                 'gemini-4-argon-medium',
                                 'gemini-4-argon-high',
@@ -3035,15 +3152,30 @@ _PRE_PR1_SNAPSHOT = {'list': [{'agents': ['opencode'],
                                 'gemini-4-hydrogen-medium',
                                 'gemini-4-hydrogen-high',
                                 'gemini-4-hydrogen-xhigh',
-                                'gemini-4-neon-low',
-                                'claude-opus-5-5-low',
+                                'gemini-pro-orchestrator',
+                                'gemini-pro-orchestrator-neon',
+                                'gemini-pro-orchestrator-argon'],
+                      'default': 'gemini-3.8-flash-low'},
+           'priority': 35,
+           'provider': 'google',
+           'schema': 1},
+          {'agents': ['agy'],
+           'available': True,
+           'available_again_at': None,
+           'cooldown': None,
+           'endpoint': None,
+           'id': 'antigravity-claude-oss',
+           'kind': 'local-login',
+           'model_cooldowns': {},
+           'models': {'allow': ['claude-opus-5-5-low',
                                 'claude-opus-5-5-medium',
                                 'claude-opus-5-5-high',
                                 'claude-sonnet-5-5-low',
                                 'claude-sonnet-5-5-medium',
-                                'claude-sonnet-5-5-high'],
-                      'default': 'gemini-3.8-flash-low'},
-           'priority': 35,
+                                'claude-sonnet-5-5-high',
+                                'gpt-oss-120b-medium'],
+                      'default': 'claude-sonnet-5-5-medium'},
+           'priority': 36,
            'provider': 'google',
            'schema': 1},
           {'agents': ['codex'],

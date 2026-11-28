@@ -694,7 +694,7 @@ class UsdCanaryTest(HttpHarness):
         keys_path.write_text(f"OPENROUTER_API_KEY={OR_KEY}\nOLLAMA_API_KEY={OL_KEY}\n", encoding="utf-8")
         self.clock = FakeClock(BASE)
         self.keys = KeyStore(str(keys_path))
-        key_by_sub = {"openrouter": OR_KEY, "ollama-cloud": OL_KEY, "antigravity": AG_KEY}
+        key_by_sub = {"openrouter": OR_KEY, "ollama-cloud": OL_KEY, "antigravity-gemini": AG_KEY}
         or_body = ('{"data": {' + FMDR_OK + ', "usage_weekly": %s, "usage_daily": %s,'
                    ' "limit": %s, "limit_remaining": %s, "token": "%s", "label": "%s"}}'
                    % (OR_WEEKLY, OR_DAILY, OR_LIMIT, OR_LIMIT_REMAINING, TOKEN, ACCOUNT)).encode()
@@ -707,7 +707,7 @@ class UsdCanaryTest(HttpHarness):
         fetchers = {
             "openrouter": OpenRouterUsageFetcher(http_get=self.or_http, clock=self.clock),
             "ollama-cloud": self.ollama,
-            "antigravity": self.antigravity,
+            "antigravity-gemini": self.antigravity,
         }
         self.usage = UsageService(self.clock, fetchers=fetchers, key_of=key_by_sub.get,
                                   deployed=lambda sub: sub in key_by_sub)
@@ -755,7 +755,7 @@ class UsdCanaryTest(HttpHarness):
         # 一覽：OpenRouter 的 weekly_used_usd 是唯一允許的 7.3191；其他欄位掃描為零命中
         self.assertEqual(self.row(summary, "openrouter")["weekly_used_usd"], float(OR_WEEKLY))
         self.assertEqual(self.row(summary, "ollama-cloud")["weekly_used_usd"], None)
-        self.assertEqual(self.row(summary, "antigravity")["weekly_used_usd"], None)
+        self.assertEqual(self.row(summary, "antigravity-gemini")["weekly_used_usd"], None)
         def without_allowed_amount(doc):
             """只拿掉 openrouter 的 weekly_used_usd（唯一允許的位置），其餘照掃。"""
             doc = json.loads(json.dumps(doc))
