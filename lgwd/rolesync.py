@@ -84,6 +84,9 @@ class RoleSyncTimer:
 
     def stop(self):
         self._stop.set()
-        with self._lock:
-            if self._proc and self._proc.poll() is None: self._proc.kill()
+        with self._lock: proc = self._proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try: proc.wait(timeout=2)
+            except subprocess.TimeoutExpired: proc.kill()
         if self._thread: self._thread.join(timeout=5)

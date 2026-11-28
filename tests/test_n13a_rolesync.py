@@ -264,9 +264,26 @@ def test_timer_retries_automatically_on_next_interval(tmp_path):
     timer.start()
     try:
         deadline=time.monotonic()+8
-        while time.monotonic()<deadline:
-            if (d/'.rolesync.sha').exists(): break
-            time.sleep(.03)
+        def done():
+            # role-sync writes .rolesync.sha before .rolesync.status; wait for the status of the retry.
+            try: return (d/'.rolesync.sha').read_text()=='retrysha\n' and json.loads((d/'.rolesync.status').read_text())['ok'] is True
+            except (OSError, ValueError, KeyError, TypeError): return False
+        while time.monotonic()<deadline and not done(): time.sleep(.03)
+        assert done(), f"retry did not succeed before deadline; status={(d/'.rolesync.status').read_text() if (d/'.rolesync.status').exists() else None}"
         assert calls.exists() and (d/'.rolesync.sha').read_text()=='retrysha\n'
         assert json.loads((d/'.rolesync.status').read_text())['ok'] is True
     finally: timer.stop()
+
+def test_timer_stop_sigterms_its_child_and_lets_it_clean_up(tmp_path):
+    d=tmp_path/'var/lib/llmgateway'; d.mkdir(parents=True)
+    script=tmp_path/'fake-role-sync'; ready=tmp_path/'ready'; mark=tmp_path/'term'
+    script.write_text('#!/bin/sh\ntrap \'echo term > "$MARK"; exit 0\' TERM\necho ready > "$READY"\nwhile :; do sleep 0.1; done\n'); script.chmod(0o755)
+    env=dict(os.environ,LLMGW_PREFIX=str(tmp_path),MARK=str(mark),READY=str(ready))
+    timer=RoleSyncTimer(str(script),interval=60,timeout=30,env=env)
+    timer.start()
+    try:
+        deadline=time.monotonic()+8
+        while time.monotonic()<deadline and not ready.exists(): time.sleep(.03)
+        assert ready.exists(), 'fake role-sync never installed its SIGTERM trap'
+    finally: timer.stop()
+    assert mark.exists() and mark.read_text()=='term\n'
