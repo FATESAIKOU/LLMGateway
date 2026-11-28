@@ -632,6 +632,10 @@ def _check_rolesync(layout, report):
     import math
     from lgwd.policy import load_policy
     from lgwd.roletable import load_valid
+    # 回滾到沒有 role-sync 的舊版（H-1）：此版本沒有角色表功能，不走 policy／落地表驗證。
+    if not os.path.exists(layout.rolesync_script):
+        report.ok("rolesync", "此版本無角色表功能（不適用）")
+        return
     path = layout.role_table_file
     fallback = os.path.join(layout.current_link, "policy", "role-rotation.default.json")
     try:

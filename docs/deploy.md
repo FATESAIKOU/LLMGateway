@@ -1218,6 +1218,27 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
 
 這三個值先合，V-0.6 再以 cgroup 的 peak 驗證（見 8.18）；高峰超過上限的一半就開 d 單調高，不要放寬到 `infinity`。
 
+### 8.17.1a 角色表（role-sync）維運（#347）
+
+角色表由 role-sync 子行程定期同步到 `/var/lib/llmgateway/role-rotation.json`，同步結果寫在 `/var/lib/llmgateway/.rolesync.status`。正式表不能用時，lgwd 改用 release 內的保底表（`policy/role-rotation.default.json`）；啟動時若兩者都不能用，角色表為空，啟動警告為 `role table unavailable; no usable table (role path disabled)`。
+
+`llmgwctl check` 的 `rolesync` 項：
+
+- **ok**：「角色表同步正常」；或「此版本無角色表功能（不適用）」——current 指向的 release 沒有 `ops-scripts/role-sync`（回滾到舊版後）。後者不看表與狀態，不需要處置。
+- **todo**：「尚未同步，使用 tag 保底」或「尚未成功同步，使用 tag 保底」。**首次升級**到有 role-sync 的版本後，timer 第一次成功前都是 todo；這不是失敗。處置：等一個 timer 週期（預設 10 分鐘）後再跑 check；仍是 todo 就看 `.rolesync.status` 的 `reason`。
+- **fail**：「角色表不可用」（正式表與保底表都不合法，或正式表壞了）、「狀態檔讀不懂」、「角色表同步失敗或過期」（上次 `ok=false`、超過 30 分鐘沒有成功更新，或正式表不存在）。處置：
+  - 看 `.rolesync.status` 的 `reason`：`gh_missing`（找不到 gh）、`gh_auth`（gh 沒登入或 token 失效，由本人處理憑證，不在這裡重新登入）、`gh_failed`、`validation_failed`（同步到的表不合法）、`timeout`、`exit_<n>`／`signal_<n>`（role-sync 非零退出或被訊號殺，由 lgwd 補寫）、`spawn_failed`、`unexpected`。
+  - 同步失敗時不會動已落地的表，lgwd 繼續用最後一份好表；所以 fail 先修同步原因，不需要手動改角色表。
+  - 「狀態檔讀不懂」：role-sync 每次都整檔 rename 寫入；等下一次 timer 覆寫，仍不行就回報 PMO。
+- **回滾後**：這一項是 ok（不適用）；不需要處置。
+
+常用指令（皆為 `llmgwctl` 子命令，各子命令的詳細參數見其 `--help`）：
+
+- `llmgwctl cooldown-clear <訂閱 id>`：本機清除整把冷卻（需 root 或 llmgw）；清單一模型加 `--model <模型>`；改成較短的到期時刻（覆寫）用 `--until <時刻>`（RFC 3339，不得晚於現行上限）。
+- `llmgwctl audit-summary --since <時刻> --until <時刻>`：唯讀統計 `[since, until)` 半開區間，時刻須為 `Z` 或 `+00:00` 整秒；可加 `--db <路徑>` 指定資料庫。
+
+正式名冊 enforce 時，`arch` 角色要補進 principal（M-1）。目前 auth 為 off，這一點只是備註，尚未處理。
+
 ### 8.17.2 enforce 的磁碟與 IO 前提（#313）
 
 **root：** 不用（這一節是部署前提與量測，不改設定）。**lgwd 停止：** 不用。

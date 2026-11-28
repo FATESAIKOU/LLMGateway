@@ -324,12 +324,16 @@ class Gateway:
         stamp = _stat_stamp(self._roles_path)
         self._roles = roletable.load_valid(self._roles_path, policy)
         self._roles_stamp = stamp if self._roles is not None else None
+        self._roles_warned_stamp = None  # M-2：reload 失敗的 warning 每個 stamp 只寫一次
         # 啟動警告先記下、等 main() 裝好 SIGTERM／SIGINT handler 之後才寫（#297：handler
         # 安裝前的 stderr 行數是固定的，tests/test_main_sigterm_297.py 依賴它）。
         self.startup_notes: list[str] = []
         if self._roles is None:
-            self.startup_notes.append("role table unavailable; using tag fallback")
             self._roles = roletable.load_valid(os.path.join(os.path.dirname(config.policy_path), "role-rotation.default.json"), policy)
+            if self._roles is None:  # L-3：保底也壞，角色路徑停用
+                self.startup_notes.append("role table unavailable; no usable table (role path disabled)")
+            else:
+                self.startup_notes.append("role table unavailable; using tag fallback")
         self._service = RegistryService(config.db, policy, keys, self._clock, usage=self._usage, roles_provider=lambda: self._roles)
         self._current = _Current(self, self._service)
         self.api_server = make_api_server(self._current, config.api_host, config.api_port,
@@ -456,10 +460,14 @@ class Gateway:
                 return False
             table = roletable.load_valid(self._roles_path, self._role_policy)
             if table is None:
-                _LOG.warning("role table reload failed")
+                # 失敗不推進戳（C-1032 h1：同 stamp 每請求重試）；warning 只在 stamp 第一次出現時寫（M-2）
+                if stamp != self._roles_warned_stamp:
+                    _LOG.warning("role table reload failed")
+                    self._roles_warned_stamp = stamp
                 return False
             self._roles = table
             self._roles_stamp = stamp
+            self._roles_warned_stamp = None
             return True
 
 

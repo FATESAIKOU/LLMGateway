@@ -283,5 +283,17 @@ def run(layout, *, since: str, until: str, db=None, out=None, err=None) -> int:
         return 1
     finally:
         conn.close()
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), file=out)
+    print(json.dumps(_null_keys(result), ensure_ascii=False, indent=2, sort_keys=True), file=out)
     return 0
+
+
+def _null_keys(value):
+    """L-11：tier／data 為 NULL 時 Counter 的鍵是 None，和字串鍵一起 sort_keys 會 TypeError。
+
+    遞迴把 None 鍵轉成字串 "null"（JSON 本來就會寫成 null；這裡只是讓排序穩定）。
+    """
+    if isinstance(value, dict):
+        return {("null" if k is None else k): _null_keys(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_null_keys(v) for v in value]
+    return value
