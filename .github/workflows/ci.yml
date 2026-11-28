@@ -1,0 +1,56 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Install test runner
+        run: python -m pip install --disable-pip-version-check 'pytest==8.3.5'
+      - name: Tools
+        run: |
+          set -euo pipefail
+          ssh -V
+          for tool in prlimit ssh-keygen openssl; do
+            if ! command -v "$tool" >/dev/null; then
+              echo "缺工具：$tool" >&2
+              exit 1
+            fi
+          done
+          # sshd 整合測試缺這些會被 skip（見 tests/tunnel_fakes.py have_real_ssh）；這裡只印狀態，
+          # 實際 skip 的測試與原因由下面 pytest 的 -rs 列出。不在這裡直接失敗，因為 runner 映像未實跑驗證。
+          for path in /usr/sbin/sshd /run/sshd /usr/bin/ssh /usr/bin/ssh-keygen; do
+            if [ -e "$path" ]; then echo "present: $path"; else echo "missing (sshd tests skip): $path"; fi
+          done
+      - name: pytest (shard ${{ matrix.shard }} of 2)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          list="$RUNNER_TEMP/shard-${{ matrix.shard }}.txt"
+          # 產生器失敗（退出碼非 0）時這一步就失敗；不用 process substitution（它吞掉產生器的退出碼）
+          python3 ops-scripts/ci-test-shard 2 ${{ matrix.shard }} > "$list"
+          mapfile -t files < "$list"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "分批 ${{ matrix.shard }} 是空的，拒絕執行（不能退回整套 discovery）" >&2
+            exit 1
+          fi
+          echo "files: ${#files[@]}"
+          python -m pytest -q -rs -p no:cacheprovider "${files[@]}"
