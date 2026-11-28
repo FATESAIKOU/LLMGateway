@@ -84,6 +84,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_usage.add_argument("--data", default=None,
                          help="資料等級（public／general／real）；只在有 --role 時用")
 
+    # 冷卻的本機縮短／清除（#347 N13a §3）：直接開 llm.db，不經 HTTP。
+    p_cd = sub.add_parser(
+        "cooldown-clear",
+        help="本機縮短或清除冷卻（需 root 或 llmgw；省略 --until 為清除，帶 --until 為覆寫）")
+    p_cd.add_argument("id", help="訂閱 id")
+    p_cd.add_argument("--model", default=None,
+                      help="只動該模型的冷卻（供應商自己的模型 id）；省略為整把")
+    p_cd.add_argument("--until", default=None,
+                      help="覆寫成這個 RFC 3339 時刻（須在 now 到 now＋until_max_ahead 之間）；"
+                           "省略則清除列")
+
+    # 冷卻與拒絕的統計（#347 N13a §4.2）：唯讀開 llm.db。
+    p_audit = sub.add_parser(
+        "audit-summary", help="唯讀統計 audit（[since, until) 半開區間；時間須為 Z 或 +00:00 整秒）")
+    p_audit.add_argument("--since", required=True, help="起點，例如 2026-12-04T00:00:00Z")
+    p_audit.add_argument("--until", required=True, help="終點（不含），格式同 --since")
+    p_audit.add_argument("--db", default=None, help="資料庫路徑（預設 llm.db）")
+
     # 認證名冊與防重放（#222 D5b；#270）。路徑由 llmgateway.env 的 LGWD_AUTH_* 推導。
     p_auth_reg = sub.add_parser(
         "auth-registry", help="名冊 check／install／status（#222 D5b）")
@@ -227,6 +245,13 @@ def main(argv=None, env=None) -> int:
         return sync.run(layout, report=report)
     if args.command == "usage":
         return usage.run(layout, role=args.role, agent=args.agent, data=args.data)
+    if args.command == "cooldown-clear":
+        from . import cooldown_clear
+        return cooldown_clear.run(layout, subscription=args.id, model=args.model,
+                                  until=args.until)
+    if args.command == "audit-summary":
+        from . import audit_summary
+        return audit_summary.run(layout, since=args.since, until=args.until, db=args.db)
     if args.command in ("auth-registry", "auth-replay", "auth-store"):
         from . import auth_cli
         if args.command == "auth-registry":

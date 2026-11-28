@@ -21,6 +21,8 @@
   合併；data 是選填的資料等級宣告（public／general／real），省略時不帶參數＝服務
   不依 privacy 過濾；每個 query 值都用 urllib.parse.quote(value, safe="") 編碼——
   `+` 因此編成 %2B，server 的 parse_qs 才不會解成空白）
+- resolve_role(role, task_length, exclude, exclude_family, model, data, ref) → GET /v1/resolve?role=…
+  （#347 N13a；與 resolve 分開；task_length 必填；409 的 until／skipped 在 data 裡）
 - roles(role, agent, data=None) → GET /v1/roles/{role}?agent={agent}[&data={data}]
   （#100；spec role-allocation。data 省略時不帶參數，由服務取最嚴）
 - agy（agent=agy、provider=google）的訂閱沒有憑證（kind local-login）：resolve 的
@@ -279,6 +281,38 @@ class Client:
             for name, value in params
         )
         return self._send("GET", "/v1/resolve?" + query, None, error_data=True)
+
+    def resolve_role(self, role: str, task_length: str, *,
+                     exclude: list[str] | None = None,
+                     exclude_family: list[str] | None = None,
+                     model: str | None = None,
+                     data: str | None = None,
+                     ref: str | None = None) -> Result:
+        """依角色選格（#347 N13a）：role 必填，task_length 必填（"short"／"long"，不猜）。
+
+        與舊 resolve 分開：不帶 agent／provider／subscription（服務會以 400 拒收）。
+        exclude、exclude_family 各自用逗號合併成一個鍵；省略的參數不帶。
+        409（cooling／no_candidate／not_deployed）的 until 與 skipped 透傳在 data 裡。
+        """
+        if task_length is None:
+            raise TypeError("resolve_role 的 task_length 必填")
+        params = [("role", str(role)), ("task_length", str(task_length))]
+        if exclude:
+            params.append(("exclude", ",".join(str(value) for value in exclude)))
+        if exclude_family:
+            params.append(("exclude_family", ",".join(str(value) for value in exclude_family)))
+        if model is not None:
+            params.append(("model", str(model)))
+        if data is not None:
+            params.append(("data", str(data)))
+        if ref is not None:
+            params.append(("ref", str(ref)))
+        query = "&".join(
+            "{0}={1}".format(name, urllib.parse.quote(value, safe=""))
+            for name, value in params
+        )
+        path = "/v1/resolve?" + query
+        return self._send("GET", path, None, error_data=True)
 
     def roles(self, role: str, agent: str, data: str | None = None) -> Result:
         """取某角色在指定 agent 下的候選（依 rank；不含 key 與額度）。
