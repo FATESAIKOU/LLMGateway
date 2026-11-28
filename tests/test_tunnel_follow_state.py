@@ -255,9 +255,17 @@ class ZeroPollingAndRotationTests(StateBase):
         self.assertEqual(self.h.stop(), 0)
 
     def test_sigterm_during_normal_run_still_exits_0(self):
+        # 假 ssh 記錄 argv 後才安裝 TERM trap；等 trap 安裝完再送訊號。
+        with open(self.h.fake_ssh) as f:
+            script = f.read()
+        trap = "trap 'echo tunnel_terminated >> \"$FAKE_DIR/ssh.log\"; exit 143' TERM"
+        self.assertIn(trap, script)
+        with open(self.h.fake_ssh, "w") as f:
+            f.write(script.replace(trap, trap + "\necho tunnel_ready >> \"$FAKE_DIR/ssh.log\""))
         self.seed_follow()
         self.start()
         self.assertTrue(wait_until(lambda: len(self.tunnel_argvs()) == 1, 15))
+        self.assertTrue(wait_until(lambda: "tunnel_ready" in self.h.ssh_log(), 15))
         self.assertEqual(self.stop_daemon(), 0)
         self.assertTrue(wait_until(lambda: "tunnel_terminated" in self.h.ssh_log(), 5))
 
@@ -530,8 +538,12 @@ class DualWatermarkTests(StateBase):
         self.seed_verified(old)
         self.github.set_gateway(**gw(OLD_IP, 1, K_OLD))
         self.h.set_fake("tunnel_exit", "1")
+        def cooldown_expired():
+            return (not self.h.exists(".tunnel_fetch_backoff") or
+                    time.time() >= self.h.read_json(".tunnel_fetch_backoff")["next_allowed_epoch"])
+
         for _ in range(3):
-            time.sleep(1.1)                                   # 讓最短冷卻過期
+            self.assertTrue(wait_until(cooldown_expired, 10))
             self.assertEqual(self.run_to_exit(), 1)
             self.assertFalse(self.h.exists(".tunnel_fetch_backoff")
                              and self.h.read_json(".tunnel_fetch_backoff")["consecutive_failures"] > 0)
@@ -539,7 +551,7 @@ class DualWatermarkTests(StateBase):
         self.assertNotIn("gateway_updated", self.h.stderr())
         # 之後真的輪換：不會被拖到最大退避，冷卻一過就抓得到
         self.github.set_gateway(**gw(NEW_IP, 2, K_NEW))
-        time.sleep(1.1)
+        self.assertTrue(wait_until(cooldown_expired, 10))
         self.run_to_exit()
         self.assertIn("gateway_updated", self.h.stderr())
         self.assertEqual(self.h.read_json("gateway.json")["generation"], 2)
@@ -551,8 +563,10 @@ class DualWatermarkTests(StateBase):
         self.assertTrue(wait_until(lambda: len(self.tunnel_argvs()) == 1, 5))
         for broken in ("{not json", json.dumps(follow_record(OLD_IP, 0, K_OLD)), ""):
             with self.subTest(broken=broken[:12]):
+                probes = self.probe_count()
                 self.h.write_state("gateway.json", broken)
-                time.sleep(0.8)
+                # 新增四次探針，確保壞檔期間經過多個完整週期。
+                self.assertTrue(wait_until(lambda: self.probe_count() >= probes + 5, 10))
                 self.assertIsNone(self.h.proc.poll())
                 self.assertEqual(len(self.tunnel_argvs()), 1)
                 self.assertNotIn("tunnel_terminated", self.h.ssh_log())
@@ -702,7 +716,8 @@ class VerifiedWatermarkIntegrityTests(StateBase):
         self.corrupt_verified("garbage")
         self.h.set_fake("probe", "200")
         self.assertTrue(wait_until(lambda: "verified_invalid" in self.h.stderr(), 5))
-        time.sleep(1.0)
+        probes = self.probe_count()
+        self.assertTrue(wait_until(lambda: self.probe_count() >= probes + 5, 10))
         self.assertEqual(self.h.read_text(".tunnel_generation"), "corrupt")
         self.assertEqual(self.h.stderr().splitlines().count("verified_invalid"), 1)   # 不洗版
         self.assertIsNone(self.h.proc.poll())
@@ -754,7 +769,8 @@ class VerifiedWriteFailureTests(StateBase):
         self.lock_state_dir()                               # 磁碟滿／權限
         self.h.set_fake("probe", "200")
         self.assertTrue(wait_until(lambda: "verified_write_failed" in self.h.stderr(), 5))
-        time.sleep(1.0)                                     # 多個探針週期：仍沒寫成、不洗版
+        probes = self.probe_count()
+        self.assertTrue(wait_until(lambda: self.probe_count() >= probes + 5, 10))  # 多個完整探針週期
         self.assertFalse(self.h.exists(".tunnel_generation"))
         self.assertEqual(self.h.read_json(".tunnel_fetch_backoff")["consecutive_failures"], 2)
         self.assertEqual(self.h.stderr().splitlines().count("verified_write_failed"), 1)
