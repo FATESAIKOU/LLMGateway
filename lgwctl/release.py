@@ -22,6 +22,8 @@ from .run import CLONE_TIMEOUT, RunError, run
 # 指令實際跑起來要用的（低-8）。
 REQUIRED_FILES = (
     "policy/default.json",
+    "policy/role-rotation.default.json",
+    "ops-scripts/role-sync",
     os.path.join("lgwd", "__main__.py"),
     os.path.join("lgwd", "main.py"),
     os.path.join("lgwd", "policy.py"),

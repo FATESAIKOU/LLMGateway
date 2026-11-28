@@ -92,6 +92,10 @@ OLD_USER_UNIT_NAMES = (SERVICE_NAME, TUNNEL_SERVICE_NAME,
 
 OPS_DIR_NAME = "ops-scripts"
 KEYSYNC_BIN_NAME = "key-sync"
+ROLESYNC_BIN_NAME = "role-sync"
+ROLE_TABLE_NAME = "role-rotation.json"
+ROLESYNC_SHA_NAME = ".rolesync.sha"
+ROLESYNC_STATUS_NAME = ".rolesync.status"
 TUNNEL_BIN_NAME = "llmgateway-tunnel"
 
 # tag 格式與 deploy/install.sh、deploy/bootstrap.sh 同值；改一邊要改另一邊。
@@ -445,6 +449,22 @@ class Layout:
     @property
     def keys_env(self) -> str:
         return os.path.join(self.state_dir, KEYS_ENV_NAME)
+
+    @property
+    def role_table_file(self):
+        return os.path.join(self.state_dir, ROLE_TABLE_NAME)
+
+    @property
+    def rolesync_status_file(self):
+        return os.path.join(self.state_dir, ROLESYNC_STATUS_NAME)
+
+    @property
+    def rolesync_sha_file(self):
+        return os.path.join(self.state_dir, ROLESYNC_SHA_NAME)
+
+    @property
+    def rolesync_script(self):
+        return os.path.join(self.current_link, OPS_DIR_NAME, ROLESYNC_BIN_NAME)
 
     @property
     def db_file(self) -> str:

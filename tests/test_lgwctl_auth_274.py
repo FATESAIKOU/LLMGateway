@@ -791,6 +791,7 @@ def test_C828_check_is_read_only_and_creates_no_files(box):
 
 def test_C828_check_run_lists_the_three_items(box):
     """C-828：`check.run` 真的會列出三項（不是只有測試直接呼叫的函式）。"""
+    box.install_state()  # rolesync validates against the installed policy
     seed_stores(box, registry_bytes())
     write_status(box, status_document())
     # #312：auth-busy 要一份新鮮的計數檔（沒有就是 todo，rc 會變 2）。

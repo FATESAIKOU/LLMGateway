@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import time
 import os
 import pwd
 import shutil
@@ -311,6 +313,11 @@ class Sandbox:
         os.makedirs(os.path.join(self.service_home, ".ssh"), exist_ok=True)
         self._write_tools()
         self._write_template()
+        # Default installed state: role rotation has synced successfully.
+        self.write(self.state("role-rotation.json"),
+                   (REPO_ROOT / "policy/role-rotation.default.json").read_text(encoding="utf-8"))
+        self.write(self.state(".rolesync.status"), json.dumps({
+            "ts": time.time(), "ok": True, "reason": "ok", "ever_ok": True}))
         # #289：install／upgrade 類的既有測試可保留「已經裝好 timer 的機器」
         # （enabled＋active），check 的 check-timer 才是 ok；遷移沙箱用
         # default_timer=False，不預設已裝（遷移流程要自己 enable）。
@@ -359,6 +366,12 @@ class Sandbox:
             os.chmod(path, 0o755)
 
     def _write_template(self) -> None:
+        # Role rotation files are part of the release and its policy dry-run.
+        for rel in ("ops-scripts/role-sync", "policy/role-rotation.default.json",
+                    "lgwd/roletable.py", "lgwd/rolesync.py"):
+            self.write(os.path.join(self.template, rel),
+                       (REPO_ROOT / rel).read_text(encoding="utf-8"),
+                       0o755 if rel == "ops-scripts/role-sync" else 0o644)
         self.write(os.path.join(self.template, "policy", "default.json"),
                    Path(REAL_POLICY).read_text(encoding="utf-8"), 0o644)
         self.write(os.path.join(self.template, "lgwd", "__main__.py"),

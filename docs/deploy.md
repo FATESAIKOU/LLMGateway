@@ -1196,6 +1196,8 @@ handler 在啟動完成後才註冊：啟動期間（含 `ssh-keygen` 自測）�
 
 ### 8.17.1 資源上限
 
+角色表另有獨立的 role-sync 計時子行程；與 key-sync 解耦，使用既有服務資源上限。
+
 **root：** 要（unit 檔與 install）。**lgwd 停止：** 要（改完重啟才生效）。
 
 unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**的上限，不是貼著用量限流：目的是擋住失控（fork 洪水、記憶體洩漏、fd 洩漏），所以三個值都比實測高峰寬很多，off 模式與現行負載的用量都遠低於它們（#247 J-5）。`TasksMax` 與 `MemoryMax` 是 cgroup 層級，把 lgwd 和它所有的子行程一起算；`LimitNOFILE` 是每個行程各自的上限。

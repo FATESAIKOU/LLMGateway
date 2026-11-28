@@ -30,6 +30,8 @@ from .keysync import DEFAULT_INTERVAL as DEFAULT_KEYSYNC_INTERVAL
 from .keysync import DEFAULT_TIMEOUT as DEFAULT_KEYSYNC_TIMEOUT
 from .keysync import KeySyncTimer, default_script as default_keysync_script
 from .policy import PolicyError, load_policy
+from . import roletable
+from .rolesync import RoleSyncTimer, default_script as default_rolesync_script
 from .providers import UsageDeps, provider_for, validate_endpoints
 from .registry import RegistryService
 from .usage import UsageService
@@ -214,6 +216,7 @@ class _Current:
 
     def __getattr__(self, name: str):
         self._owner.reload_keys_if_changed()
+        self._owner.reload_roles_if_changed()
         return getattr(self.service, name)
 
 
@@ -314,7 +317,17 @@ class Gateway:
         self._keys = keys
         self._keys_lock = threading.Lock()
         self._usage = self._make_usage(policy, usage_deps)
-        self._service = RegistryService(config.db, policy, keys, self._clock, usage=self._usage)
+        self._role_policy = policy
+        prefix = os.environ.get("LLMGW_PREFIX", "").rstrip("/")
+        self._roles_path = prefix + "/var/lib/llmgateway/role-rotation.json"
+        self._roles_lock = threading.Lock()
+        stamp = _stat_stamp(self._roles_path)
+        self._roles = roletable.load_valid(self._roles_path, policy)
+        self._roles_stamp = stamp if self._roles is not None else None
+        if self._roles is None:
+            _LOG.warning("role table unavailable; using tag fallback")
+            self._roles = roletable.load_valid(os.path.join(os.path.dirname(config.policy_path), "role-rotation.default.json"), policy)
+        self._service = RegistryService(config.db, policy, keys, self._clock, usage=self._usage, roles_provider=lambda: self._roles)
         self._current = _Current(self, self._service)
         self.api_server = make_api_server(self._current, config.api_host, config.api_port,
                                           gate=auth_runtime.gate if auth_runtime else None)
@@ -323,6 +336,10 @@ class Gateway:
         # 停止時只等「在途請求」，不等閒置／慢連線；連線執行緒維持 daemon
         # （與 D1 相同，#263 高-1：設成 False 會讓 server_close() 無限期 join）。
         self._inflight = _track_inflight(self.api_server)
+        script = default_rolesync_script()
+        self.rolesync = RoleSyncTimer(script) if os.access(script, os.X_OK) else None
+        if self.rolesync is not None:
+            self.rolesync.start()
         self.keysync = make_keysync(config)  # 關閉時是 None
         self._thread: threading.Thread | None = None
 
@@ -371,6 +388,8 @@ class Gateway:
             self.keysync.start()  # 啟動後先跑一次（在 30 秒內），之後照 interval
 
     def stop(self) -> None:
+        if self.rolesync is not None:
+            self.rolesync.stop()
         self._usage.stop()  # 先設已停止旗標並收掉取用量子行程，再停其他
         if self.keysync is not None:
             self.keysync.stop()  # 先叫停 key 拉取，再關 API
@@ -423,6 +442,22 @@ class Gateway:
             if ok:
                 self._keys_stamp = stamp
             return ok
+
+    def reload_roles_if_changed(self):
+        stamp = _stat_stamp(self._roles_path)
+        if stamp == self._roles_stamp:
+            return False
+        with self._roles_lock:
+            stamp = _stat_stamp(self._roles_path)
+            if stamp == self._roles_stamp:
+                return False
+            table = roletable.load_valid(self._roles_path, self._role_policy)
+            if table is None:
+                _LOG.warning("role table reload failed")
+                return False
+            self._roles = table
+            self._roles_stamp = stamp
+            return True
 
 
 def main(argv: list[str] | None = None) -> int:
