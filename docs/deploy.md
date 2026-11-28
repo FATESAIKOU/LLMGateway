@@ -1232,10 +1232,10 @@ unit 在 `[Service]` 段設三個資源上限。它們是**保護整台主機**�
   - 「狀態檔讀不懂」：role-sync 每次都整檔 rename 寫入；等下一次 timer 覆寫，仍不行就回報 PMO。
 - **回滾後**：這一項是 ok（不適用）；不需要處置。
 
-常用指令（皆為 `llmgwctl` 子命令，詳細參數見 `llmgwctl <子命令> --help`）：
+常用指令（皆為 `llmgwctl` 子命令，各子命令的詳細參數見其 `--help`）：
 
-- `llmgwctl cooldown-clear <訂閱 id> [--model <模型>] [--until <RFC 3339>]`：本機縮短或清除冷卻；省略 `--until` 為清除，帶 `--until` 為覆寫（需 root 或 llmgw）。
-- `llmgwctl audit-summary --since <時刻> --until <時刻> [--db <路徑>]`：唯讀統計 `[since, until)` 半開區間，時刻須為 `Z` 或 `+00:00` 整秒。
+- `llmgwctl cooldown-clear <訂閱 id>`：本機清除整把冷卻（需 root 或 llmgw）；清單一模型加 `--model <模型>`；改成較短的到期時刻（覆寫）用 `--until <時刻>`（RFC 3339，不得晚於現行上限）。
+- `llmgwctl audit-summary --since <時刻> --until <時刻>`：唯讀統計 `[since, until)` 半開區間，時刻須為 `Z` 或 `+00:00` 整秒；可加 `--db <路徑>` 指定資料庫。
 
 正式名冊 enforce 時，`arch` 角色要補進 principal（M-1）。目前 auth 為 off，這一點只是備註，尚未處理。
 
