@@ -324,8 +324,11 @@ class Gateway:
         stamp = _stat_stamp(self._roles_path)
         self._roles = roletable.load_valid(self._roles_path, policy)
         self._roles_stamp = stamp if self._roles is not None else None
+        # 啟動警告先記下、等 main() 裝好 SIGTERM／SIGINT handler 之後才寫（#297：handler
+        # 安裝前的 stderr 行數是固定的，tests/test_main_sigterm_297.py 依賴它）。
+        self.startup_notes: list[str] = []
         if self._roles is None:
-            _LOG.warning("role table unavailable; using tag fallback")
+            self.startup_notes.append("role table unavailable; using tag fallback")
             self._roles = roletable.load_valid(os.path.join(os.path.dirname(config.policy_path), "role-rotation.default.json"), policy)
         self._service = RegistryService(config.db, policy, keys, self._clock, usage=self._usage, roles_provider=lambda: self._roles)
         self._current = _Current(self, self._service)
@@ -509,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    for note in gateway.startup_notes:
+        _LOG.warning("%s", note)
     gateway.start()
     host, port = gateway.addr[:2]
     _LOG.info("serving api=%s:%s", host, port)
