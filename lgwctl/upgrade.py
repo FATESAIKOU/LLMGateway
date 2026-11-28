@@ -26,9 +26,18 @@ from .report import Report
 DRY_RUN_SNIPPET = """\
 import sys
 from lgwd.policy import PolicyError, load_policy
+import os
 
 try:
-    load_policy(sys.argv[1])
+    policy = load_policy(sys.argv[1])
+    from lgwd.roletable import load_valid
+    if load_valid(sys.argv[2], policy) is None:
+        raise ValueError("invalid tag role table")
+    if os.path.exists(sys.argv[3]):
+        if load_valid(sys.argv[3], policy) is None:
+            raise ValueError("invalid installed role table")
+    else:
+        print("installed role table absent: skipped")
 except PolicyError as exc:
     print(exc)
     sys.exit(1)
@@ -54,7 +63,7 @@ def _dry_run_policy(layout, tag_dir: str, report) -> bool:
     """用**新 tag 目錄裡的 lgwd** 驗那一版的 policy（不過就不切）。"""
     policy_path = os.path.join(tag_dir, "policy", "default.json")
     try:
-        proc = runmod.run([layout.python3, "-c", DRY_RUN_SNIPPET, policy_path],
+        proc = runmod.run([layout.python3, "-c", DRY_RUN_SNIPPET, policy_path, os.path.join(tag_dir, "policy", "role-rotation.default.json"), layout.role_table_file],
                           cwd=tag_dir, timeout=runmod.DEFAULT_TIMEOUT)
     except runmod.RunError as exc:
         report.fail("policy", f"dry-run 跑不起來（{layout.python3} {exc.kind}）")
@@ -63,6 +72,8 @@ def _dry_run_policy(layout, tag_dir: str, report) -> bool:
         detail = (_first_line(proc.stdout) or _last_line(proc.stderr) or "未知原因")
         report.fail("policy", f"dry-run 不過（不切版）：{detail}")
         return False
+    if _first_line(proc.stdout):
+        report.ok("rolesync", _first_line(proc.stdout))
     report.ok("policy", "dry-run 通過")
     return True
 

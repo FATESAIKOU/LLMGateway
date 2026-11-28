@@ -121,7 +121,9 @@ class RegistryService:
         keys: KeyStore,
         clock: Clock,
         usage: UsageService | None = None,
+        *, roles_provider=None,
     ):
+        self._roles_provider = roles_provider
         self._store = Store(db_path)
         self._policy = policy
         self._keys = keys

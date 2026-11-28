@@ -327,6 +327,7 @@ class EnforceCase(unittest.TestCase):
         """
         box = Sandbox()
         self.addCleanup(box.close)
+        box.install_state()  # rolesync checks the installed policy
         if env_file:
             box.write(box.etc("llmgateway.env"),
                       'LGW_API_PORT="{0}"\nLGWD_AUTH_MODE="{1}"\n'.format(

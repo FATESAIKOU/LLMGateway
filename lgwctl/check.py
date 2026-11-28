@@ -628,6 +628,45 @@ def _check_auth_degraded(layout, report) -> None:
         report.fail("auth-degraded", detail)
 
 
+def _check_rolesync(layout, report):
+    import math
+    from lgwd.policy import load_policy
+    from lgwd.roletable import load_valid
+    path = layout.role_table_file
+    fallback = os.path.join(layout.current_link, "policy", "role-rotation.default.json")
+    try:
+        policy = load_policy(os.path.join(layout.current_link, "policy", "default.json"))
+        local = load_valid(path, policy)
+        tag = load_valid(fallback, policy)
+    except Exception:
+        local = tag = None
+    exists = os.path.exists(path)
+    if (local is None and tag is None) or (exists and local is None):
+        report.fail("rolesync", "角色表不可用")
+        return
+    try:
+        with open(layout.rolesync_status_file, encoding="utf-8") as f:
+            status = json.load(f)
+    except FileNotFoundError:
+        report.todo("rolesync", "尚未同步，使用 tag 保底")
+        return
+    except (OSError, ValueError):
+        report.fail("rolesync", "狀態檔讀不懂")
+        return
+    if (not isinstance(status, dict) or type(status.get("ok")) is not bool
+        or type(status.get("ever_ok")) is not bool or type(status.get("ts")) not in (int, float)
+        or (isinstance(status["ts"], float) and not math.isfinite(status["ts"]))
+        or status["ts"] > time.time() + 60
+        or not isinstance(status.get("reason"), str)):
+        report.fail("rolesync", "狀態檔讀不懂")
+    elif not status["ever_ok"]:
+        report.todo("rolesync", "尚未成功同步，使用 tag 保底")
+    elif not exists or not status["ok"] or status["ts"] < time.time() - 1800:
+        report.fail("rolesync", "角色表同步失敗或過期")
+    else:
+        report.ok("rolesync", "角色表同步正常")
+
+
 def run(layout, *, report: Report | None = None, no_remote: bool = False,
         tag: str | None = None) -> int:
     report = report or Report(journal=(layout.env.get(ENV_CHECK_JOURNAL) == "1"))
@@ -645,6 +684,7 @@ def run(layout, *, report: Report | None = None, no_remote: bool = False,
         _check_follow(layout, report, tunnel_state == "active")
         _check_list_remote(layout, report)
     _check_keysync(layout, report)
+    _check_rolesync(layout, report)
     _check_policy(layout, report)
     _check_gh_repo(layout, report)
     return report.exit_code()

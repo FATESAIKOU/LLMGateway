@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "roles": {
+    "impl": [
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "deepseek-v4.1-flash-free", "effort": null, "tier": "free", "family": "deepseek"},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "glm-5.3-flash-free", "effort": null, "tier": "free", "family": "zhipu"},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "mimo-v2.6-flash-free", "effort": null, "tier": "free", "family": "xiaomi"},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "hy4-flash-free", "effort": null, "tier": "free", "family": "hy4", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "tidepool-alpha-free", "effort": null, "tier": "free", "family": "tidepool", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "flint-40b-free", "effort": null, "tier": "free", "family": "recursive", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "nemotron-3.5-super-vl-free", "effort": null, "tier": "free", "family": "nvidia", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "nemotron-3.5-lightning-free", "effort": null, "tier": "free", "family": "nvidia", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "openrouter", "model": "particle-ai/particle-1:free", "effort": null, "tier": "free", "family": "particle-ai", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "openrouter", "model": "recursive/flint-v1.0:free", "effort": null, "tier": "free", "family": "recursive", "short_only": true, "unscored": true},
+      {"agent": "agy", "subscription": "antigravity-gemini", "model": "gemini-3.8-flash-medium", "effort": null, "tier": "low", "family": "google"},
+      {"agent": "agy", "subscription": "antigravity-claude-oss", "model": "claude-sonnet-5-5-medium", "effort": null, "tier": "normal", "family": "anthropic"},
+      {"agent": "codex", "subscription": "chatgpt-personal", "model": "gpt-6.1-terra", "effort": "medium", "tier": "low", "family": "openai"},
+      {"agent": "opencode", "subscription": "ollama-cloud", "model": "deepseek-v4.1-flash", "effort": "max", "tier": "low", "family": "deepseek"},
+      {"agent": "claude-code", "subscription": "claude-personal", "model": "claude-haiku-5-5", "effort": "medium", "tier": "low", "family": "anthropic"}
+    ],
+    "qa": [
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "deepseek-v4.1-flash-free", "effort": null, "tier": "free", "family": "deepseek"},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "glm-5.3-flash-free", "effort": null, "tier": "free", "family": "zhipu"},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "mimo-v2.6-flash-free", "effort": null, "tier": "free", "family": "xiaomi"},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "hy4-flash-free", "effort": null, "tier": "free", "family": "hy4", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "tidepool-alpha-free", "effort": null, "tier": "free", "family": "tidepool", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "flint-40b-free", "effort": null, "tier": "free", "family": "recursive", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "nemotron-3.5-super-vl-free", "effort": null, "tier": "free", "family": "nvidia", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "openrouter", "model": "particle-ai/particle-1:free", "effort": null, "tier": "free", "family": "particle-ai", "short_only": true, "unscored": true},
+      {"agent": "opencode", "subscription": "openrouter", "model": "recursive/flint-v1.0:free", "effort": null, "tier": "free", "family": "recursive", "short_only": true, "unscored": true},
+      {"agent": "agy", "subscription": "antigravity-gemini", "model": "gemini-3.8-flash-medium", "effort": null, "tier": "low", "family": "google"},
+      {"agent": "agy", "subscription": "antigravity-claude-oss", "model": "claude-sonnet-5-5-medium", "effort": null, "tier": "normal", "family": "anthropic"},
+      {"agent": "codex", "subscription": "chatgpt-personal", "model": "gpt-6.1-terra", "effort": "medium", "tier": "low", "family": "openai"},
+      {"agent": "opencode", "subscription": "ollama-cloud", "model": "deepseek-v4.1-flash", "effort": "max", "tier": "low", "family": "deepseek"},
+      {"agent": "claude-code", "subscription": "claude-personal", "model": "claude-haiku-5-5", "effort": "medium", "tier": "low", "family": "anthropic"}
+    ],
+    "rev": [
+      {"agent": "opencode", "subscription": "opencode-zen", "model": "deepseek-v4.1-flash-free", "effort": null, "tier": "free", "family": "deepseek"},
+      {"agent": "agy", "subscription": "antigravity-gemini", "model": "gemini-4-hydrogen-medium", "effort": null, "tier": "normal", "family": "google"},
+      {"agent": "agy", "subscription": "antigravity-claude-oss", "model": "claude-sonnet-5-5-high", "effort": null, "tier": "normal", "family": "anthropic"},
+      {"agent": "codex", "subscription": "chatgpt-personal", "model": "gpt-6.1-terra", "effort": "medium", "tier": "low", "family": "openai"},
+      {"agent": "opencode", "subscription": "ollama-cloud", "model": "deepseek-v4.1-flash", "effort": "max", "tier": "low", "family": "deepseek"},
+      {"agent": "claude-code", "subscription": "claude-personal", "model": "claude-sonnet-5-5", "effort": "high", "tier": "normal", "family": "anthropic"}
+    ],
+    "arch": [
+      {"agent": "agy", "subscription": "antigravity-gemini", "model": "gemini-4-hydrogen-high", "effort": null, "tier": "normal", "family": "google"},
+      {"agent": "agy", "subscription": "antigravity-claude-oss", "model": "claude-opus-5-5-medium", "effort": null, "tier": "normal", "family": "anthropic"},
+      {"agent": "codex", "subscription": "chatgpt-personal", "model": "gpt-6.1-sol", "effort": "medium", "tier": "normal", "family": "openai"},
+      {"agent": "claude-code", "subscription": "claude-personal", "model": "claude-opus-5-5", "effort": "medium", "tier": "normal", "family": "anthropic"}
+    ]
+  }
+}
